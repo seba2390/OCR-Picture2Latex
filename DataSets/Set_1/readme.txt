@@ -1,3 +1,5 @@
+Can be found at: https://zenodo.org/record/56198#.ZCH2-i_YnXa
+
 Structure
 =========
 
@@ -5,7 +7,7 @@ Structure
     - Each line is separate generated image per formula
     - Line structure: "[formula_idx] [image_name] [render_type]"
         - formula_idx is the line number of the formula in im2latex_formulas.lst
-        - image_name is the name of rendered image (without '.png')
+        - image_name is the name of rendered image (without '.png') (can be found at: https://zenodo.org/record/56198/files/formula_images.tar.gz?download=1)
         - render_type is the name of used rendering settings (in image2latex.py)
     - Dataset is split to train, validation and test
         - train is for training the model
