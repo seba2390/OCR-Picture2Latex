@@ -71,7 +71,7 @@ def latex_to_image(math_expr: str, file_name: str, location: str, file_format: s
     ax.set_axis_off()
 
     # Save the plot as a PNG with a transparent background
-    plt.savefig(fname=file_name+"."+file_format, format=file_format, transparent=transparent, bbox_inches='tight', pad_inches=0.0, dpi=resolution)
+    plt.savefig(fname=location+file_name+"."+file_format, format=file_format, transparent=transparent, bbox_inches='tight', pad_inches=0.0, dpi=resolution)
     plt.close(fig)
 
 
