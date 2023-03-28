@@ -11,97 +11,73 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 
-def math_scraper(input_names: List[str], output_name: str) -> None:
+def math_scraper(input_names: List[str], output_name: str) -> List[str]:
     """
-    Reads the input LaTeX file and extracts all equations, align, and $$ environments
-    into the output file, with each math environment on a separate line.
+    Reads the input LaTeX file and extracts all equations environments. All equations
+    are written to the output file, with each math environment on a separate line.
+    All equations are returned as list of strings.
 
     Args:
         input_names (List[str]): A list of the names of the input LaTeX files.
         output_name (str): The name of the output text file.
 
     Returns:
-        None
+        formatted_equations (List[str]): A list of strings, where each string corresponds a latex math equation.
 
     Example Usage:
         >>> math_scraper(['input1.tex', 'input2.tex'], 'output.txt')
     """
+
+    # Define the regular expressions to match and remove \nonumber, \label{} and % tokens
+    nonumber_regex = r'\\nonumber'
+    label_regex = r'\\label{.*?}'
+    bm_regex = r'\\bm'
+    prct_rexeg = r'%'
+
+    def remover(math_str: str) -> str:
+        # Remove \nonumber tokens
+        _math_str = re.sub(nonumber_regex, '', math_str)
+        # Remove \label{} tokens and their contents
+        _math_str = re.sub(label_regex, '', _math_str)
+        # Remove % tokens and their contents
+        _math_str = re.sub(prct_rexeg, '', _math_str)
+        # Removing explicit \bm toke
+        _math_str = re.sub(bm_regex, '', _math_str)
+        # Removing explicit \n chars
+        _math_str = _math_str.replace('\n', '')
+        # Adding space to after special chars like \circ
+        _math_str = _math_str.replace('\circ', '\circ ')
+        return _math_str
+
+    # Define the regular expression to match and extract '\begin{equation}' type fields
+    equation_regex = r'\\begin{equation}(.*?)\\end{equation}\s*'
+    equation_start_token = r'\begin{equation}'
+    equation_end_token = r'\end{equation}'
+
     # Open the output file for writing
+    formatted_equations = []
     with open(output_name, 'w') as output_file:
-
-        # Define regular expressions for equation, align, and $$ environments
-        equation_regex = re.compile(r'\\begin\{equation\}(.*?)\\end\{equation\}', re.DOTALL)
-        equation_star_regex = re.compile(r'\\begin\{equation\*\}(.*?)\\end\{equation\*\}', re.DOTALL)
-
-        align_regex = re.compile(r'\\begin\{align\}(.*?)\\end\{align\}', re.DOTALL)
-        align_star_regex = re.compile(r'\\begin\{align\*\}(.*?)\\end\{align\*\}', re.DOTALL)
-
-        multiline_regex = re.compile(r'\\begin\{multiline\}(.*?)\\end\{multiline\}', re.DOTALL)
-        multiline_star_regex = re.compile(r'\\begin\{multiline\*\}(.*?)\\end\{multiline\*\}', re.DOTALL)
-
-        gather_regex = re.compile(r'\\begin\{gather\}(.*?)\\end\{gather\}', re.DOTALL)
-        gather_star_regex = re.compile(r'\\begin\{gather\*\}(.*?)\\end\{gather\*\}', re.DOTALL)
-
-        aligned_regex = re.compile(r'\\begin\{aligned\}(.*?)\\end\{aligned\}', re.DOTALL)
-
         # Find matches within each input file and write them to the output file
         for idx in tqdm(range(len(input_names))):
             input_name = input_names[idx]
-            with open(input_name, 'r', encoding='utf-8') as input_file:
+            with open(input_name, 'r') as input_file:
                 try:
+                    # Read .tex file contents
                     input_contents = input_file.read()
-                    for match in equation_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
-                    for match in equation_star_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
-
-                    for match in align_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
-                    for match in align_star_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
-
-                    for match in multiline_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
-                    for match in multiline_star_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
-
-                    for match in gather_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
-                    for match in gather_star_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
-
-                    for match in aligned_regex.findall(input_contents):
-                        output_file.write(match.strip() + '\n')
+                    # Use regex to find all '\begin{equation}' type fields
+                    equation_fields = re.findall(equation_regex, input_contents, re.DOTALL)
+                    for math_equation in equation_fields:
+                        # Removing unwanted tokens
+                        math_equation = remover(math_str=math_equation)
+                        # Putting start and end tokens back
+                        math_equation = math_equation#equation_start_token + math_equation + equation_end_token
+                        # Saving equation
+                        formatted_equations.append(math_equation)
+                        # Writing equation to file
+                        output_file.write(math_equation+'\n')
                 except UnicodeDecodeError:
-                    print(f"Error: File {input_name} cannot be decoded with UTF-8. Trying latin-1 encoding instead...")
-                    try:
-                        input_file.seek(0)  # Reset the file pointer
-                        input_contents = input_file.read().encode('latin-1').decode('utf-8', 'ignore')
-                        for match in equation_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-                        for match in equation_star_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-
-                        for match in align_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-                        for match in align_star_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-
-                        for match in multiline_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-                        for match in multiline_star_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-
-                        for match in gather_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-                        for match in gather_star_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-
-                        for match in aligned_regex.findall(input_contents):
-                            output_file.write(match.strip() + '\n')
-                    except UnicodeDecodeError:
-                        print(f"Error: File {input_name} cannot be decoded with Latin-1 - skipping file..")
-                        continue
+                    print(f"Error: File {input_name} cannot be decoded - skipping..")
+                    continue
 
             input_file.close()
     output_file.close()
@@ -109,6 +85,8 @@ def math_scraper(input_names: List[str], output_name: str) -> None:
         lines = f.read().split('\n')
         num_lines = len(lines)
         print(f"==== Scraped: {num_lines} equations, and saved to: {output_name} ====")
+    f.close()
+    return formatted_equations
 
 
 def move_files_to_parent(download_directory: str) -> None:
