@@ -1,6 +1,5 @@
 from typing import Union, Tuple
 import os
-import logging
 
 import matplotlib.pyplot as plt
 
