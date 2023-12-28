@@ -1,0 +1,1778 @@
+\begin{figure*}[t!]\small
+\begin{tabular}{c|c}
+\begin{lstlisting}[basicstyle=\footnotesize,language=fstar]
+let chacha20 
+  (len: uint32{len <= blocklen}) !\label{line:c20:args1}!
+  (output: bytes{len = output.length}) !\label{line:c20:args2}!
+  (key: keyBytes)
+  (nonce: nonceBytes{disjoint [output; key; nonce]}) 
+  (counter: uint32) : Stack unit!\label{line:c20:args3}!
+  (requires (fun m0 ->  output $\in$ m0 /\ key $\in$ m0 /\ nonce $\in$ m0))!\label{line:c20:spec1}!
+  (ensures (fun m0 _ m1 -> modifies$_1$ output m0 m1 /\ !\label{line:c20:spec2}!
+      m1.[output] == 
+      Seq.prefix len (Spec.chacha20 m0.[key]  m0.[nonce]) counter))) =!\label{line:c20:spec3}!
+    push_frame ();! \label{line:c20:push}!
+    let state = Buffer.create 0ul 32ul in! \label{line:c20:create}!
+    let block = Buffer.sub state 16ul 16ul in! \label{line:c20:sub}!
+    chacha20_init block key nonce counter;
+    chacha20_update output state len;
+    pop_frame ()! \label{line:c20:pop}!
+\end{lstlisting}
+&\quad
+\;\;
+%[language=[ANSI]C] NS: How to format this as C?
+\begin{lstlisting}[basicstyle=\footnotesize,language=C]
+void chacha20 ( 
+  uint32_t len,
+  uint8_t *output, 
+  uint8_t *key,
+  uint8_t *nonce,
+  uint32_t counter)
+
+
+
+
+{
+  uint32_t state[32] = { 0 };
+  uint32_t *block = state + 16;
+  chacha20_init(block, key, nonce, counter);
+  chacha20_update(output, state, len);
+}
+\end{lstlisting}
+\end{tabular}
+\caption{A snippet from ChaCha20 in \lowstar (left) and its C compilation
+(right)\jp{
+  Add some disjoint clauses.
+}\cf{This code is further away from hacl-star.}}
+\label{fig:chacha20-both}
+\end{figure*}
+\section{A \lowstar Tutorial}
+\label{sec:examples}
+
+At the core of \lowstar is a library for programming with
+structures and arrays manually allocated on the stack or the heap (\sref{dsl}).
+\cf{A bit restrictive? FStar.HyperStack is important too!}
+Memory safety demands reasoning about the extents and
+liveness of these objects, while functional correctness and security
+may require reasoning about their contents. Our library
+provides %dependently typed
+specifications to allow client code to be
+proven safe, correct and secure,
+while KreMLin compiles such verified client code to C.
+
+We illustrate the design of \lowstar using several examples from our
+codebase. We show the ChaCha20 stream cipher~\cite{chacha20}, focusing on
+memory safety (\sref{chacha20}), and the Poly1305
+MAC~\cite{bernstein2005poly1305}, focusing on functional correctness.
+(\sref{poly1305}).
+%
+Going beyond functional correctness, we explain how we prove a
+combination of ChaCha20 and Poly1305 cryptographically secure
+(\sref{crypto}).
+%
+Throughout, we point out key benefits of our approach, notably our use
+of dependently typed metaprogramming to work at a relatively high-level of
+abstraction at little performance cost. \nik{Can the stackinline
+  stuff be folded into an extended version of \sref{crypto}?}
+
+%% along with its C extraction. We gradually
+%% introduce the syntax and libraries of \lowstar, and show how the
+%% memory-safe \lowstar subset statically prevents memory violations.  A
+%% second example goes beyond memory safety and describes a proof of
+%% functional correctness using our Poly1305 MAC
+%% implementation~\cite{bernstein2005poly1305}. Each of these examples is
+%% supported by performance measurements.
+
+
+
+%% As mentioned earlier, low-level code is often vulnerable to attacks
+%% that rely on memory mismanagement. \lowstar prevents such vulnerabilities by
+%% construction. To illustrate our methodology, we present a snippet of code from
+%% the ChaCha20 stream cipher~\cite{chacha20}, along with its C extraction. We
+%% gradually introduce the syntax and libraries of \lowstar, and show how the
+%% memory-safe \lowstar subset statically prevents memory violations.
+%% A second example goes
+%% beyond memory safety and describes a proof of functional correctness using
+%% our Poly1305 MAC implementation~\cite{bernstein2005poly1305}. Each of these
+%% examples is supported by performance measurements.
+
+% We present a series of examples that highlight how \lowstar rules out such errors by
+% construction. We start with three cryptographic algorithms taken from \haclstar, our
+% high-assurance crypto library; then, we move on to three higher-level examples that
+% build upon the \haclstar primitives. We provide side-by-side comparisons between
+% \lowstar programs and the extracted C code and run performance evaluations to
+% show that going through \lowstar still yields the desired performance.
+
+% \cf{The section feels too stack specific; heap-allocated buffers are
+%   also useful.}
+% CH: it was only the first sentence above, I think; fixed that
+
+\subsection{A First Example: the ChaCha20 Stream Cipher}
+\label{sec:chacha20}
+
+% \nik{I'm intentionally dropping uses of \lst$v$ here and throughout,
+%   since we don't really have space to discuss bounded integer types
+%   etc. Besides, everything is a UInt32 here (except Seq.length ... so
+%   it's a little cheating, but I think it's ok). Besides, we should
+%   really get the FStar.Integers overloading thing to work at scale and
+%   use it in our \lowstar code. 
+% %
+%   CF What happened to syntax compliance? :). I suggest writing
+%   \lst$uint32$ instead of the distracting \lst$UInt32.t$; we do that
+%   in some files.  }
+
+% \nik{I'm intentionally renaming GTot to Ghost here and ignoring
+% \lst!Div! since the footnote covers partiality already}
+
+Figure~\ref{fig:chacha20-both} shows code snippets for the core
+function of ChaCha20~\cite{chacha20}, a modern stream cipher widely
+used for fast symmetric encryption.
+%
+This function computes a block of pseudo-random bytes, usable for
+encryption, for example, by XORing them with a plaintext message.
+%
+%
+On the left is our \lowstar code; on the right its compilation to
+C. 
+%
+The function takes as arguments an output length and buffer, and some
+input key, nonce, and counter. 
+%
+It allocates 32 words of auxiliary, contiguous state on the stack; then it calls a
+function to initialize the cipher block from the inputs (passing an
+interior pointer to the state); and finally it calls another function that
+computes a cipher block and copies its first \lst$len$ bytes to the
+output buffer.
+
+Aside from the erased specifications at
+lines~\ref{line:c20:spec1}--\ref{line:c20:spec3}, the C code is in
+one-to-one correspondence with its \lowstar counterpart.
+%
+These specifications capture the safe memory usage of \lst$chacha20$.
+(Their syntax is explained next, in~\S\ref{sec:dsl}.)
+%
+For each argument passed by reference, and for the auxiliary state,
+they keep track of their liveness and size. They also capture its
+correctness, by describing the final state of the \lst$output$ buffer
+using a pure function.
+
+Lines~\ref{line:c20:args1}--\ref{line:c20:args2} use type refinements to require that the
+\lst$len$ argument equals the length of the \lst$output$ buffer and it does not
+exceed the block size. (Violation of these conditions would
+lead to a buffer overrun in the call to \lst$chacha20_update$.)
+%
+Similarly, types \lst$keyBytes$ and \lst$nonceBytes$ specify
+pointers to fixed-sized buffers of bytes.
+%
+The return type \lst$Stack unit$ on \lref{c20:args3} 
+says that \lst$chacha20$ returns
+nothing and may allocate on the stack, but not on the heap (in
+particular, it has no memory leak).
+%
+On the next line, the pre-condition \li+requires+ that all arguments
+passed by reference
+%(\li+key+, \li+nonce+ and \li+output+) 
+be live.
+%
+On lines~\ref{line:c20:spec2}--\ref{line:c20:spec3}, the post-condition 
+first \li+ensures+ that the function modifies at most the contents of \li+output+ (and, 
+implicitly, that all buffers remain live).
+%
+We further explain this specification in the next subsection.
+%
+The rest of the post-condition specifies functional correctness:
+the \lst$output$ buffer must contain a sequence of bytes
+equal to the first \lst$len$ bytes of the cipher specified by 
+function \lst$Spec.chacha20$ for the input values of \lst$key$, \lst$nonce$, and \lst$counter$.
+
+As usual for symmetric ciphers, RFC 7539 specifies \lst$chacha20$ as
+imperative pseudocode, and does not further discuss its mathematical
+properties.
+%
+We implement this pseudocode as a series of pure functions in 
+\fstar, which can be extracted to OCaml and tested for conformance 
+with the RFC test vectors.
+%
+Functions such as \lst$Spec.chacha20$ then serve as logical
+specifications for verifying our stateful implementation. 
+%
+In particular, the last postcondition of \lst$chacha20$ ensures that
+its result is determined by its inputs.
+%
+We describe more sophisticated functional correctness proofs 
+for Poly1305 in \S\ref{sec:poly1305}.
+% \cf{This got better. Shall I upgrade this paragraph?  We now have a
+%   functional spec, could add a couple of functional-correctness
+%   refinements to the code, and explain that is matters to prove that
+%   our code is deterministic, and that its optimizations are correct.
+%   But this may break the flow with poly1305.  }
+
+
+%% The \li+chacha20+ function generates at most \li+len+ random bytes; it takes the
+%% key and the nonce mentioned earlier. The result is written in \li+output+.
+%% \lowstar enforces numerous safety conditions; for instance, the number of
+%% desired bytes \li+len+ shall be at most 64 (the block length); similarly,
+%% \li+output+ shall be large enough to accommodate \li+len+ bytes. In addition,
+%% \lowstar tracks \emph{ghost} lengths and knows that although at run-time \li+m+
+%% and \li+state+ are the same pointer, morally, \li+m+ only ranges over the first
+%% half of \li+state+. Finally, \lowstar checks that all buffers are live when
+%% reading or writing into them.
+
+
+%% ChaCha20 is a modern stream cipher with 256-bit keys, based on its
+%% predecessor Salsa20~\cite{chacha20}. It is generally considered
+%% fast and secure.
+%% %
+%% ChaCha20, at its core, shuffles 64 bytes of internal state,
+%% initialized from the key, a nonce, and a counter, in a
+%% (computationally) irreversible manner, to generate an output block.
+%% %
+%% These blocks can then be concatenated and truncated to form a
+%% one-time-pad, used for stream encryption (and decryption) by XORing
+%% with the plaintext (or the ciphertext).
+
+
+%% \begin{figure}
+%% \begin{lstlisting}[language=fstar]
+%% module B = Buffer
+
+%% let keylen    = 32ul! \label{line:c20:constants}!
+%% let blocklen  = 64ul
+%% let ivlen     = 12ul
+%% type lbytes l = b:(B.buffer UInt8.t){B.length b = l}! \label{line:c20:lbytes}!
+%% type key      = lbytes (v keylen)
+%% type block    = lbytes (v blocklen)
+%% type iv       = lbytes (v ivlen)
+
+%% let chacha20 (output:bytes) (k:key) (n:iv) (counter: uint32) ! \label{line:c20:val}!
+%%   (len:uint32{v len <= v blocklen /\ v len <= length output})
+%%   : Stack unit!  \label{line:c20:lengths}!
+%%     (requires (fun h -> h $\in$ k /\ h $\in$ n /\ h $\in$ output))
+%%     (ensures (fun h0 _ h1 -> h1 $\in$ output /\ modifies$_1$ output h0 h1 ))
+%%  = push_frame ();! \label{line:c20:push}!
+%%    let state = B.create 0ul 32ul in! \label{line:c20:create}!
+%%    let m = B.sub state 0ul 16ul in! \label{line:c20:sub}!
+%%    chacha20_init m key n counter;
+%%    chacha20_update output state len;
+%%    pop_frame ()! \label{line:c20:pop}!
+%% \end{lstlisting}
+%% \caption{The ChaCha20 pseudo-random function}
+%% \label{fig:chacha20}
+%% \end{figure}
+
+%% \fref{chacha20} is a snippet from our \lowstar implementation of ChaCha20;
+%% \fref{chacha20-c} is the corresponding extracted C version. The \lowstar
+%% version contains several annotations, refinements and proof-related bits; the C
+%% version contains none of these and is straightforward. From our simulation proof
+%% it follows that since the original \lowstar code is well-typed, then the C
+%% version is safe.
+
+%% The \li+chacha20+ function generates at most \li+len+ random bytes; it takes the
+%% key and the nonce mentioned earlier. The result is written in \li+output+.
+%% \lowstar enforces numerous safety conditions; for instance, the number of
+%% desired bytes \li+len+ shall be at most 64 (the block length); similarly,
+%% \li+output+ shall be large enough to accommodate \li+len+ bytes. In addition,
+%% \lowstar tracks \emph{ghost} lengths and knows that although at run-time \li+m+
+%% and \li+state+ are the same pointer, morally, \li+m+ only ranges over the first
+%% half of \li+state+. Finally, \lowstar checks that all buffers are live when
+%% reading or writing into them.
+
+\subsection{\lowstar: An Embedded DSL for Low-Level Code}
+\label{sec:dsl}
+
+As in ML, by default \fstar does not provide an
+explicit means to reclaim memory or to allocate memory on the stack, nor does
+it provide support for pointing to the interior of arrays. Next, 
+we sketch the design of a new \fstar library that provides a
+structured memory model suitable for program verification, while
+supporting low-level features like explicit freeing, stack
+allocation, and interior pointers.
+In subsequent sections, we describe how programs
+type-checked against this library can be compiled safely to C.
+First, however, we begin with some background on \fstar.
+
+\paragraph*{Background:} \fstar is a dependently
+typed language with support for user-defined monadic effects.
+%
+Its types separate computations from values, giving the former
+\emph{computation types} of the form \lst!M t$_1$ $\ldots$ t$_n$! where
+\lst!M! is an effect label and \lst!t$_1$ $\ldots$ t$_n$! are
+\emph{value types}. For example, \lst!Stack unit (...) (...)! on lines
+\ref{line:c20:spec1}--\ref{line:c20:spec2}
+of Figure~\ref{fig:chacha20-both} is an instance of a
+computation type, while types like \lst!unit! are value types.
+%
+There are two distinguished computation types: \lst!Tot t! is the type
+of a total computation returning a \lst!t!-typed value;
+%
+\lst!Ghost t!, a computationally irrelevant computation returning a
+\lst!t!-typed value.
+%
+Ghost computations are useful for specifications and proofs but
+are erased when extracting to OCaml or C.
+%
+%% The syntax \lst@fun (b$_1$) ... (b$_n$) -> t@ introduces a lambda
+%% abstraction, where \lst@b$_i$@ ranges over binding occurrences \lst$x:t$
+%% declaring a variable \lst$x$ at type \lst$t$.
+%% %
+%% The type \lst@b$_1$ -> ... -> b$_n$ -> c@ is the type of a curried
+%% function, where \lst$c$ is a computation type---we emphasize the lack
+%% of enclosing parentheses on the \lst@b$_i$@. We write just the type in
+%% \lst$b$ when the name is irrelevant. We also write \lst$t -> t'$ for
+%% %
+%% \lst$t -> Tot t'$.
+%
+
+To add state to \fstar, one defines a state monad represented (as
+usual) as a function from some initial memory \lst!m$_0$:s! to a
+pair of a result \lst!r:a! and a final memory \lst!m$_1$:s!, for
+some type of memory \lst!s!. Stateful computations are specified
+using the computation type:
+%
+\begin{lstlisting}[numbers=none]
+  ST (a:Type) (pre: s -> Type) (post: s -> a -> s -> Type)
+\end{lstlisting}
+%
+Here, \lst$ST$ is a computation type constructor applied to three
+arguments: a result type \lst!a!; a pre-condition predicate on the
+initial memory, \lst$pre$; and a post-condition predicate relating the
+initial memory, result and final memory. We generally annotate the
+pre-condition with the keyword \lst$requires$ and the post-condition
+with \lst$ensures$ for better readability.  A computation \lst$e$ of
+type
+%
+\lst$ST a (requires pre) (ensures post)$, when run in an initial
+memory \lst!m$_0$:s! satisfying \lst!pre m!, produces a result
+\lst!r:a! and final memory \lst!m$_1$:s! satisfying
+%
+\lst!post m$_0$ r m$_1$!, unless it diverges.\footnote{\fstar recently
+  gained support for proving stateful computations terminating. We
+  have begun making use of this feature to prove our code terminating,
+  wherever appropriate, but make no further mention of this.} \fstar
+uses an SMT solver to discharge the verification conditions it
+computes when type-checking a program.
+
+%% \begin{figure}
+%% \begin{lstlisting}[escapechar=@]{fstar}
+%% module FStar.HyperStack
+
+%% (* Distinguishing stack and heap *)
+%% type rid@\label{line:mm:rid}@
+%% val is_stack_region: rid -> Tot bool
+%% type sid = r:rid{is_stack_region r}@\label{line:mm:sid}@
+%% type hid = r:rid{not (is_stack_region r)}
+%% val root: sid@\label{line:mm:root}@
+
+%% (* The general heap effect *)
+%% type mem@\label{line:mm:mem}@
+%% effect ST (a:Type) (pre: mem -> Type) (post: mem -> a -> mem -> Type)
+%% type ref (a:Type)
+%% val @$\in$@ : ref a -> mem -> Tot Type@\label{line:mm:in}@
+%% val region_of: ref a -> Tot rid@\label{line:mm:regionof}@
+%% val alloc : r:hid -> init:a -> ST (ref a)
+%%   (requires (fun m -> True))
+%%   (ensures (fun m0 x m1 -> x @$\not\in$@ m0 /\ x @$\in$@ m1 /\
+%%               region_of x = r /\ m1[x] = init))
+%% val (!): r:ref a -> ST a
+%%   (requires (fun m -> r @$\in$@ h))
+%%   (ensures (fun m0 x m1 -> m0=m1 /\ x=m1[r]))@\label{line:mm:bang}@
+%% val (:=): ...
+
+%% (* Stack-specific combinators *)
+%% effect Stack = ...
+%% val tip : mem -> Tot sid@\label{line:mm:tip}@
+%% val push: mem -> Tot mem
+%% val pop:  m:mem{tip m <> root} -> Tot mem
+%% val push_frame : unit -> ST unit@\label{line:mm:push}@
+%%  (requires (fun m -> True))
+%%  (ensures  (fun m0 _ m1 -> pop m1 = m0))
+%% val pop_frame : unit -> ST unit
+%%  (requires (fun m -> tip m <> root))
+%%  (ensures  (fun m0 _ m1 -> m1 = pop m0))
+%% val salloc : init:a -> ST (ref a)@\label{line:mm:salloc}@
+%%   (requires (fun m -> True))
+%%   (ensures (fun m0 x m1 -> x @$\not\in$@ m0 /\ x @$\in$@ m1 /\
+%%               region_of x = tip m1 /\ tip m0 = tip m1 /\
+%%               m1 = (m0[x] <- init)))
+%% \end{lstlisting}
+%% \caption{The memory model of \lowstar}
+%% \label{fig:memory-model}
+%% \end{figure}
+
+% \ch{``region-based memory model'' might be missing the point here,
+%   an especially the reference to \cite{tt97regions}, which is
+%   about memory management not reasoning!}
+
+\paragraph{Hyper-stacks: A region-based memory model for \lowstar}
+For \lowstar, we instantiate the type \lst$s$ in the state monad to
+\lst$HyperStack.mem$ (which we refer to as just
+``hyper-stack''), a new region-based memory model~\citep{tt97regions}
+covering both stack and heap. Hyper-stacks are a
+generalization of hyper-heaps, a memory model proposed previously for
+\fstar~\cite{mumon}, designed to provide lightweight support for
+separation and framing for stateful verification. 
+%
+Hyper-stacks augment hyper-heaps with a shape invariant to indicate
+that the lifetime of a certain set of regions follow a specific
+stack-like discipline. We sketch the \fstar signature of hyper-stacks
+next.
+
+\paragraph*{A logical specification of memory} Hyper-stacks partition
+memory into a set of regions.
+%
+% \nik{I'm not going to speak about the
+%   tree-shaped structure of the region hierarchy here ... asfaik, we
+%   don't make use of it in the paper}
+%
+Each region is identified by an
+\lst$rid$ and regions are classified as either stack or heap regions,
+according to the predicate \lst$is_stack_region$---we use the type
+abbreviation \lst$sid$ for stack regions and \lst$hid$ for heap
+regions. A distinguished stack region, \lst$root$, outlives all other stack regions. The
+snippet below is the corresponding \fstar code.
+
+\begin{lstlisting}[numbers=none]
+type rid
+val is_stack_region: rid -> Tot bool
+type sid = r:rid{is_stack_region r}
+type hid = r:rid{$\lnot$ (is_stack_region r)}
+val root: sid
+\end{lstlisting}
+
+Next, we show the (partial) signature of \lst$mem$, our model of the
+entire memory, which is equipped with a select/update
+theory~\cite{mccarthy62} for typed references \lst$ref a$.
+%in the memory.
+Additionally, we have a function to refer to the
+\lst$region_of$ a reference, and a relation \lst$r \in m$ to indicate
+that a reference is live in a given memory.
+
+\begin{lstlisting}[numbers=none]
+type mem
+type ref : Type -> Type
+val region_of: ref a -> Ghost rid
+val `_ \in _`  : ref a -> mem -> Tot Type  (* a ref is contained in a mem *)
+val `_ [_] `     : mem -> ref a -> Ghost a   (* selecting a ref *)
+val `_ [_] <- _` : mem -> ref a -> a -> Ghost mem (* updating a ref *)
+val rref r a = x:ref a {region_of x = r} (* abbrev. for a ref in region r *)
+\end{lstlisting}
+
+\paragraph*{Heap regions} By defining the \lst$ST$ monad
+over the \lst$mem$ type, we can program stateful primitives for creating
+%and deleting -- CH: no, we don't have that yet
+new heap regions, and allocating, reading,
+writing and freeing references in those regions---we show some of
+their signatures below. Assuming an infinite amount of memory,
+\lst$alloc$'s pre-condition is trivial while its post-condition
+indicates that it returns a fresh reference in region \lst$r$
+initialized appropriately.  Freeing and dereferencing ($!$) require their
+argument to be present in the current memory, eliminating double-free
+and use-after-free bugs.
+
+\ch{Could save quite a bit of space by bringing the requires on the
+  same line as ST. It looks more crammed, but might have to make
+  these kind of compromises for space.}
+
+\begin{lstlisting}[numbers=none]
+val alloc: r:hid -> init:a -> ST (rref r a) (ensures  (fun m0 x m1 -> x $\not\in$ m0 /\ x \in m1 /\ m1 = (m0[x]<-init)))
+val free: r:hid -> x:rref r a -> ST unit (requires (fun m -> x \in m)) (ensures  (fun m$_0$ $\_$ m$_1$ -> x $\not\in$ m$_1$ /\ forall y<>x. m$_0$[y] = m$_1$[y]))
+val ($!$): x:ref a -> ST a (requires (fun m -> x \in m)) (ensures  (fun m0 y m1 -> m0 = m1 /\ y = m1[x]))
+\end{lstlisting}
+
+Since we support freeing individual references within a region, our
+model of regions could seem similar to \citet{berger02reaps}'s
+\emph{reaps}. However, at present, we do not support
+freeing heap objects \emph{en masse} by deleting heap regions;
+indeed, this would require using a special memory allocator.
+%, which we have not done yet.
+Instead, for us heap regions serve only to {\em logically} partition
+the heap in support of separation and modular
+verification, as is already the case for hyper-heaps~\cite{mumon},
+and heap region creation is currently compiled to a no-op by KreMLin.
+
+\paragraph*{Stack regions,} which we will henceforth call {\em stack
+  frames}, serve not just as a reasoning device, but provide the
+efficient C stack-based memory management mechanism. KreMLin maps
+stack frame creation and destruction directly to
+the C calling convention and lexical scope.
+To model this, we extend the signature of \lst$mem$ to include a
+\lst$tip$ region representing the currently active stack frame, ghost
+operations to \lst$push$ and \lst$pop$ frames on the stack
+of an explicitly threaded memory,
+and their effectful analogs, \lst$push_frame$ and \lst$pop_frame$ that modify
+the current memory.
+%
+In \lst$chacha20$ in Fig.~\ref{fig:chacha20-both}, the
+\lst$push_frame$ and \lst$pop_frame$ correspond precisely to the
+braces in the C program that enclose a function body's scope.
+%
+We also provide a derived combinator, \lst[language={}]{with_frame},
+which combines \lst$push_frame$ and \lst$pop_frame$ into a single,
+well-scoped operation. Programmers are encouraged to use the
+\lst[language={}]{with_frame} combinator, but, when more convenient
+for verification, may also use \lst$push_frame$ and \lst$pop_frame$
+directly. KreMLin ensures that all uses of \lst$push_frame$ and
+\lst$pop_frame$ are well-scoped.
+%
+Finally, we show the signature of \lst$salloc$ which allocates a
+reference in the current \lst$tip$ stack frame.
+
+\begin{lstlisting}[numbers=none]
+val tip: mem -> Ghost sid
+val push: mem -> Ghost mem
+val pop:  m:mem{tip m <> root} -> Ghost mem
+val push_frame: unit -> ST unit (ensures  (fun m0 () m1 -> m1 = push m0))
+val pop_frame: unit -> ST unit (requires (fun m -> tip m <> root)) (ensures  (fun m0 () m1 -> m1 = pop m0))
+val salloc: init:a -> ST (ref a) (ensures (fun m0 x m1 -> x $\not\in$ m0 /\ x \in m1 /\ region_of x = tip m1 /\
+                                               tip m0 = tip m1 /\ m1 = (m0[x] <- init)))
+\end{lstlisting}
+
+\paragraph*{The \lst$Stack$ effect} The specification of \lst$chacha20$
+claims that it uses only stack allocation and has no memory leaks,
+using the \lst$Stack$ computation type. This is straightforward to
+define in terms of \lst$ST$, as shown below.
+
+\begin{lstlisting}[numbers=none]
+effect Stack a pre post = ST a (requires pre)
+                           (ensures (fun m0 x m1 -> post m0 x m1 /\  tip m0 = tip m1 /\ (forall r. r \in m1<==>r \in m0)))
+\end{lstlisting}
+
+\noindent \lst$Stack$ computations are \lst$ST$ computations that
+leave the stack tip unchanged (i.e., they pop all frames they may
+have pushed) and yield a final memory with the same domain as the initial memory.
+%
+This ensures that \lowstar code with \lst+Stack+ effect has explicitly
+deallocated all heap allocated references before returning,
+ruling out memory leaks.
+%
+As such, we expect all externally callable \lowstar functions to have
+\lst$Stack$ effect.
+%
+Other code can safely pass pointers to objects allocated in their
+heaps into \lowstar functions with \li+Stack+ effect since the definition of
+\li+Stack+ forbids the \lowstar code from freeing these references.
+
+\cf{Comment that \lst$Stack$ may in principle return 'dangling
+  pointers'?  type safety ensures such pointers cannot be dereferenced.}
+
+%% A HyperHeap divides the heap into an arborescent structure of heaplets
+%% (\fref{hs}); the type \li+mem+ (\lref{mm:mem}, contents hidden for brevity)
+%% captures this structure. Each heaplet is tagged with a unique region identifier
+%% (\lref{mm:rid}). References, when allocated, come with a predicate that states
+%% the region they live in (\lref{mm:regionof}). The effect system of \fstar
+%% threads the current \li+mem+ throughout the program's control flow, and a
+%% reference may only be read if still alive at dereference time (lines
+%% \ref{line:mm:in} and \ref{line:mm:bang}).
+
+
+%% are easier to support in a runtime, since they are
+%% natively supported via the C calling convention and lexical scope. To
+%% model this, we extend the signature of \lst$mem$ to include a
+%% \lst$tip$ region representing the top-most stack frame, ghost
+%% operations to \lst$push$ and \lst$pop$ stack regions and their
+%% effectful analogs, \lst$push_frame$ and \lst$pop_frame$ that modify
+%% the current memory. We also provide \lst$salloc$, to allocate a
+%% reference in the current \lst$tip$ region.
+
+%% Regions give the programmer control over the granularity of their
+%% framing invariants, by stating that a function modifies nothing, a region, or a
+%% region and possibly all of its descendants. This limited form of separation
+%% logic helps verification bigly.
+
+%% \begin{figure}
+%%   \centering
+%%   \begin{tikzpicture}[every node/.style={
+%%   },heaplet/.style={
+%%     draw, thick,
+%%     isosceles triangle,
+%%     isosceles triangle stretches,
+%%     minimum height=1cm,
+%%     minimum width=1cm,
+%%     shape border rotate=90,
+%%     anchor=apex
+%%   }]
+%%   \node (root) { \sffamily{}root };
+%%   \node [heaplet]       (frame1) at ($(root.south west)+(-1cm,-.4cm)$)   { };
+%%   \node [anchor=north]  (frame2) at ($(frame1.south west)+(-.3cm,-.4cm)$) { \ldots };
+%%   \node [heaplet]       (frame3) at ($(frame2.south west)+(-.3cm,-.4cm)$) { };
+%%   \draw [->, thick] (frame1.apex)  -- (root.south west);
+%%   \draw [->, thick] (frame2.north) -- ($(frame1.south west)+(0,-.05cm)$);
+%%   \draw [->, thick] (frame3.apex)  -- ($(frame2.south west)+(0,-.05cm)$);
+
+%%   \node [heaplet, minimum height=2.4cm] (eternal) at ($(root.south)+(0,-.4cm)$) { };
+%%   \node [anchor=north]  (dots1) at ($(eternal.south west)+(-.4cm,-.4cm)$) { \ldots };
+%%   \node [anchor=north]  (dots4) at ($(eternal.south east)+(0,-.4cm)$) { \ldots };
+%%   \draw [->, thick] (eternal.apex) -- (root.south);
+%%   \draw [->, thick] (dots1.north)  -- ($(eternal.south west)+(0,-.05cm)$);
+%%   \draw [->, thick] (dots4.north)  -- ($(eternal.south east)+(0,-.05cm)$);
+
+%%   \node [heaplet, minimum height=2.4cm] (manual)  at ($(root.south)+(1.4cm,-.4cm)$) { };
+%%   \node [anchor=north]  (dots2) at ($(manual.south west)+(0,-.4cm)$) { \ldots };
+%%   \node [anchor=north]  (dots3) at ($(manual.south east)+(.4cm,-.4cm)$) { \ldots };
+%%   \draw [->, thick] (manual.apex) -- (root.south east);
+%%   \draw [->, thick] (dots2.north) -- ($(manual.south west)+(0,-.05cm)$);
+%%   \draw [->, thick] (dots3.north) -- ($(manual.south east)+(0,-.05cm)$);
+
+%%   \path [
+%%     postaction={
+%%       decorate,
+%%       decoration={
+%%         raise=.8ex,
+%%         text along path,
+%%         text align=center,
+%%         % reverse path,
+%%         text={|\sffamily\small|frame 1}
+%%       }
+%%     }
+%%   ] (frame1.left corner) -- (frame1.apex);
+
+%%   \path [
+%%     postaction={
+%%       decorate,
+%%       decoration={
+%%         raise=.8ex,
+%%         text along path,
+%%         text align=center,
+%%         % reverse path,
+%%         text={|\sffamily\small|tip}
+%%       }
+%%     }
+%%   ] (frame3.left corner) -- (frame3.apex);
+
+%%   \path [
+%%     postaction={
+%%       decorate,
+%%       decoration={
+%%         raise=.8ex,
+%%         text along path,
+%%         text align=center,
+%%         % reverse path,
+%%         text={|\sffamily\small|eternal region}
+%%       }
+%%     }
+%%   ] (eternal.left corner) -- (eternal.apex);
+
+%%   \path [
+%%     postaction={
+%%       decorate,
+%%       decoration={
+%%         raise=.8ex,
+%%         text along path,
+%%         text align=center,
+%%         % reverse path,
+%%         text={|\sffamily\small|manual region}
+%%       }
+%%     }
+%%   ] (manual.left corner) -- (manual.apex);
+%%   \end{tikzpicture}
+%%   \caption{The HyperStack memory model}
+%%   \label{fig:hs}
+%% \end{figure}
+
+%% HyperStack adds more structure on top of HyperHeap (\lref{mm:sid}) and distinguishes three
+%% classes of regions:
+%% \begin{itemize}
+%%   \item objects with automatically managed
+%%     lifetimes live in the \emph{eternal region} and
+%%     enjoy special axioms such as \li+recall+, which states that merely knowing
+%%     a reference allows one to assert its liveness; such a region may be garbage
+%%     collected using a conservative, stack-scanning GC;
+%%   \item objects that are manually allocated and de-allocated live in the
+%%     \emph{manual region}; this is the \li+malloc+/\li+free+ discipline, and any
+%%     reference must be shown to be alive before the programmer can access its
+%%     contents;
+%%   \item the most interesting type of region is the stack region; stack regions
+%%     form a list starting from the root (\lref{mm:root});
+%%     there exists a distinguished \emph{tip} region (\lref{mm:tip}) that stands
+%%     for the ``topmost stack frame''. The \li+mem+ type again captures this
+%%     structure.
+%% \end{itemize}
+
+%% \noindent\li+push_frame+ and \li+pop_frame+ (\lref{mm:push}) are effectful
+%% combinators that change the \li+tip+ of the stack. Their definitions are elided
+%% for brevity. Finally, the \li+salloc+ combinator (\lref{mm:salloc}) performs the
+%% allocation of a fresh reference in the topmost frame; the function does not
+%% modify the structure of the stack, and the new memory \li+m1+ is \li+m0+ where
+%% \li+x+ has now been assigned the initial value \li+init+.
+
+%% \jp{I was about to write that all of these functions are backed by an actual
+%% model to show that we're sound, but realized that this isn't the case}
+
+%% The \li+chacha20+ function uses all the mechanisms above to show that it is
+%% sound with regard to the low-level C model.
+%% \ch{Now stack effect explained above more formally}
+%% It has effect \li+Stack+
+%% (\lref{c20:spec1}). In addition to being state-modifying, being in \li+Stack+
+%% implies the preservation of a distinguished \li+equal_domains+ predicate.
+%% Specifically: the set of stack region identifiers remains the same, the tip
+%% remains the same, and no allocation occurs in any of the existing stack regions.
+%% From an implementation perspective, this is a function that cannot allocate in
+%% any of its callers' stack frames, and that must restore the stack upon exiting
+%% -- in other words, this is a function that can be directly translated to a C
+%% function.
+
+%% Therefore, the only way for \li+chacha20+ to satisfy the \li+equal_domains+
+%% predicate is to push its own, fresh stack frame via \li+push_frame+, then pop
+%% it before exiting via \li+pop_frame+. Calling these two combinators indicates to
+%% \fstar that \li+chacha20+ modifies the (new) tip of the HyperStack, and allows
+%% verification to track any allocation as pertaining to a fresh region.
+%% Specifically, the buffer allocation (\lref{c20:create}) is known at
+%% verification-time to belong to the \li+tip+.
+
+%% Most of our cryptographic code uses the \li+Stack+ effect, and only occasional
+%% snippets rely on the eternal region; therefore, we focus our formalization
+%% efforts on the stack part of the memory model (\sref{formal}) and do not mention
+%% the two regions any further, as they have already been formalized~\cite{mumon}.
+
+\paragraph{Modeling arrays} Hyper-stacks separate heap and
+stack memory, but each region of memory still only supports abstract,
+ML-style references. A crucial element of low-level programming is
+control over the specific layout of objects, especially for arrays and structs.
+% Leaving structs for future work,
+We describe first our modeling of arrays by implementing an abstract
+type for buffers in \lowstar, using just the references provided by
+hyper-stacks. Relying on its abstraction, KreMLin compiles our buffers to
+native C arrays.
+
+The type `\lst$buffer a$' below is a single-constructor inductive type
+with 4 arguments.
+%%(Note that \fstar argument types may depend on prior arguments.)
+%%\nik{rather late for this ... we've seen many such examples already}
+Its main \lst$content$ argument
+holds a reference to a \lst$seq a$, a purely functional sequence of
+\lst$a$'s whose length is determined by the first argument
+\lst$max_length$. The refinement type \lst$b:buffer uint32{length b = n}$ is
+translated to a C declaration \li+uint32_t b[n]+ by KreMLin and, relying on C
+pointer decay,\ch{ha?} further referred to via \li+uint32_t *+.
+
+\begin{lstlisting}[numbers=none]
+abstract type buffer a =
+  | MkBuffer: max_length:uint32
+    -> content:ref (s:seq a{Seq.length s = max_length})
+    -> idx:uint32
+    -> length:uint32 {idx + length <= max_length} -> buffer a
+\end{lstlisting}
+
+% \nik{I'm also using projectors b.length, b.content etc. instead of
+% defining ghost functions for each of them. It's a little loose since
+% b is an abstract type, but I think it is probably more intuitive to
+% the reader anyway}
+
+% JP: I would like to say in this paragraph that these semantics are sound
+% w.r.t. the C standard (see
+% http://www.open-std.org/jtc1/SC22/wg14/www/docs/n1548.pdf 6.2.4/2) but I can't
+% convince myself that
+%   If an object is referred to outside of its lifetime, the behavior is undefined
+% means that taking a pointer within bounds is ok.
+\noindent 
+The last two arguments of a buffer are there to support creating smaller
+sub-buffers from a larger buffer, via the \li+Buffer.sub+ operation
+below. A call to `\lst$Buffer.sub b i l$' returning \lst!b$'$! is compiled
+to C pointer arithmetic \li!b + i! (as seen in
+Figure~\ref{fig:chacha20-both} line~\ref{line:c20:sub} in
+\lst$chacha20$). To accurately model this, the \li+content+ field is
+shared between \li+b+ and \li+b$'$+, but \li+idx+ and \li+length+
+differ, to indicate that the sub-buffer \li+b$'$+ covers only a
+sub-range of the original buffer \li+b+. 
+The \lst+sub+ operation has computation type \li+Tot+, meaning that it
+does not read or modify the state. The refinement on the result
+\lst+b$'$+ indicates its length and, using the \lst$includes$
+relation, records that \lst$b$ and \lst+b$'$+ are aliased.
+
+\cf{pls check; is there a better place to explain machine integers?
+  Also, shouldn't we account for the size of \lst$a$ to prevent
+  overflows? Or use 64-bit indexes when compiling to a 64-bit
+  architecture? We may also explain that (presumably)
+  \lst$Buffer.create$ fails to allocate oversized buffers---I guess C
+  programmers explicitly check for allocation errors. }
+
+\cf{We had long discussions about the purity of \lst$sub$; noop for now?}
+
+\begin{lstlisting}[numbers=none]
+val sub: b:buffer a -> i:uint32 -> len:uint32{i + len <= b.length} -> Tot (b':buffer a{b'.length = len /\ b `includes` b'})
+\end{lstlisting}
+
+\cf{The first refinement above is at odd with my understanding of
+  integer overflows. Have we decided to omit \lst$UInt32.v$ for
+  simplicity?}
+
+We also provide statically bounds-checked operations for indexing and
+updating buffers. The signature of the \lst$index$ function below requires the
+buffer to be live and the index location to be within bounds. Its
+postcondition ensures that the memory is unchanged and describes what
+is returned in terms of the logical model of a buffer as a sequence.
+
+\begin{lstlisting}[numbers=none]
+let get (m:mem) (b:buffer a) (i:uint32{i < b.length}) : Ghost a = Seq.index (m[b.content]) (b.idx + i)
+val index: b:buffer a -> i:uint32{i < b.length} -> Stack a
+  (requires (fun m -> b.content \in m))
+  (ensures (fun m0 z m1 -> m1 = m0 /\ z = get m1 b i))
+\end{lstlisting}
+
+% JP: https://www.viva64.com/en/a/0050/ is a good reminder... of what we should
+% be doing
+All lengths and indices are 32-bit machine integers, and refer to the number of
+elements in the buffer, not the number of bytes the buffer occupies. 
+%
+This currently prevents addressing very large buffers on 64-bit platforms.
+%
+(To this end, we may parameterize our development over a C data model,
+wherein indices for buffers would reflect the underlying (proper)
+\li+ptrdiff_t+ type.)
+
+Similarly, memory allocation remains platform-specific. 
+%
+It may cause a (fatal) error as it runs out of memory.
+%
+More technically, the type of \li+create+ may not suffice to prevent
+pointer-arithmetic overflow; if the element size is greater than a
+byte, and if the number of elements is $2^{32}$, then the argument
+passed to \li+malloc+ will overflow on a platform where %
+\li+sizeof size_t == 4+.
+% 
+To prevent such cases, KreMLin inserts defensive dynamic checks
+(which typically end up eliminated by the C compiler since our
+stack-allocated buffer lengths are compile-time constants).
+%
+In the future, we may statically prevent it by mirroring the C \li+sizeof+
+operator at the \fstar level, and requiring that for each
+\li+Buffer.create+ operation, the resulting allocation size, in bytes,
+is no greater than what \li+size_t+ can hold.
+
+
+\paragraph{Modeling structs}
+\label{sec:structs}
+
+Generalizing `\lst$buffer t$' (abstractly, a reference to a finite map
+from natural numbers \cf{unsigned machine integers?}%
+to \lst$t$), we model C-style structs as an
+abstract reference to a `\lst$struct key value$', that is, a map from keys
+\lst$k:key$ to values whose type `\lst$value k$' depends on the
+key. 
+%
+For example, we represent the type of a colored point as follows,
+using a struct with two fields \lst$X$ and \lst$Y$ for coordinates and one 
+field \lst$Color$, itself a nested struct of RGB
+values.
+
+\begin{lstlisting}[numbers=none]
+type color_fields = R | G | B
+type color = struct color_fields (fun R | G | B -> uint32)
+type colored_point_fields = X | Y | Color
+type colored_point = struct colored_point_fields (fun X | Y -> int32 | Color -> color)
+\end{lstlisting}
+
+\cf{Wondering how to better balance the buffer vs struct presentation,
+  e.g. we don't have local examples for buffers and we don't discuss
+  their framing}
+
+C structs are flatly allocated; the declaration above models a contiguous memory
+block that holds 20 bytes or more, depending on alignment constraints. As such,
+we cannot directly perform pointer arithmetic within that block; rather, we 
+navigate it by referring to fields. 
+%
+To this end, our library of structs provides an interface to
+manipulate pointers to these C-like structs, including pointers that
+follow a path of fields throughout nested structs. The main type
+provided by our library is the indexed type \lst$ptr$ shown below,
+encapsulating a base reference \lst$content: ref from$ and a path
+\lst$p$ of fields leading to a value of type \lst$to$.
+%
+
+\begin{lstlisting}[numbers=none]
+abstract type ptr: Type -> Type = Ptr: #from:Type -> content: ref from -> #to: Type -> p: path from to -> ptr to
+\end{lstlisting}
+
+When allocating a struct on the stack, the caller provides a
+`\lst$struct k v$' literal and obtains a
+%
+`\lst$ptr (struct k v)$', a pointer to a struct literal in the current
+stack frame (a \lst$Ptr$ with an empty path).
+
+The \lst$extend$ operator below supports extending the access path
+associated with a `\lst$ptr (struct k v)$' to obtain a pointer to one of
+its fields.
+
+\begin{lstlisting}[numbers=none]
+val extend: #key: eqtype -> #value: (key -> Tot Type) -> p: ptr (struct key value) -> fd: key -> ST (ptr (value fd))
+  (requires (fun h -> live h p))
+  (ensures (fun h0 p$'$ h1 -> h0 == h1 /\ p$'$ == field p fd))
+\end{lstlisting}
+
+Finally, the \lst$read$ and \lst$write$ operations allows accessing and
+mutating the field referred to by a \lst$ptr$.
+
+% JP: do we want to say something along the lines of ``the analogous of indexing
+% the ghost struct in the post-condition of index for buffers is, here,
+% following the dependent map along the path until we reach the value, via
+% as_value''.
+\begin{lstlisting}[numbers=none]
+val read: #a:Type -> p: ptr a -> ST value
+  (requires (fun h -> live h p))
+  (ensures (fun h0 v h1 -> live h0 p /\ h0 == h1 /\ v == as_value h0 p))
+
+val write: #a:Type -> b:ptr a -> z:a -> ST unit
+  (requires (fun h -> live h b))
+  (ensures (fun h0 _ h1 -> live h0 b /\ live h1 b /\ modifies_1 b h0 h1 /\ as_value h1 b == z))
+\end{lstlisting}
+
+%% Initially, \li+idx+ is \li+0+
+%% and \li+length+ and \li+max_length+ coincide; the \li+content+ field
+%% always covers the entire range of the buffer.
+
+
+%% val index: #a:Type -> b:buffer a -> n:uint32{v n < length b} ->
+%%              Stack a (requires (fun m -> live m b))
+%%                      (ensures (fun m0 z m1 -> live m0 b /\ m1 = m0))
+%% val sub: #a:Type -> b:buffer a -> i:uint32{v i + v b.idx < pow2 n}
+%%   -> len:uint32{v i + v len <= length b}
+%%   -> Tot (b':(buffer a){b `includes` b' /\ length b' = v len})
+%% \end{lstlisting}
+%% \caption{Modeling buffers in \lowstar}
+%% \label{fig:buffer}
+%% \end{figure}
+
+
+%% \paragraph{Buffers with bounds}
+
+%% \ch{One important thing to mention here is that this representation of
+%%   buffers with lots of instrumentation is just for reasoning. Low*
+%%   compiles buffers to regular pointers to arrays (not fat pointers or
+%%   other crazy stuff).}
+
+%% Buffer overflows are a top source of (reported)
+%% vulnerabilities~\cite{younan201325, Szekeres2013}. To rule out such programming
+%% mistakes, \lowstar models 
+
+%% The \li+Buffer+ library relies on the earlier C memory model to check that
+%% pointers are live before dereferencing them. 
+
+%% %To permit buffer aliasing -- CH: aliasing is freely allowed just by copying values
+%% To permit creating smaller sub-buffers from a larger buffer
+%%  we offer a \li+Buffer.sub+ operation. A call to
+%% \li+Buffer.sub b i l+ performs C pointer arithmetic of the form \li!b + i!
+%% and returns sub-buffer \li+b'+ for that.  To
+%% accurately model this, the \li+content+ field is shared between \li+b+ and \li+b'+,
+%% but \li+idx+ and \li+length+ differ, to indicate that the sub-buffer \li+b'+
+%% only covers a sub-range of the original buffer \li+b+.
+%% The operation has computation type \li+Tot+, meaning that it does
+%% not modify the state. The \li+v+ function used in the specification
+%% maps a machine integer
+%% (of type \li+uint32+) to its mathematical-level counterpart (of type
+%% \li+nat+).
+
+%% \begin{figure}
+%% \begin{lstlisting}
+%% module FStar.Buffer
+
+%% abstract type buffer a =
+%%   | MkBuffer: max_length:uint32
+%%     -> content:ref (s:seq a{Seq.length s = v max_length})
+%%     -> idx:uint32
+%%     -> length:uint32{v idx + v length <= v max_length}
+%%     -> buffer a
+
+%% val index: #a:Type -> b:buffer a -> n:uint32{v n < length b} ->
+%%              Stack a (requires (fun m -> live m b))
+%%                      (ensures (fun m0 z m1 -> live m0 b /\ m1 = m0))
+%% val sub: #a:Type -> b:buffer a -> i:uint32{v i + v b.idx < pow2 n}
+%%   -> len:uint32{v i + v len <= length b}
+%%   -> Tot (b':(buffer a){b `includes` b' /\ length b' = v len})
+%% \end{lstlisting}
+%% \caption{Modeling buffers in \lowstar}
+%% \label{fig:buffer}
+%% \end{figure}
+
+%% The \li+chacha20+ function leverages these mechanisms. Its signature
+%% \li+chacha20+ at \lref{c20:val} uses a dependent function type with multiple
+%% refined arguments, to statically track the length of the arguments.
+%% The call to \li+create+ (\lref{c20:create}) returns a reference to a sequence
+%% (\fref{buffer}). The call to \li+sub+ performs checked pointer arithmetic as we
+%% mentioned earlier. The buffer read and write operations rely on the lengths as
+%% setup by \li+create+ to check statically that all array accesses are within bounds.
+
+%% Our extraction toolchain verifies that the argument to \li+Buffer.create+ is a
+%% literal, as we do not rely on C99 variable-length arrays (VLA), nor do we wish
+%% to rely on \li+alloca+ for obvious performance reasons.\ch{This seems like
+%%   a gory implementation detail that we should omit}
+
+%% \paragraph{Integer arithmetic}
+%% Finally, for bound checks to work, one must keep track of integer values. We
+%% model machine integers of different signedness and widths, and offer
+%% bounds-checked and wrap-around arithmetic (\fref{machineints}). The former requires as a
+%% pre-condition that the result fit within bounds, and is compiled as a straight C
+%% operator; the latter has wraparound semantics, and may require the insertion of
+%% C casts to workaround the C undefined overflow behavior of signed integers.
+
+%% \begin{figure}
+%%   \begin{lstlisting}
+%% module FStar.UInt32
+
+%% val add: a:uint32 -> b:uint32 -> Pure uint32
+%%   (requires (size (v a + v b) n))
+%%   (ensures (fun c -> v a + v b = v c))
+%% val add_underspec: a:uint32 -> b:uint32 -> Pure uint32
+%%   (requires True)
+%%   (ensures (fun c -> size (v a + v b) n ==> v a + v b = v c))
+%% val add_mod a:uint32 -> b:uint32 -> Pure uint32
+%%   (requires True)
+%%   (ensures (fun c -> (v a + v b) % pow2 n = v c))
+%% \end{lstlisting}
+%% \caption{Three flavors for addition in \lowstar}
+%% \label{fig:machineints}
+%% \end{figure}
+
+\subsection{Using \lowstar for Proofs of Functional Correctness and Side-Channel Resistance}
+\label{sec:poly1305}
+
+This section and the next illustrate our ``high-level
+verification for low-level code'' methodology.
+%
+Although programming at a low-level, we rely on features like type
+abstraction and dependently typed meta-pro\-gramming, to prove our
+code functionally correct, cryptographically secure, and free of a
+class of side-channels.
+
+We start with Poly1305~\cite{bernstein2005poly1305}, a Message
+Authentication Code (MAC) algorithm.\footnote{Implementation bugs in
+  Poly1305 are still a practical concern: in 2016 alone, the Poly1305 OpenSSL
+  implementation experienced two correctness bugs~\cite{polybug,polybug2}
+  and a buffer overflow~\cite{CVE7054}.}
+%
+% \jp{JK please provide a public URL for the other vulnerability, your earlier
+% URLs require a username and password}
+% \ch{CVE7054 above is 3 days old, here are more details:
+%   \url{https://www.openssl.org/news/secadv/20161110.txt}.
+%   Couldn't find the other one. If it is not yet publicly disclosed we
+%   need to be super careful mentioning it.}
+% JK's links for the record
+% https://rt.openssl.org/Ticket/Display.html?id=4439
+% https://rt.openssl.org/Ticket/Display.html?id=4482
+% (Username/password are guest/guest)
+% Public OpenSSL vulnerabilities:
+% https://www.openssl.org/news/vulnerabilities.html
+%
+Unlike \lst$chacha20$, for which
+the main property of interest is implementation safety, Poly1305 has a
+mathematical definition in terms of a polynomial in the prime field
+$\ii{GF}(2^{130}-5)$, against which we prove our code functionally correct.
+%
+Relying on correctness, we then prove injectivity lemmas on encodings
+of messages into field polynomials, and we finally prove
+%
+cryptographic security of a one-time MAC construction for Poly1305,
+specifically showing unforgeability against chosen message attacks
+(UF1CMA).
+%
+This game-based proof involves an idealization step, justified by a
+probabilistic proof on paper, following the methodology we explain in
+\S\ref{sec:crypto}.
+
+For side-channel resistance, we use type abstraction to ensure that our
+code's branching and memory access patterns are secret independent.
+%
+This style of \fstar{} coding is advocated by Zinzindohou{\'e} et
+al.~\cite{ZBB16}; we place it on formal ground by showing that
+it is a sound way of enforcing secret independence at the source level
+(\sref{lamstar}) and that our compilation carries such properties to
+the level of Clight (\sref{to-clight}).
+%
+To carry our results further down, one may validate the output of the C
+compiler by relying on recent tools proving side-channel resistance at
+the assembly level~\cite{almeida-usenix2016, almeida16fse}.
+%
+We sketch our methodology on a small snippet from our
+specialized arithmetic (bigint) library upon which we built Poly1305.
+
+\paragraph*{Representing field elements using bigints}
+%
+We represent elements of the field underlying Poly1305 as $130$-bit
+integers stored in \lowstar buffers of machine integers called
+\emph{limbs}.
+%
+Spreading out bits evenly across $32$-bit words yields five limbs
+$\ell_i$, each holding $26$ bits of significant data.
+%
+A ghost function $\kw{eval} = \sum_{i=0}^4 \ell_i\times2^{26\times i}$ maps
+%
+each buffer to the mathematical integer it represents.
+%
+Efficient bigint arithmetic departs significantly from elementary
+school algorithms. Additions, for instance, can be made more efficient
+by leveraging the extra $6$ bits of data in each limb to delay carry
+propagation.
+%
+For Poly1305, a bigint \lst$b$ is in compact form in state \lst$m$
+(i.e., \lst$compact m b$) when all its limbs fit in $26$ bits.
+%
+Compactness does not guarantee uniqueness of representation as
+$2^{130}-5$ and $0$ are the same number in the field but they have two
+different compact representations that both fit in $130$ bits---this
+is true for similar reasons for the range $[0,5)$.
+
+\paragraph*{Abstracting integers as a side-channel mitigation}
+%
+Modern cryptographic implementations are expected to be protected
+against side-channel %(e.g., timing)
+attacks~\cite{Kocher1996}.
+As such, we aim to show that the branching behavior and memory
+accesses of our crypto code are independent of secrets. To
+enforce this, we use an abstract type \lst$limb$ to represent limbs,
+all of whose operations reveal no information about the contents of
+the \lst$limb$, either through its result or through its branching behavior and
+memory accesses. For example, rather than providing a
+comparison operator, \lst$eq_leak: limb -> limb -> Tot bool$, whose
+boolean result reveals information about the input limbs, we use a
+masking operation (\lst$eq_mask$) to compute equality securely. Unlike OCaml, \fstar's
+equality is not fully polymorphic, being restricted to only those types
+that support decidable equality, \lst$limb$ not being among them. 
+%% Even though \fstar is
+%% equipped with polymorphic equality in the style of OCaml, a combination of equality
+%% predicates (``\li+noeq+'') and universe polymorphism prevent the comparison of
+%% secrets, even in the face of existential packing.
+
+\begin{lstlisting}[numbers=none]
+val v : limb -> Ghost nat  (* limbs only ghostly revealed as numbers *)
+val eq_mask: x:limb -> y:limb -> Tot (z:limb{if v x <> v y then v z = 0 else v z = pow2 26 - 1})
+\end{lstlisting}
+
+\noindent In the signature above, \lst$v$ is a function that reveals
+an abstract \lst$limb$ as a natural number, but only in ghost code---a
+style referred to as translucent abstraction~\cite{mumon}. The
+signature of \lst$eq_mask$ claims that it returns a zero limb if the
+two arguments differ, although computationally relevant code cannot
+observe this fact. \ch{bad transition, what's the precise connection}Note,
+the number of limbs in a Poly1305 bigint is a
+public constant, i.e., \lst$bigint = b:(buffer limb){b.length = 5}$.
+
+\begin{figure*}[t!]\small
+\begin{tabular}{c|c}
+\begin{lstlisting}[language=fstar]
+let normalize (b:bigint) : Stack unit
+  (requires (fun m$_0$ -> compact m$_0$ b))
+  (ensures (fun m$_0$ () m$_1$ -> compact m$_1$ b /\ modifies$_1$ b m$_0$ m$_1$ /\
+             eval m$_1$ b = eval m$_0$ b % (pow2 130 - 5)))
+= let h0 = ST.get() in (* a logical snapshot of the initial state *)
+  let ones = 67108863ul in (* 2^26 - 1 *)
+  let m5   = 67108859ul in (* 2^26 - 5 *)
+  let m    = (eq_mask b.(4ul) ones) & (eq_mask b.(3ul) ones)
+        & (eq_mask b.(2ul) ones) & (eq_mask b.(1ul) ones) 
+        & (gte_mask b.(0ul) m5) in
+  b.(0ul) <- b.(0ul) - m5 & m;
+  b.(1ul) <- b.(1ul) - b.(1ul) & m; b.(2ul) <- b.(2ul) - b.(2ul) & m;
+  b.(3ul) <- b.(3ul) - b.(3ul) & m; b.(4ul) <- b.(4ul) - b.(4ul) & m;
+  lemma_norm h0 (ST.get()) b m (* relates mask to eval modulo *) !\label{line:finalize:lemma}!
+\end{lstlisting}
+
+&\quad
+
+\begin{lstlisting}
+val poly1305_mac:
+  tag:nbytes 16ul ->
+  len:u32 ->
+  msg:nbytes len{disjoint tag msg} ->
+  key:nbytes 32ul{disjoint msg key /\
+                  disjoint tag key} ->
+  Stack unit
+(requires (fun m -> msg $\in$ m /\ key $\in$ m /\ tag $\in$ m))
+(ensures (fun m$_0$ _ m$_1$ ->
+ let r = Spec.clamp m$_0$[sub key 0ul 16ul] in
+ let s = m$_0$[sub key 16ul 16ul] in
+ modifies {tag} m$_0$ m$_1$ /\
+ m$_1$[tag] ==
+ Spec.mac_1305 (encode_bytes m$_0$[msg]) r s))
+\end{lstlisting}
+\end{tabular}
+\caption{Unique representation of a Poly1305 bigint (left) and the top-level spec of Poly1305 (right)}
+\label{fig:finalize}
+\end{figure*}
+
+\paragraph*{Proving \lst$normalize$ correct and side-channel resistant}
+The \lst$normalize$ function of \fref{finalize} modifies a compact
+bigint in-place to reduce it to its canonical representation. The code
+is rather opaque, since it operates by strategically masking each limb
+in a secret independent manner. However, its specification clearly
+shows its intent: the new contents of the input bigint is the same as
+the original one, \emph{modulo $2^{130}-5$}. At
+line~\autoref{line:finalize:lemma}, we see a call to a \fstar lemma,
+which relates the masking operations to the modular arithmetic in the
+specification---the lemma is erased during extraction.
+
+\paragraph*{A top-level functional correctness spec} Using our
+bigint library, we implement \lst$poly1305_mac$ and prove it
+functionally correct. Its specification (\fref{finalize}, right)
+states that the final value of the 16 byte tag (\lst@m$_1$[tag]@) is the
+value of \lst$Spec.mac_1305$, a polynomial of the message and the key
+encoded as field elements. We use this mathematical specification as a
+basis for the game-based cryptographic proofs of constructions built
+on top of Poly1305, such as the AEAD construction, described next.
+
+%% Implementing and proving that \ls$multiply$ meets its mathematical
+%% specification involves hundreds of lines of source code, including a
+%% custom, verified Bignum library in \lowstar~\cite{ZBB16}. Using this
+%% library, 
+   %% Functional specification of Poly1305.
+   %% Words in the input text are encoded as field elements and interpreted as
+   %% coefficients of the polynomial, which is evaluted on r.
+   %% Note that the because of the way we use this is in ideal logs, the order of
+   %% the input words is reversed, i.e.
+   %% poly (w_q ... w_1) r = encode w_q * r + ... + encode w_1 * r^q
+   %% Accordingly, sequences seen as polynomials are implicitly extended with 0s.
+
+%% The post-condition of \li+finalize+ indicates that reading the bigint
+%% after calling the function , i.e.  ensures the
+%% bigint adopts the canonical representation. \fstar verifies that these
+%% sophisticated bit manipulations do indeed perform the intended
+%% mathematical operation.
+
+
+%% The definition of \li+eval+ uses the \li+v+ function we mentioned earlier to map
+%% each machine integer (limb) to its mathematical counterpart. In the context of
+%% \haclstar,\ch{Why just in \haclstar and not everywhere?}
+%% the \li+v+ function itself is marked as \li+Ghost+, and the module
+%% provides carefully-engineered functions such as \li+eq_mask+ (\fref{finalize})
+%% that do not leak bits from the machine integer. The net result is that the
+%% client code, through abstraction, simply cannot examine secrets directly.
+%% Callers know that a bignum uses 5 limbs and can allocate memory accordingly;
+%% they can even reason about the value in \emph{specifications} through the ghost
+%% \li+eval+ function; but they cannot examine these limbs at run-time.
+
+
+
+
+%% Similarly, multiplications generally defer modulo reductions and
+%% represent their results using $9$ limbs.
+
+%% %
+%% -Efficient bigint arithmetic departs significantly from elementary school
+%% -algorithms, and most often relies on carrying bigints that do not follow a
+%% -unique representation. Additions, for instance, can be made more efficient by
+%% -leveraging the extra $6$ bits of data in each limb to delay carry propagation.
+
+
+%% The essence of verification
+%% is to show that these optimizations are mathematically correct.
+
+%% \nik{Reached up to here ... but got stuck ... will continue tomorrow}
+
+%% type bigint = b:buffer u32{b.length >= norm_length}
+%% val prime : nat  
+%% val eval: m:mem->b:bigint{live m b}->n:nat{n<=b.length}->Ghost nat
+%% let norm (m:mem) (b:bigint) : Ghost Type0 = live m b /\
+%%   (forall (i:nat). i < norm_length ==> get m b i < pow2 26)
+
+
+
+% Computing the MAC of a given
+% message involves constructing a polynomial in the prime field whose coefficients
+% are derived from the message bytes, then evaluating the polynomial over an
+% element derived from the key. The performance of a Poly1305 implementation thus
+% directly depends on efficient big number (bignum) arithmetic.
+
+
+
+
+
+
+%% \begin{figure}
+%% \begin{lstlisting}
+%% (* From the [Parameters] module *)
+%% let norm_length = 5
+%% let templ = fun x -> 26
+
+%% (* From the [Bigint] module *)
+%% \end{lstlisting}
+%% \caption{Essential \li+bigint+ functions}
+%% \label{fig:norm}
+%% \end{figure}
+
+\if0
+\subsection{A Curve: Curve25519}
+Curve25519~\cite{curve25519} is an elliptic curve defined of the prime field
+$GF(2^{255}-19)$. It is suitable for use in the Diffie-Helman key agreement
+protocol over elliptic curves (ECDH). ~\cite{ZBB16} showed how to prove functional
+correctness for several elliptic curve computations in \fstar, including Curve25519.
+The proof mechanism was generic and relying on modular structure that isolated the
+underlying prime field operations, the curve group operations and the group scalar multiplication
+(corresponding to the exponentiation of the ECDH algorithm).
+The compilation process relied on both the extraction of the \fstar code to OCaml code, and
+the OCaml compiler and runtime system. The running code was too slow real-life applications,
+and lacked any form of side-channel mitigation.
+
+We took over that implementation of Curve25519 in \fstar and ported it to the \lowstar subset. Using
+proofs mechanisms similar to those presented in ~\cite{ZBB16} and the previous section we
+show that our \lowstar code correctly implements the $GF(2^{255}-19)$ field operations. Memory-safety
+is guaranteed by the \lowstar type-system and we enforce the side-channel mitigation mechanisms
+that were part of the original implementation. The generated C code is much faster than the
+previous OCaml code.
+\fi%0
+
+% \subsection{Huffman encoding}
+% To illustrate our low-level discipline, we present one last application, namely
+% a Huffman encoding routine, that we intend to eventually integrate within a
+% larger DEFLATE implementation that could be used as a compression scheme for the
+% earlier example.
+
+\subsection{Cryptographic Provable-Security Example: AEAD}
+\label{sec:crypto}
+
+% \cf{Now splitting AEAD in two; here we emphasize our use of \lowstar
+%   features; \sref{aead} gives a more abstract, quantitative
+%   description of what we did.}
+
+Going beyond functional correctness, we sketch how we use \lowstar
+to do security proofs in the standard model of cryptography, using
+``authenticated encryption with associated data'' (AEAD) as a
+sample construction. % on top of ChaCha20 and Poly1305.
+%
+AEAD is the main protection mechanism for the TLS record layer; it
+secures most Internet traffic.
+
+AEAD has a generic security proof by reduction to two core
+functionalities: a stream cipher (such as ChaCha20) and a one-time-MAC
+(such as Poly1305).
+%
+The cryptographic, game-based argument supposes that these two
+algorithms meet their intended \emph{ideal functionalities}, e.g.,
+that the cipher is indistinguishable from a random function.
+%
+Idealization is not perfect, but is supposed to hold against
+computationally limited adversaries, except with small probabilities,
+say, $\varepsilon_\mathrm{ChaCha20}$ and $\varepsilon_\mathrm{Poly1305}$.
+%
+The argument then shows that the AEAD construction also meets its own
+ideal functionality, except with probability, say, $\varepsilon_\mathrm{Chacha20} +
+\varepsilon_\mathrm{Poly1305}$.
+
+To apply this security argument to our implementation of AEAD, we need
+to encode such assumptions.  To this end, we supplement our real
+\lowstar code with ideal \fstar code.
+%
+% using Boolean idealization flags to switch between the two variants of
+% the code (so that we can conduct each step of the argument by
+% switching a flag).
+%
+For example, ideal AEAD is programmed as follows:
+\begin{itemize}
+\item encryption generates a fresh random ciphertext, and it records
+  it together with the encryption arguments in a log.
+
+\item decryption simply looks up an entry in the log that matches its
+  arguments and returns the corresponding plaintext, or reports an
+  error.
+\end{itemize}
+These functions capture both confidentiality (ciphertexts do not
+depend on plaintexts) and integrity (decryption only succeeds on
+ciphertexts output by encryption).
+%
+Their behaviors are precisely captured by typing, using pre- and
+post-conditions about the ghost log shared between them, and
+abstract types to protect plaintexts and keys.
+%
+% Thus, for instance, we verify by typing that our AEAD construction,
+% when using \emph{any} ideal cipher and one-time MAC, perfectly
+% implements ideal AEAD.
+%
+% We also rely on typing to verify that our code complies with the
+% pre-conditions of the intermediate proof steps.
+%
+% We want to perform this security proof on \emph{our} implementation of AEAD; for
+% the purposes of the proof, we need to materialize the cryptographic assumptions,
+% i.e. replace every call to a concrete cryptographic primitive (e.g.
+% \li+chacha20+) by a call to the equivalent ideal functionality (e.g.
+% \li+random_bytes+); then, we can reason on our ideal implementation.
+%
+We show below the abstract type of keys and the encryption function for
+idealizing AEAD.
+\begin{lstlisting}[numbers=none]
+type entry = cipher * data * nonce * plain
+abstract type key = { key: keyBytes; log: if Flag.aead then ref (seq entry) else unit }
+let encrypt (k:key) (n:nonce) (p:plain) (a:data)  =
+  if Flag.aead then let c = random_bytes !$\ell_c$! in k.log := (c, a, n, p) :: k.log; c
+  else encrypt k.key n p a
+\end{lstlisting}
+
+A module \li+Flag+ declares a set of abstract booleans (\emph{idealization
+flags}) that precisely capture each cryptographic assumption.
+%
+For every real functionality that we wish to idealize, we branch on
+the corresponding flag. In the code above, for instance we idealize
+encryption when \li+Flag.prf+ is set.
+%
+% Every flag idealization formalizes a of a cryptographic primitive has to be manually
+% checked by a cryptographer.
+%
+%\ch{Still don't have a clear idea what is verified here}
+%
+
+This style of programming heavily relies on the normalization capabilities of
+\fstar. 
+%
+At verification time, flags are kept abstract, so that we verify both the real and ideal versions of the code.
+% (intuitively covering every step of the cryptographic argument)
+%
+At extraction time, we reveal these booleans to be \li+false+, allowing the
+\fstar normalizer to drop the \li+then+ branch, and replace the
+\li+log+ field with \li+unit+, meaning that both the high-level,
+list-manipulating code and corresponding type definitions are erased, leaving
+only low-level code from the \li+else+ branch to be extracted.
+
+Using this technique, we verify by typing that our AEAD code,
+when using \emph{any} ideal cipher and one-time MAC, perfectly
+implements ideal AEAD.
+%
+We also rely on typing to verify that our code complies with the
+pre-conditions of the intermediate proof steps. Finally, we also prove
+that our code does not reuse nonces, a common cryptographic pitfall.
+
+\iffalse
+
+ATTIC 
+
+Embedding the cryptographic proof in our code yields strong security
+guarantees, but also requires aggressive erasure before extraction.
+Indeed, ideal code uses the functional convenience of \fstar,
+representing for instance the log as a sequence of tuples of sequences
+of bytes.
+%
+After typechecking (for any values of the idealization flags, to cover
+all steps in the game-based proof), we clear all flags and rely on
+\fstar normalization and inlining to guarantee that only real code is
+extracted to C.
+
+For concreteness, we give the type of keys in idealized AEAD,
+parameterized by an \lst$ideal_aead$ flag:
+\begin{lstlisting}
+type entry (i:id) = { nonce: UInt128.t; cipher: seq UInt8.t; 
+                      plain: plainVal i (* abstract *) }
+abstract type key (r:region) (i:id) = | AEAD_State :
+  key: lbytes 32 { region key = r } -> 
+  log: if ideal_aead i then rref r (seq entry) else unit 
+\end{lstlisting}
+The type is abstract, to protect access to the real key state.  
+It is indexed both by its allocation region (for framing) and
+by a key index, intuitively a unique key identifier.
+%
+It \emph{conditionally} includes the ideal encryption log we discussed
+above.
+%
+This log is used to specify ideal AEAD, and also to enforce an
+important restriction: encryption should be used \emph{at most once}
+for every nonce.
+%
+(This is a common pitfall with AEAD, as an adversary can XOR
+ciphertexts with the same nonce to obtain their XORed plaintexts).
+%
+The restriction is statically enforced by a log lookup in the
+pre-condition of AEAD encryption.
+%
+After typechecking, and erasure with \lst$not ideal_aead$, AEAD keys
+extract to just \lst$uint8[32]$, but we are still guaranteed that
+nonces are never re-used, and (at least) the concrete security bound
+of the construction.
+
+\ch{one really needs to read s2.4 to the end to figure out what is
+  being verified with F* here, since that's mentioned only in the
+  very last paragraph ... could we move this much earlier?}
+\fi
+
+% A short overview of our ideal
+% AEAD proof follows.
+% %, accouting for all implementation details.
+
+% %
+% Encryption replaces the contents of the plaintext buffer with
+% dummy values \lst$0x00$ before real encryption; and also appends the
+% encryption arguments and resulting plaintext to a log.
+% %
+% Decryption simply looks up an entry in the log that matches its
+% arguments and returns the corresponding plaintext (or reports an
+% error).
+% %
+% They yield both integrity (decryption at most undoes encryption) and
+% confidentiality (ideal AEAD never actually accesses the plaintext).
+% %
+% Their behaviors are precisely captured by typing, using pre- and
+% post-conditions about the log shared between all encryptions and
+% decryptions, as well as abstract types to protect plaintexts and keys.
+
+% For concreteness, we give the type of keys in idealized AEAD,
+% parameterized by an \lst$ideal_aead$ flag:
+% \begin{lstlisting}
+% type entry (i:id) = { nonce: UInt128.t; cipher: seq UInt8.t; 
+%                       plain: plainVal i (* abstract *) }
+% abstract type key (r:region) (i:id) = | AEAD_State :
+%   key: lbytes 32 { region key = r } -> 
+%   log: if ideal_aead i then rref r (seq entry) else unit 
+% \end{lstlisting}
+% The type is abstract, to protect access to the real key state.  
+% It is indexed both by its allocation region (for framing) and
+% by a key index, intuitively a unique key identifier.
+% %
+% It \emph{conditionally} includes the ideal encryption log we discussed
+% above.
+% %
+% This log is used to specify ideal AEAD, and also to enforce an
+% important restriction: encryption should be used \emph{at most once}
+% for every nonce.
+% %
+% (This is a common pitfall with AEAD, as an adversary can XOR
+% ciphertexts with the same nonce to obtain their XORed plaintexts).
+% %
+% The restriction is statically enforced by a log lookup in the
+% pre-condition of AEAD encryption.
+% %
+% After typechecking, and erasure with \lst$not ideal_aead$, AEAD keys
+% extract to just \lst$uint8[32]$, but we are still guaranteed that
+% nonces are never re-used, and (at least) the concrete security bound
+% of the construction.
+
+% \iffalse
+
+% (Cryptographically, this would be disastrous as the adversary can then
+% XOR the resulting ciphertexts and obtain a XOR of the corresponding
+% plaintexts.)
+
+% To this end, the real AEAD state, essentially just a buffer containing
+% the encryption key, is supplemented with a log of prior encryptions:
+
+
+% For verification, we type our code without providing a value for \lst$ideal$, 
+% and, as a precondition of our encrypt function, we require that, if \lst$ideal$ holds,
+% then the nonce passed as an argument does not occur yet in the log.
+
+
+% Composition of Chacha and Poly. Why it is difficult: Three loops. Complex message formats and
+% invariants. Endianness details.
+
+% Functional correctness and injectivity properties of various
+% encodings.
+
+% For example, we type nonces as 128-bit unsigned integers whose value
+% are smaller than $2^{96}$; and we prove that their little-endian
+% encoding into 12-byte buffers is injective.
+
+% %-- illustrate compilation of local state (using a type constructor) to a flat struct.
+
+% Functional Correctness vs Security. The two are intertwined. Each of them a significant effort. 
+
+% (\dots) 
+
+\paragraph{Inlining and Type Abstraction} 
+
+In cryptographic constructions, we often rely on type abstraction to
+protect private state that depends on keys and other secrets.
+
+A typical C application, such as OpenSSL, achieves limited type abstraction
+as follows. The library exposes a public C header file for its clients,
+relying on \li+void *+ and opaque heap allocation functions for type abstraction.
+\begin{lstlisting}[numbers=none,language=C]
+typedef void *KEY_HANDLE;
+void KEY_init(KEY_HANDLE *key);
+void KEY_release(KEY_HANDLE key);
+\end{lstlisting}
+Opportunities for mistakes abound, since the \li+void *+ casts are unchecked.
+Furthermore, abstraction only occurs at the public header boundary, not between
+internal translation units. Finally, this pattern does not allow the caller to
+efficiently allocate the actual key on the stack.
+
+The \lowstar discipline allows the programmer to achieve type abstraction and
+modularity, while still supporting efficient stack allocation.
+As an example, for computing one-time MACs incrementally, we use an accumulator
+that holds the current value of a polynomial computation, which depends on a
+secret key.  For cryptographic soundness, we must ensure that no information
+about such intermediate values leak to the rest of the code.
+
+To this end, all operations on accumulators are defined in a single
+module of the form below---our code is similar but more complex, as it
+supports MAC algorithms with different field representations and key
+formats, and also keeps track of the functional correctness of the
+polynomial computation.
+
+\begin{lstlisting}[numbers=none]
+module OneTimeMAC
+type elem = lbytes (v accLen) (* intermediate value (representing a a field element) *) 
+abstract type key (i:macID) = elem
+abstract type accum (i:macID) = elem
+(* newAcc allocates on the caller's frame *)
+let newAcc (i:macID) : StackInline (accum i) (...) = Buffer.create 0ul accLen 
+let extend (i:macID) (key: macKey i) (acc:accum i) (word:elem) : Stack unit (...) = add acc word; mul acc key
+\end{lstlisting}
+
+The index \lst$i$ is used to separate multiple instances of MACs; for
+instance, it prevents calls to extend an accumulator with the wrong
+key. Our type-based separation between different kinds of elements is
+purely static. At runtime, the accumulator, and probably the key, are
+just bytes on the stack (or in registers), whereas the calls to
+\lst$add$ and \lst$mul$ are also likely to be have been inlined in the
+code that uses MACs.
+
+The \lst$newAcc$ function creates a new buffer for a given index, initialized to
+0. The function returns a pointer to the buffer it allocates. The
+\li+StackInline+ effect indicates that the function does need to push a frame
+before allocation, but instead allocates in its caller's stack frame.
+%
+\kremlin textually inlines the function in its caller's body at every
+call-site, ensuring that the allocation performed by \li+newAcc+
+indeed happens in the caller's stack frame.
+%
+From the perspective of \lowstar, \li+newAcc+ is a function in a
+separate module, and type abstraction is preserved.
+
+\iffalse
+NS: I think it's clear already ... contrary to my earlier in-person comments,
+    I think the text below belabors the point. So, it's better to leave it out.
+
+ATTIC
+
+Finally, to re-assert the importance of \li+StackInline+, let us show how the
+\li+Stack+ effect alone fails to enable type abstraction and stack allocation.
+
+\begin{lstlisting}
+(* Failure: the Stack effect alone cannot enable this programming pattern. *)
+module OneTimeMAC
+val newAcc: i:macID -> Stack (accumulator i) (...)
+let newAcc i = Buffer.create 0ul accLen (* allocated in its own frame *)
+
+module Client
+let mac #i key elems =
+  let acc = OneTimeMAC.newAcc i in
+  (* acc is no longer live, meaning that this code is ill-typed *)
+  OneTimeMAC.extend i key acc (elems.(0))
+\end{lstlisting}
+
+With \li+newAcc+ only using the \li+Stack+ effect, the post-condition
+\li+(ensures (fun h b h' -> live h' b)+ is not provable, since the function
+executes within its own C stack frame, meaning that \li+acc+ is a dead pointer
+by the time the function returns. This in turn means that the client cannot pass
+\li+acc+ to \li+extend+, since \li+acc+ is now referred to outside of its
+lifetime.
+
+The \li+mac+ function cannot allocate the accumulator itself, either, since this
+is an abstract type and the \li+Client+ module does not have access to the
+representation.
+\fi
+
+\iffalse
+\subsection{Efficient, Verified JSON Parsers}
+\label{sec:jsonparsing}
+
+We developed a low-level library for parsing JSON objects whose format
+is specified in a fragment of JSON schema, \lst$json_schema$, defined by
+the type below---essentially nested objects with string-typed fields
+at the leaves. Enriching \lst$json_schema$ is future work.
+%
+Our goal is to parse a JSON string (represented as a buffer of
+characters) into flatly allocated nested C structs, with pointers at
+the leaves referring to substrings of the original string---the
+\lst$lbuffer t$ type is similar to \lst$buffer t$, except it provides
+a length field as well.
+%
+We exploit the embedding of \lowstar within a dependently typed
+language to obtain parsers and printers specialized to particular
+schemas, together with their proofs of their correctness.
+
+\begin{lstlisting}
+type json_schema =
+ | Obj    : l:list (string * json_schema){no_duplicate_keys l} -> json_schema
+ | String : json_schema
+\end{lstlisting}
+
+First, we define a function \lst$as_type spec j$ to interpret \lst$j$
+as a nest of \lst$struct$s, in two ways. When \lst$spec=true$, we
+store pure string values at the leaves; otherwise, the leaves store
+\lst$lbuffer char$ pointers to fragments of the original string.
+
+\begin{lstlisting}
+type key (l:list (string * 'a)) = s:string{s $\in$ map fst l}
+let rec as_type (spec:bool) (j: json_schema) : Tot Type (decreases j) =
+  match j with
+  | String -> if spec then seq char else lbuffer char
+  | Obj l -> struct (key l) (object_as_type spec l)
+and object_as_type (spec:bool) (l: list (string * json_schema)) (s:string) : Tot Type (decreases l) =
+  match l with
+  | [] -> False
+  | (s', j') :: q -> if s = s' then as_type spec j' else object_as_type spec q s
+let as_spec_type = as_type true
+let as_type = as_type false
+\end{lstlisting}
+
+Next, we write pure parsers and printers for \lst$json_schema$, prove
+them (partial) inverses, and define a coercion, \lst$to_spec_type$
+that folds over the content of nested structures gathering
+the leaf buffers as strings. 
+
+\begin{lstlisting}
+val parse_spec:   #j:json_schema -> src:seq char -> Tot (option (as_spec_type j))
+val print_spec:   #j:json_schema -> src:as_spec_type j -> Tot (seq char)
+val inverse_1:    #j:json_schema -> src:as_spec_type j -> Tot (parse_spec (print_spec src) == Some src)
+val to_spec_type: #j:json_schema -> p:ptr (as_type j) -> h:heap -> GTot (as_spec_type j)
+\end{lstlisting}  
+
+For the concrete, imperative parser, we first define
+%
+\lst$json_init: j:json_schema -> StackInline (ptr (as_type j))$, which
+allocates and returns a pointer to a structure for storing a JSON
+object, initialized with empty strings. We then pass this pointer to
+\lst$parse$, the main parsing function proven to correctly implement
+\lst$parse_spec$ by the signature shown below.
+
+\begin{lstlisting}
+val parse: j:json_schema -> dest:ptr (as_type j) -> src:lbuffer char -> ST bool
+  (requires (fun h -> live h dest))
+  (ensures (fun h0 b h1 -> modifies_ptr_1 dest h0 h1 /\ (match parse_spec (as_seq h0 src) with
+                                                 | None -> b = false
+                                                 | Some b -> b == to_spec_type dest h)))
+\end{lstlisting}
+
+By partially evaluating \lst$parse js$ for a particular JSON schema
+constant, we obtain a parser specialized to that schema. For example,
+the following schema describes records of hostnames and their base-64
+encoded public keys.
+
+\begin{lstlisting}
+let known_hosts = Obj [("hostname", String); ("keytype", String); ("b64key", String)]
+\end{lstlisting}
+
+Partially evaluating \lst$parse known_hosts$ allows KreMLin to extract
+it to a C parser that returns a struct with three fields, each a
+pointer to struct containing a length field and a \lst$char*$.
+
+\fi
+
+% \paragraph{Game-Based Idealization and Erasure} 
+
+% \cf{Not sure where this is going. Do I need to explain standard crypto
+%   proof to a PLDI audience??}
+
+% Security proofs in the standard, probabilistic, computational model of
+% cryptography rely on sequences of games, gradually transforming the
+% construction being verified from the real one, using concrete
+% algorithms such as ChaCha20, to an ideal one that has perfect security
+% properties.
+% %
+% (For encryption, for instance, a game transformation may replace the
+% plaintext with a dummy value. As a result, the construction does not
+% depend on the plaintext anymore, hence clearly preserves its secrecy.)
+
+% As we apply this approach to \lowstar code, we program and typecheck
+% idealized variants of e.g. ChaCha20 as part of the proof.
+
+% Crucially, the same source program is used both to obtain the real
+% implementation, using `real' code, and to conduct the cryptographic
+% proof, using `ideal' code. 
+% %
+% Once the proof is complete, we expect all the additional scaffolding
+% built for the cryptographic proof to be erased before extraction, much
+% as ghost variables.
+
+% This is important for efficiency, but also because `ideal' code tend
+% to use high-level data structures outside the domain of \lowstar.
+
+% This is implemented using families of idealization flags, all cleared
+% before KreMLin extraction, and aggressive inlineing, normalization,
+% and erasure in \fstar.
+% \fi 
+
+% \comment{JK: How much do we want to say about the AEAD construction vs the Box/Unbox construction ?
+%   It will be somehow redundant.}

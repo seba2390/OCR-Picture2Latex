@@ -1,0 +1,411 @@
+\documentclass{article}
+
+% if you need to pass options to natbib, use, e.g.:
+% \PassOptionsToPackage{numbers, compress}{natbib}
+% before loading nips_2016
+%
+% to avoid loading the natbib package, add option nonatbib:
+% \usepackage[nonatbib]{nips_2016}
+
+%\usepackage{nips_2016}%[nonatbib]
+
+% to compile a camera-ready version, add the [final] option, e.g.:
+\usepackage[nonatbib,final]{nips_2017}
+%\usepackage[nonatbib]{nips_2017}
+
+\usepackage[round]{natbib}
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage[hyperfootnotes=false]{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+
+%%%%%%%add cls
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tabularx}
+\usepackage{wrapfig}
+\usepackage[toc,page]{appendix}
+
+%\nolinenumbers
+\usepackage{amsmath,amssymb,amstext,xparse}
+\usepackage{textcmds}
+\usepackage{float}
+\usepackage{graphicx}
+\makeatletter
+\g@addto@macro\@floatboxreset\centering
+\makeatother
+\graphicspath{{./figures/}}
+\DeclareMathOperator{\argmax}{argmax}
+\newcommand*\mean[1]{\bar{#1}}
+\renewcommand{\vec}[1]{\mathbf{#1}}
+
+\title{Teacher-Student Curriculum Learning}
+
+% The \author macro works with any number of authors. There are two
+% commands used to separate the names and addresses of multiple
+% authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to
+% break the lines. Using \AND forces a line break at that point. So,
+% if LaTeX puts 3 of 4 authors names on the first line, and the last
+% on the second line, try using \AND instead of \And before the third
+% author name.
+
+\author{
+  Tambet Matiisen\thanks{Work done while interning at OpenAI.}\phantom{\footnotesize 1}\textsuperscript{,}\thanks{Correspondence to \texttt{tambet.matiisen@gmail.com}.} \\
+  University of Tartu \\
+%  \texttt{tambet.matiisen@gmail.com} \\
+  \And
+  Avital Oliver\footnotemark[1]\phantom{\footnotesize 1}\textsuperscript{,}\thanks{Author currently at Google Brain} \\
+  OpenAI \\
+%  \texttt{avital@aoliver.org} \\
+  \And
+  Taco Cohen\footnotemark[1] \\
+  University of Amsterdam \\
+%  \texttt{taco.cohen@gmail.com} \\
+  \And
+  John Schulman \\
+  OpenAI \\
+%  \texttt{joschu@openai.com} \\
+}
+
+\begin{document}
+% \nipsfinalcopy is no longer used
+
+\maketitle
+
+\begin{abstract}
+
+We propose Teacher-Student Curriculum Learning (TSCL), a framework for automatic curriculum learning, where the Student tries to learn a complex task and the Teacher automatically chooses subtasks from a given set for the Student to train on. We describe a family of Teacher algorithms that rely on the intuition that the Student should practice more those tasks on which it makes the fastest progress,\textit{ i.e.} where the slope of the learning curve is highest. In addition, the Teacher algorithms address the problem of forgetting by also choosing tasks where the Student's performance is getting worse.
+We demonstrate that TSCL matches or surpasses
+the results of carefully hand-crafted curricula in two tasks: addition of decimal numbers with LSTM and navigation in Minecraft. Using our automatically generated curriculum enabled to solve a Minecraft maze that could not be solved at all when training directly on solving the maze, and the learning was an order of magnitude faster than uniform sampling of subtasks.
+
+\end{abstract}
+
+\section{Introduction}
+
+Deep reinforcement learning algorithms have been used to solve difficult tasks in video games \citep{Mnih2015}, locomotion \citep{Schulman2015, lillicrap2015continuous} and robotics \citep{Levine2015}. But tasks with sparse rewards like ``Robot, fetch me a beer'' remain challenging to solve with direct application of these algorithms. One reason is that the number of samples needed to solve a task with random exploration increases exponentially with the number of steps to get a reward \citep{langford2011efficient}. One approach to overcome this problem is to use curriculum learning \citep{Bengio2009,Zaremba2014,Graves2016,wu2017training}, where tasks are ordered by increasing difficulty and training only proceeds to harder tasks once easier ones are mastered. Curriculum learning helps when after mastering a simpler task the policy for a harder task is discoverable through random exploration.
+
+To use curriculum learning, the researcher must:
+\begin{itemize}
+\item Be able to order subtasks by difficulty.
+\item Decide on a \qq{mastery} threshold. This can be based on achieving certain score \citep{Zaremba2014,wu2017training}, which requires prior knowledge of acceptable performance of each task. Alternatively this can be based on a plateau of performance, which can be hard to detect given the noise in the learning curve.
+\item Continuously mix in easier tasks while learning harder ones to avoid forgetting. Designing these mixtures effectively is challenging
+\citep{Zaremba2014}.
+\end{itemize} 
+
+In this paper, we describe a new approach called Teacher-Student Curriculum Learning (TSCL). The Student is the model being trained. The Teacher monitors the Student's training progress and determines the tasks on which the Student should train at each training step, in order to maximize the Student's progression through the curriculum. The Student can be any machine learning model. The Teacher is itself learning about the Student as it's giving tasks, all as part of a single training session.
+
+We describe several Teacher algorithms based on the notion of learning progress \citep{Oudeyer2007}. The main idea is that the Student should practice more the tasks on which it is making fastest progress i.e. the learning curve slope is highest. To counter forgetting, the Student should also practice tasks where the performance is getting worse
+i.e. the learning curve slope is negative.
+
+The main contributions of the paper are:
+\begin{itemize}
+    \item We formalize TSCL, a Teacher-Student framework for curriculum learning as partially observable Markov decision process (POMDP).
+    \item We propose a family of algorithms based on the notion of learning progress. The algorithms also address the problem of forgetting previous tasks.
+    \item We evaluate the algorithms on two supervised and reinforcement learning tasks: addition of decimal numbers with LSTM and navigation in Minecraft.
+\end{itemize}
+
+\section{Teacher-Student Setup}
+\label{teacher-student-setup}
+
+\begin{figure}[h!]
+  \includegraphics[scale=0.5]{figures/f1}
+\caption{The Teacher-Student setup}
+\label{f1} 
+\end{figure}
+
+Figure \ref{f1} illustrates the Teacher-Student interaction.  At each timestep, the Teacher chooses tasks for the Student to practice on. The Student trains on those tasks and returns back a score. The Teacher's goal is for the Student to succeed on a final task with as few training steps as possible. Usually the task is parameterized by a categorical value representing one of $N$ subtasks, but one can imagine also multi-dimensional or continuous task parameterization. The score can be episode total reward in reinforcement learning or validation set accuracy in supervised learning.
+
+We formalize the Teacher's goal of helping the Student to learn a final task as solving a partially observable Markov decision process (POMDP). We present two POMDP formulations: (1) \textit{Simple}, best suited for reinforcement learning; and (2) \textit{Batch}, best suited for supervised learning.
+
+\subsection{Simple POMDP Formulation}
+\label{ssec21}
+
+The simple POMDP formulation exposes the score of the Student on a single task and is well-suited for reinforcement learning problems.
+\begin{itemize}
+\item  The state $s_t$ represents the entire state of the Student (\textit{i.e.} neural network parameters and optimizer state) and is not observable to the Teacher.
+
+\item  The action $a_t$ corresponds to the parameters of the task chosen by Teacher. In following we only consider a discrete task parameterization. Taking an action means training Student on that task for certain number of iterations.
+
+\item  The observation $o_t$ is the score $x^{(i)}_t$ of the task $i=a_t$ the Student trained on at timestep $t$, i.e. the episode total reward.
+%\[
+%o_t=x^{(i)}_t,\quad a_t=i,
+%\]
+%where $x^{(i)}_t$ is the score of task $i$ at timestep $t$.
+While in theory the Teacher could also observe other aspects of the Student state like network weights, for simplicity we choose to expose only the score.
+
+\item  Reward $r_t$ is the change in score for the task the Student trained on at timestep $t$: $r_t=x^{(i)}_t-x^{(i)}_{t'_i}$, 
+%\[
+%r_t=x^{(i)}_t-x^{(i)}_{t'},\quad
+%a_t=a_{t'}=i,\quad
+% t'<t,
+%\]
+where $t'_i$ is the previous timestep when the same task was trained on.
+\end{itemize}
+
+\subsection{Batch POMDP Formulation}
+\label{ssec22}
+
+In supervised learning a training batch can include multiple tasks. Therefore action, observation, and reward apply to the whole training set and scores can be measured on a held-out validation set. This motivates the batch formulation of the POMDP:
+\begin{itemize}
+\item  The state $s_t$ represents training state of the Student.
+
+\item  The action $a_t$ represents a probability distribution over $N$ tasks. Each training batch is sampled according to the distribution:
+$
+ a_t=(p^{(1)}_t,\ldots, p^{(N)}_t),
+$
+where $p^{(i)}_t$ is the probability of task $i$ at timestep $t$.
+
+\item  The observation $o_t$ is the scores of all tasks after the training step:
+$
+o_t=(x^{(1)}_t,\ldots ,x^{(N)}_t)
+$
+In the simplest case the scores could be accuracies of the tasks in the training set. But in the case of minibatch training the model evolves during training and therefore additional evaluation pass is needed anyway to produce consistent results. Therefore we use a separate validation set that contains uniform mix of all tasks for this evaluation pass.
+
+\item  The reward $r_t$ is the sum of changes in evaluation scores from the previous timestep:
+$
+r_t=\sum^N_{i=1}x^{(i)}_t-x^{(i)}_{t-1}
+$.
+
+\end{itemize}
+
+This setup could also be used with reinforcement learning by performing training in batches of episodes. But because scoring one sample (one episode) in reinforcement learning is usually much more computationally expensive than in supervised learning, it makes sense to use simple POMDP formulation and make decision about the next task after each training step.
+
+\subsection{Optimization Criteria}
+
+For either of the POMDP formulations, maximizing the Teacher episode total reward is equivalent to maximizing the score of all tasks at the end of the episode:
+$
+\sum^T_{t=1}{}r_t=
+\sum^N_{i=1}{}x^{(i)}_{T_i},
+$
+where $T_i$ is the last training step where task $i$ was being trained on\footnote{Due to telescoping summation cancelling out all $x_t^{(i)}$ terms but the $T_i$\textsuperscript{th}.}.
+
+While an obvious choice for optimization criteria would have been the performance in the \textit{final task}, initially the Student might not have any success in the final task and this does not provide any meaningful feedback signal to the Teacher. Therefore we choose to maximize the sum of performances in \textit{all tasks}. The assumption here is that in curriculum learning the final task includes the elements of all previous tasks, therefore good performance in the intermediate tasks usually leads to good performance in the final task.
+
+\section{Algorithms}
+
+POMDPs are typically solved using reinforcement learning algorithms. But those require many training episodes, while we aim to train the Student in one Teacher episode. Therefore, we resort to simpler heuristics. The basic intuition is that the Student should practice those tasks more for which it is making most progress \citep{Oudeyer2007}, while also practicing tasks that are at risk of being forgotten.
+
+\begin{figure}[h]
+  \includegraphics[scale=0.65]{figures/sigmoid}
+\caption{Idealistic curriculum learning. Left: Scores of different tasks improve over time, the next task starts improving once the previous task has been mastered. Right: Probability of sampling a task depends on the slope of the learning curve.}
+\label{f2}
+\end{figure}
+
+Figure \ref{f2} is a demonstration of the ideal training progress in a curriculum learning setting:
+\begin{enumerate}
+\item  At first, the Teacher has no knowledge so it samples from all tasks uniformly.
+
+\item  When the Student starts making progress on task 1, the Teacher allocates more probability mass to this task.
+
+\item  When the Student masters task 1, its learning curve flattens and the Teacher samples the task less often. At this point Student also starts making progress on task 2, so the Teacher samples more from task 2.
+
+\item  This continues until the Student masters all tasks. As all task learning curves flatten in the end, the Teacher returns to uniform sampling of the tasks.
+\end{enumerate}
+
+The picture above is idealistic, since in practice some  unlearning often occurs, \textit{i.e.} when most of the probability mass is allocated to the task 2, performance on task 1 might get worse. To counter this the Student should also practice all learned tasks, especially those where unlearning occurs. For this reason we sample tasks according to the \textit{absolute value} of the slope of the learning curve instead. If the change in scores is negative, this must mean that unlearning occurred and this task should be practiced more.
+
+This description alone does not prescribe an algorithm. We need to propose a method of estimating learning progress from noisy task scores, and a way to balance exploration and exploitation. We take inspiration from algorithms for the non-stationary multi-armed bandit problem \citep{Sutton1998} and adapt them to TSCL. For brevity we only give intuition for the simple formulation algorithms here, the formal descriptions can be found in appendices \ref{appendix:simple_algs} and \ref{appendix:batch_algs}.
+
+\subsection{Online algorithm}
+
+The Online algorithm is inspired by the basic non-stationary bandit algorithm
+\citep{Sutton1998}. It uses exponentially weighted moving average to track the expected return $Q$ from different tasks:
+\[
+Q_{t+1}(a_t)=\alpha r_t+(1- \alpha)Q_t(a_t),
+\]
+where $\alpha$ is learning rate. The next task can be chosen by $\epsilon$-greedy exploration: sample a random task with probability $\epsilon$, or $\argmax Q_t(a)$ otherwise.
+
+
+Alternatively the next task can be chosen using Boltzmann distribution:
+\[
+p(a)=\frac{e^{Q_t(a)/\tau}}{\sum^N_{i=1}e^{Q_t(i)/\tau}},
+\]
+where $\tau$ is the temperature of Boltzmann distribution. For details, see Algorithm \ref{online_simple} in Appendix \ref{appendix:simple_algs}.
+
+\subsection{Naive algorithm}
+
+To estimate the learning progress more reliably one should practice the task several times. The Naive algorithm trains each task $K$ times, observes the resulting scores and estimates the slope of the learning curve using linear regression. The regression coefficient is used as the reward in the above non-stationary bandit algorithm. For details, see Algorithm \ref{naive_simple} in Appendix \ref{appendix:simple_algs}.
+
+\subsection{Window algorithm}
+
+Repeating the task a fixed number of times is expensive, when clearly no progress is made. The Window algorithm keeps FIFO buffer of last $K$ scores, and timesteps when these scores were recorded. Linear regression is performed to estimate the slope of the learning curve for each task, with the timesteps as the input variables. The regression coefficient is used as the reward in the above non-stationary bandit algorithm. For details, see Algorithm \ref{window_simple} in Appendix \ref{appendix:simple_algs}.
+  
+\subsection{Sampling algorithm}
+
+The previous algorithms require tuning of hyperparameters to balance exploration. To get rid of exploration hyperparameters, we take inspiration from Thompson sampling. The Sampling algorithm keeps a buffer of last $K$ rewards for each task. To choose the next task, a recent reward is sampled from each task's $K$-last-rewards buffer.  Then whichever task yielded the highest sampled reward is chosen. This makes exploration a natural part of the algorithm: tasks that have recently had high rewards are sampled more often. For details, see Algorithm \ref{sampling_simple} in Appendix \ref{appendix:simple_algs}.
+
+\section{Experiments}
+
+\subsection{Decimal Number Addition}
+
+Addition of decimal numbers with LSTM is a well known task that requires a curriculum to learn in reasonable time \citep{Zaremba2014}. It is implemented as sequence-to-sequence model \citep{sutskever2014sequence}, where the input to the network is two decimal-coded numbers separated by a 'plus' sign, and output of the network is the sum of those numbers, also in decimal coding. The curriculum is based on the number of digits in the input numbers -- it is easier to learn addition of short numbers and then move on to longer numbers.
+
+Number addition is a supervised learning problem and therefore can be trained more efficiently by including several curriculum tasks in the mini-batch. Therefore we adopt batch training scheme as outlined in \ref{ssec22}. The score we use is the accuracy of each task calculated on validation set. The results shown below are means and standard deviations of 3 runs with different random seeds. Full experiment details can be found in appendix \ref{appendix:addition}.
+
+
+\subsubsection{Addition with 1-dimensional Curriculum}
+
+We started with a similar setup to \citep{Zaremba2014}, where the curriculum task determines the maximum number of digits in both added numbers. The results are shown on Figure \ref{f5}. Our algorithms outperformed uniform sampling and the best manual curriculum ("combined") for 9-digit addition from \citep{Zaremba2014}. An example of the task distribution during training session is given on figure \ref{f6}.
+
+\begin{figure}[h]
+\begin{minipage}[b]{65mm}
+  \includegraphics[scale=0.42]{figures/addition1d}
+\caption{Results for 9-digit 1D addition, lower is better. Variants using the absolute value of the expected reward surpass the best manual curriculum ("combined").}
+\label{f5}
+\end{minipage}
+%%%%%%%%%%%%%%
+\hfill
+%%%%%%%%%%%%%%
+\begin{minipage}[b]{65mm}
+  \includegraphics[scale=0.39]{figures/addition1d_probs}
+\caption{Progression of the task distribution over time for 9-digit 1D addition (Sampling). The algorithm progresses from simpler tasks to more complicated. Harder tasks take longer to learn and the algorithm keeps training on easier tasks to counter unlearning.}
+\label{f6}
+\end{minipage}
+\end{figure}
+
+\subsubsection{Addition with 2-dimensional Curriculum}
+
+We also experimented with a curriculum where the ordering of tasks is not obvious. We used the same decimal addition task, but in this case the length of each number is chosen separately, making the task-space 2-dimensional. Each training batch is modelled as a probability distribution over the length of both numbers $P(l_1, l_2)$. We also tried making this distribution independent such that $P(l_1, l_2) = P(l_1) P(l_2)$, but that did not work as well.
+
+There is no equivalent experiment in \citep{Zaremba2014}, so we created a manual curriculum inspired by their best 1D curriculum. In particular we increase difficulty by increasing the maximum length of both two numbers, which reduces the problem to a 1D curriculum. Figure \ref{f7} shows the results for 9-digit 2D addition. Figure \ref{f8} illustrates the different approaches taken by manual and automated curriculum.
+
+\begin{figure}[h]
+\begin{minipage}[b]{65mm}
+  \includegraphics[scale=0.42]{figures/addition2d}
+\caption{Results for 9-digit 2D addition, lower is better. The task seems easier, manual curriculum is hard to beat and uniform sampling is competitive.}
+\label{f7}
+\end{minipage}
+%%%%%%%%%%%%%%
+\hfill
+%%%%%%%%%%%%%%
+\begin{minipage}[b]{65mm}
+  \includegraphics[scale=0.28]{figures/addition_sampling_accuracy}
+  \includegraphics[scale=0.28]{figures/addition_combined_accuracy}
+\caption{Accuracy progress for 4-digit 2D addition. Top: TSCL. Bottom: the best manual curriculum. Our algorithm takes distinctively different approach by training on shorter numbers first. 9-digit videos can be found \url{https://youtu.be/y_QIcQ6spWk} and \url{https://youtu.be/fB2kx-esjgw}.}
+\label{f8}
+\end{minipage}
+\end{figure}
+
+\subsubsection{Observations}
+
+\begin{itemize}
+\item Using absolute value of $Q$ boosts the performance of almost all the algorithms, which means it is efficient in countering forgetting.
+
+\item There is no universal best algorithm. For 1D the Window algorithm and for 2D the Naive algorithm performed the best. Sampling is competitive in both and has least hyperparameters.
+
+\item Whether $\epsilon$-greedy or Boltzmann exploration works better depends on the algorithm.
+
+\item Uniform sampling is surprisingly efficient, especially in 2D case.
+
+\item The 2D task is solved faster and the manual curriculum is hard to beat in 2D.
+\end{itemize}
+
+\subsection{Minecraft}
+
+Minecraft is a popular 3D video game where players can explore, craft tools and build arbitrary structures, making it a potentially rich environment for AI research. We used the Malmo platform \citep{johnson2016malmo} with OpenAI Gym wrapper\footnote{\url{ https://github.com/tambetm/gym-minecraft}}
+%%%%%
+to interact with Minecraft in our reinforcement learning experiments. In particular we used \textit{ClassroomDecorator}
+from Malmo to generate random mazes for the agent to solve. The mazes contain sequences of rooms separated by the following obstacles:
+\begin{itemize}
+\item  \textbf{Wall} -- the agent has to locate a doorway in the wall.
+
+\item  \textbf{Lava} -- the agent has to cross a bridge over lava.
+
+%\item  \textbf{door} -- the agent has to open the door,
+
+%\item  \textbf{door with lever} -- the agent has to pull lever to open the door,
+
+%\item  \textbf{jump} -- the agent has to jump over lava.
+\end{itemize}
+% (images of wall, lava, door, door with lever, jump?)
+
+We only implemented the Window algorithm for the Minecraft task, because other algorithms rely on score change, which is not straightforward to calculate for parallel training scheme. As baseline we use uniform sampling, training only on the last task, and a manually tuned curriculum. Full experimental details can be found in appendix \ref{appendix:minecraft}.
+
+
+\begin{wrapfigure}[3]{r}{0.5\textwidth}
+  \begin{center}
+    \includegraphics[width=0.4\textwidth]{figures/minecraft_curriculum5}
+  \end{center}
+  \caption{5-step curriculum.}
+  \label{5step}
+\end{wrapfigure}
+
+\subsubsection{5-step Curriculum}
+
+We created a simple curriculum with 5 steps:
+
+\begin{enumerate}
+\item 
+A single room with a target.
+
+\item  
+Two rooms separated by lava.
+
+\item  
+Two rooms separated by wall.
+
+\item  
+Three rooms separated by lava and wall, in random order.
+
+\item  
+Four rooms separated by lava and walls, in random order.
+\end{enumerate}
+
+Refer to Figure \ref{5step} for the room layout. The starting position of the agent and the location of the target were randomized for each episode. Manual curriculum trained first task for $200\,000$ steps, second, third and fourth task for $400\,000$ steps, and fifth task for $600\,000$ steps.
+
+Figure \ref{f11} shows learning curves for Minecraft 5-step curriculum. The mean curve and standard deviation are based on 3 runs with different random seeds.
+
+\begin{figure}[h]
+  \includegraphics[scale=0.5]{figures/minecraft}
+\caption{Minecraft 5-step curriculum results, Y-axis shows mean episode reward per $10\,000$ timesteps for the current task. Left: training performance, notice the manual curriculum task switches after $200\,000$, $600\,000$, $1\,000\,000$ and $1\,400\,000$ steps. For automatic curriculum the training score has no clear interpretation. Right: evaluation training on the last task. When training only on the last task the agent did not make any progress at all. When training on a uniform mix of the tasks the progress was slow. Manual curriculum allowed the agent to learn the last task to an acceptable level. TSCL is comparable to the manual curriculum in performance.}
+\label{f11}
+\end{figure}
+
+Video of the trained agent can be found here: \url{https://youtu.be/cada0d_aDIc}. The learned policy is robust to the number of rooms, given that obstacles are of the same type. The code is available at \url{https://github.com/tambetm/TSCL}.
+
+
+\section{Related Work}
+
+Work by \citep{Bengio2009} sparked general interest in curriculum learning. More recent results include learning to execute short programs \citep{Zaremba2014}, finding shortest paths in graphs \citep{Graves2016} and learning to play first-person shooter \citep{wu2017training}. All those works rely on manually designed curricula and do not attempt to produce it automatically.
+
+The idea of using learning progress as the reward could be traced back to \citep{schmidhuber1991curious}. It has been successfully applied in the context of developmental robotics to learn object manipulation \citep{oudeyer2007intrinsic,baranes2013active} and also in actual classroom settings to teach primary school students \citep{clement2015multi}. Using learning progress as the reward can be linked to the concept of intrinsic motivation \citep{Oudeyer2007,Schmidhuber2010}.
+
+Several algorithms for adversarial bandits were analyzed in \citep{Auer2002}. While many of those algorithms have formal worst-case guarantees, in our experiments they did not perform well. The problem is that they come with no assumptions. In curriculum learning we can assume that rewards change smoothly over time.
+
+More recently \citep{sukhbaatar2017intrinsic} proposed a method to generate incremental goals and therefore curricula automatically. The setup consists of two agents, Alice and Bob, where Alice is generating trajectories and Bob is trying to either repeat or reverse them. Similar work by \citep{held2017automatic} uses generative adversarial network to generate goal states for an agent. Compared to TSCL, they are able to generate new subtasks on the go, but this mainly aids in exploration and is not guaranteed to help in learning the final task. \citep{sharma2017online} apply similar setup as ours to multi-task learning. In their work they practice more tasks that are underperforming compared to preset baseline, as opposed to our approach of using learning progress. \citep{jain2017faster} estimate transfer between subtasks and target task, and create curriculum based on that.
+
+The most similar work to ours was done concurrently in \citep{Graves2017}. While the problem statement is strikingly similar, our approaches differ. They apply the automatic curriculum learning only to supervised sequence learning tasks, while we consider also reinforcement learning tasks. They use the EXP3.S algorithm for adversarial bandits, while we propose alternative algorithms inspired by non-stationary bandits. They consider other learning progress metrics based on complexity gain while we focus only on prediction gain (which performed overall best in their experiments). Moreover, their work only uses uniform sampling of tasks as a baseline, whereas ours compares the best known manual curriculum for the given tasks. In summary they arrive to very similar conclusions to ours.
+
+Decimal addition has also been explored in \citep{kalchbrenner2015grid, reed2015neural, kaiser2015neural}, sometimes improving results over original work in \citep{Zaremba2014}. Our goal was not to improve the addition results, but to evaluate different curriculum approaches, therefore there is no direct comparison.
+
+Minecraft is a relatively recent addition to reinforcement learning environments. Work by \citep{oh2016control} evaluates memory-based architectures for Minecraft. They use cognition-inspired tasks in visual grid-world. Our tasks differ in that they do not need explicit memory, and the movement is continuous, not grid-world. Another work by \citep{tessler2016deep} uses tasks similar to ours but they take different approach: they learn a Deep Skill Module for each subtask, freeze weights of those modules and train hierarchical deep reinforcement learning network to pick either single actions or subtask policies. In contrast our approach uses simple policy network and relies on the TSCL to learn (and not forget) the subtasks.
+
+While exploration bonuses \citep{bellemare2016unifying,houthooft2016vime,stadie2015incentivizing} solve the same problem of sparse rewards, they apply to Student algorithms, while we were considering different Teacher approaches. For this reason we leave the comparison with exploration bonuses to future work.
+
+%Another line of related work concerns Bayesian optimization \citep{Mockus2012}. While solving a bandit problem can be seen as optimizing black-box function, Bayesian optimization takes a global view instead of relying on local function properties, and therefore proved unsuitable to our context. Recently proposed bandit-based approaches to hyperparameter optimization 
+%\citep{Li2016} solve different task and are not directly applicable.
+
+
+\section{Conclusion}
+We presented a framework for automatic curriculum learning that can be used for supervised and reinforcement learning tasks. We proposed a family of algorithms within that framework based on the concept of learning progress. While many of the algorithms performed equally well, it was crucial to rely on the absolute value of the slope of the learning curve when choosing the tasks. This guarantees the re-training on tasks which the network is starting to forget. In our LSTM decimal addition experiments, the Sampling algorithm outperformed the best manually designed curriculum as well as the uniform sampling. On the challenging 5-task Minecraft navigation problem, our Window algorithm matched the performance of a carefully designed manual curriculum, and significantly outperformed uniform sampling. For problems where curriculum learning is necessary, TSCL can avoid the tedium of ordering the difficulty of subtasks and hand-designing the curriculum.
+
+\section{Future Work}
+In this work we only considered discrete task parameterizations. In the future it would be interesting to apply the idea to continuous task parameterizations. Another promising idea to explore is the usage of automatic curriculum learning in contexts where the subtasks have not been pre-defined. For example, subtasks can be sampled from a generative model, or taken from different initial states in the same environment.
+
+\section{Acknowledgements}
+We thank Microsoft for their excellent Malmö environment for Minecraft, Josh Tobin and Pieter Abbeel for suggestions and comments, Vicky Cheung, Jonas Schneider, Ben Mann and Art Chaidarun for always being helpful with OpenAI infrastructure. Also Raul Vicente, Ardi Tampuu and Ilya Kuzovkin from University of Tartu for comments and discussion.
+\nocite{*}
+
+\bibliographystyle{plainnat}%apa}%
+\bibliography{main}
+
+\clearpage
+\input{appendices.tex}
+
+\end{document}

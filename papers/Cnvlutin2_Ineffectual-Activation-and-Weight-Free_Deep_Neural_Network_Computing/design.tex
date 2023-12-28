@@ -1,0 +1,83 @@
+\section{Alternate Encoding of Effectual Activations} 
+Earlier we described the ZFNAf format which encodes the effectual neuron values by packing them at the beggining of the brick container. Their offsets were encoded separately using 4 bits per value for a brick of 16 values. This represents a 25\% overhead for 16-bit values and bricks of 16 elements. This section presents alternate activation array formats that reduce memory overhead. For clarity, the discussion that follows uses examples where only zero-value activations are considered as ineffectual. However, the criterion can be more relaxed in practice.
+
+\subsection{RAW or Encoded Format (RoE)}
+ Another encoding uses just one extra bit per brick container at the expense of not being able to encode all possible combinations of ineffectual values. Specifically, the first bit of the brick specifies whether the brick is encoded or not. When the brick is encoded the remaining bits are used to store the neuron values and their offsets. As long as the number of effectual activations is such so that they fit in the brick container the brick can be encoded. Otherwise, all activation values are stored as-is and we lose the ability to skip the ineffectual activations for the specific brick. For example, let us assume that we have bricks of size 4 and 16 bit values. In total, each such brick requires $4\times 16=64$ bits. A brick containing the values $(1,2,0,0)$ can be encoded using 65 bits as follows: $(1,(0,1),(1,2))$. The first $1$ means that the brick is encoded. The $(offset,value)=(0,1)$ that follows uses two bits for the offset and 16 bits for the value. In total, the aforementioned brick requires $1+2\times(16+4)=41$ bits can fit within the 65 bits available. A brick containing the values $(2,1,3,4)$ cannot fit within 65 bits and thus will be stored in raw format: $(0,2,1,3,4)$ using 65 bits where the first $1$ is a single bit indicating that the rest of the brick is not encoded and every value is 16 bits long.
+
+\subsection{Vector Ineffectual Activation Identifier Format (VIAI)}
+
+An alternate encoding would leave the activation values in place and  use an extra 16-bit bit vector $I$ to encode which ones are ineffectual and thus can be skipped. For example, assuming bricks of 4 elements a brick containing $(1, 2, 0, 4)$ could be encoded as-is plus a 4 bit  $I$ vector containing $(1101)$. For bricks of 16 activations each of 16 bits, this format imposes an overhead of 16/256, or 6.25\%.
+
+\subsection{Storing Only the Effectual Activations}
+ Another format builds on VIAI by storing only the effectual values. For example, a 4 element activation brick of (1,0,0,4) in VIAI would be stored as (1001,1,0,0,4). In the CompressedVIAI it would stored instead as (1001,1,4). Here the two ineffectual zero activations were not stored in memory. Since now bricks no longer have a fixed size, a level of indirection is necessary to support fetching of arbitrary bricks. If the original activation array dimensions are $(X.Y,I)$ then this indirection array $IR$  would have $(X,Y,\lceil I/16\rceil)$ pointers. These can be generated at the output of the preceding layer. 
+ 
+ Further reduction in memory storage can be possible by storing activations at a reduced precision. For example, using the method of Judd \textit{et al.}~\cite{judd:reduced} it is possible to determine precisions per layer in advance based on profiling. 
+ It may be possible to adjust precisions at a finer granularity. However, both the pointers and the precision specifier are overheads which reduce the footprint reduction possible.
+ 
+\section{Zero-Memory-Overhead Ineffectual Activation Skipping}
+
+In the original \ZF  implementation the ineffectual activations were ``removed'' at the output of the preceding layer. The ZFNAf incurs a memory storage overhead and the writes and reads of the activation offset values, require additional energy. This section describes an alternate dispatcher design that ``eliminates'' ineffectual activations while fetching them from the NM and prior to communicating these activation values to the tiles.
+
+Specifically, processing for a layer starts by having the dispatcher, as described previously, fetch 16 activation bricks, one brick per neuron lane. The dispatcher then calculates the I (as described previously in the VIAI format) vectors on-the-spot using 16 comparators per brick, one per activation value. The dispatcher then proceeds to communicate the effectual activations at a rate of  one per cycle. When communicating an activation value, the dispatcher will send also the offset of the activation within its containing brick. For example, if the input activation brick contains $(1,0,0,4)$, the dipatcher over two cycles will send to the tiles first $(00b,1)$ ($(offset, value)$) followed by $(11b,4)$. Once all effectual activation values have been communicated to the titles, the dispatcher can then proceed to process another brick for the specific neuron lane. Many options exist for what should be the criterion for detecting ineffectual activations. For example, we could use a simple comparison with zero, a comparison with an arbitrary threshold, or a comparison with a threshold that is a power of two.
+
+\begin{figure}
+        \centering
+        \includegraphics[width=\columnwidth]{figs/cnv2_activations_only}
+   
+\caption{Detecting and Skipping Ineffectual Activations at the Brick Buffer in the Dispatcher.}
+\label{fig:activationskipping}
+\end{figure}
+
+Figure~\ref{fig:activationskipping} shows an example, detailed brick buffer implementation of activation skipping in the dispatcher. For clarity, the figure shows only one of the 16 brick buffers and assumes that bricks contain only 8 activations. A second brick buffer per activation lane (not shown) could overlap the detection and communication of the effectual activations from the current brick, with the fetching of the next brick. More such brick buffers may be needed to completely hide the latency of NM.
+
+The figure shows an activation brick that has just been placed into the BB. Next to each BB entry there is an ``ineffectual activation'' (shown as a hexagon labeled as ``In?'') detector. These detectors identify those activations that are ineffectual. As drawn, the output is set to zero if the activation is ineffectual. The collective outputs of these detector form an $E$ vector which drives a ``leading  bit that is 1'' detector. The output of this detector is the offset of the first effectual activation which drives a decoder that reads the activation value out from the BB. The activation value and its offset is then broadcast to the tiles. The E vector position for this activation is reset and the process continues with the next effectual activation. For our example, four cycles would be needed to communicate the four effectual activation values.
+
+\section{Skipping Ineffectual Synapses (Weights)}
+\label{sec:weight_skipping}
+This section describes \ZFLn which extends \ZFL to also skip ineffectual weights. We have known that a large fraction of weights are ineffectual. For example, once precisions are trimmed per layer as per the methodology of Judd \textit{et al.}~\cite{judd:reduced} a large fraction of weights becomes zero. Most likely, additional weights are ineffectual, for example, weights whose value is near zero. Other work has shown that networks can be also be trained to increase the fraction of weights that are ineffectual~\cite{weightsharing}. Different than activations, weight values are available in advance and thus identifying which are ineffectual can be done statically. This information can be encoded in advance and conveyed to the hardware which can then skip the corresponding multiplications at run-time even when the corresponding activation value is non-zero (or, in general, effectual depending on the criterion being used for classifying activations as ineffectual). 
+
+As described, each cycle, \ZFL processes 16 activations in parallel across 16 filters per unit. The number of activations and filters per unit are design parameters which can be adjusted accordingly. For the purposes of this discussion we will describe \ZFLn assuming that both are 16.
+
+Without loss of generality let us assume that the input neuron array has a depth of 256 and that the window stride is 1. For clarity, let us use $n^B(x,y,i)$ to denote an activation brick that contains $n(x,y,i)...n(x,y,i+15)$ and where $(i\   MOD\  16) = 0$. Similarly, let $s^Bf(x,y,i)$ denote a weight brick containing weights $s^f(x,y,i)...s^f(x,y,i+15)$ of filter $f$ and where again $(i\  MOD\  16)=0$.
+
+%
+For the purposes of this discussion we assume that for each input activation brick $n^B(x,y,i)$, a 16-bit vector $I^B(x,y,i)$ is available, whose bit $j$ indicates whether activation $n^B(x,y,i+j)$ is ineffectual. There is one $I^B(x,y,i)$ vector per input activation brick, hence $i$ is divisible by 16. As with ZFNAf, the $I$ vectors can be calculated at the output of the previous layer, or at runtime, as activation bricks are read from NM as per the discussion of the preceding section. We also assume that for each weight brick, similar $IS$ vectors are available.  Specifically, for each weight brick $s^Bf(x,y,i)$ where $f$ a filter, there is a 16-bit bit vector $IS^B_f(x,y,i)$ which indicates which weights are ineffectual. For example, bit $j$ of $IS^B_0(x,y,i)$ indicates whether weight $s^0(x,y,i+j)$ (filter 0) is ineffectual. The $IS$ vectors can be pre-calculated and stored in an extension of the SB. 
+
+
+%
+Without loss of generality, let us assume that at some cycle $C$, \ZFL starts processing the following set of 16 activation bricks in its 16 neuron lanes: Neuron lane 0 would be processing activations $n^B(x,y,0)$ while neuron lane 15 would be processing $n^B(x,y,240)$. If all activation values are effectual 16 cycles would be needed to process these 16 activation bricks. However, in \ZFL the activation bricks will be encoded so that only the effectual activations are processed. 
+
+%
+In that case, all neuron lanes will wait for the one with the most effectual activations before proceeding with the next set of bricks. Equivalently, the same is possible if the positions of the effectual activations per brick are encoded using the aforementioned $I$ vectors. The dispatcher performs a leading zero detection on the $I$ vector per neuron lane to identify which is the next effectual activation to process for the lane. It then proceeds with the next zero bit in $I$ until all effectual activations have been processed for the lane. When all neuron lanes have processed their effectual activations, all proceed with the next set of bricks.
+
+Since now the $IS$ vectors are also available at the dispatcher needs to do is to take them into account to determine whether an activation ought to be communicated. Specifically, since each activation is combined with 16 weights, each from a different filter, an effectual activation could be skipped if \textit{all} corresponding weights are ineffectual. That is, each neuron lane can combine its single $I$ vector with the 16 $IS$ vectors for the corresponding weight bricks to determine which activations it should process. Specifically, a neuron lane processing $n^B(x,y,i)$ calculates each bit $j$ of a $Can\ Skip$ 16-bit vector as follows:
+
+\begin{equation}
+\label{eq:CanSkip}
+Can\ Skip^B(x,y,i,j) = \prod_{f=0}^{15}IS^B_f(x,y,j) + I^B(x,y,j)
+\end{equation}
+
+and where the operations are boolean: the product is an AND and summation is an OR.
+That is, an activation value can be skipped if the activation is ineffectual as specified by  $I$ (activation vector) or if \textit{all} corresponding weights are ineffectual. The higher the number of filters that are being processed concurrently, the lower the probability that an otherwise effectual activation will be skipped. For the original DaDianNao configuration which uses 16 tiles of 16 filters each, 256 weights, one per filter, will have to be ineffectual for the activation to be skipped. However, pruning has been known to be able to identify ineffectual weights and retraining has been known to increase the number of ineffectual weights. Both will increase opportunities for skipping additional neurons beyond what is possible with \ZFL.
+Moreover, other configurations may process fewer filters concurrently, thus having a larger probability of combining an activation with weights that are all ineffectual.
+
+It can be observed that in Equation~\ref{eq:CanSkip} all the $IS$ product terms  are constants. As described in \ZFL the same set of 16 weight bricks will be processed concurrently over different windows. Accordingly, the $IS$ products (first term of the sum) can be precalculated and only the final result need to be stored and communicated to hardware. For a brick size of 16 and for tiles that process 16 filters concurrently, the overhead drops from 16 bits per brick to 16 bits per 16 bricks. Assuming 16-bit weights, the overhead drops from $\frac{1}{16}^{th}$ to $\frac{1}{256}^{th}$.
+
+\begin{figure*}
+        \centering
+        \includegraphics[width=\textwidth]{figs/example_cnv2}
+   
+\caption{\ZFLn:An example showing the skipping of weights and activations. (a) Processing bricks of 4 elements each on a tile that processes 2 filters and 4 weights per filter. (b) Execution progression in \ZFL. (c) Execution in \ZFLn.}
+\label{fig:weightskipping}
+\end{figure*}
+
+\noindent\textbf{\ZFLn -- An Example:}
+Figure~\ref{fig:weightskipping} 
+shows an example of how \ZFLn operates. For clarity, the example assumes that the brick size is 4 and shows a tile that processes two filters in parallel and two weights (synapses) per filter. As part (b) shows it takes 3 cycles to process all input bricks as activation (neuron) brick $n^B(x,y,i+12)$ contains 3 effectual activations. However, as part (c) shows, one of these effectual activations, specifically, $n(x,y,13)=6$ would have been combined with weights $s^0(x,y,13)$ and $s^1(x,y,13)$ which are both 0 and hence ineffectual. \ZFLn skips this computation and now the input activation bricks can all be processed in just 2 cycles. Additional effectual activations are skipped as well as they would have been combined with ineffectual weights.
+%
+%
+%
+%
+%
+%
+%

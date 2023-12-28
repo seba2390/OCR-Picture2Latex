@@ -1,0 +1,170 @@
+\section{Innovations}
+We present Galactos, a scalable algorithm and highly optimized implementation for both the isotropic and anisotropic 3PCF. In this section we describe the innovations introduced in this implementation. 
+These include a distinctive algorithm that reduces the computational complexity of the dominant kernel from  $\mathcal{O}(N^3)$ to $\mathcal{O}(N^2)$, code optimizations that extract maximum benefit from thread-level parallelism and vectorization to obtain $\sim\!39\%$ of the peak performance per node,
+and an enhanced  distributed k-d tree partioning that scales to the full system size and provides good load balance. This code has been scaled to nearly 2 billion galaxies on 9636 nodes of the Intel Xeon Phi-based supercomputer ``Cori'' (Section \ref{sec:weak-scaling}).  We discuss the algorithmic and code optimizations that enabled this performance in this section.
+
+\subsection{$\mathcal{O}(N^2)$ algorithm for the anisotropic 3PCF}
+\label{sec:a3PCF}
+
+Galactos uses a novel algorithm, described in detail in a companion paper \cite{SE3ptAniso}, that we implement here at massive scale. The algorithm builds on developments in~\cite{SE3ptalg}  but generalizes to include fundamentally new, additional information.
+
+The anisotropic 3PCF depends on two triangle sides, $r_1$ and $r_2$, the angle between them, 
+and the angle of each triangle side to the line of sight to the galaxy, which we here take to be the $z$-axis. 
+Note that these triangle sides define the radial bin, as illustrated in  Figure~\ref{fig:alg_plus_eqn}. 
+
+The unit vectors describing the sides' directions will capture both the angle between the two sides and the angle between each side and the line of sight.  Spherical harmonics provide a complete basis for directions, so we may write the 3PCF as
+\begin{equation*}
+\zeta(\vec{r}_1,\vec{r}_2)=\sum_{\ell \ell' m}\zeta_{\ell\ell'}^m(r_1,r_2)Y_{\ell m}(\hat{r}_1)Y^*_{\ell' m}(\hat{r}_2).
+\end{equation*}
+Note that the $m$ (spin) of the two spherical harmonics are equal---this results from the axisymmetry about the $z$-axis (line of sight). 
+
+The algorithm proceeds by measuring the 3PCF for all galaxies in the survey out to a maximum scale $R_{\text{max}}$, iterating over each "primary" galaxy; the first step for a given primary galaxy is to obtain all neighbors (secondaries) within that sphere. 
+We use $R_{\text{max}} = 200~\text{Mpc}/h$ ($1~\text{Mpc}/h \approx 4.59$ million light-years). On scales larger than $200~\text{Mpc}/h$  there are too few independent samples of galaxies available in the Universe to add meaningful information (e.g. \cite{SERSDmodel}).
+
+The secondaries are then binned into spherical shells based on distance from the primary; this corresponds to the bins in triangle side lengths $r_1$ and $r_2$. 
+
+In order to track the anisotropic clustering, the key step is to rotate the primary and all secondaries associated with that primary such that the primary lies on the $z$-axis of the line of sight. 
+This process is illustrated in Figure~\ref{fig:alg_flow}. 
+We also provide pseudo-code describing the implementation of this algorithm in Algorithm~\ref{algo:3pcf}.
+
+We then need to obtain the spherical harmonic coefficients $a_{\ell m}$ of the secondaries' angular clustering on each spherical shell.  The desired radial coefficient $\zeta_{\ell \ell'}^m$ estimated about the given primary is simply $a_{\ell m}(r_1)a_{\ell' m}^*(r_2)$ for a bin combination of triangle side lengths $r_1,r_2$. 
+
+To obtain these coefficients, we are calculating the integral
+\begin{equation*}
+\int d\Omega Y_{\ell m}(\hat{r})\delta(\hat{r}),
+\end{equation*}
+where $\Omega$ is the solid angle and $\delta$ is the density as a function of angle of a given bin. This integral reduces to a discrete sum for a set of points, becoming $\sum_i Y_{\ell m}(\hat{r}_i)$ where $i$ indexes all galaxies in a given radial bin.  Thus we simply evaluate the spherical harmonics at the location of each galaxy in the bin.
+
+To do so, we construct the scaled separations $\Delta x/r,\Delta y/r,$ and $\Delta z/r$ between each secondary and the primary, where
+\begin{equation*}
+r=\sqrt{\Delta x^2 +\Delta y^2 +\Delta z^2}
+\end{equation*}
+is the distance between the secondary and the primary. The spherical harmonic coefficients are then just weighted sums of all combinations of powers of these
+\begin{equation}
+\left( \frac{\Delta x}{r} \right)^k \left( \frac{\Delta y}{r} \right)^p \left(\frac{\Delta z}{r} \right)^q
+\label{eqn:powers}
+\end{equation}
+such that $k+p+q<=\ell$.  
+This procedure yields the estimated anisotropic 3PCF about a single primary; it is repeated for all primaries.  
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{Figures/sc_ppr_alg_diagram.png}
+\caption{About a given primary galaxy, the algorithm first gathers all neighbors (``secondaries'') within $R_{\rm max}$ and bins them into spherical shells. Second, it rotates all coordinates so that the primary is along the $z$-axis of the line of sight to the observer, and all of the secondaries' separation vectors from the primary are transformed to that frame. Third, the algorithm expands the angular dependence of the galaxies within each radial bin into spherical harmonics; this expansion is represented here by the shading. 
+\label{fig:alg_flow}}
+\end{figure}
+\begin{algorithm}
+    \SetAlgoLined
+    \KwData{$(x,y,z)$ coordinates of a set of galaxies}
+    \KwResult{Estimation of 3-point correlation function}
+    \For{$i \leftarrow 1$ to $N_{\text{primaries}}$} {
+        \If {not primary} {skip galaxy}
+        Search node-local k-d tree for neighbors (secondaries) of $i$ within $r_{\text{max}}$\;
+        \For{$j \leftarrow 1$ to $N_{\text{secondaries}}$} {
+            compute Cartesian distances $(\Delta x, \Delta y, \Delta z)$ between $i$ and $j$\;
+            rotate distances\;
+            compute radial distance $r$ between $i$ and $j$\;
+            compute radial bin $r_n$ for galaxy pair $(i, j)$\;
+            compute power combinations $((\Delta x/r)^a, (\Delta y/r)^b, (\Delta z/r)^c)$\;
+            add power combinations to multipole for $r_n$\;
+        }
+    } 
+    
+    \caption{Pseudo-code describing the main computational kernel of Galactos.}
+    \label{algo:3pcf}
+\end{algorithm}
+
+
+\subsection{Multi-node scaling}
+\label{subsec:multinode_scaling}
+
+The distribution of matter in the observable universe exhibits a complex variety of structures, on multiple length scales up to approximately \num{200}~\si{\mega\parsec}$/h$.
+Partitioning such a problem across distributed memory computers requires a non-uniform partition of data in order to avoid significant load imbalances.
+Our initial implementation used the parallel k-d tree partitioning from \cite{patwary2015bd}, which recursively partitions MPI processes and spatial domains into two sub-communicators with equal numbers of galaxies (but unequal volumes) until there is one sub-space per process.
+The requirement of a perfect binary tree constrained the concurrency of the original algorithm to powers of two.
+
+To overcome this restriction, we modified the k-d tree partitioning scheme so that each level of the tree divides MPI processes into sub-communicators of nearly equal size (i.e., equal to within a factor of 2) and divides galaxies in proportion to the sizes of the sub-communicators.
+This important change enabled us to relax the constraint of using power-of-two nodes that exists in~\cite{patwary2015bd}. 
+In our case, we were able to use 9636 nodes on Cori, rather than being restricted to 8192 nodes. 
+
+
+Computation of the 3PCF requires evaluation of the relative coordinates between each primary galaxy and all other galaxies within a cutoff distance.
+We avoid inter-process communication \emph{ during} the 3PCF evaluation by exchanging all necessary neighbor galaxies beforehand.
+This step is analogous to the ``halo exchange'' encountered in many structured grid PDE solvers, but is complicated by the irregular partitioning, which prevents \textit{a priori} computation of a process's neighbor list.
+We perform the halo exchange by following the k-d partition: for each branch of the tree, a process gathers galaxies within the cutoff radius from the partition boundary, and sends copies of these particles to a peer on the opposite sub-communicator. 
+Note that we split our dataset evenly across all available nodes on Cori (see Section~\ref{sec:outer-rim} for details), so each node processes 225,000 primaries. This corresponds to a box roughly $140~\text{Mpc}/h$ on a side, so to contain all secondaries that lie within $200~\text{Mpc}/h$ almost 2 million additional galaxies must be assigned to each node during the halo exchange.  
+The remainder of the 3PCF calculation (besides a final reduction) is strongly parallel, leading to near-perfect weak scaling, as we show in Section~\ref{sec:weak-scaling}.
+
+
+The overall load balance is determined by the number of pairs of primary and secondary (halo) galaxies on each node.
+The number of primary galaxies is explicitly balanced by the k-d tree partition.
+Because our cutoff distance for our 3PCF is large (\num{200}~\si{\mega\parsec}$/h$), we can rely on the long-range homogeneity of density to balance the number of secondary galaxies per primary.
+In practice, we observed load imbalances of $\sim\!25$\% in our weak scaling tests.
+
+
+\subsection{Single-node optimizations}  
+\label{subsec:single-node-optimizations}
+
+The majority of the execution time in Galactos is spent in a doubly nested loop over primary and secondary galaxies in the dataset, as shown in Algorithm~\ref{algo:3pcf}.
+Consequently, optimizations targeting this kernel affect code performance more than any other.
+At the thread level, we achieve efficient parallelism by distributing the primary galaxies over threads. We use OpenMP dynamic scheduling to allocate primaries to threads, since we iterate over all the galaxies in the k-d tree and perform further computations only on primaries (ignoring secondary galaxies that are in the k-d tree because of halo exchange). Using a dynamic schedule gives a significant performance boost over using a static schedule. Each thread computes the distances to the secondaries and the multipole contributions independently; the multipole values are combined at the end of the loop over primary galaxies. This approach ensures maximum independent work for each thread. 
+We now enumerate the finer-grained optimizations and parallelization strategies in the code.
+
+\subsubsection{Pre-binning/post-binning}
+\label{sec:binning}
+The multipole algorithm accumulates combinations of powers of the distances between each pair of galaxies independently for each radial bin.
+As a result, since the galaxy dataset is not sorted with respect to galaxy pair distances, consecutive pairs of galaxies in the innermost loop (the loop over secondary galaxies, see Algorithm~\ref{algo:3pcf}) contribute their multipole values to random radial bins, leading to inefficient memory access patterns.
+Galactos mitigates this problem by collecting all pairs of one primary (i.e. pairs with all its secondaries) that fall in the same radial bin into temporary ``buckets'' of any desired size (to be set to fully exploit a given machine's vector registers).
+When a bucket fills, then Galactos computes the multipole contributions of all galaxies in that bucket.
+This approach enables the use of effective vectorization over galaxy pairs, and also yields efficient cache reuse, since all vector operations access the multipole arrays corresponding to the same radial bin.
+At the end of the loop over secondary galaxies, the buckets are swept once more, as they likely are only partially filled.
+
+\subsubsection{Vectorization}
+\label{subsubsec:vectorization}
+
+Within the inner loop over secondaries (see Algorithm~\ref{algo:3pcf}), most of the code execution time is spent computing the multipole contributions of each pair (see  Figure~\ref{fig:single-node}).
+Using a maximum multipole order $\ell = 10$ amounts to
+\begin{equation*}
+\frac{(\ell + 1) (\ell + 2) (\ell + 3)}{6} = 286
+\end{equation*}
+unique contributions of each galaxy pair to each radial bin's spherical harmonic expansion. 
+One option is to vectorize this array of 286 elements; however
+
+it is difficult to vectorize the computation along the multipole ``axis;'' doing so would lead to poor cache reuse due to the large number of temporary arrays that must be stored for each of the 286 power combinations.
+However, without using these extra temporary arrays, the powers must be updated \textit{in situ}, leading to a data dependence which prohibits vectorization, e.g., the spherical harmonic multipole coefficient that is a combination $(\Delta x/r)^4(\Delta y/r)^5(\Delta z/r)^2$ is not computed until the value of $(\Delta x/r)^3(\Delta y/r)^5(\Delta z/r)^2$ is known.
+Consequently, we vectorize the multipole computation loop over pairs rather than multipoles.
+
+Within the multipole accumulation function for a given galaxy pair bucket for a given radial bin (as described in Section~\ref{sec:binning}), we compute the distance power combination given in Equation~\ref{eqn:powers}
+
+from all galaxies to each multipole term $Y_{\ell m}$.
+Ultimately these values are all accumulated to the same multipole array element, such that each group of 8 galaxy pairs (since 8 double precision numbers fill up the 512 bit-wide vector lanes on Xeon Phi) must perform a vector reduction of their contributions onto the same variable.
+Thus for $N$ total galaxy pairs per radial bin, the algorithm must perform $N/8$ vector reductions per power combination.
+To avoid computing so many reductions, we introduce an extra array of length 8 corresponding to each multipole $Y_{\ell m}$ for each radial bin.
+Each time a set of 8 galaxy pairs computes their multipole contributions, they accumulate the result into the corresponding array locations of this temporary 8-element array.
+After all galaxy pairs for a given primary galaxy have been computed, the code performs a single reduction of each of these 8-element arrays onto the corresponding multipole, replacing $N/8$ vector reductions with only 1 vector reduction for each of the 286 elements.
+
+Computing the 286 multipole values given a single vector of $\Delta x/r, \Delta y/r, \Delta z/r$ involves many data dependencies; thus the amount of instruction-level parallelism (ILP) in this algorithm is limited.
+In order to increase ILP, we perform computations on 4 independent vectors at once. 
+This provides sufficient ILP to keep the hardware vector units busy. 
+Note that this strategy increases register pressure and decreases performance if the number of independent vectors is increased beyond 4. 
+
+Let us calculate the efficiency bound for the multipole addition function here.
+For a set of $k$ pairs, we read in $3k$ elements ($\Delta x/r, \Delta y/r, \Delta z/r$), perform $286 \times 2k$ floating point operations and then load+store $286$ outputs. 
+The flop to byte ratio is
+\begin{equation*}
+\frac{286\times 2 \times k}{(3k+286\times2)\times 8}
+\end{equation*}
+which is approximately equal to $1/8=0.125$ for small $k$ and $286\times 2/(3\times 8)=23.8$ for large $k$. 
+We use a galaxy pair ``bucket'' size of $k=128$, giving a best-case flop/byte ratio of $9.6$. In practice, this ratio is slightly lower because of the need to load/store some temporary buffers due to blocking.
+
+
+\subsubsection{Data Locality}
+
+In the vectorized multipole computation loop, the distances for each galaxy pair are stored such that the $\Delta x$ for all pairs are stored contiguously, and similarly for the $\Delta y$ and $\Delta z$.
+
+By storing the distances along a particular axis for all pairs contiguously, these vector operations result in the fewest possible number of loads from memory for the inputs.
+Cache blocking is essential to achieving good performance on this kernel as the entire working set ($=128\times 8\times 3$ bytes (inputs) + $286\times 8\times 8$ (outputs) $= 21.4$ kB per thread) does not fit in L1 cache when run with 4 threads per core (see Section~\ref{sec:cori} for details of the memory configuration on Cori). Note that the outputs are each produced in an array of length 8 before a final reduction.
+We compute a subset of the multipole terms for the entire bucket before moving on the next set of terms. This ensures that not all of the outputs need to be in cache at any given time, leading to better data locality.
+
+
+

@@ -1,0 +1,161 @@
+%!TEX root = main.tex
+
+We now present our model, which \emph{metalearns} algorithms for active learning. Our model metalearns by attempting to actively learn on tasks sampled from a distribution over tasks, using supervised feedback to improve its expected performance on new tasks drawn from a similar distribution.
+Succinctly, our model solves each task by adaptively selecting items for the labeled support set used by a Matching Network \cite{vinyals2016matching} to classify test items.
+The full support set from which our model selects these examples contains both labeled and unlabeled data.
+
+For a summary of our model, see the architecture diagram in Figure~\ref{fig:model_diagrams}, the optimization objectives in Equations~\ref{eq:task_obj_general}, \ref{eq:task_obj_training}, and \ref{eq:task_obj_gradient}, and the pseudo-code in Algorithm~\ref{alg:al_loop}. We present a formal description of our meta active learning task in Section~\ref{sec:model_task}. We describe the details of our model in Section~\ref{sec:model_architecture}, and our approach to parameter optimization in Section~\ref{sec:model_training}.
+
+
+\subsection{Task Description}
+\label{sec:model_task}
+
+Our model refines its behaviour over many \emph{training episodes}, in order to maximize performance during \emph{test episodes} not encountered in training.
+In each episode, our model interacts with a support set $S \equiv \{(x, y)\}$ comprising items $x$ for which the model can request labels $y$, and a similarly-defined evaluation set $E \equiv \{(\hat x, \hat y)\}$.
+Let $S^u_t \equiv \{(x, \cdot)\}$ denote the set of items in the support set whose labels are still unknown after $t$ label queries, and let $S^k_t \equiv \{(x, y)\}$ denote the complementary set of items whose labels are known.
+Let $S_t$ denote the joint set of labeled and unlabeled items after $t$ label queries.
+Let the real-valued vector $h_t$ denote the \emph{control state} of our model after viewing $t$ labels, and let $R(E, S_t, h_t)$ denote the reward won by our model when predicting labels for the evaluation set based on the information it has received after $t$ label queries. We assume all functions depend on the model parameters $\theta$, and omit this dependence from our notation for brevity.
+
+We define the prediction reward as follows:
+\begin{equation}
+R(E, S_t, h_t) \equiv \sum_{(\hat x, \hat y) \in E} \log p(\hat y | \hat x, h_t, S_t),
+\label{eq:task_reward_general}
+\end{equation}
+which gives log-likelihood of the predictions $p(\hat y | \hat x, h_t, S_t)$ on the evaluation set. The prediction $\hat{y}$ conditions on: the test item $\hat{x}$, the current control state $h_t$, and the current labeled/unlabeled support set $S_t$. For tests on Omniglot (see Section~\ref{sec:omniglot}), we use negative cross-entropy on the class labels, and for MovieLens (see Section~\ref{sec:movielens}), we use the negative Root Mean Squared Error (RMSE).
+
+At each step $t$ of active learning, the model requests the label for an item $x$ from the set $S^u_{t-1}$ and updates its control state from $h_{t-1}$ to $h_t$ based on the response.
+Together, $h_t$ and $S_t$ determine the model's predictions for test items and the model's decision about which label to request next.
+Algorithm~\ref{alg:al_loop} describes this process in detail, and Section~\ref{sec:model_architecture} formally describes the functions used in Algorithm~\ref{alg:al_loop}.
+
+
+The idealized objective for training our model is:
+\begin{equation}
+\maximize_{\theta} \expect_{(S, E) \sim \DD} \left[ \expect_{\pi(S, T)} \left[ \sum_{t=1}^{T} R(E, S_t, h_t) \right] \right],
+\label{eq:task_obj_general}
+\end{equation}
+in which $T$ is the max number of label queries to perform, $(S, E)$ indicates an episode sampled from some distribution $\DD$, and $\pi(S, T)$ indicates unrolling the model's active learning policy $\pi$ for $T$ steps on support set $S$. Unrolling $\pi$ produces the intermediate states $\{(S_1, h_1), ..., (S_T, h_T)\}$.
+
+To optimize this objective, our model repeatedly samples an episode $(S, E)$, then unrolls $\pi$ for $T$ steps of active learning, and maximizes the prediction reward $R(E, S_t, h_t)$ at each step.
+Alternately, our model could maximize only the reward at the final step.
+We maximize reward at each step in order to promote \emph{anytime} behaviour -- i.e.~the model should perform as well as possible after each label query.
+Anytime behaviour is desirable in many practical settings, e.g.~for movie recommendations the model should be robust to early termination while eliciting the preferences of a new user.
+
+During training, for computational efficiency, our model maximizes the following approximation of Equation~\ref{eq:task_obj_general}:
+\begin{align}
+\expect_{(S, E) \sim \DD} \left[  \expect_{\pi(S, T)} \left[ \sum_{t=1}^{T} \tilde{R}(S^u_t, S_t, h_t) + R(E, S_T, h_T) \right] \right],
+\label{eq:task_obj_training}
+\end{align}
+in which $\tilde{R}(S^u_t, S_t, h_t)$ is a prediction reward for unlabeled items in the support set. We assume labels for the full support set are available during training.
+We compute $\tilde{R}(S^u_t, S_t, h_t)$ using a \emph{fast prediction} module, and compute $R(E, S_t, h_t)$ using a \emph{slow prediction} module.
+The fast and slow prediction rewards can be obtained by substituting the appropriate predictions into Equation~\ref{eq:task_reward_general}.
+Sections~\ref{sec:fast_prediction} and \ref{sec:slow_prediction} describe these modules in detail. 
+
+%Equation~\ref{eq:task_obj_training} gives the full objective used to train the parameters of our model.
+%Many computations in the fast prediction module can be precomputed and reused at each step when unrolling $\pi$ on $S$, which makes Equation~\ref{eq:task_obj_training} faster to evaluate than Equation~\ref{eq:task_obj_general}.
+
+\subsection{Model Architecture Details}
+\label{sec:model_architecture}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.68\linewidth]{al.pdf}
+\caption{A summary of the modules in our model. Items in the support and evaluation set are embedded using a context-free encoder. Final embeddings for support set items are computed by processing their context-free embeddings with a context-sensitive encoder. The selection module places a distribution over unlabelled items in $S^u_t$ using a gated combination of controller-item similarity features and item-item similarity features. The read module copies the selected item and its label, and transforms them for input to the controller, which then updates its state from $h_{t-1}$ to $h_{t}$. Fast predictions are made within the support set $S$ based on sharpened item-item similarity features. Slow predictions are made for items in the held-out set $E$ using a Matching Network-style function which incorporates masking to account for known/unknown labels, and conditions on the state $h_t$. We train this system end-to-end with Reinforcement Learning.}
+\label{fig:model_diagrams}
+\vspace{-0.5cm}
+\end{figure*}
+
+Our model comprises multiple modules: \emph{context-free} and \emph{context-sensitive} encoding, \emph{controller}, \emph{selection}, \emph{reading}, \emph{fast prediction}, and \emph{slow prediction}. We present an overview of our model in Fig.~\ref{fig:model_diagrams} and Alg.~\ref{alg:al_loop}, which describe how our model's modules perform active learning. The rest of this subsection describes the individual modules in more detail.
+
+\input{pseudo}
+
+\subsubsection{Context-[Free|Sensitive] Encoding}
+The context-free encoder associates each item with an embedding independent of the context in which the item was presented. For our Omniglot tests, this encoder is a convnet with two convolutional layers that downsample via strided convolution, followed by another convolutional layer and a fully-connected linear layer which produces the final context-free embedding. For our MovieLens tests, this encoder is a simple look-up-table mapping movie ids to embeddings. We denote the context-free encoding of item $x_i \in S$ as $x^{\prime}_i$, and similarly define $\hat{x}^{\prime}_i$ for $\hat{x}_i \in E$.
+
+The context-sensitive encoder produces an embedding $x_i^{\prime\prime}$ for each item $x_i \in S$ based on the context-free embeddings $x_j^{\prime}: \; \forall x_j \in S$. The context-sensitive encoder is not applied to items in the evaluation set. Our model uses a modified form of the encoder from Matching Networks \cite{vinyals2016matching}. Specifically, we run a bidirectional LSTM \cite{hochreiter1997, Schuster1997} over all context-free embeddings for the support set, and then add a linear function of the concatenated forwards and backwards states to the context-free embedding $x_i^{\prime}$ to get $x_i^{\prime\prime}$.
+
+We can write this as follows:
+\begin{equation}
+x_i^{\prime\prime} = x_i^{\prime} + W_{e} \left[ \vec{h}_i; \cev{h}_i \right],
+\end{equation}
+in which $\vec{h}_i$ gives the forward encoder state for item $x_i$, $\cev{h}_i$ gives the backward encoder state, and $W_{e}$ is a trainable matrix. We compute the forward states $\vec{h}_i$ as in a standard LSTM, processing the support set items $x_i$ sequentially following a random order. We compute the backward states $\cev{h}_i$ by processing the sequence of concatenated $x_i^{\prime}$ and $\vec{h}_i$ vectors in reverse.
+
+\subsubsection{Reading}
+This module concatenates the embedding $x^{\prime\prime}_i$ and label $y_i$ for the item indicated by the selection module, and linearly transforms them before passing them to the controller (Alg.~\ref{alg:al_loop}, line 8).
+
+\subsubsection{Controller}
+At each step $t$, the controller receives an input $r_t$ from the reading module which encodes the most recently read item/label pair. Additional inputs could take advantage of task-specific information. The control module performs an LSTM update:
+$$h_t = \mbox{LSTM}(h_{t-1}, r_t).$$
+We initialize $h_0$ for each episode $(S, E)$ using the final state of the backwards LSTM in the context-sensitive encoder which processed the support set $S$. In principal, this allows the controller to condition its behaviour on the full unlabeled contents of the support set  (Alg.~\ref{alg:al_loop}, line 9).
+
+\subsubsection{Selection}
+At each step $t$, the selection module places a distribution $P^u_t$ over all unlabeled items $x^u_i \in S^u_t$. It then samples the index of an item to label from $P^u_t$, and feeds it to the reading module (Alg.~\ref{alg:al_loop}, line 6).
+
+Our model computes $P^u_t$ using a gated, linear combination of features which measure controller-item similarity and item-item similarity. For each item, we compute the controller-item similarity features:
+$$b^i_t = x^{\prime\prime}_i \odot W_{b} h_t,$$
+where $W_{b}$ is a trainable matrix and $\odot$ indicates elementwise multiplication.
+We also compute the following six item-item similarity features: [max|mean|min] cosine similarity to any labeled item, and [max|mean|min] cosine similarity to any unlabeled item.
+We concatenate the controller-item similarity features and item-item similarity features to get a vector $d^i_t$. We also compute a gating vector: $g_t = \sigma(W_g h_t)$, in which $W_g$ is a trainable matrix and $\sigma(\cdot)$ indicates the standard sigmoid.
+
+For each $x^u_i \in S^u_t$, we compute the selection logit: $$p^i_t = (g_t \odot d^i_t)^{\top} w_p,$$ where $w_p$ indicates a trainable vector. Finally, we compute $P^u_t$ by normalizing over the logits $p^i_t: \; \forall x^u_i \in S^u_t$ via softmax. This module performs worse when the controller-item or item-item features are removed. Our model intelligently adapts these heuristics to the task at hand. We provide pseudo-code for how these modules interact during active learning in Algorithm~\ref{alg:al_loop}.
+
+\subsubsection{Fast Prediction}
+\label{sec:fast_prediction}
+The fast prediction module makes an attention-based prediction for each unlabeled item $x^u_i \in S^u_t$ using its cosine similarities to the labeled items $x^k_j \in S^k_t$, which are sharpened by a non-negative matching score $\gamma^i_t$ between $x^u_i$ and the control state $h_t$. The cosine similarities are taken between the context-sensitive embeddings $x^{\prime\prime}_i$ and $x^{\prime\prime}_j$ of the respective items. These do not change with $t$ and may be precomputed before unrolling the active learning policy. Predictions from this module are thus fast to compute while unrolling the policy (Alg.~\ref{alg:al_loop}, line 14). The cosine similarities may be reused in the selection module for computing item-item similarity features, further amortizing their cost.
+
+For each unlabeled $x^u_i$, we compute a set of attention weights over the labeled $x^k_j \in S^k_t$ by applying a softmax to the relevant cosine similarities, using $\gamma^i_t$ as a temperature for the softmax. We compute the sharpening term as follows:
+$$\gamma^i_t = \exp((x^{\prime\prime}_i)^{\top} W_{\gamma} h_t),$$
+where $W_{\gamma}$ indicates a trainable matrix.
+This module performs significantly worse without the sharpening term.
+The final \emph{fast prediction} is formed by taking a convex combination of the labels $y_j$ for the labeled $x^k_j \in S^k_t$ using the computed attention weights.
+
+\subsubsection{Slow Prediction}
+\label{sec:slow_prediction}
+The slow prediction module implements a modified Matching Network prediction, which accounts for the distinction between labeled and unlabeled items in $S_t$, and conditions on the active learning control state $h_t$ (Alg.~\ref{alg:al_loop}, line 17).
+
+Given the context-free embedding $\hat{x}^{\prime}$ for some held-out example $\hat{x} \in E$, the state $h_t$, and required initial values,
+% for $m_0$/$\tilde{x}_0$
+this module predicts a label by iterating the steps:
+\begin{enumerate}
+\setlength\itemsep{0.01em}
+\item $m_k = \mbox{LSTM}(m_{k-1}, \tilde{x}_{k-1}, \hat{x}^{\prime}, h_t)$
+\item $\hat{x}^{\prime\prime} = \hat{x}^{\prime} + W_m m_k$
+\item $\tilde{a}_k = \mbox{attend}(\hat{x}^{\prime\prime}, S^k_t)$
+\item $\tilde{x}_k, \tilde{y}_k = \mbox{attRead}(\tilde{a}_k, S^k_t)$
+\end{enumerate}
+Here, $\mbox{LSTM}$ is an LSTM update, $m_k$ is the \emph{matching state} at step $k$, $\hat{x}^{\prime\prime}$ is the match-sensitive embedding of $\hat{x}$ at step $k$, $W_m$ is a trainable matrix, $\tilde{a}_k$ are the matching attention weights at step $k$, $\tilde{x}_k$ is the ``item attention'' result from step $k$, and $\tilde{y}_k$ is the ``label attention'' result from step $k$.
+For details of the $\mbox{attend}$ and $\mbox{attRead}$ functions, refer to~\citet{vinyals2016matching}.
+As a final prediction, this module returns the label attention result $\tilde{y}_K$ from the $K$th (final) step of iterative matching. In our tests we fix $K = 3$.
+
+\textbf{Note:} our model contains many linear transforms $W v$. Our model adds bias and gain terms to all of these transforms, as described for weight normalization \cite{Salimans2016}. We omit these terms for brevity. Similarly, we use layer normalization in our active learning and matching controller LSTMs \cite{Ba2016}.
+
+\subsection{Training the Model}
+\label{sec:model_training}
+
+We optimize the parameters of our model using a combination of backpropagation and policy gradients. For a clear review of optimization techniques for general stochastic computation graphs, see \citet{schulman2015}.
+
+%We briefly examine the policy gradient. Let $T(\cdot | s, a)$ denote the distribution over next states following action $a$ in state $s$, $r(s, a)$ denote the reward for action $a$ in state $s$, $V(s)$ denote the expected reward for following policy $p$ starting in state $s$, and assume all functions may depend on $\theta$. We first define the \emph{continuation reward} $\tilde{V}^s_a$:
+%\begin{align}
+%\tilde{V}^s_a \equiv& \expect_{T(s^{\prime} | s, a)} \left[ V(s^{\prime}) \right], \\
+%\nabla_{\theta} \tilde{V}^s_a =& \expect_{T(s^{\prime} | s, a)}\left[ \nabla_{\theta} V(s^{\prime}) \right],
+%\end{align}
+%where $\tilde{V}^s_a$ gives the expected value $V(s^{\prime})$ of states visited immediately after taking action $a$ in state $s$. This is similar to the standard $Q(s, a)$, but removes immediate reward and discounting. Using the continuation reward $\tilde{V}^s_a$, we write:
+%\begin{align}
+%V(s_t) =& \sum_a p(a | s) \left[ \gamma %\tilde{V}^s_a + r(a, s) \right] \\
+%\nabla_{\theta} V(s) =& \sum_a \Big( \nabla_{\theta} p(a | s) \left[ \gamma \tilde{V}^s_a + r(a, s) \right] + \\
+%\;& \qquad \quad p(a | s) \left[ \gamma %\nabla_{\theta} \tilde{V}^s_a + \nabla_{\theta} r(a, s) \right] \Big) \nonumber \\
+% =& \expect_{a \sim p(a | s)} \Big( \nabla_{\theta} \log p(a | s) \left[ \gamma \tilde{V}^s_a + r(a, s) \right] + \nonumber \\
+%& \qquad \qquad \quad \left[ \gamma \nabla_{\theta} \tilde{V}^s_a + \nabla_{\theta} r(a, s) \right] \Big) \nonumber \\
+% =& \expect_{a \sim p(a | s)} \bigg( \gamma \expect_{T(s^{\prime}|s, a)} \left[ \nabla_{\theta} V(s^{\prime}) \right] + \label{eq:pg_deriv_value_grad_1} \\
+%& \quad \Big[ \nabla_{\theta} \log p(a | s) \left[ Q(s, a) \right] + \nabla_{\theta} r(a, s) \Big] \bigg) \nonumber
+%\end{align}
+%In the last line we swap $Q(s, a)$ for the term $r(s, a) + \tilde{V}^s_a$. Notice that $\nabla_{\theta}V(s)$ can be expressed recursively, in terms of the similar gradients $\nabla_{\theta}V(s^{\prime})$. We derive this form by applying the product rule for derivatives.
+
+Using the notation from Section~\ref{sec:model_task} and following the approach of \cite{schulman2015}, we can write the gradient of our training objective as follows:
+\begin{align}
+ \nabla_{\theta} R(& S, E, \theta) = \label{eq:task_obj_gradient} \\
+ \expect_{p(\vec{S} | (S, E))} \bigg(& \nabla_{\theta} \log p(\vec{S} | (S, E)) \left[ R(\vec{S}) \right] + \nabla_{\theta} R(\vec{S}) \bigg), \nonumber
+\end{align}
+in which $R(S, E, \theta)$ denotes the expected reward won by the active learning model while working on episode $(S, E)$. $\vec{S}$ denotes the set of intermediate states $\{(S_t, h_t)\}$ generated by the model while working with $(S, E)$. $R(\vec{S})$ denotes the sum of rewards (as described in Equation~\ref{eq:task_obj_training}) received by the model while working on episode $(S, E)$. In the term $\nabla_{\theta} R(\vec{S})$, all decisions made by the model to produce $\vec{S}$ are treated as constant. Taking the expectation of Equation~\ref{eq:task_obj_gradient} with respect to episodes $(S, E) \sim \DD$ gives us an unbiased gradient estimator for the objective in Equation~\ref{eq:task_obj_training}.
+
+Rather than using the gradients in Equation~\ref{eq:task_obj_gradient} directly, we optimize the model parameters using Generalized Advantage Estimation \cite{schulman2016}, which provides an actor-critic approach for approximately optimizing the policy gradients in Equation~\ref{eq:task_obj_gradient}.
+For more details on how Generalized Advantage Estimation helps reach a favourable bias-variance trade-off in policy gradient estimation, see the source paper \cite{schulman2016}. We apply the GAE updates using ADAM \cite{kingma2015}. 

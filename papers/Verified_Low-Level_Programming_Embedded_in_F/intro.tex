@@ -1,0 +1,782 @@
+\section{Introduction}
+
+In the pursuit of high performance, 
+cryptographic software widely deployed throughout the internet 
+is still often subject to dangerous 
+%security-critical 
+attacks~\cite{ws96,
+  freestart, Heartbleed, tlstrunc, BhargavanDFPS14, ap13, POODLE,
+  tlsattacker, BEAST, cryptoeprint:2016:475, sweet32, CRIME, polybug2,
+  chachaoverflow,
+  PincusB04, Szekeres2013,
+  AfekS07,UseAfterFreeCWE,
+  Dobrovitski03,DoubleFreeCWE,
+  IntegerOverflowCWE}. 
+Recognizing a clear need, %serious risk,
+the programming language,
+verification, and 
+applied cryptography communities are 
+devoting
+significant efforts to develop implementations proven
+secure by construction against 
+broad classes of these attacks.
+
+Focusing on low-level attacks caused by violations of
+memory safety, several researchers have used high-level, type-safe
+programming languages to implement standard protocols such as Transport Layer
+Security (TLS).
+% , which now handles most web traffic~\cite{morethan50}. 
+For example, \citet{kaloper2015not} provide nqsbTLS, an implementation of TLS in
+OCaml, which by virtue of its type and memory safety is impervious to attacks
+(like \citet{Heartbleed}) that exploit buffer overflows.
+\citet{bhargavan2014proving} program miTLS
+in F\#, also enjoying type and memory safety, but go further using a refinement
+type system to prove various higher-level
+security properties of the protocol.
+%
+While this approach is attractive for its simplicity, to get
+acceptable performance, both nqsbTLS and miTLS link with fast, unsafe
+implementations of complex cryptographic algorithms, such as those provided by
+\citet{nocrypto}, an implementation that mixes C and OCaml, and
+libcrypto, a component of the widely used \citet{openssl}.
+In the worst case, linking with vulnerable C code 
+can void all the %security 
+guarantees of the high-level code.
+
+In this paper, we aim to bridge the gap between high-level,
+safe-by-construction code, optimized for clarity and ease of
+verification, and low-level code exerting fine control
+over data representations and memory layout in order to achieve
+better performance.
+%
+To this end, 
+we introduce \lowstar, a domain-specific language
+for verified, efficient, low-level programming embedded within 
+\fstar~\cite{mumon}, an ML-like language with dependent
+types designed for program verification.
+%
+We
+% \ch{who's we? can we just make this passive (``one can use'')?
+%   or use ``the [mythical] programmer'' as the subject? \lowstar
+%   is not just for we to use, right? CF: we = the reader and us.}
+use \fstar
+% 's verification features 
+to prove functional correctness
+and security properties of high-level code. 
+%
+Where efficiency is paramount, we drop into its C-like \lowstar subset
+while still relying on
+%the host language's
+the verification capabilities of~\fstar
+to prove our code is memory safe, functionally correct, and secure.
+
+We have applied \lowstar to program and verify a range of sequential low-level
+programs, including libraries for multi-precision arithmetic and
+buffers, and various cryptographic algorithms, constructions, and
+protocols built on top of them.
+%
+Our experiments indicate that compiled \lowstar code yields performance
+on par with existing C code. This code can be used on its own,
+or used within existing software through the C ABI. In particular, our C code may
+be linked to \fstar programs compiled to
+OCaml, providing large speed-ups via its foreign-function interface (FFI)
+without compromising safety or security.%
+% \footnote{In this second case, as we switch to verified
+%   \lowstar libraries, we still trust the OCaml runtime and its
+%   foreign-function interface mechanism.}
+
+% \cf{DONE. This wrongly suggested Ocaml is our main deployment scenario. We
+%   want to replace C code, not just make Ocaml faster.}
+
+% \ch{add ``sequential'' to make it clear that we don't deal with
+%   concurrency in this paper}
+
+% \ch{My other worry here is that we present ourselves as the only
+%   potential users of this DSL and miTLS as the only use
+%   case. Scratching your own itch is usually not enough to motivate a
+%   general piece of work. It also plays badly with double-blind review,
+%   since miTLS should be cited in 3rd person and in this paragraph
+%   we=miTLS.}
+% \nik{I don't see why you interpret ``we'' as ``miTLS''}
+
+\subsection*{An Embedded DSL, Compiled Natively}
+
+\lowstar programs are a subset of \fstar programs:
+% \ch{Cedric dropped
+%   this, but I think it's an important point. What do others think?}\cf{
+%   This does not make sense grammatically.}\ch{Looks fine to me}
+the programmer
+writes \lowstar code using regular \fstar syntax, against a library we
+provide that models a lower-level view of memory, akin to the
+structured memory layout of a well-defined C program
+(this is similar to the structured memory model
+of CompCert~\cite{Leroy-Compcert-CACM, 2012-Leroy-Appel-Blazy-Stewart},
+rather than the ``big array of bytes'' model systems programmers sometimes use).
+%
+\lowstar programs interoperate naturally with
+other \fstar programs, and precise specifications of \lowstar and
+\fstar code are intermingled when proving properties of their
+combination. As usual in \fstar, programs are type-checked and compiled
+to OCaml for execution, after erasing their computationally irrelevant parts,
+such as proofs and specifications, using a process similar
+to Coq's extraction mechanism~\cite{letouzey2002new}. 
+In particular, our memory-model library compiles to a simple, heap-based OCaml implementation.
+% \cf{Does it help? also adjusted the explanation below: manual memory
+%   management is in low star, irrespective of the back-end.}
+
+Importantly, \lowstar programs have a second, equivalent but more efficient
+semantics via compilation to~C, with the predictable
+performance that comes with a native implementation of their
+lower-level memory model. 
+% that reaps the benefits of programming against a lower-level memory model,
+% with manual allocations and deallocations%
+% including manual memory management%
+%manually managed memory allocation and deallocation
+This compilation is implemented by KreMLin, a new
+compiler from the \lowstar subset of \fstar to~C. 
+Figure~\ref{fig:bigpicture} illustrates the high-level design of
+\lowstar and its compilation to native code.
+%
+Our main contributions are as follows:
+
+\input{bigpicture}
+
+\paragraph*{Libraries for low-level programming within \fstar~(\S\ref{sec:examples})}
+At its core, \fstar is a purely functional language
+to which effects like state are added programmatically using monads.
+%
+In this work, we instantiate the state monad of \fstar to use a CompCert-like
+structured memory model that separates the stack and the heap,
+supporting bulk %en masse 
+allocation and deallocation on the stack,
+and allocating and freeing individual blocks %reference cells 
+on the heap.
+%
+Both the heap and the stack are further divided into disjoint logical
+regions, which enables us to manage the separation properties
+necessary for modular, stateful verification.
+%
+On top of this, we program a library of C-style arrays and structs passed by
+reference, with support for pointer arithmetic and pointers to the interior of
+an array or a struct.  
+%
+By virtue of \fstar typing, our libraries and all their well-typed
+clients are guaranteed to be memory safe, e.g., they never access
+out-of-bounds or deallocated memory.
+
+\paragraph*{Designing \lowstar, a subset of \fstar easily compiled to C}
+We intend to give \lowstar programmers precise control over the
+performance profile of the generated C code. As much as possible, 
+we aim for the programmer to control even the
+syntactic structure of the C code, to
+facilitate its review by security experts unfamiliar with \fstar. 
+As such, to
+a first approximation, \lowstar programs are \fstar programs
+well-typed in the state monad described above, which, after all their
+computationally irrelevant (ghost) parts have been erased, must
+meet several restrictions, as follows: the code 
+(1) must be first order, to prevent the need to allocate closures in C; 
+(2) must make any heap allocation explicit; 
+%\cf{how would I know? rewrite to: must explicitly allocate xxxx?}
+(3) must not use any recursive datatype, since these would have to be compiled using additional
+indirections to C structs; and 
+(4) must be monomorphic, since C does not support polymorphism directly. 
+%
+% \cf{would be nice to mention inlining above. Trying:}%
+% JP: rephrased the paragraph below
+Importantly, \lowstar heavily leverages \fstar's capabilities for
+partial evaluation, hence allowing the programmer to write high-level, reusable
+code that is normalized via meta-programming into the \lowstar subset before
+the restrictions are enforced.
+%
+We emphasize that these restrictions apply only to computationally
+relevant code---proofs and specifications are free to use arbitrary
+higher-order, dependently typed \fstar, and very often they do.
+
+
+%% \aseem{Moved this text to beginning of s3.}
+%% \paragraph{Formalizing \lowstar and its translation to Comp\-Cert
+%%   Clight (\S\ref{sec:formal})}
+%% We formalize different layers of our toolchain and prove several
+%% properties about them.
+
+%% For formalizing \fstar, we use EM\fstar~\cite{dm4free}, the
+%% recently proposed core calculus of \fstar. To reason about the erasure
+%% of computationally irrelevant code, we extend EM\fstar with a
+%% \kw{Ghost} monad, and prove that the erasure of the \kw{Ghost} code
+%% does not alter the semantics of an EM\fstar term.
+
+%% We formalize the core of \lowstar as \lamstar, with a primitive
+%% stack-based memory. The semantics of \lamstar contains a notion
+%% of observable traces, where the traces contain the memory addresses
+%% accessed by the \lamstar program, as well as its branching
+%% behavior. We prove a non-interference property stating that the execution
+%% trace of a \lamstar program that uses the secret values
+%% \emph{abstractly}\ch{parametrically? at an abstract type?} is
+%% secret-independent.  We have not yet formally
+%% proved the simulation between the EM\fstar semantics (instantiated
+%% with the stack-based memory model) and the \lamstar
+%% semantics, but we conjecture that the proof would be on the similar
+%% lines as~\cite{dm4free}.\ch{can we leave this conjecture for
+%%   section 3? it seems too emphasized here and we could focus on
+%%   what we proved, not on what we didn't prove}
+
+%% We then formalize \cstar, a model of C and prove a
+%% bisimulation between \lamstar and \cstar. To establish that \cstar is
+%% a faithful model of the C-semantics, we formalize a translation
+%% from \cstar to Comp\-Cert's Clight~\cite{Blazy-Leroy-Clight-09}, and show that this
+%% translation preserves the notion of secret-independent traces. In
+%% addition to ensuring that the functional behavior of a program is
+%% preserved, trace equivalence also guarantees that the compiler does
+%% not introduce unexpected side-channels due to timing or memory access
+%% patterns, at least until it reaches Clight---a useful feature for
+%% cryptographic code.
+%% % \ch{This claim sounds too strong, Cedric thinks we should be very careful
+%% %   about what we claim about side-channels.
+%% % \nik{I added the ``until it reaches Clight''}}
+%% % CH: replaced cache behavior with memory access patterns
+%% %     (there are no caches at the Clight level)
+%% %
+
+%% Our formal results cover the translation of standalone \lowstar
+%% programs to C, proving that execution in C preserves the original
+%% \fstar semantics of the \lowstar program. More pragmatically, we have
+%% built several cryptographic libraries in \lowstar, compiled them to C,
+%% and integrated them within larger programs compiled to OCaml, relying
+%% on OCaml's foreign function interface for interoperability and
+%% trusting it for correctness.
+
+\paragraph*{A formal translation from \lowstar to Comp\-Cert Clight (\sref{formal})}
+Justifying its dual interpretation as a subset of \fstar and a subset of C,
+we provide a formal model of \lowstar, called \lamstar,
+give a translation from \lamstar to %Comp\-Cert's
+Clight~\cite{Blazy-Leroy-Clight-09} and show that it
+preserves %a notion of 
+trace equivalence with respect to the original
+\fstar semantics. In addition to ensuring that the
+functional behavior of a program is preserved, our trace equivalence also
+guarantees that the compiler does not accidentally introduce 
+side-channels due to %timing or 
+memory access patterns (as would be the case without the restrictions above)
+at least until it reaches Clight, a useful sanity check for cryptographic code.
+% \ch{This claim sounds too strong, Cedric thinks we should be very careful
+%   about what we claim about side-channels.
+% \nik{I added the ``until it reaches Clight''}}
+% CH: replaced cache behavior with memory access patterns
+%     (there are no caches at the Clight level)
+%
+Our theorems cover the translation of standalone \lamstar
+programs to~C, proving that execution in C preserves the original
+\fstar semantics of the \lamstar program. 
+
+\paragraph*{%The implementation of 
+KreMLin, a compiler from \lowstar to C (\S\ref{sec:impl})}
+Our formal development guides the implementation of KreMLin, a new
+tool that emits C code from \lowstar. KreMLin is designed to emit
+well-formatted, idiomatic C code suitable for manual review.
+% redundant:
+% by security experts unfamiliar with \fstar. 
+The resulting C programs can be
+compiled with Comp\-Cert for greatest assurance, and with mainstream C
+compilers, including GCC and Clang, for greatest performance.  
+We have used KreMLin to extract to C the 20,000+ lines of 
+\lowstar code we have written so far.
+%
+After compilation, our verified standalone C libraries can be
+integrated within larger programs using standard means.
+%% , e.g., they may
+%% be used within other \fstar programs by relying on OCaml's foreign
+%% function interface for interoperability and trusting it for
+%% correctness.  
+\cf{LATER: \nik{moved it here from the previous para}.Does KreMLin
+  support the generation of FFI? Do we really claim that ocaml-interop
+  is the only part of Kremlin not covered by our formal results? This
+  is our usual ambiguity between \lowstar as our formal source
+  language vs as the subset of \fstar currently supported by KreMLin.}
+
+\paragraph*{An empirical evaluation (\S\ref{sec:moreexamples})}
+We present a few developments of efficient, verified, interoperable
+cryptographic libraries programmed in \lowstar.
+
+(1) We provide \haclstar, a ``high-assurance crypto library''
+implementing and proving (in $\sim$6,000 lines of \lowstar) several
+cryptographic algorithms, including the Poly1305
+MAC~\cite{bernstein2005poly1305}, the ChaCha20 cipher~\cite{chacha20},
+and multiplication on the Curve25519 elliptic curve
+~\cite{curve25519}.
+%
+We package these algorithms to provide the popular NaCl
+API~\cite{bernstein2012security}, yielding the first performant
+implementation of NaCl verified for memory safety and side-channel
+resistance, along with functional correctness proofs for its core
+components, including a verified bignum library customized for safe,
+fast cryptographic use (\S\ref{sec:haclstar}).  
+%
+Using this API, we build new standalone applications such as
+ \emph{PneuTube}, a new secure, asynchronous, file transfer 
+application whose performance compares favorably with widely 
+used, existing utilities like scp.
+\cf{Should we cite the CSF paper? Not all of it is new}
+
+(2) Emphasizing the applicability of \lowstar for high-level,
+cryptographic security proofs on low-level code, we briefly describe
+its use in programming and proving (in $\sim$14,000 lines of \lowstar)
+the Authenticated Encryption with Associated Data (AEAD) construction
+at the heart of the record layer of the new TLS 1.3 Internet Standard.
+%
+We prove memory safety, functional correctness, and cryptographic
+security for its main ciphersuites, relying, where available, on
+verified implementations of these ciphersuites provided by \haclstar.
+%
+The C code extracted from our verified implementation is easily
+integrated within other applications, including, for example, an
+implementation in \fstar of TLS separately verified and compiled to
+OCaml (through OCaml's FFI).
+
+
+%% (which still relies on the high-level memory model of \fstar).
+
+
+%% We obtain an API with strong type-based guarantees.
+%% \cf{not sure what to say on type abstraction or side-channel protections.}
+%% %
+%% We compile our \lowstar AEAD code both to OCaml and to C, linking it
+%% in both cases with the \fstar implementation of miTLS compiled to
+%% OCaml (which still relies on the high-level memory model of \fstar).
+%% %
+%% As expected by the design of \lowstar, relative to the full OCaml
+%% version, miTLS linked with the C version of our libraries shows an
+%% improvement in throughput of data transfer by at least two orders of
+%% magnitude.  There is still room for improvement, however---one measure
+%% shows our verified code integrated with miTLS is still be around
+%% 5$\times$ slower than OpenSSL's libcrypto. (\S\ref{sec:aead})
+%% \nik{TODO: revise this part after cleaning up the experimental story}
+%
+% \ch{All this sounds very impressive; isn't
+%   this precisely the Oakland submission though? If so how do we still
+%   mention this without claiming the same contribution in two different
+%   papers, which I don't think is allowed.}
+% %
+% \nik{The Oakland submission is about the cryptographic model and the
+%   proof of security. This paper is about how we program the code,
+%   compile it and get good performance.}
+\cf{LATER: cite the oakland paper.}
+
+
+\paragraph*{Trusted computing base} To date,
+we have focused on designing and evaluating our methodology of
+programming and verifying low-level code shallowly embedded within a
+high-level programming language and proof assistant.
+%
+We have yet to invest effort in minimizing the trusted computing base
+of our work, an effort we plan to expend now that we have evidence
+that our methodology is worthwhile.
+%
+Currently, the trusted computing base of our verified libraries
+includes the implementation of the \fstar typechecker and the Z3 SMT
+solver~\citep{MouraB08}.
+%
+Additionally, we trust the manual proofs of the metatheory relating
+the semantics of \lamstar to CompCert Clight. The KreMLin tool is
+informed by this metatheory, but is currently implemented in
+unverified OCaml, and is also trusted.
+%
+Finally, we inherit the trust assumptions of the C compiler used to
+compile the code extracted from \lowstar.
+
+\paragraph*{Supplementary materials}
+First, we provide, in the appendix, the hand proofs
+of the theorems described in \sref{formal}.
+%
+The present paper is focused on the metatheory and tools; we also authored a
+companion paper~\cite{record} that describes the cryptographic model we
+used for the record layer of TLS 1.3.
+%
+Finally, we have an ongoing submission of a paper focused on our
+\haclstar library~\cite{haclstar}, where we
+describe in greater detail our
+proof techniques for reusing the bignum formalization across different
+algorithms and implementations, and provide a substantial performance
+evaluation.
+
+We also offer numerous software artifacts. Our tool \kremlin~\cite{kremlin} is
+actively developed on GitHub, and so is \haclstar~\cite{haclstar-gh}. Most of
+the \lowstar libraries live in the \fstar repository, also on GitHub. The
+integration of \haclstar within miTLS is also available on GitHub. For
+convenience, we offer a regularly-updated Docker image of Project
+Everest~\cite{everest-website}, which bundles together
+\fstar, miTLS, \haclstar, \kremlin. One may
+fetch it via \texttt{docker pull projecteverest/everest}.  The Docker image
+contains a \texttt{README.md} with an overview of the proofs and the code.
+%
+
+% A separate paper describing our cryptographic model of the TLS 1.3
+% record layer will soon be published and is also available in the
+% non-anonymous supplementary material.
+
+%% Full formalization \cf{avoid?
+%%   this somehow suggests a machine-checked development.} and hand
+%% proofs of all the theorems in this paper are available in the long
+%% version\ifanon{} included with this submission\fi.  We also provide
+%% the KreMLin compiler and our verified \lowstar code for AEAD,
+%% \haclstar, and PneuTube as supplementary materials. %% Our
+%% %% experiments use \fstar and are partly based on miTLS, both of which
+%% %% are publicly available in open source repositories.
+
+%
+
+\if0
+
+An alternative execution path alternative execution
+
+dual reading: for verification
+purposes, it is an \fstar program with all the verification advantages
+this entails; for execution purposes, it is a C program, that performs
+predictable memory allocation and whose performance model is
+clear. The \lowstar code may be low-level, but its proof is usually
+not.
+
+
+
+
+Like any \fstar program, a \lowstar program can be
+
+C memory layout. Lik
+
+
+, a language in
+the tradition of ML equipped with dependent types, monadic effects,
+refinement types and a weakest precondition calculus.
+
+ If the program is well-typed and falls within the
+\lowstar subset, then it abides by the constraints of the C memory model and can
+be translated directly to well-defined C code.
+A \lowstar program enjoys a dual reading: for verification purposes,
+it is an \fstar program with all the verification advantages this
+entails; for execution purposes, it is a C program, that
+performs predictable memory allocation and whose performance model is
+clear. The \lowstar code may be low-level, but its proof is usually not.
+
+
+
+
+Security-critical components of the internet infrastructure have
+received sustained interest from the verification community over the past few
+years.
+
+\subsection{High-level Verification for Low-Level Code}
+Security-critical components of the internet infrastructure have
+received sustained interest from the verification community over the past few
+years. Indeed, a combination of design flaws and implementation mistakes has led
+to a series of highly-publicized attacks, sometimes with devastating consequences,
+and the realization we are still depending on substantial amounts of insecure code in
+deployed systems.
+
+One crucially important class of software is cryptographic
+libraries,\ch{implementations/applications (broader), miTLS and
+  HACL* is a crypto library, but PneuTube are not really libraries!?}
+which pervade the entire internet stack.
+Setting aside the logical or mathematical
+attacks, which break the underlying mathematical robustness
+assumptions~\cite{freestart} to the point that a brute-force attack may be
+possible, cryptography is notoriously difficult to implement correctly. As one
+cryptographer accurately puts it, ``the only people who hate [the GCM cipher]
+are those who’ve had to implement it''~\cite{green-gcm}. Therefore,
+most of the high-profile vulnerabilities in cryptographic
+libraries\ch{implementations/applications} have targeted
+implementation flaws~\cite{Heartbleed}.
+\ch{other examples?}
+
+Many strands of work\jp{ TODO: cite} have shown that re-building parts
+of this infrastructure using verification and formal methods is a
+promising way of removing such vulnerabilities.
+%
+Yet, verification often proves very challenging. One reason is that
+cryptographic code works at a very low-level; the performance of cryptography is
+often the limiting factor after network speed in many networked applications,
+and the code is hand-optimized to squeeze the last bit of performance out of the
+system. In practice, this means that any replacement must be at least
+as good as the existing C libraries, and offer the same level of portability.
+
+
+The contribution of this paper is \emph{the design, proof, implementation
+and evaluation of \lowstar}, a domain-specific language for
+verified low-level programming
+that tries to combine the advantages of the approaches above.
+
+\lowstar is a shallow embedding of C inside of \fstar, a language in
+the tradition of ML equipped with dependent types, monadic effects,
+refinement types and a weakest precondition calculus. The programmer writes
+\lowstar code using regular \fstar syntax, against a library we provide that
+models the C memory layout. If the program is well-typed and falls within the
+\lowstar subset, then it abides by the constraints of the C memory model and can
+be translated directly to well-defined C code.
+A \lowstar program enjoys a dual reading: for verification purposes,
+it is an \fstar program with all the verification advantages this
+entails; for execution purposes, it is a C program, that
+performs predictable memory allocation and whose performance model is
+clear. The \lowstar code may be low-level, but its proof is usually not.
+
+\subsection{An Overview of \lowstar}
+% \lowstar is \emph{designed} as a subset of \fstar, along with a set of libraries that
+% model the C stack and heap, and their mutable data structures (buffers). \lowstar exposes a
+% \emph{curated} set of low-level primitives, meaning the programmer writes code in the
+% \lowstar subset of \fstar, but may use any degree of sophistication in the proofs. In
+% short, the code is low-level, but the verification is not. Once a \lowstar program
+% type-checks, proofs are erased and it is extracted by a translation to C.
+% By allowing what we deem a ``reasonable'' subset of C, the programmer is faced
+% with less proof obligations than with a general C program, and can combine
+% the performance benefits of low-level programming with the expressive power of
+% the \fstar verification language.
+
+
+\fref{bigpicture} depicts the various steps that convert a \lowstar
+source program to executable machine code.\ch{How about calling the
+  first box \lowstar?}
+%
+Black boxes denote intermediary languages;
+colored background rectangles indicate which concrete tool implements a given
+translation step in the diagram.
+
+\lowstar is designed as a subset of \fstar. As such, we rely on the latest
+formalization of \fstar~\cite{dm4free}, which introduces EM\fstar, a
+dependently-typed core calculus with a user-extensible lattice of effects.
+EM\fstar is pure, and user-defined effects are pure too; this allows the
+verification system of \fstar to reason over pure effect combinators and
+programs.\ch{Bringing up EMF* and formalization seems unjustified.
+  Very much afraid we'll lose many readers by going in gory formal
+  details and \fstar jargon for little gain. I would prefer explaining
+  this in intuitive terms from more basic principles, like monads,
+  than expecting the reader to know \cite{dm4free} already}
+
+Programs are not generally executed against a pure implementation of the state;
+rather, they rely on the execution environment's primitive notion of
+state. The original \emfst~\cite{dm4free} semantics model the
+built-in state of the OCaml extraction target of \fstar; the authors show that
+\emfst is a simulation of EM\fstar, i.e. that a \emph{concrete} implementation
+using native state preserves the pure semantics of the original, pure \li+ST+
+effect that the programmer dealt with.\ch{Again, why not phrase this in
+  terms of actual implementation, instead of theory? In terms of actual
+  implementation \fstar erases types using an algorithm very similar to Coq;
+  and uses primitive OCaml effects on top of that.}
+
+\ch{How about just saying that effects in \fstar{} can be defined and
+  customized by the user using monads. The state effect of \fstar{} is
+  parameterized by the precise memory model.  Code using the state
+  effect instantiated with HyperHeaps~\cite{mumon} can be translated
+  to native OCaml state, with automatic memory management and garbage
+  collection. Here we parametrize the state effect of \fstar{} with
+  HyperStacks, a memory model corresponding to C stack allocation.}
+
+In a similar fashion,\ch{the similar fashion part doesn't seem understandable
+  to someone who didn't read \cite{dm4free}}
+we design a ``HyperStack'' memory model that captures the
+C stack discipline, and model stack-allocated, mutable, by-reference arrays with
+static liveness and bounds checks.
+Pointer arithmetic on buffers is checked statically;\ch{Do you really check the
+  pointer arithmetic, not the actual memory accesses? So you can't get a off-by-one
+  pointer at the end of a loop, as often happens in perfectly valid C?}
+``ghost'' lengths that only exist in the type system allow verification to show that
+well-typed programs are memory safe. We instantiate EM\fstar with these
+``HyperStack'' semantics and obtain \emfhst, a language that enjoys a simulation
+to EM\fstar, and whose semantics feature a primitive notion of state with a
+stack of frames.  We further define an erasure transformation over \emfhst that
+removes calls to lemmas and ghost code while preserving semantics.
+
+\fstar effects are user-defined so this required no change to F* and could be
+implemented as a library. This library does not
+expose the full power of C; rather, it exposes a \emph{curated} set of
+combinators. This strikes a balance between expressiveness, and ease of proof /
+programmer productivity. Notably, programs may not take the address of an
+arbitrary object, and may not perform any sort of memory trick.\ch{unclear
+  what you mean by memory trick, maybe give concrete examples of the things
+  you prohibit?}  This discipline
+did not turn out to be a restriction for the several thousand lines of
+cryptographic code we wrote in \lowstar.\ch{20,000? should maybe define
+  a macro for that?}
+
+This code can still be extracted to OCaml using the existing extraction facility
+of \fstar; this would, however, be a poor idea: the presence of a garbage
+collector exposes our program to side-channels, and the uniform, tagged memory
+representation would make array subscripting operations linear instead of
+constant-time in the C semantics.\ch{Still don't understand this one,
+  seems very much like OCaml jargon}
+
+At this stage, a program may not qualify as \lowstar; the programmer may, for
+instance, use partial applications or closures. This is part of our design:
+\lowstar is not a general-purpose compilation scheme to C for arbitrary \fstar
+programs. Rather, we view it as a DSL that shines for writing cryptographic
+systems. \ch{wasn't this already said above, all this seems just an
+  unstructured collection of thoughts}
+
+We write out the semantics of the \emfhst language as \lamstar, a core calculus
+that thus models the \lowstar subset that the user programs in. This step
+contains a degree of informality: we have not written out the output of
+instantiating EM\fstar with HyperStack, and claim that \lamstar is the same as
+``erased \emfhst'', modulo $\alpha$-renaming. \ch{gory details}
+
+We wish to prove that our compilation scheme to C is sound. For that purpose, we
+introduce \cstar, a statement language that we claim is an ``idealized''
+subset of C. \cstar has an explicit notion of a stack and of block scope.
+\lamstar programs require two simplification before they can be soundly
+translated to \cstar; this is due to the function-level notion of scope in
+\lamstar, along with the \li+StackInline+ effect our memory model offers.
+The translated \cstar program refines the semantics of the
+\lamstar program. \ch{gory details}
+
+Finally, we wish to relate \cstar to an actual formalization of C. To that
+effect, we define a translation from \cstar to Comp\-Cert's
+Clight~\cite{Blazy-Leroy-Clight-09}. The final compilation step may be handled
+by a certified compiler, such as
+Comp\-Cert~\cite{Leroy-Compcert-CACM,compcert-url}, and is not covered here.
+\ch{gory details}
+
+In addition to semantics preservation, our simulations also prove that our
+compilation scheme preserves side-channel security properties. Combined with our
+proof that well-typed \lowstar programs are free of memory access-based and
+branching-based side-channels, our toolchain thus provides a degree of
+end-to-end side-channel protection.
+
+\lowstar is \emph{implemented} via KreMLin, a new tool that extracts an \fstar
+program into a set of \emph{readable}, \emph{manually-reviewable} C files that
+map almost transparently to the original code. KreMLin implements a superset of
+the transformations described in the present paper, and can already extract
+the 20,000+ lines of cryptographic code we have written.
+
+\lowstar is \emph{evaluted} using two flagship cryptographic developments.
+The first one is \haclstar,
+a \lowstar library that aims to provide a reference, gold-standard, verified set of
+cryptographic routines.\ch{Could mention which ones?}
+\haclstar implements the popular \li+box+/\li+unbox+ API
+from \li+libsodium+; its performance is comparable to that of the original
+\li+sodium+ library. The second is our AEAD\ch{what's AEAD? please explain}
+development, that provides a
+cryptographically-sound AEAD implementation for several combinations of stream
+ciphers and MAC algorithms. We evaluate the interoperability claim via an
+ongoing replacement of the cryptographic stack of the miTLS project with our
+AEAD library; measured against OpenSSL, our development exhibits comparable
+performance.
+
+\ch{How about structuring the contributions better, e.g. separate subsection
+  (or just used named paragraphs instead of subsections in the intro)}
+
+\fi
+% packaged as a set of C files. 
+
+% so that it does not expose the full power of C; the programmer may not, for
+% instance, take the adress of any expression. 
+
+% At one end of the spectrum, one may start from an optimized, existing C
+% implementation of cryptographic code, and show that memory accesses are safe;
+% that certain invariants are preserved; and, eventually, that functional
+% correctness is preserved. In short, one may build proof structure on top of
+% optimized code. At the other end of the spectrum, one may start with a language
+% designed for proofs; prove functional correctness; then gradually move the code
+% towards a more low-level, efficient implementation while extending the proof to
+% deal with the correctness of lower-level code.
+
+% The present paper proposes a hybrid approach that mixes a low-level 
+
+% \comment{JP: be more general and say that one can write code at the level of C
+% directly (e.g. Frama-C, Vcc, Verifast) vs. in a high-level language}
+% %
+% There are several ways to tackle the issue. On one end of the spectrum, one may
+% work within the Coq proof assistant on a deep embedding of the C language,
+% possibly relying on Comp\-Cert's semantics. The deep embedding models the full
+% semantics of C; if the Coq development is proven, then the code has the desired
+% behavior~\cite{chlipala2013bedrock}. One may add cryptographic reasoning to the
+% Coq development in the form of games. This approach has yielded successful
+% results for self-contained core cryptographic building blocks, such as the HMAC
+% algorithm~\cite{beringer2015verified}.
+
+% At the other end of the spectrum, one may verify large-scale systems such as the
+% TLS protocol~\cite{bhargavan2014proving}.\ch{Could take TLS as the
+%   example from the end of the first paragraph already. Otherwise a bit
+%   unclear for what HMAC is a building block.}
+% Using a high-level language, one
+% relies on module abstraction, higher-order proofs and ghost code to create an
+% elaborate proof structure on top of a rather mundane implementation. The
+% high-level nature of the host language makes it a prime tool for
+% game-based cryptographic proofs; however, such a toolset is not suited to
+% low-level code. For instance, the released version of the miTLS
+% library~\cite{bhargavan2014proving} models the TLS Handshake and Record Layer,
+% but relies on OpenSSL's cryptographic ciphers for lack of an F7 implementation.
+
+% Our approach bridges the gap between high-level and low-level verification by
+% offering a \emph{whole-stack verification result}.\ch{I thought that
+%   this paper was about the methodology/tools, not yet a whole-stack
+%   verification result. Or is AEAD a whole-stack result? Is this
+%   paragraph about that?}
+% Our low-level subset of \fstar,
+% dubbed \lowstar, exposes the \emph{memory model of C with the verification power of
+% \fstar}.\ch{Should reintroduce \fstar in the intro, when talking about old miTLS}
+% The programmer may use any degree of sophistication in the proofs, as they
+% are erased; thus, the code may be low-level, but the verification is not. A
+% piece of code that is well-typed in \fstar \emph{and} fits within \lowstar can be
+% compiled to the C language; a series of simulations show that our compilation
+% scheme preserves semantics all the way to Clight
+% \cite{Blazy-Leroy-Clight-09}, a subset of C formally specified by
+% Comp\-Cert \cite{Leroy-Compcert-CACM,compcert-url}. The rest of the
+% program may not fit in \lowstar; it may thus be compiled using the original
+% OCaml extraction mechanism of \fstar.
+% The whole program is verified; for critical parts,
+% the programmer opts into the \lowstar model and enjoys the same performance as in
+% the C, at the expense of an extra proof burden for memory safety.
+
+% \comment{JP: say something along the lines of ``we provide spatial safety (no
+% out-of-bounds access), temporal safety (no use-after-free) and resource safety
+% (no memory leaks if the code is in \li+Stack+)''. Really should hammer that we
+% offer a transparent, predictable allocation model. Also, we should list 1) the
+% contributions and 2) the ingredients that we need for low-level crypto, then
+% explain why we have these, e.g. we have well-engineered curves meaning we must
+% have fixed-size stack-allocated arrays and pointer arithmetic, and not much
+% more\ldots}\ch{Spelling out the contributions is really important.  At
+%   this point, the intro is focused almost entirely on AEAD as the
+%   contribution, so one might wonder whether there are any PL
+%   contributions here too. You're sending this to PLDI after all, so
+%   even AEAD should be explained from the POV of a PL audience.}
+
+% To demonstrate the viability of our approach, we replace the cryptographic stack
+% of miTLS with a verified \lowstar implementation, effectively removing the
+% dependency on OpenSSL.\ch{Is all of this crypto replacement really already done?
+%   Aren't you talking only about the transport layer for now?}
+% We operate on the in-progress rewrite of miTLS in \fstar,
+% which aims at modeling the interaction of TLS 1.2 and the upcoming TLS 1.3
+% standard~\cite{record}. Within the \lowstar subset, we write memory-safe,
+% functionally-correct low-level cryptographic modules, starting from big number
+% arithmetic.  Building upon this, we implement finite fields $GF(128)$ and
+% $GF(2^{130}-5)$. These fields are used respectively for MAC algorithms GHASH and
+% Poly1305; combining the latter two with the AES and ChaCha20 ciphers yields
+% various implementations of the AEAD construction in \lowstar. We leverage the
+% expressiveness of the \fstar proof system to show that we have a
+% cryptographically-strong AEAD implementation for any combination of cipher and
+% MAC algorithm. Our implementation is made up of $10,500$ lines of \fstar, including
+% whitespace and comments.
+
+% The compilation pipeline is as follows. The AEAD library in \lowstar is extracted to
+% human-readable C code using a new tool dubbed KreMLin~\cite{kremlin}. For the
+% miTLS development, we write (unverified) \li+ocaml-ctypes+ bindings, which glue
+% together the rest of the code extracted via the regular OCaml extraction backend
+% of \fstar. For the demo purposes of this paper, we link the library against a sample
+% program dubbed PneuTube, which performs public-key authenticated and encrypted
+% file transfer.
+
+% Our AEAD implementation offers, among other APIs, the \li+box/unbox+
+% primitives as exposed by the popular \li+libsodium+ cryptographic library.
+% Performance measurements for a large file transfer using the PneuTube demo
+% application show our code to be 40\% faster than OpenSSL,\ch{Is the OpenSSL
+%   code you test against in C or ASM?}
+% head-to-head with
+% unoptimized \li+libsodium+ and 40\% slower than hand-optimized \li+libsodium+
+% with assembly.
+
+% Our long-term plan is to extract the entire miTLS codebase to C by fitting it
+% within the \lowstar subset of \fstar. Indeed, our ambition is to see our
+% provably-secure TLS code execute in the ``real world''; that is, servers (such as
+% Apache, Nginx or IIS) and browsers (such as Chrome, Firefox or Edge). In that
+% context, extracting to OCaml is not an option. The first reason is performance:
+% switching to the OCaml value representation at ABI boundaries, and GC pauses are
+% a hard sell for performance-conscious browser vendors. Second the target
+% audience will most likely not be familiar with OCaml. Thus, for social and
+% technical reasons, our plan is to extract to C or C++.
+

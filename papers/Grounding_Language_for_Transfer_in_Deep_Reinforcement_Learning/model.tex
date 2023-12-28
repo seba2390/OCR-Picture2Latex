@@ -1,0 +1,280 @@
+\section{Model}
+\label{sec:model}
+
+Grounding language for policy transfer across domains requires a model that meets two needs. First, it must allow for a flexible representation that fuses information from both state observations and text descriptions. This representation should capture the compositional nature of language while mapping linguistic semantics to characteristics of the world. Second, the model must have the capability to learn an accurate prototype  of the environment (i.e. transitions and rewards) using only interactive feedback. Overall, the model must enable an agent to map text descriptions to environment dynamics; this allows it to predict transitions and rewards in a completely new world, without requiring substantial interaction.
+
+To this end, we propose a neural architecture consisting of two main components: (1) a \emph{representation generator} ($\phi$), and (2) a \emph{value iteration network} (VIN)~\cite{tamar2016value}. First, the representation generator takes a state observation and a set of text descriptions as input and produces a tensor output, capturing  information essential for decision-making. Then, the VIN module implicitly encodes the value iteration computation (Eq.~\ref{eq:vi}) into a recurrent network with convolutional modules, producing an action-value function using the previously constructed tensor representation as input. Together, both modules form an end-to-end differentiable network that can be trained using gradient back-propagation.  
+ 
+\subsection{Representation Generator}
+
+The main purpose of this module (Figure~\ref{fig:transfer-state}) is to fuse together information from two inputs -- the state, and the text specifications. An important consideration, however, is the ability to handle partial or incomplete text descriptions, which may not contain all the particulars of an entity. Thus, we would like to incorporate useful information from the text, yet, not rely on it completely. This motivates us to use a representation that is factorized over the two input modalities.
+
+\begin{figure}[t]
+\centering
+ \includegraphics[width=0.8\linewidth]{fig/state2}
+\caption{Representation generator combining both object-specific and description-informed vectors for each entity. Each cell in the input state (2-D matrix) is converted to a corresponding real-valued vector, resulting in a 3-D tensor output. The two-part representation allows us to exploit partial/noisy information from text while also learning other aspects of the environment dynamics directly through interaction.} 
+	\label{fig:transfer-state}
+\end{figure}
+
+\color{black}
+Formally, given a state matrix $s$ of size $m \times n$ and a set of text descriptions $Z$, the module produces a tensor $\phi(s, Z)$. Recall that each cell in state $s$ is occupied by a single entity. Consider one such cell containing an entity $o_i$, with a corresponding description $z_i$ (if available). The representation generator performs two operations:
+\begin{enumerate}
+\item First, it generates an entity-specific vector $v_{o_i}$ of dimension $d$. This vector is initialized arbitrarily and learned using rewards received by the agent in the environment. One can view this operation as an `object embedding', similar to the notion of a word embedding~\fullcite{mikolov2013efficient}.
+\item Second, the description $z_i$ is converted into a continuous valued vector  \textbf{$v_{z_i}$} (also of dimension $d$). This can be achieved in several different ways, but in this work, we experiment with using an LSTM recurrent neural network~\cite{hochreiter1997long} and a mean bag-of-words (BOW) approach, which entails taking the average over word vectors corresponding to each word in the description. 
+\end{enumerate}
+Both these sets of parameters (including the embeddings and LSTM weights) are all initialized at random and learned through reinforcement on the source tasks.
+
+The two vectors, $v_{o_i}$ and  $v_{o_z}$,  are then concatenated to produce a single representation for this cell: $\phi_i = [v_{o_i};v_{z_i}]$. Performing the same operations over all cells of the state results in a tensor $\phi(s,Z)$ with dimensions $m \times n \times 2d$ for the entire state.\footnote{$d$ is a hyperparameter choice here. Also, one can have vectors $v_{o_i}$ and $v_{z_i}$ of different dimensions, say $d_1$ and $d_2$, if necessary. We use the same dimensionality for simplicity.} For cells with no entity (i.e. empty space), $\phi_i$ is simply a zero vector, and for entities without a description, $v_{z_i} = \vec{0}$.  Figure~\ref{fig:transfer-state} illustrates this module.
+
+This decomposition into $v_o$ and $v_z$ allows us to learn policies based on both the ID of an object and its described behavior in text. This enables the model to retain knowledge of observed entities while being adaptable to new entities. For instance, if a new environment contains some previously seen entities,\footnote{Note that this is just a possible situation our model can handle. The different domains we consider in this work have no entity symbol overlap.} the agent can reuse the learned representations directly based on their symbols. For completely new entities (with unseen IDs), the model can form useful representations using their text descriptions. 
+
+\color{black}
+\subsection{Value Iteration Network}
+
+\begin{figure}[!t]
+\centering
+  \includegraphics[width=\linewidth]{fig/vin_model}
+\caption{Value iteration network (VIN) module to compute $Q_{vin}$ from $\phi(s, Z)$. The module approximates the value iteration computation using neural networks to predict reward and value maps, arranged in a recurrent fashion. Functions $f_T$ and $f_R$ are implemented using convolutional neural networks (CNNs). $\delta_s$ is a selection function to pick out a single Q-value (at the agent's current location) from the output Q-value map $\hat{Q}^{(k)}$.}
+	\label{fig:transfer-model}
+\end{figure}
+
+For a model-based RL approach to this task, we require some means to estimate $T$ and $R$ of an environment. One way to achieve this is by explicitly using predictive models for both functions and learning these through transitions experienced by the agent. These models can then be used to estimate the optimal $Q$ using equation~\ref{eq:vi}. However, this pipelined approach would result in  errors propagating through the different stages of predictions.
+ 
+A value iteration network (VIN)~\cite{tamar2016value} abstracts away explicit computation of $T$ and $R$ by directly predicting the outcome of value iteration (Figure~\ref{fig:transfer-model}), thereby avoiding the aforementioned error propagation. In this model, the VI computation is mimicked by a recurrent network with two key operations at each step. First, to compute $Q$, we have two functions -- $f_R$ and $f_T$. $f_R$ is a reward predictor that operates on $\phi(s, Z)$ while $f_T$ uses the output of $f_R$ and any previous $V$ to predict $Q$. Both functions are parametrized as convolutional neural networks (CNNs),\footnote{Other parameterizations are possible for different input types, as noted by~\citeA{tamar2016value}.} to suit our tensor representation $\phi$. Subsequently, in the second operation, the network employs max pooling over the action channels in the $Q$-value map produced by $f_T$ to obtain $V$. 
+The value iteration computation (from Eq.~\ref{eq:vi}) can thus be approximated as:
+\begin{dmath}
+\hat{Q}^{(n+1)}(s, a, Z) = f_T \Big(f_R(\phi(s,Z), a; \theta_R), \hat{V}^{(n)}(s, Z); \theta_T \Big) 
+\end{dmath} \vspace{-0.1cm}
+\begin{dmath}
+\hat{V}^{(n+1)}(s, Z) = \max_a \hat{Q}^{(n+1)}(s,a, Z)
+\end{dmath}
+Note that while the VIN operates on $\phi(s,Z)$, we write $\hat{Q}$ and $\hat{V}$ in terms of the original state input $s$ and text $Z$, since these are independent of our chosen representation.
+
+The outputs of both CNNs are real-valued tensors. The output of $f_R$ has the same dimensions as the input state  ($m \times n$), while $f_T$ produces $\hat{Q}^{(n+1)}$ as a tensor of dimension $m \times n \times |A|$, where $|A|$ is the number of actions available to the agent. A key point here is that the model produces $Q$ and $V$ values for each cell of the input state matrix, assuming the agent's position to be that particular cell. The convolution filters help capture information from neighboring cells in our state matrix, which act as approximations for $V^{(n)}(s', Z)$. The parameters of the CNNs, $\theta_R$ and $\theta_T$, approximate $R$ and $T$, respectively. See the work of  Tamar~et~al.~\citeyear{tamar2016value} for a more detailed discussion.
+
+The recursive computation of traditional value iteration~(Eq.~\ref{eq:vi}) is captured by employing the CNNs in a recurrent fashion for $k$ steps.\footnote{$k$ is a model hyperparameter.} Intuitively, larger values of $k$ imply a larger field of neighbors influencing the Q-value prediction for a particular cell as the information propagates longer. The final output of this recurrent computation, $\hat{Q}^{(k)}$, is a 3-D tensor of size $m \times n \times |A|$. However, since we need a policy only for the agent's current location, we use an appropriate selection function $\delta_s$, which reduces this Q-value map to a single set of action values for the agent's location:
+\begin{align}
+Q_{vin}(s, a, Z; \Theta_1) &=  \delta_s (\hat{Q}^{(k)} (s, a, Z))
+\end{align}
+This is simply an indexing operation performed on $\hat{Q}^{(k)}$ to retrieve the $|A|$-dimensional vector from the cell corresponding to the agent's location in state $s$.
+
+\subsection{Final Prediction} 
+Games exhibit complex dynamics, which are challenging to capture precisely, especially for long-term prediction. VINs approximate the dynamics implicitly via learned convolutional operations. It is thus likely that the estimated $Q_{vin}$ values are most helpful for short-term planning that corresponds to a limited number of iterations $k$. Therefore, we need to complement these `local' Q-values with estimates based on a more global view.
+
+To this end, following the VIN specification by~\citeA{tamar2016value}, our architecture also contains a model-free action-value function, implemented as a deep Q-network (DQN)~\cite{mnih2015dqn}. This network provides a Q-value prediction -- $Q_{r} (s,a,Z; \Theta_2)$ -- which is combined with $Q_{vin}$ using a composition function $g$:\footnote{Although $g$ can also be learned, we use component-wise addition in our experiments.}
+\begin{dmath}
+Q(s, a, Z; \Theta) = g(Q_{vin}(s, a, Z; \Theta_1), Q_{r}(s, a, Z; \Theta_2))
+\label{eq:final-q}
+\end{dmath}
+% In our experiments, we use simple component-wise addition for $g$.
+The fusion of our model components enables our agent to establish the connection between input text descriptions, represented as vectors, and the environment's transitions and rewards, encoded as VIN parameters. In a new domain, the model can produce a reasonable policy using corresponding text, even before receiving any interactive feedback.
+
+% \todo{add intuition for model-free vs VIN here}
+
+\subsection{Parameter Learning}
+Our entire model is end-to-end differentiable. We perform updates derived from the Bellman equation~\cite{sutton1998introduction}:
+\begin{dmath}
+	{Q_{i+1}(s,a, Z) = \mathrm{E}[r + \gamma \max_{a'} Q_i(s',a', Z) \mid s, a]} 
+\label{eq:transfer-bellman-update}
+\end{dmath}
+where the expectation is over all transitions from state $s$ with action $a$ and $i$ is the update number. To learn our parametrized Q-function (the result of Eq.~\ref{eq:final-q}), we can use backpropagation through the network to minimize the following loss:
+\begin{dmath}
+	{\mathcal{L}(\Theta_i) = \mathrm{E}_{\hat{s},\hat{a}}  [ (y_i - Q(\hat{s}, \hat{a}, Z ; \Theta_i))^2 ]}
+\label{eq:transfer-loss}
+\end{dmath}
+where $ {y_i = r + \gamma \max_{a'} Q (s',a', Z; \Theta_{i-1})}$ is the target Q-value with parameters $\Theta_{i-1}$ fixed from the previous iteration.  We employ an experience replay memory $\mathcal{D}$ to store transitions~\cite{mnih2015dqn}, and periodically perform updates with random samples from this memory. We use an $\epsilon$-greedy policy~\cite{sutton1998introduction} for exploration.  
+
+ \begin{algorithm}[t]
+% \small
+\caption{\textsc{Multitask\_Train ($\mathcal{E}$)}}
+\label{alg:transfer-train}
+\begin{algorithmic}[1]
+% \State \textbf{Input:} Set of environments $\mathcal{E}$
+\State Initialize parameters $\Theta$ and experience replay $\mathcal{D}$
+\For {$ k = 1,M $}  \Comment{New episode}
+	\State Choose next environment $E_k \in \mathcal{E}$
+	\State Initialize $E_k$; get start state $s_1 \in S_k$	
+	\For {$ t = 1, N $}   \Comment{New step}
+    	\State Select $a_t \sim \textsc{eps-greedy}(s_t, Q_\Theta, Z_k, \epsilon)$		
+		\State Execute action $a_t$, observe reward $r_t$ and new state $s_{t+1}$
+		\State $\mathcal{D} = \mathcal{D} \cup (s_t, a_t, r_t, s_{t+1}, Z_k)$
+		\State Sample mini batch $(s_j, a_j, r_j, s_{j+1}, Z_k) \sim \mathcal{D}$
+		\State Perform gradient descent on loss $\mathcal{L}$ to update $\Theta$
+		\If { $s_{t+1}$ is terminal}
+			\textbf{break}
+		\EndIf
+	\EndFor
+\EndFor
+\State Return $\Theta$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{\textsc{eps-greedy} ($s,Q,Z,\epsilon$)}
+\label{alg:transfer-eps-greedy}
+\begin{algorithmic}[1]
+% \State \textbf{Input:} Set of environments $\mathcal{E}$
+\If {$ random() < \epsilon $}			
+			\State Return random action $a$
+		\Else		        	
+			\State Return  $\argmax_a~Q(s, a, Z)$  
+		\EndIf
+\State Return $\Theta$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Transfer Procedure}
+The traditional transfer learning scenario often involves a single task in both source and target environments. To better test generalization and robustness of our methods, in this work we consider transfer from \emph{multiple} source tasks to \emph{multiple} target tasks.
+We first train a model to achieve optimal performance on the set of source tasks. All model parameters ($\Theta$) are shared between these tasks. The agent experiences one episode at a time, sampled from each environment in a round-robin fashion, along with the corresponding text descriptions. The parameters of the model are optimized using the reward-based feedback gathered across all these tasks. Algorithm~\ref{alg:transfer-train} details this multi-task training procedure.
+
+After training converges, we use the learned parameters to initialize a model for tasks in the target domain. Specifically, all parameters of the VIN are replicated, while most weights of the representation generator are reused. Previously seen objects and words retain their learned entity-specific embeddings ($v_o$), whereas vectors for new objects/words in the target tasks are initialized randomly. Following this initialization, all parameters are then fine-tuned on the target tasks using the corresponding rewards, again with episodes sampled in a round-robin fashion.
+ 
+%  \todo{expand on this and add in algo to make things clear. What exactly is transferred?}
+
+
+
+% Grounding language for policy transfer across domains requires a model that meets two needs. First, it must allow for a flexible representation that fuses information from both state observations and text descriptions. This representation should capture the compositional nature of language while mapping linguistic semantics to characteristics of the world. Second, the model must have the capability to learn an accurate prototype  of the environment (i.e. transitions and rewards) using only interactive feedback. Overall, the model must enable an agent to map text descriptions to environment dynamics; this allows it to predict transitions and rewards in a completely new world, without requiring substantial interaction.
+
+% To this end, we propose a neural architecture consisting of two main components: (1) a \emph{representation generator} ($\phi$), and (2) a \emph{value iteration network} (VIN)~\cite{tamar2016value}. The representation generator takes the state observation and the set of text descriptions to produce a tensor, capturing essential information  for decision making. The VIN module implicitly encodes the value iteration computation (Eq.~\ref{eq:vi}) into a recurrent network with convolutional modules, producing an action-value function using the tensor representation as input. Together, both modules form an end-to-end differentiable network that can be trained using simple back-propagation.  
+ 
+
+
+% \subsection{Representation generator}
+
+% The main purpose of this module is to fuse together information from two inputs - the state, and the text specifications. An important consideration, however, is the ability to handle partial or incomplete text descriptions, which may not contain all the particulars on an entity. Thus, we would like to incorporate useful information from the text, yet, not rely on it completely. This motivates us to utilize a factorized representation over the two input modalities.
+
+% \begin{figure}[!t]
+%  \includegraphics[width=0.9\linewidth]{fig/state}
+% \caption{Representation generator combining both object specific and description-informed vectors for each entity.}
+% 	\label{fig:state}
+% \end{figure}
+
+
+
+% Formally, given a state matrix $s$ and a set of text descriptions $Z$, the module produces a tensor $\phi(s, Z$). Consider a cell in $s$ containing an entity $o_i$, with a corresponding description $z_i$ (if available). Each such cell is converted into a vector $\phi_i = [v_{o_i};v_{z_i}]$, consisting of two parts concatenated together:
+% \begin{enumerate}
+% % \itemsep0em
+% \item \textbf{$v_{o_i}$}, which is an entity-specific vector embedding of dimension $d$
+% \item \textbf{$v_{z_i}$} (also of dimension $d$), produced from $z_i$ using an LSTM recurrent neural network~\cite{hochreiter1997long}.
+% \end{enumerate}
+% % \begin{dmath*}
+% % \phi(s, \mathcal{Z}) = [v_z(s, \mathcal{Z}); v_o(s)]
+% % \end{dmath*}
+% This gives us a tensor $\phi$ with dimensions $m \times n \times 2d$ for the entire state. For cells with no entity (i.e. empty space), $\phi_i$ is simply a zero vector, and for entities without a description, $v_{z_i} = \vec{0}$.  Figure~\ref{fig:state} illustrates this module.
+
+
+
+
+
+% % \begin{dmath*}
+% % \phi(s, \mathcal{Z}) = [v_z(s, \mathcal{Z}); v_o(s)]
+% % \end{dmath*}
+% % The dimensions of $\phi(s, \mathcal{Z})$ are $m \times n \times 2d$. 
+
+% This decomposition allows us to learn policies based on both the ID of an object and its described behavior in text. In a new environment, previously seen entities can reuse the learned representations directly based on their symbols. For completely new entities (with unseen IDs), the model can form useful representations from their text descriptions. 
+
+% \subsection{Value iteration network}
+
+% \begin{figure*}[!t]
+% \centering
+%   \includegraphics[width=\linewidth]{fig/vin_model}
+% \caption{Value iteration network module to compute $Q_{vin}$ from $\phi(s)$. Functions $f_T$ and $f_R$ are implemented using convolutional neural networks (CNNs).}
+% 	\label{fig:model}
+% \end{figure*}
+
+% For a model-based RL approach to this task, we require some means to estimate $T$ and $R$ of an environment. One way to achieve this is by explicitly using predictive models for both functions and learning these through transitions experienced by the agent. These models can be then used to estimate the optimal $Q$ with equation~\ref{eq:vi}. However, this pipelined approach would result in  errors propagating through the different stages of predictions.
+ 
+% A value iteration network (VIN)~\cite{tamar2016value} abstracts away explicit computation of $T$ and $R$ by directly predicting the outcome of value iteration (Figure~\ref{fig:model}), thereby avoiding the aforementioned error propagation. The VI computation is mimicked by a recurrent network with two key operations at each step. First, to compute $Q$, we have two functions -- $f_R$ and $f_T$. $f_R$ is a reward predictor that operates on $\phi(s, Z)$ while $f_T$ utilizes the output of $f_R$ and any previous $V$ to predict $Q$. Both functions are parametrized as convolutional neural networks (CNNs),\footnote{Other parameterizations are possible for different input types, as noted in Tamar et al.~\cite{tamar2016value}.} to suit our tensor representation $\phi$. Second, the network employs max pooling over the action channels in the $Q$-value map produced by $f_T$ to obtain $V$. 
+% The value iteration computation (Eq.~\ref{eq:vi}) can thus be approximated as:
+% \begin{dmath}
+% \hat{Q}^{(n+1)}(s, a, Z) = f_T \Big(f_R(\phi(s,Z), a; \theta_R), \hat{V}^{(n)}(s, Z); \theta_T \Big) 
+% \end{dmath} \vspace{-0.1cm}
+% \begin{dmath}
+% \hat{V}^{(n+1)}(s, Z) = \max_a \hat{Q}^{(n+1)}(s,a, Z)
+% \end{dmath}
+% Note that while the VIN operates on $\phi(s,Z)$, we write $\hat{Q}$ and $\hat{V}$ in terms of the original state input $s$ and text $Z$, since these are independent of our chosen representation.
+
+% The outputs of both CNNs are real-valued tensors -- that of $f_R$ has the same dimensions as the input state  ($m \times n$), while $f_T$ produces $\hat{Q}^{(n+1)}$ as a tensor of dimension $m \times n \times |A|$. A key point to note here is that the model produces $Q$ and $V$ values for each cell of the input state matrix, assuming the agent's position to be that particular cell. The convolution filters help capture information from neighboring cells in our state matrix, which act as approximations for $V^{(n)}(s', Z)$. The parameters of the CNNs, $\theta_R$ and $\theta_T$, approximate $R$ and $T$, respectively. See Tamar et al.~\cite{tamar2016value} for a more detailed discussion.
+
+% The recursive computation of traditional value iteration~(Eq.~\ref{eq:vi}) is captured by employing the CNNs in a recurrent fashion for $k$ steps.\footnote{$k$ is a model hyperparameter.} Intuitively, larger values of $k$ imply a larger field of neighbors influencing the Q-value prediction for a particular cell, as the information propagates longer. Note that the output of this recurrent computation, $\hat{Q}^{(k)}$, will be a 3-D tensor. However, since we need a policy only for the agent's current location, we use an appropriate selection function $\delta_s$, which reduces this Q-value map to a single set of action values for the agent's location:
+% \begin{align}
+% Q_{vin}(s, a, Z; \Theta_1) &=  \delta_s (\hat{Q}^{(k)} (s, a, Z))
+% \end{align}
+
+% \paragraph{Final prediction} 
+% Games follow a complex dynamics which is challenging to capture precisely, especially longer term. VINs approximate the dynamics implicitly via learned convolutional operations. It is thus likely that the estimated $Q_{vin}$ values are most helpful for short-term planning that corresponds to a limited number of iterations $k$. We need to complement these local Q-values with estimates based on a more global view.
+
+% Following the VIN specification in \cite{tamar2016value}, our architecture also contains a model-free component, implemented as a deep Q-network (DQN)~\cite{mnih2015dqn}. This network also provides a prediction of a Q-value, $Q_{r} (s,a,Z; \Theta_2)$, which is combined with $Q_{vin}$ using a composition function $g$\footnote{Although $g$ can also be learned, we use component-wise addition in our experiments.}: 
+% \begin{dmath}
+% Q(s, a, Z; \Theta) = g(Q_{vin}(s, a, Z; \Theta_1), Q_{r}(s, a, Z; \Theta_2))
+% \label{eq:final-q}
+% \end{dmath}
+% % In our experiments, we use simple component-wise addition for $g$.
+% The fusion of our model components enables our agent to establish the connection between input text descriptions, represented as vectors, and the environment's transitions and rewards, encoded as VIN parameters . In a new domain, the model can produce a reasonable policy using corresponding text, even before receiving any interactive feedback.
+
+% \subsection{Parameter learning}
+% Our entire model is end-to-end differentiable.We perform updates derived from the Bellman equation~\cite{sutton1998introduction}:
+% \begin{dmath*}
+% 	{Q_{i+1}(s,a, Z) = \mathrm{E}[r + \gamma \max_{a'} Q_i(s',a', Z) \mid s, a]} 
+% \label{eq:bellman-update}
+% \end{dmath*}
+% where the expectation is over all transitions from state $s$ with action $a$ and $i$ is the update number. To learn our parametrized Q-function (the result of Eq.~\ref{eq:final-q}), we can use backpropagation through the network to minimize the following loss:
+% \begin{dmath}
+% 	{\mathcal{L}_i(\Theta_i) = \mathrm{E}_{\hat{s},\hat{a}}  [ (y_i - Q(\hat{s}, \hat{a}, Z ; \Theta_i))^2 ]}
+% \label{eq:loss}
+% \end{dmath}
+% where $ {y_i = r + \gamma \max_{a'} Q (s',a', Z; \Theta_{i-1})}$ is the target Q-value with parameters $\Theta_{i-1}$ fixed from the previous iteration.  We employ an experience replay memory $\mathcal{D}$ to store transitions~\cite{mnih2015dqn}, and periodically perform updates with random samples from this memory. We use an $\epsilon$-greedy policy~\cite{sutton1998introduction} for exploration.  
+
+%  \begin{algorithm}[t]
+% \small
+% \caption{\textsc{Multitask\_Train ($\mathcal{E}$)}}
+% \label{alg:train}
+% \begin{algorithmic}[1]
+% % \State \textbf{Input:} Set of environments $\mathcal{E}$
+% \State Initialize parameters $\Theta$ and experience replay $\mathcal{D}$
+% \For {$ k = 1,M $}  \Comment{New episode}
+% 	\State Choose next environment $E_k \in \mathcal{E}$
+% 	\State Initialize $E_k$; get start state $s_1 \in S_k$	
+% 	\For {$ t = 1, N $}   \Comment{New step}
+%     	\State Select $a_t \sim \textsc{eps-greedy}(s_t, Q_\Theta, \epsilon)$		
+% 		\State Execute action $a_t$, observe reward $r_t$ and new state $s_{t+1}$
+% 		\State $\mathcal{D} = \mathcal{D} \cup (s_t, a_t, r_t, s_{t+1}, Z_k)$
+% 		\State Sample mini batch $(s_j, a_j, r_j, s_{j+1}, Z_k) \sim \mathcal{D}$
+% 		\State Do gradient descent on loss $\mathcal{L}$ to update $\Theta$
+% 		\If { $s_{t+1}$ is terminal}
+% 			\textbf{break}
+% 		\EndIf
+% 	\EndFor
+% \EndFor
+% \State Return $\Theta$
+% \end{algorithmic}
+% \normalsize
+% \end{algorithm}
+
+
+% %  \begin{algorithm}
+% % \small
+% % \caption{\textsc{Transfer}($\mathcal{E}_u, \mathcal{E}_v$)}
+% % \label{alg:transfer}
+% % \begin{algorithmic}[1]
+% % \State Initialize parameters $\Theta_u$ randomly
+% % \State Initialize all source environments $\mathcal{E}_u$
+% % \State $\Theta_u$ = \textsc{Multitask\_Train}($\mathcal{E}_u, \Theta_u$)
+% % \State Initialize all target environments $\mathcal{E}_v$
+% % \State $\Theta_v$ = \textsc{Multitask\_Train}($\mathcal{E}_v, \Theta_u$)
+% % \end{algorithmic}
+% % \normalsize
+% % \end{algorithm}
+
+% \subsection{Transfer procedure}
+% The traditional transfer learning scenario considers a single task in both source and target environments. To better test generalization and robustness of our methods, we consider transfer from \emph{multiple} source tasks to \emph{multiple} target tasks.
+% We first train a model to achieve optimal performance on a set of tasks in the source domain. All model parameters ($\Theta$) are shared between the tasks. The agent receives one episode at a time from each environment in a round-robin fashion, along with the corresponding text descriptions.  Algorithm~\ref{alg:train} details this multi-task training procedure.
+
+% After training converges, we use the learned parameters to initialize a model for the target tasks. All parameters of the VIN are replicated, while most weights of the representation generator are reused. Specifically, previously seen objects and words obtain their learned entity-specific embeddings ($v_o$), whereas vectors for new objects and unseen words in the target tasks are initialized randomly. All parameters are then fine-tuned on the target tasks, again with episodes sampled in a round-robin fashion.
+
+% 
+
+
+
+
+

@@ -1,0 +1,716 @@
+\chapter{Video Propagation Networks}
+\label{chap:vpn}
+
+In this chapter, we leverage the learnable bilateral filters developed in the
+previous chapter, and develop a novel neural network architecture for inference
+in video data. We focus on the task of propagating information across video
+frames. Standard CNNs are poor candidates for filtering video data.
+Standard spatial CNNs have fixed receptive fields whereas the video content
+changes differently in different videos depending on the type of scene and camera
+motion. So, filters with video adaptive receptive fields are better candidates
+for video filtering.
+
+Based on this observation, we adapt the bilateral convolution layers (BCL) proposed
+in the previous chapter for filtering video data.
+By stacking several BCL and standard spatial convolutional
+layers, we develop a neural network architecture for video information propagation
+which we call `Video Propagation Network' (VPN). We evaluate VPN on different
+tasks of video object segmentation and semantic video segmentation
+and show increased performance comparing to the best previous task-specific methods,
+while having favorable runtime. Additionally we demonstrate our approach on an example
+regression task of propagating color in a grayscale video.
+
+\section{Introduction}
+
+% Why information propagation in videos?
+We focus on the problem of propagating structured information across video frames in this chapter.
+~This problem appears in many forms (e.g., semantic segmentation or depth estimation) and is a pre-requisite for many applications.~An example instance is shown in Fig.~\ref{fig:illustration-vpn}.
+Given an accurate object mask for the first frame, the problem is to propagate this mask forward
+through the entire video sequence.~Propagation of semantic information through time and video
+colorization are other problem instances.
+
+% What are the main challenges?
+Videos pose both technical and representational challenges.
+The presence of scene and camera motion lead to the difficult association problem of optical flow.
+Video data is computationally more demanding than static images. A naive per-frame approach would scale at least linear with frames.
+These challenges complicate the use of standard convolutional neural networks (CNNs) for video processing.
+As a result, many previous works for video propagation use slow optimization based techniques.
+
+
+\begin{figure}[t!]
+\begin{center}
+\centerline{\includegraphics[width=\columnwidth]{figures/teaser_network.pdf}}
+  \mycaption{Video Propagation with VPNs} {The end-to-end trained VPN network is composed
+  of a bilateral network followed by a standard spatial network and can be used for
+  propagating information across frames. Shown here is an example result
+  of foreground mask from the 1$^{st}$ frame to other video frames.}
+  \label{fig:illustration-vpn}
+  \vspace{-0.3cm}
+\end{center}
+\end{figure}
+
+% What we do in this work? And also briefly about VPNs
+We propose a generic neural network architecture that propagates information across
+video frames. The main innovation is the use of image adaptive convolutional operations that automatically
+adapt to
+the video stream content.~This allows the network to adapt to the changing content of the video stream.
+It can be applied to several types of information, e.g. labels, colors, etc. and runs online, that is, only requiring current and previous frames.
+
+% Briefly about VPNs
+Our architecture is composed of two components (see Fig.~\ref{fig:illustration-vpn}).
+A temporal \textit{bilateral network} that performs image-adaptive spatio-temporal dense filtering.
+This part allows to connect densely all pixels from current and previous frames and to propagate associated pixel information to the current frame.
+The bilateral network allows the specification of a metric between video pixels and allows a straight-forward integration of temporal information.
+This is followed by a standard \textit{spatial CNN} on the filter output to refine and predict for the present video frame.
+We call this combination a \textit{Video Propagation Network (VPN)}.
+In effect we are combining a filtering technique with rather small spatial CNNs which leads to a favorable runtime compared to many previous approaches.
+
+VPNs have the following suitable properties for video processing:
+
+\vspace{-0.5cm}
+\paragraph{General applicability:} VPNs can be used for propagating any
+type of information content i.e., both discrete
+(e.g., semantic labels) and continuous (e.g. color) information across video frames.
+\vspace{-0.5cm}
+\paragraph{Online propagation:} The method needs no future frames
+and so can be used for online video analysis.
+\vspace{-0.5cm}
+\paragraph{Long-range and image adaptive:} VPNs can efficiently handle a large
+number of input frames and are adaptive to the video.
+\vspace{-0.5cm}
+\paragraph{End-to-end trainable:} VPNs can be trained end-to-end, so they
+can be used in other deep network architectures.
+\vspace{-0.5cm}
+\paragraph{Favorable runtime:} VPNs have favorable runtime in comparison to several current
+best methods, also making them amenable for learning with
+large datasets.
+
+Empirically we show that VPNs, despite being generic,
+perform better or on-par with current best approaches on video object segmentation
+and semantic label propagation while being faster.
+VPNs can easily be integrated into sequential per-frame approaches
+and require only a small fine-tuning step that can be performed separately.
+
+\section{Related Work}
+\label{sec:related}
+
+The literature on propagating information across video frames contains a vast and varied number of approaches.
+Here, we only discuss those works that are related to our technique and applications.
+
+\vspace{-0.3cm}
+\paragraph{General propagation techniques}
+Techniques for propagating content across
+image or video pixels are predominantly
+optimization based or filtering techniques. Optimization
+based techniques typically formulate the propagation as an energy minimization problem
+on a graph constructed across video pixels or frames.
+A classic example is the color propagation technique from~\cite{levin2004colorization} which uses
+graph structure that encodes prior knowledge about pixel colors in a local neighborhood.
+Although efficient closed-form
+solutions~\cite{levin2008closed} exists for certain scenarios,
+optimization tends to be slow due to either large graph structures for videos and/or the use of
+complex connectivity resulting in the use of iterative optimization schemes. Fully-connected conditional
+random fields (CRFs)~\cite{krahenbuhl2012efficient} open a way for incorporating dense
+and long-range pixel connections while retaining fast inference.
+
+Filtering techniques~\cite{kopf2007joint,chang2015propagated,he2013guided} aim to propagate
+information with the use of image or video filters resulting in fast runtimes compared
+to optimization techniques. Bilateral filtering~\cite{aurich1995non,tomasi1998bilateral} is
+one of the popular filters for long-range information propagation.
+We have already discussed bilateral filtering and its generalization in the previous
+chapter. A popular application, that is also discussed in previous chapter, is joint
+bilateral up-sampling~\cite{kopf2007joint} that up-samples a low-resolution signal with
+the use of a high-resolution guidance image.
+Chapter~\ref{chap:bnn} and the works
+of~\cite{li2014mean,domke2013learning,zheng2015conditional,schwing2015fully,barron2015bilateral}
+showed that one can back-propagate through the bilateral filtering operation for
+learning filter parameters (Chapter~\ref{chap:bnn}) or doing optimization in the bilateral
+space~\cite{barron2015bilateral,barron2015defocus}.
+Recently, several works proposed to do upsampling
+in images by learning CNNs that mimics edge-aware filtering~\cite{xu2015deep} or
+that directly learns to up-sample~\cite{li2016deep,hui2016depth}.
+Most of these works are confined to images and are either not extendible or computationally
+too expensive for videos. We leverage some of these previous works and propose a
+scalable yet robust neural network based approach for video content propagation.
+
+\vspace{-0.3cm}
+\paragraph{Video object segmentation}
+
+Prior work on video object segmentation can be broadly categorized into two types:
+Semi-supervised methods that require manual annotation to define what is foreground
+object and unsupervised methods that does segmentation completely automatically.
+Unsupervised techniques such as
+~\cite{faktor2014video,li2013video,lee2011key,papazoglou2013fast,wang2015saliency,
+zhang2013video,taylor2015causal,dondera2014interactive}
+use some prior information about the foreground objects such as
+distinctive motion, saliency etc. And, they typically fail if these
+assumptions do not hold in a video.
+
+In this work, we focus on the semi-supervised task of propagating the foreground
+mask from the first frame to the entire video. Existing works
+predominantly use graph-based optimization frameworks that perform graph-cuts~\cite{boykov2001fast,
+boykov2001interactive,shi2000normalized} on video data.
+Several of these works~\cite{reso2014interactive,
+li2005video,price2009livecut,wang2005interactive,kohli2007dynamic,jain2014supervoxel}
+aim to reduce the complexity of graph structure with
+clustering techniques such as spatio-temporal superpixels and
+optical flow~\cite{tsaivideo}.
+Another direction was to estimate correspondence between different frame
+pixels~\cite{agarwala2004keyframe,bai2009video,lang2012practical} by using
+nearest neighbor fields~\cite{fan2015jumpcut} or optical flow~\cite{chuang2002video}
+and then refine the propagated masks with the use of local classifiers.
+Closest to our technique are the works of~\cite{perazzi2015fully} and~\cite{marki2016bilateral}.
+~\cite{perazzi2015fully} proposed to use fully-connected CRF over the
+refined object proposals across the video frames.~\cite{marki2016bilateral} proposed a
+graph-cut in the bilateral space. Our approach is similar in the regard that we also
+use a bilateral space embedding. Instead of graph-cuts, we learn
+propagation filters in the high-dimensional bilateral space with CNNs.
+This results in a more generic architecture and allows integration into other deep learning frameworks.
+
+Two contemporary works~\cite{caelles2016one,khoreva2016learning} proposed CNN based
+approaches for video object segmentation. Both works rely on fine-tuning a deep network
+using the first frame annotation of a given test sequence. This could potentially result
+in overfitting to the background.
+In contrast, the proposed approach relies only on offline training and thus can be easily adapted
+to different problem scenarios.
+
+\vspace{-0.3cm}
+\paragraph{Semantic video segmentation}
+Earlier methods such as~\cite{brostow2008segmentation,sturgess2009combining} use structure from motion
+on video frames to compute geometrical and/or motion features.
+More recent works~\cite{ess2009segmentation,chen2011temporally,de2012line,miksik2013efficient,tripathi2015semantic,
+kundu2016feature} construct large graphical models on videos and enforce temporal consistency across frames. \cite{chen2011temporally} used dynamic temporal links in their CRF energy formulation.
+\cite{de2012line} proposes to use Perturb-and-MAP random field model with spatio-temporal energy terms
+based on Potts model and \cite{miksik2013efficient} propagate predictions across time by learning
+a similarity function between pixels of consecutive frames.
+
+In the recent years, there is a big leap in the performance of semantic image
+segmentation~\cite{long2014fully,chen2014semantic} with the use of CNNs but mostly
+applied to images. Recently,~\cite{shelhamer2016clockwork}
+proposed to retain the intermediate CNN representations while sliding the image based
+CNN across the frames. Another approach, which inspired our work, is to take unary
+predictions from CNN and then propagate semantic information across the frames. A recent
+prominent approach in this direction is of~\cite{kundu2016feature} which proposes
+a technique for optimizing feature spaces for fully-connected CRF.
+
+\section{Video Propagation Networks}
+\label{sec:vpn}
+
+We aim to adapt the bilateral filtering operation to predict information forward in time, across video frames.
+Formally, we work on a sequence of $n$ (color or grayscale) images $\obs = \{\obs_1, \obs_2, \cdots, \obs_n\}$
+and denote with $\target = \{\target_1, \target_2, \cdots, \target_n\}$ a sequence of outputs, one per frame.
+Consider as an example, a sequence $\target_1,\ldots,\target_n$ of foreground masks for a moving object in the
+scene. Our goal is to develop an online propagation method, that is, a function that has no access to the future frames.
+Formally we predict $\target_t$, having observed the video up to frame $t$ and possibly previous $\target_{1,\cdots,t-1}$
+\begin{equation}
+\mathcal{F}(\target_{t-1}, \target_{t-2}, \cdots; \obs_t, \obs_{t-1}, \obs_{t-2},\cdots) = \target_t.
+\end{equation}
+
+\begin{figure*}[t!]
+\begin{center}
+\centerline{\includegraphics[width=\textwidth]{figures/net_illustration.pdf}}
+  \mycaption{Computation Flow of Video Propagation Network} {Bilateral networks (BNN) consist of a series of bilateral filterings interleaved with ReLU non-linearities. The filtered information from BNN is then passed into a spatial network (CNN) which refines the features with convolution layers interleaved with ReLU
+  non-linearities, resulting in the prediction for the current frame.}
+  \label{fig:net_illustration}
+\end{center}
+\end{figure*}
+
+
+If training examples $(\obs,\target)$ with full or partial knowledge of $\target$ are available, it is possible to learn $\mathcal{F}$ and for a complex and unknown relationship between input and output, a deep CNN is a natural design
+choice. However, any learning based method has to face the main challenge: the scene and camera motion and its
+effect on $\target$. Since no motion in two different videos is the same, fixed-sized static receptive fields of CNN units are insufficient.
+We propose to resolve this with video-adaptive convolutional component, an adaption of the bilateral filtering to videos.
+Our Bilateral Network (Section~\ref{sec:bilateralnetwork}) has a connectivity that adapts to video sequences, its output is then fed into a common Spatial Network (Section~\ref{sec:spatialcnn}) that further refines the desired output.
+The combined network layout of this Video Propagation Network is depicted in Fig.~\ref{fig:net_illustration}.
+It is a sequence of learnable bilateral and spatial filters that is efficient, trainable end-to-end and adaptive to the video input.
+
+\begin{figure*}[t!]
+\begin{center}
+  \centerline{\includegraphics[width=\textwidth]{figures/permutohedral_illustration_2.pdf}}
+    \mycaption{Schematic of Fast Bilateral Filtering for Video Processing}
+    {Mask probabilities from previous frames $V_{1,\cdots,t-1}$ are splatted on to the
+    lattice positions defined by the image features $f_{I_{1}},f_{I_2},\cdots,f_{I_{t-1}}$.
+    The splatted result is convolved with a $1 \times 1$ filter $B$, and the filtered
+    result is sliced back to the original image space to get $V_t$ for the present frame.
+    Input and output need not be $V_t$, but can also be an intermediate neural network representation.
+    $B$ is learned via back-propagation through these operations.}
+    \label{fig:filter_illustration}
+\end{center}
+\end{figure*}
+
+\subsection{Bilateral Network (BNN)}\label{sec:bilateralnetwork}
+In this section, we describe the extension of the learnable bilateral filtering, proposed in
+Chapter~\ref{chap:bnn} to video data.
+Several properties of bilateral filtering make it a perfect candidate for information propagation in videos.
+In particular, our method is inspired by two main ideas that we extend in this work: joint bilateral up-sampling~\cite{kopf2007joint} and learnable bilateral filters (Chapter~\ref{chap:bnn}). Although,
+bilateral filtering has been used for filtering video data before~\cite{paris2008edge},
+its use has been limited to fixed filter weights (say, Gaussian).
+
+{\bf Fast Bilateral Up-sampling across Frames} The idea of joint bilateral up-sampling~\cite{kopf2007joint}
+is to view up-sampling as a filtering operation.
+A high resolution guidance image is used to up-sample a low-resolution result.
+In short, a smaller number of input points $\target_i$ and the corresponding features $\f_i$
+are given $\target_i,\f_i; i=1,\ldots,N_{in}$, for example a segmentation result $\target_i$ at a lower resolution.
+This is then scaled to a larger number of output points $\f_j;j=1,\ldots,N_{out}$ using the
+bilateral filtering operation, that is to compute the following bilateral filtering equation:
+
+\begin{equation}
+  \target'_i = \sum_{j=1}^n \bw_{\f_i,\f_j} \target_j
+  \label{eq:bilateral2}
+\end{equation}
+
+where the sum runs over all $N_{in}$ points and the output is computed for all $N_{out}$ positions.
+We will use this idea to propagate content from previous frames to the current frame (all of which have the same dimensions), using the current frame as a guidance image.
+This is illustrated in Fig.~\ref{fig:filter_illustration}. We take all previous frame results $\target_{1,\cdots,t-1}$
+ and splat them into a lattice using the features computed on video frames $\obs_{1,\cdots,t-1}$.
+A filtering (described below) is applied to every lattice point and the result is then sliced back using the
+current frame $\obs_t$.
+This result need not be the final $\target_t$, in fact we compute a filter bank of responses and continue with further
+processing as will be discussed.
+
+For videos, we need to extend bilateral filtering to temporal data, and there are two natural choices.
+First, one can simply attach a frame index $t$ as an additional time dimension to the input data, yielding a six dimensional feature vector $\f=(x,y,r,g,b,t)^{\top}$ for every pixel in every frame.
+The summation in Eq.~\ref{eq:bilateral2} now runs over \emph{all} previous frames and pixels.
+Imagine a video where an object moves to reveal some background.
+Pixels of the object and background will be close spatially $(x,y)$ and temporally $(t)$ but likely be of different color $(r,g,b)$.
+Therefore they will have no strong influence on each other (being splatted to distant positions in the six-dimensional bilateral space).
+In summary, one can understand the filter to be adaptive to color changes across frames, only pixels that are static and have similar color have a strong influence on each other (end up nearby in the lattice space).
+The second possibility is to use optical flow. If the perfect flow is available, the video frames could be warped into a common frame of reference. This would resolve the corresponding problem and make information propagation much easier.
+We can make use of an optical flow estimate by warping pixel positions $(x,y)$ by their displacement vector $(u_x,u_y)$ to $(x+u_x,y+u_y)$.
+
+Another property of permutohedral filtering that we exploit
+is that the \emph{inputs points need not lie on a regular grid} since the filtering
+is done in the high-dimensional lattice. Instead of splatting millions of pixels on to the
+lattice, we randomly sample or use superpixels and perform filtering using these sampled
+points as input to the filter. In practice, we observe that this results in big computational
+gains with minor drop in performance (more in Sec.~\ref{sec:videoseg}).
+
+{\bf Learnable Bilateral Filters} The property of propagating information forward using a guidance image through filtering solves the problem of pixel association.
+But a Gaussian filter may be insufficient and further, we would like to increase the capacity by using a filter bank instead of a single fixed filter.
+We propose to use the technique proposed in previous chapter
+to learn the filter values in the permutohedral lattice using back-propagation.
+
+The process works as follows.
+A input video is used to determine the positions in the bilateral space to splat the input points
+$\target(i)\in\mathbb{R}^D$ i.e. the features $\f$ (e.g. $(x,y,r,g,b,t)$) define the splatting matrix $S_{splat}$.~This leads to a number of vectors $\target_{splatted} = S_{splat}\target$, that lie on the permutohedral lattice, with dimensionality $\target_{splatted}\in\mathbb{R}^D$.
+In effect, the splatting operation groups points that are close together, that is, they have similar $\f_i,\f_j$.
+All lattice points are now filtered using a filter bank $B\in\mathbb{R}^{F\times D}$ which results in $F$ dimensional vectors on the lattice points.
+These are sliced back to the $N_{out}$ points of interest (present video frame).
+The values of $B$ are learned by back-propagation.
+General parameterization of $B$ from previous chapter allows to have
+any neighborhood size for the filters. Since constructing the neighborhood structure in
+high-dimensions is time consuming, we choose to use $1 \times 1$ filters for speed reasons.
+This makes up one \emph{Bilateral Convolution Layer (BCL)} which we will stack and concatenate to form a Bilateral Network. See Fig.~\ref{fig:filter_illustration} for an illustration of a BCL.
+
+{\bf BNN Architecture} The Bilateral Network (BNN) is illustrated in the green box of
+Fig.~\ref{fig:net_illustration}.
+The input is a video sequence $\obs$ and the corresponding predictions $\target$ up to frame
+$t$. Those are filtered using two BCLs with $32$ filters each.
+For both BCLs, we use the same features $\f$ but scale them with different diagonal matrices
+$\f_a=\Lambda_a\f,\f_b=\Lambda_b\f$. The feature scales are found by cross-validation.
+The two $32$ dimensional outputs are concatenated, passed through a ReLU non-linearity and passed to a
+second layer of two separate BCL filters that uses same feature spaces $\f_a,\f_b$.
+The output of the second filter bank is then reduced using a $1\times 1$ spatial filter (C-1) to map to
+the original dimension of $\target$.
+We investigated scaling frame inputs with an exponential time decay and found that, when processing
+frame $t$, a re-weighting with $(\alpha \target_{t-1}, \alpha^2 \target_{t-2}, \alpha^3 \target_{t-3} \cdots)$ with
+$0\le\alpha\le 1$ improved the performance a little bit.
+
+In the experiments, we also included a simple BNN variant,
+where no filters are applied inside the permutohedral space, just splatting and slicing
+with the two layers $BCL_a$ and $BCL_b$ and adding the results.
+We will refer to this model as \emph{BNN-Identity},
+it corresponds to an image adaptive smoothing of the inputs $\target$.
+We found this filtering to have a positive effect and include it as a baseline in our experiments.
+
+\vspace{-0.1cm}
+\subsection{Spatial Network}\label{sec:spatialcnn}
+
+The BNN was designed to propagate the information from the previous frames, respecting the scene and object motion.
+We then add a small spatial CNN with 3 layers, each with $32$ filters of size $3\times 3$,
+interleaved with ReLU non-linearities.
+The final result is then mapped to the desired output of $\target_t$ using a $1\times 1$
+convolution.
+The main role of this spatial CNN is to refine the information in frame $t$.
+Depending on the problem and the size of the available training data, other network designs are
+conceivable. We use the same network architecture shown in Fig.~\ref{fig:net_illustration}
+for all the experiments to demonstrate the generality of VPNs.
+
+\vspace{-0.1cm}
+\section{Experiments}
+\label{sec:exps}
+
+We evaluated VPN on three different propagation tasks: foreground masks, semantic
+labels and color information in videos. Our implementation runs in Caffe~\cite{jia2014caffe} using standard settings. We used Adam~\cite{kingma2014adam} stochastic optimization for training VPNs, multinomial-logistic loss for label propagation networks and Euclidean loss for training
+color propagation networks. Runtime computations were performed using a
+Nvidia TitanX GPU and a 6 core Intel i7-5820K CPU clocked at 3.30GHz machine.
+We will make available all the code and experimental results.
+
+\subsection{Video Object Segmentation}
+\label{sec:videoseg}
+
+The task of class-agnostic video object segmentation aims to segment foreground objects in
+videos. Since the semantics of the foreground object is not pre-defined, this problem is
+usually addressed in a semi-supervised manner. The goal is to propagate a
+given foreground mask of the first frame to the entire video frames.
+Object segmentation in videos is useful for several high level tasks such
+as video editing, summarization, rotoscoping etc.
+
+\vspace{-0.5cm}
+\paragraph{Dataset} We use the recently published DAVIS dataset~\cite{Perazzi2016}
+for experiments on this task. The
+DAVIS dataset consists of 50 high-quality (1080p resolution) unconstrained videos
+with number of frames in each video ranging from 25 to 104. All the frames come with
+high-quality per-pixel annotation of the foreground object. The videos for this
+dataset are carefully chosen to contain motion blur, occlusions, view-point changes
+and other occurrences of object segmentation challenges.
+For robust evaluation and to get results on all the dataset videos,
+we evaluate our technique using 5-fold cross-validation.
+We randomly divided the data into
+5 folds, where in each fold, we used 35 images for training, 5 for validation and
+the remaining 10 for the testing. For the evaluation, we used the 3 metrics that
+are proposed in~\cite{Perazzi2016}: Intersection over Union (IoU) score, Contour
+accuracy ($\mathcal{F}$) score and temporal instability ($\mathcal{T}$) score. The widely
+used IoU score is defined as $TP/(TP+FN+FP)$, where TP: True positives; FN: False negatives
+and FP: False positives. Please refer to~\cite{Perazzi2016} for the definition of the contour
+accuracy and temporal instability scores. We are aware of some other datasets for
+this task such as JumpCut~\cite{fan2015jumpcut} and
+SegTrack~\cite{tsai2012motion}, but we note that the number of videos in these datasets is too
+small for a learning based approach.
+
+\begin{table}[t]
+    % \scriptsize
+    % \fontsize{5}{3.2}\selectfont
+    \centering
+    \begin{tabular}{p{3.0cm}>{\centering\arraybackslash}p{1.2cm}>{\centering\arraybackslash}
+      p{1.2cm}>{\centering\arraybackslash}p{1.2cm}>{\centering\arraybackslash}p{1.2cm}>{\centering\arraybackslash}p{1.2cm}
+      >{\centering\arraybackslash}p{0.6cm}}
+        \toprule
+        \scriptsize
+        & Fold-1 & Fold-2 & Fold-3 & Fold-4 & Fold-5 & All\\ [0.1cm]
+        \midrule
+        BNN-Identity & 56.4 & 74.0 & 66.1 & 72.2 & 66.5 & 67.0 \\
+        VPN-Stage1 & 58.2 & 77.7 & 70.4 & 76.0 & 68.1 & 70.1 \\
+        VPN-Stage2 & \textbf{60.9} & \textbf{78.7} & \textbf{71.4} & \textbf{76.8} & \textbf{69.0} & \textbf{71.3} \\
+
+        \bottomrule
+        \\
+    \end{tabular}
+    \mycaption{5-Fold Validation on DAVIS Video Segmentation Dataset}
+    {Average IoU scores for different models on the 5 folds.}
+    \label{tbl:davis-folds}
+\end{table}
+
+\begin{table}[t]
+    % \scriptsize
+    % \fontsize{5}{3.2}\selectfont
+    \centering
+    \begin{tabular}{p{3.0cm}>{\centering\arraybackslash}p{1.2cm}>{\centering\arraybackslash}
+      p{1.2cm}>{\centering\arraybackslash}p{1.2cm}>{\centering\arraybackslash}p{2.3cm}}
+      \toprule
+      \scriptsize
+      & \textit{IoU$\uparrow$} & $\mathcal{F}\uparrow$ & $\mathcal{T}\downarrow$ & \textit{Runtime}(s) \\ [0.1cm]
+      \midrule
+      BNN-Identity & 67.0 & 67.1 & 36.3 & 0.21\\
+      VPN-Stage1 & 70.1 & 68.4 & 30.1 & 0.48\\
+      VPN-Stage2 & 71.3 & 68.9 & 30.2 & 0.75\\
+      \midrule
+      \multicolumn{4}{l}{\emph{With pre-trained models}} & \\
+      DeepLab & 57.0 & 49.9 & 47.8 & 0.15 \\
+      VPN-DeepLab & \textbf{75.0} & \textbf{72.4} & 29.5 & 0.63 \\
+      \midrule
+      OFL~\cite{tsaivideo} & 71.1 & 67.9 & 22.1 & $>$60\\
+      BVS~\cite{marki2016bilateral} & 66.5 & 65.6 & 31.6 &  0.37\\
+      NLC~\cite{faktor2014video} & 64.1 & 59.3 & 35.6 & 20\\
+      FCP~\cite{perazzi2015fully} & 63.1 & 54.6 & 28.5 & 12\\
+      JMP~\cite{fan2015jumpcut} & 60.7 & 58.6 & \textbf{13.2} & 12\\
+      HVS~\cite{grundmann2010efficient} & 59.6 & 57.6 & 29.7 & 5\\
+      SEA~\cite{ramakanth2014seamseg} & 55.6 & 53.3 & 13.7 & 6\\
+      \bottomrule
+        \\
+    \end{tabular}
+    \mycaption{Results of Video Object Segmentation on DAVIS dataset}
+    {Average IoU score, contour accuracy ($\mathcal{F}$),
+    temporal instability ($\mathcal{T}$) scores, and average runtimes (in seconds)
+    per frame for different VPN models along with recent published
+    techniques for this task. VPN runtimes also include superpixel computation (10ms).
+    Runtimes of other methods are taken from~\cite{marki2016bilateral,perazzi2015fully,tsaivideo}
+    and only indicative and are not directly comparable to our runtimes. Runtime of VPN-Stage1 includes
+    the runtime of BNN-Identity which is in-turn included in the runtime of VPN-Stage2. Runtime
+    of VPN-DeepLab model includes the runtime of DeepLab.}
+    \label{tbl:davis-main}
+    \vspace{-0.7cm}
+\end{table}
+
+\begin{figure}[t!]
+\begin{center}
+  \centerline{\includegraphics[width=0.5\columnwidth]{figures/acc_points_plots.pdf}}
+    \mycaption{Random Sampling of Input Points vs. IoU}
+    {The effect of randomly sampling points from input video frames on object
+    segmentation IoU of BNN-Identity on DAVIS dataset.
+    The points sampled are out of $\approx$2 million points from the previous 5 frames.}
+    \label{fig:acc_vs_points}
+\end{center}
+\vspace{-0.8cm}
+\end{figure}
+
+\begin{figure}[th!]
+\begin{center}
+  \centerline{\includegraphics[width=0.65\columnwidth]{figures/video_seg_visuals.pdf}}
+    \mycaption{Video Object Segmentation}
+    {Shown are the different frames in example videos with the corresponding
+    ground truth (GT) masks, predictions from BVS~\cite{marki2016bilateral},
+    OFL~\cite{tsaivideo}, VPN (VPN-Stage2) and VPN-DLab (VPN-DeepLab) models.}
+    \label{fig:video_seg_visuals}
+\end{center}
+\vspace{-1.0cm}
+\end{figure}
+
+\vspace{-0.5cm}
+\paragraph{VPN and Results} In this task, we only have access to foregound mask
+for the first frame $V_1$.
+For the ease of training VPN, we obtain initial set of predictions with
+\emph{BNN-Identity}. We sequentially apply \emph{BNN-Identity} at each frame
+and obtain an initial set of foreground masks for the entire video.
+These BNN-Identity propagated masks are then used as inputs to train a VPN to
+predict the refined masks at each frame. We refer to this
+VPN model as \emph{VPN-Stage1}. Once VPN-Stage1 is trained, its refined training
+mask predictions are in-turn used as inputs to train another VPN model which we
+refer to as \emph{VPN-Stage2}. This resulted in further refinement of foreground
+masks. Training further stages did not result in any improvements.
+
+Following the recent work of~\cite{marki2016bilateral} on video object segmentation,
+we used scaled features $\f=(x,y,Y,Cb,Cr,t)$ with YCbCr color features for bilateral filtering.
+To be comparable with the one of the fastest state-of-the-art technique~\cite{marki2016bilateral},
+we do not use any optical flow information. First, we analyze the performance of BNN-Identity by changing the number of randomly sampled input points. Figure~\ref{fig:acc_vs_points} shows how the segmentation IoU changes with the increase
+in the number of sampled points (out of 2 million points) from the previous frames.
+The IoU levels out after sampling 25\% of points. For
+further computational efficiency, we used superpixel sampling instead of random
+sampling. Usage of superpixels reduced the IoU slightly (0.5\%), while reducing the
+number of input points by a factor of 10 in comparison to a large number
+of randomly sampled points. We used 12000 SLIC~\cite{achanta2012slic} superpixels from each frame
+computed using the fast GPU implementation from~\cite{gSLICr_2015}. For predictions
+at each frame, we input mask probabilities of previous 9 frames into VPN as we observe
+no significant improvements with more frames. We set $\alpha$ to $0.5$ and the
+feature scales for bilateral filtering are presented in Tab.~\ref{tbl:parameters_supp}.
+
+Table~\ref{tbl:davis-folds} shows the IoU scores for each of the 5 folds and
+Tab.~\ref{tbl:davis-main} shows the overall scores and runtimes of different VPN
+models along with the best performing segmentation techniques.
+The performance improved consistently across all 5 folds with the addition of new VPN stages.~BNN-Identity already performed reasonably well.
+And with 1-stage and 2-stage VPNs, we outperformed the present fastest
+BVS method~\cite{marki2016bilateral} by a significant margin on all
+the performance measures of IoU, contour accuracy and temporal instability scores,
+while being comparable in runtime. We perform marginally better than OFL method~\cite{tsaivideo}
+while being at least 80$\times$ faster and OFL relies on optical flow whereas we
+obtain similar performance without using any optical flow.
+~Further, VPN has the advantage of doing online processing
+as it looks only at previous frames whereas BVS processes entire video at once.
+One can obtain better VPN performance with using better superpixels and
+also incorporating optical flow, but this increases runtime as well.
+Figure~\ref{fig:video_seg_visuals} shows some qualitative results and more are present
+in Figs.~\ref{fig:video_seg_pos_supp}. A couple of
+failure cases are shown in Fig.~\ref{fig:video_seg_neg_supp}. Visual results indicate that learned VPN is able to retain foreground masks even with large variations in viewpoint and object size.
+
+\paragraph{Augmenation of Pre-trained Models:} One of the main advantages of the proposed
+VPN architecture is that it is end-to-end trainable and can be easily integrated into
+other deep neural network architectures. To demonstrate this, we augmented VPN architecture
+with standard DeepLab segmentation architecture from~\cite{chen2014semantic}.
+We replaced the last classification layer of DeepLab-LargeFOV model
+from~\cite{chen2014semantic} to output 2 classes (foreground and background)
+in our case and bi-linearly up-sampled the resulting low-resolution probability map to
+the original image dimension. 5-fold fine-tuning of the DeepLab model on DAVIS dataset
+resulted in the IoU of 57.0 and other scores are shown in Tab.~\ref{tbl:davis-main}.
+Then, we combine the VPN and DeepLab models in the following way: The output from
+the DeepLab network and the bilateral network are concatenated and then passed on to the spatial network.
+In other words, the bilateral network propagates label information from previous frames to the present
+frame, whereas the DeepLab network does the prediction for the present frame. The results
+of both are then combined and refined by the spatial network in the VPN architecture.
+We call this `VPN-DeepLab' model. We trained this model end-to-end and observed big
+improvements in performance. As shown in Tab.~\ref{tbl:davis-main}, the VPN-DeepLab
+model has the IoU score of 75.0 and contour accuracy score of 72.4 resulting
+in significant improvements over the published results. Since DeepLab has also fast
+runtime, the total runtime of VPN-DeepLab is only 0.63s which makes this also one of
+the fastest video segmentation systems. A couple of visual results of
+VPN-DeepLab model are shown in Fig.~\ref{fig:video_seg_visuals}
+and more are present in
+Figs.~\ref{fig:video_seg_pos_supp} and~\ref{fig:video_seg_neg_supp}.
+
+\vspace{-0.2cm}
+\subsection{Semantic Video Segmentation}
+
+A semantic video segmentation assigns a semantic label to every video pixel.
+Since the semantics between adjacent frames does not change
+radically, intuitively, propagating semantic information across frames should improve
+the segmentation quality of each frame. Unlike mask propagation in the previous
+section where the ground-truth mask for the first frame is given, we approach
+semantic video segmentation in a fully automatic fashion. Specifically, we start
+with the unary predictions of standard CNNs and use VPN for propagating semantics across the frames.
+
+\begin{table}[t]
+    % \scriptsize
+    % \fontsize{5}{3.2}\selectfont
+    \centering
+    \begin{tabular}{p{5.0cm}>{\centering\arraybackslash}p{2.4cm}>{\centering\arraybackslash}p{3.5cm}}
+        \toprule
+        \scriptsize
+        & \textit{IoU} & \textit{Runtime}(s) \\ [0.1cm]
+        \midrule
+        CNN from ~\cite{yu2015multi} & 65.3 & 0.38\\
+        + FSO-CRF~\cite{kundu2016feature} & 66.1 & \textbf{$>$}10\\
+        + BNN-Identity  & 65.3 & 0.31\\
+        + BNN-Identity-Flow  & 65.5 & 0.33\\
+        + VPN (Ours) & 66.5 & 0.35\\
+        + VPN-Flow (Ours) & \textbf{66.7} & 0.37\\
+        \midrule
+        CNN from ~\cite{richter2016playing} & 68.9 & 0.30\\
+        + VPN-Flow (Ours) & \textbf{69.5} & 0.38\\
+        \bottomrule
+        \\
+    \end{tabular}
+    \mycaption{Results of Semantic Segmentation on the CamVid Dataset}{
+    Average IoU and runtimes (in seconds)
+    per frame of different models on \textit{test} split.
+    Runtimes exclude CNN computations which are shown separately.
+    VPN and BNN-Identity runtimes include superpixel computation which
+    takes up large portion of computation time (0.23s).}
+    \label{tbl:camvid}
+    \vspace{-0.5cm}
+\end{table}
+
+\vspace{-0.4cm}
+\paragraph{Dataset} We use the CamVid dataset~\cite{brostow2009semantic} that contains 4 high
+quality videos captured at 30Hz while the semantically labelled 11-class ground truth is
+provided at 1Hz. While the original dataset comes at a resolution of 960$\times$720, similar to
+previous works~\cite{yu2015multi,kundu2016feature}, we operate on a resolution of 640$\times$480.
+We use the same splits proposed in~\cite{sturgess2009combining} resulting in
+367, 100 and 233 frames with ground-truth for training, validation and testing.
+Following common practice, we report the IoU scores for evaluation.
+
+\begin{figure}[th!]
+\begin{center}
+  \centerline{\includegraphics[width=0.9\columnwidth]{figures/semantic_visuals.pdf}}
+    \mycaption{Semantic Video Segmentation}
+    {Input video frames and the corresponding ground truth (GT)
+    segmentation together with the predictions of CNN~\cite{yu2015multi} and with
+    VPN-Flow.}
+    \label{fig:semantic_visuals}
+\end{center}
+\vspace{-0.7cm}
+\end{figure}
+
+\vspace{-0.5cm}
+\paragraph{VPN and Results} Since we already have CNN predictions for every
+frame, we train a VPN that takes the CNN predictions of previous \emph{and} present
+frames as input and predicts the refined predictions for the present frame.
+We compare with the state-of-the-art CRF approach for this problem~\cite{kundu2016feature}
+which we refer to as `FSO-CRF'. Following~\cite{kundu2016feature}, we also experimented with
+optical flow in our framework and refer that model as \emph{VPN-Flow}.
+We used the fast optical flow method that uses dense inverse search
+~\cite{kroeger2016fast} to compute flows and modify the positional features of previous frames.
+We used the superpixels method of Dollar et al.~\cite{DollarICCV13edges} for this dataset as
+gSLICr~\cite{gSLICr_2015} has introduced artifacts.
+
+We experimented with predictions from two different CNNs:
+One is with dilated convolutions~\cite{yu2015multi} (CNN-1) and another one~\cite{richter2016playing} (CNN-2)
+is trained with the additional data obtained from a video game,
+which is the present state-of-the-art on this dataset.
+For CNN-1 and CNN-2, using 2 and 3 previous frames respectively as input
+to VPN is found to be optimal. Other parameters of the bilateral network are presented
+in Tab.~\ref{tbl:parameters_supp}. Table~\ref{tbl:camvid} shows quantitative results on this dataset.
+Using BNN-Identity only slightly improved the CNN performance whereas training the
+entire VPN significantly improved the CNN performance by over 1.2\% IoU, with both
+VPN and VPN-Flow networks. Moreover, VPN is at least 25$\times$ faster, and simpler to use
+compared to the optimization based FSO-CRF which relies on
+LDOF optical flow~\cite{brox2009large}, long-term tacks~\cite{sundaram2010dense} and
+edges~\cite{dollar2015fast}.
+We further improved the performance of the state-of-the-art CNN~\cite{richter2016playing}
+with the use of VPN-Flow model. Using better optical flow estimation
+might give even better results. Figure~\ref{fig:semantic_visuals} shows some qualitative
+results and more are presented in Fig.~\ref{fig:semantic_visuals_supp}.
+
+\subsection{Video Color Propagation}
+
+We also evaluate VPNs on a different kind of information and
+experimented with propagating color information in a grayscale video. Given the
+color image for the first video frame, the task is to propagate the color to the entire
+video. Note that this task is fundamentally different from automatic colorization of images
+for which recent CNN based based methods have become popular.
+For experiments on this task, we again used the DAVIS dataset~\cite{Perazzi2016} with the
+first 25 frames from each video. We randomly divided the dataset into 30 train,
+5 validation and 15 test videos.
+
+\begin{table}[t]
+    % \scriptsize
+    % \fontsize{5}{3.2}\selectfont
+    \centering
+    \begin{tabular}{p{4.0cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{3.5cm}}
+        \toprule
+        \scriptsize
+        & \textit{PSNR} & \textit{Runtime}(s) \\ [0.1cm]
+        \midrule
+        BNN-Identity & 27.89 & 0.29\\
+        VPN-Stage1 & \textbf{28.15} & 0.90\\
+        \midrule
+        Levin et al.~\cite{levin2004colorization} & 27.11 & 19\\
+        \bottomrule
+        \\
+    \end{tabular}
+    \mycaption{Results of Video Color Propagation}{Average PSNR results and runtimes of
+    different methods for video color propagation on images from DAVIS dataset.}
+    \label{tbl:color}
+    \vspace{-0.5cm}
+\end{table}
+
+\begin{figure}[th!]
+\begin{center}
+  \centerline{\includegraphics[width=0.9\columnwidth]{figures/colorization_visuals.pdf}}
+    \mycaption{Video Color Propagation}
+    {Input grayscale video frames and corresponding ground-truth (GT) color images
+    together with color predictions of Levin et al.~\cite{levin2004colorization} and VPN-Stage1 models.}
+    \label{fig:color_visuals}
+\end{center}
+\vspace{-1.0cm}
+\end{figure}
+
+We work with YCbCr representation of images and propagate CbCr values from previous
+frames with pixel intensity, position and time features as guidance for VPN.
+The same strategy as in object segmentation is used, where an initial
+set of color propagated results was obtained with BNN-Identity and then used to trained a VPN-Stage1 model.
+Training further VPN stages did not improve the performance.
+Table~\ref{tbl:color} shows the PSNR results.
+We use 300K radomly sampled points from previous 3 frames as input
+to the VPN network. We also show a baseline result of~\cite{levin2004colorization} that
+does graph based optimization and uses optical flow. We used fast
+DIS optical flow~\cite{kroeger2016fast} in the baseline method~\cite{levin2004colorization}
+and we did not observe significant differences with using LDOF optical flow~\cite{brox2009large}.
+Figure~\ref{fig:color_visuals} shows a visual result with more
+in Fig.~\ref{fig:color_visuals_supp}.
+From the results,
+VPN works reliably better than~\cite{levin2004colorization} while being 20$\times$ faster.
+The method of~\cite{levin2004colorization} relies heavily on optical flow
+and so the color drifts away with incorrect flow. We observe that our method also bleeds color
+in some regions especially when there are large viewpoint changes.
+We could not compare against recent video color propagation techniques such as
+~\cite{heu2009image,sheng2014video} as their codes are not available online.
+This application shows general applicability of VPNs in propagating different
+kinds of information.
+
+\vspace{-0.3cm}
+\section{Discussion and Conclusions}
+\label{sec:conclusion}
+
+We proposed a fast, scalable and generic neural network based learning approach
+for propagating information across video frames.~The video propagation network uses
+bilateral network for long-range video-adaptive propagation of information from previous
+frames to the present frame which is then refined by a standard spatial network.
+Experiments on diverse tasks show that VPNs, despite being generic, outperformed
+the current state-of-the-art task-specific methods. At the core of our technique
+is the exploitation and modification of learnable bilateral filtering for the use
+in video processing. We used a simple and fixed network architecture for all the
+tasks for showcasing the generality of the approach. Depending on the type of
+problems and the availability of data, using more filters and deeper layers
+would result in better performance. In this work, we manually tuned the feature scales which
+could be amendable to learning. Finding optimal yet fast-to-compute bilateral features for
+videos together with the learning of their scales is an important future
+research direction.

@@ -1,0 +1,73 @@
+\section{Introduction}
+
+Albericio \textit{et al.} proposed the \textit{Cnvlutinn } (\ZF) accelerator~\cite{cnvlutin} which exploits ineffectual activation values to improve performance and energy efficiency over conventional hardware that processes all activations regardless of their value content. \ZF benefits fully-connected and convolutional layers and was evaluated for image classification convolutional neural networks (CNNs). \ZF detects the ineffectual activations at runtime and thus does not require purpose-trained Neural Networks (NNs). This work extends the work of Albericio \textit{et al.}~\cite{cnvlutin} by discussing design alternatives and extensions over the originally proposed design.
+
+Specifically, this work presents the following: 1) Different ways of encoding which activation values are ineffectual. The proposed encodings reduce memory storage and energy overhead compared to the original proposal. 2) An extension where the detection of ineffectual activations is done while fetching them from memory. This design presents no memory  storage and energy overhead as it obviates the needs to store explicit information about which activations are ineffectual. 3) An extension where only the effectual activations are stored in memory which can reduce memory footprint. Finally, 4) this work presents an extension to \ZF that eliminates computations involving not only ineffectual activations but also ineffectual weights. All aforementioned alternatives and extensions do not modify the core execution engines of \ZF. Instead, they require changes only to the \textit{dispatcher} and the \textit{reducer. }In the original \ZF\ the dispatcher  fetches activations and distributes them to the execution units, while the Reducer writes the output activations to memory.  
+\section{Background}
+\subsection{DaDianNao}
+
+
+\ZFL\ was shown to improve performance and energy over  the data-parallel  DaDianNao (DaDN)\ accelerator~\cite{DaDiannao}. This work uses the same baseline for consistency. DaDN processes all activations regardless of their values. DaDN is a massively data-parallel architecture. Every cycle, it processes 16 activation values, and weights from up to 256 filters. Specifically, for each filter, DaDN multiplies the 16 activation values with 16 weights and accumulates the result into a partial output activation. This process repeats until all activation values necessary have been processed for each desired output activation.  
+
+\begin{figure*}[htb!]
+        \centering
+        \includegraphics[width=\textwidth]{figs/nodes}
+   
+\caption{Compute Units. \textbf{a)} DaDianNao NFU. \textbf{b)} \ZF unit. From Albericio \textit{et al.}~\cite{cnvlutin}}
+\label{fig:nodes-overview}
+\end{figure*}
+
+Each \BASE chip, or node, contains 16 \textit{Neural Functional Units (NFUs)}, or simply \textit{units}. Figure~\ref{fig:nodes-overview}(a) shows one such unit. Each cycle the unit processes 16 input activations, 256 weights from 16 filters, and produces 16 partial output activations. In detail, the unit has 16 neuron lanes,\footnote{The original DaDianNao publication uses the terms neuron and synapse instead of the more commonly used terms activations and weights. We maintain their terminology for the phyical structures} 16 filter lanes each with 16 synapse lanes (256 in total), and produces 16 partial sums for 16 output activations. The unit's SB has 256 lanes ($16\times 16$) feeding the 256 synapse lanes, NBin has 16 lanes feeding the 16 neuron lanes, and NBout has 16 lanes. Each neuron lane is connected to 16 synapse lanes, one from each of the 16 filter lanes. The unit has 256 multipliers and 16 17-input adder trees (16 products plus the partial sum from NBout). The number of neuron lanes and filters  per unit are design time parameters that could be changed. All lanes operate in lock-step.\\ \BASE is designed with the intention to minimize off-chip bandwidth and to maximize on-chip compute utilization. The total per cycle weight bandwidth required by all 16 units of a node is 4K weights per cycle, or 8TB/sec assuming a 1GHz clock and 16-bit weights. The total SB capacity is designed to be sufficient to store all weights for the layer being processed (32MB or 2MB per unit) thus avoiding fetching weights from off-chip. Up to 256 filters can be processed in parallel, 16 per unit. All inter-layer activation outputs except for the initial input and final output are also stored in an appropriately sized central eDRAM, or \textit{Neuron Memory} (NM). NM is shared among all 16 units and is 4MB for the original design. The only traffic seen externally is for the initial input, for loading the weights once per layer, and for writing the final output.
+
+Processing starts by reading from external memory: 1) the filter weights, and 2) the initial input. The filter weights are distributed accordingly to the SBs whereas the activation input is fed to the NBins. The layer outputs are stored through NBout to NM and then fed to the NBins for processing the next layer. Loading the next set of weights from external memory can be overlapped with the processing of the current layer as necessary. Multiple nodes can be used to process larger DNNs that do not fit in the NM and SBs available in a single node. NM and the SBs are implemented using eDRAM as the higher the capacity the larger the inputs and filters that can be processed by a single chip without forcing external memory spilling and excessive off-chip accesses.  
+
+\subsection{\ZFL}
+
+Figure~\ref{fig:nodes-overview}(b) shows a \ZF unit that offers the same computation bandwidth as a \BASE unit. The front-end comprising the neuron lanes and the corresponding synapse lanes is partitioned into 16 independently operating subunits, each containing a single neuron lane and 16 synapse lanes. Each synapse lane processes a different filter for a total of 16.
+
+In the original \ZF design, activations are stored in a ``\textit{Zero-Free Neuron Array Format}'', or ZFNAf. For the time being suffices to know that each activation now is encoded as a $(activation,offset)$ pair in memory where the \textit{activation} field is the raw value, and the \textit{offset }field encodes the coordinates of the activation. Every cycle, each subunit fetches a single $(activation,\mathit{offset})$ pair from NBin, uses the offset to index the corresponding entry from its SBin to fetch 16 weights and produces 16 products, one per filter. The backend is unchanged. It accepts the $16\times 16$ products from 16 subunits which are reduced using 16 adder trees. The adder trees produce 16 partial output activations which the unit accumulates using 64 NBout entries.  The subunit  NBin is 64 entries deep with each entry containing a 16-bit fixed-point value plus an offset field. The total SB capacity remains at 2MB per unit as per the original \BASE design, with each subunit having an SB of 128KB. Each subunit SB entry contains $16\times 16$~bits corresponding to 16 weights. In summary, each subunit corresponds to a single neuron lane and processes 16 weights,  one per filter. Collectively, all subunits have 16 neuron lanes, 256 synapse lanes and produce 16 partial output activations each from a different filter.
+
+\begin{figure}[t]
+\centering
+\includegraphics[scale=0.45]{figs/encoding}
+\caption{Top: \ZFNAf for 4-element bricks. \ZF uses 16-element bricks. Bottom: NBin store format. From Albericio  \textit{et al.}~\cite{cnvlutin}}.
+\label{fig:encoding}
+\end{figure}
+
+Figure~\ref{fig:encoding} shows the Zero-Free Neuron Array format (\ZFNAf)  that enables \ZF to avoid computations with ineffectual activations. in ZFNAf only the effectual activations are stored, each along with an offset indicating its original position. The ZFNAf is generated at the output of the preceding layer, where it typically would take several tens of cycles or more to produce each activation.  
+\ZFNAf encodes activations as $(value, \mathit{offset})$ pairs in groups, or \textit{bricks}. Each brick corresponds to a fetch block of the \BASE design, that is an aligned, continuous along the input features dimension $i$ group of 16 activations, i.e., they all have the same x and y coordinates. Bricks are stored starting at the position their first neuron would have been stored in the conventional 3D array format adjusted to account for the offset fields and are zero padded. Thr grouping in bricks maintains the ability to index the activation array in the granularity necessary to process each layer.
+
+\subsubsection{Skipping the Ineffectual Activations}
+
+%
+
+ 
+
+
+
+ \BASE fetches a single fetch block of 16 activations per cycle which it broadcasts to all 16 units. This blocks contains work for all synapse lanes across 256 filters. In order to keep the neuron lanes busy as much as possible, \ZF assigns work differently to the various neuron lanes. Specifically, while \BASE, as originally described, used an \textit{activation interleaved} assignment of input activations to neuron lanes (i.e., if neuron lane 0 was given activation $a(x,y,i)$, then neuron lane one would be given $a(x,y,i+1)$), \ZF uses a \textit{brick interleaved} assignment (which is compatible with \BASE as well).  For example, if neuron lane is processing an activation brick starting at $a(x,y,i)$, neuron lane 1 would be given the brick starting at $a(x,y,i+16)$. Specifically, \ZF  divides the window evenly into 16 \textit{slices}, one per neuron lane. Each slice corresponds to a complete vertical chunk of the window (all bricks having the same starting $z$ coordinate). Each cycle, one activation per slice is fetched resulting into a group of 16 activations, one per lane, thus keeping all lanes busy. For example, let $e(x,y,z)$ be the $(activation, \mathit{offset})$ pair stored at location $(x,y,z)$ of an input array in \ZFNAf. In cycle 0, the encoded activations at position $e(0,0,0)$, $e(0,0,16)$, ..., $e(0,0,240)$ will be fetched and broadcast to all units and processed by neuron lanes 0 through 15, respectively. As long as all 16 bricks have a second effectual activation, in cycle 1, $e(0,0,1)$, $e(0,0,17)$, ..., $e(0,0,241)$ will be processed. If, for example, brick 0 had only one non-zero neuron, in the next cycle the first encoded activation that will be fetched will be $e(1,0,0)$ assuming an input activation depth $i$ of 256. 
+
+\subsubsection{Fetching the Effectual Activations}
+
+To avoid performing 16 independent, single-activation-wide NM accesses per cycle, \ZF uses a \textit{dispatcher} unit that makes 16-activation wide accesses to NM while keeping all neuron lanes busy. For this purpose, the subarrays the NM is naturally composed of are grouped into 16 independent banks and the input neuron slices are statically distributed one per bank. While the dispatcher is physically distributed across the NM banks.  
+
+
+\begin{figure}[]
+\centering
+\includegraphics[scale=0.6]{figs/dispatcher}
+\caption{Dispatcher~\cite{cnvlutin}}
+\label{fig:dispatcher}
+\end{figure}
+
+Figure~\ref{fig:dispatcher} shows that the dispatcher has a 16-entry Brick Buffer ($BB$) where each entry can hold a single brick. Each BB entry is connected to one NM bank via a 16-activation-wide bus and feeds one of the neuron lanes across all units via a single-activation-wide connection. Initially, the dispatcher reads in parallel one brick from each bank for a total of 16 activation bricks. In subsequent cycles, the dispatcher broadcasts the non-zero activations, a single activation from each BB entry at a time, for a total of 16 activation, one per BB entry and thus per neuron lane each cycle.  
+Before all the effectual activations of a brick have been sent to the units, the dispatcher fetches the next brick from the corresponding NM bank. To avoid stalling for the NM's response, the fetching of the next in processing order brick per bank can be initiated as early as desired since the starting address of each brick and the processing order are known in advance. Since the rate at which each BB will drain will vary depending on the number of effectual activations per brick, the dispatcher maintains a per NM bank fetch pointer.
+
+\subsubsection{Generating the ZFNAf}
+The initial input to the CNNs studied are images which are processed using a conventional 3D array format. The first layer treats them as a 3-feature deep neuron array with each color plane being a feature. All other convolutional layers use the \ZFNAf which \ZF generates on-the-fly at the output of the immediately preceding layer. %
+
+In \ZF before writing to the NM, each 16 element output activation group is encoded into a brick in \ZFNAf.  This is done by the \textit{Encoder} subunit. One encoder subunit exists per \ZF unit.
+The same interconnect as in \BASE is used, but widened to accommodate the offset fields.
+The encoder can afford to do the encoding serially since: 1) output activations are produced at a much slower rate, and 2) the encoded brick is needed for the next layer.
+
+
+

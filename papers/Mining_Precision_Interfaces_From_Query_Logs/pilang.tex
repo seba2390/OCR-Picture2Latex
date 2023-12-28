@@ -1,0 +1,122 @@
+\section{Interaction Mining}\label{s:pilang}
+
+The Interface Generation problem states that the output interface should be capable of expressing the queries in the log.  However naively mining the log for all query differences leads to irrelevant differences (say, between two unrelated queries), as well as semantically similar but syntactically different changes (e.g., table aliases), that result in overly complex or semantically meaningless interactive interfaces.  In other words, not all possible interactions that can be mined from the query log are meaningful.    In this section, we present \lang, a domain specific language for specifying types of meaningful changes, as well as a tool to help developers write \lang statements.
+
+\subsection{Why \lang?}
+
+Why not use \difftable to analyze all differences in the log?
+There are three types of issues that arise:
+
+\stitle{Irrelevant Changes: } Changes to queries such as function renaming, changing the alias of a project clause, reordering tables in the \texttt{FROM} clause do not have any impact on the semantics of the query.
+
+\stitle{Misleading Differences: } Consider the following two example queries:
+{\small\begin{verbatim}
+      SELECT a FROM T WHERE 1 = 1
+      SELECT a FROM T GROUP BY a\end{verbatim}}
+\noindent the tree alignment algorithm would identify that replacing the first query's \texttt{WHERE} clause with the \texttt{GROUPBY} clause produces the second query.  Even if this pair of queries are found in the query log, it is unlikely to be a meaningful interaction to map to a widget.  For instance, it is possible that they were created by adding the \texttt{WHERE} and \texttt{GROUPBY} clauses to a base query \texttt{SELECT a FROM T}.
+
+\stitle{Special Cases: } Consider changes affecting the constants $5$ and $10$ in the following two queries:
+{\small\begin{verbatim}
+      SELECT b FROM T WHERE a > 5 AND a < 10
+      SELECT b FROM T WHERE c > 5 AND a=10 \end{verbatim}
+}
+The first query involves filtering the values based on an interval, a natural fit for a range slider widget. The same widget would not apply for the second query. In order to distinguish between these two cases, \sys needs additional semantics to specify that the constants that change should be part of $>$ and $<$ inequality expressions that share the same attribute.
+
+
+For these reasons, it is desirable to filter \difftable to a subset of query changes that are meaningful, as defined by the application and developer needs.  Note that \sys can be bootstrapped with a set of \lang statements for a given language so that, by default, it generates reasonable interfaces without any user intervention, and additional \lang statements can be added if desired.  It is an open area of investigation whether learning-based approaches can replace the need for manual \lang statements.
+
+
+\subsection{\lang}
+\lang is a domain specific language for users to easily specify {\it where} and {\it how} queries change.  A \lang statement $s$ is evaluated over a pair of queries $s(p_1, p_2)$ and returns an output table, or $\emptyset$ if it does not match. It is equivalent to filtering \difftable$_{\{p_1, p_2\}}$ by its $\pi$ attribute and transforming its subtrees $\tau_1$, $\tau_2$.  Although we will introduce simple tree traversal syntax that serves our purposes, more powerful nested SQL syntax such as SQL++~\cite{ong2014sqlpp} could be adopted in the future.
+
+\lang{} statement comprises a From clause, a Where clause and a Match clause, organized as follows:
+
+{\small
+\begin{verbatim}
+    	  FROM <path expression> AS <table name>, ...
+    	[WHERE <boolean expression>]
+    	 MATCH <stmt name>[(<table name>)]\end{verbatim}}
+
+\stitle{From Clause: } The \texttt{FROM} clause is used to both define the query scope within which \sys searches for structural differences, and to transform the subtrees $\tau_1$ and $\tau_2$ in \difftable.  The path expression $path$ is composed of operators to specify ancestor \texttt{//} and child \texttt{/} relationships between node types; \texttt{*} denotes a wildcard node.
+
+For instance \texttt{*//*} matches all possible paths, \texttt{a//*} matches any path containing node type \texttt{a}, \texttt{/a//*} matches paths whose root node is \texttt{a}, while \texttt{a/b} matches paths that contain \texttt{a} with direct child \texttt{b} that is also a leaf node.  If there are multiple matching nodes, \texttt{[i]} can be used to specify a specific child: \texttt{a/*[1]} selects the second child of \texttt{a}, while \texttt{a/b[1]} selects the second \texttt{b} child of \texttt{a}.
+
+Since $path$ is always matched against $\text{\difftable}.\pi$, it will always match an ancestor of the subtrees $\tau_1$ and $\tau_2$; it is also used to specify the ancestor subtree to return.  The \texttt{FROM} clause returns the deepest subtree that matches $path$ and contains the subtree; the trailing \texttt{//*} specifies that the subtrees in \difftable should not be transformed.  In short, the \texttt{FROM} clause is equivalent to binding a range variable to the following SQL statement:
+{\small
+\begin{lstlisting}[
+	mathescape,
+	columns=fullflexible,
+	basicstyle=\ttfamily\selectfont,
+]
+  SELECT id, pid1, pid2, extract($\pi$, path),
+          ancestor($\tau_1$, path), ancestor($\tau_2$, path)
+    FROM diffs
+   WHERE matches($\pi$, path)
+\end{lstlisting}
+}
+
+\stitle{Where Clause: } The \texttt{WHERE} clause is a boolean expression over the variables defined in the \texttt{FROM} clause. In addition to classic SQL expressions, path operators can be used to manipulate the subtrees $\tau_i$. Ellipsis notation (\texttt{..}) denotes the parent node, and the single dot (\texttt{.}) is used to access node attributes.  For instance, the following identifies tree differences within equality predicates:
+{\small
+\begin{lstlisting}[
+	mathescape,
+	columns=fullflexible,
+	basicstyle=\ttfamily\selectfont,
+]
+    FROM Where/BiExpr AS T
+   WHERE T.$\tau_1$.op = '=' AND T.$\tau_2$.op = '=' AND
+          T.$\tau_1$/*[0].name = 'cty' AND T.$\tau_2$/*[0].name = 'cty'
+\end{lstlisting}
+}
+The $\tau$ attribute can be used as shorthand for expressions over both subtrees.  Thus, the following is equivalent to the above example:
+{\small
+\begin{lstlisting}[
+	mathescape,
+	columns=fullflexible,
+	basicstyle=\ttfamily\selectfont,
+]
+    FROM Where/BiExpr AS T
+   WHERE T.$\tau$.op = '=' AND T.$\tau$/*[0].name = 'cty'
+\end{lstlisting}
+}
+The following example checks for insertions in the query's project clause:
+{\small
+\begin{lstlisting}[
+	mathescape,
+	columns=fullflexible,
+	basicstyle=\ttfamily\selectfont,
+]
+    FROM Project/ProjClause AS T
+   WHERE T.$\tau_1$ is null AND T.$\tau_2$ is not null
+\end{lstlisting}
+}
+
+
+
+\stitle{Match Clause: } This clause is used to name the \lang statement so that successful matches can be used as labeled edges in the interaction graph.  In addition, the statement returns one of the range variables so that it is accessible in for the interface generation step.  The returned range variable is augmented with a \texttt{name} attribute containing the statement's name.
+
+% \iffalse
+% 	\begin{example}
+% 	This statement identifies pairs of queries with different string literals in an equality expression within their \emph{where} clause. The \emph{from} clause matches all string literal nodes that are children of equality expressions in the filter clause. These nodes are bound to T. The WHERE clause checks that there is a single string literal that has changed (and implicitly that nothing else in the ASTs have changed). If there is a match, then we add an edge between the two input ASTs and label the edge change-where-equal.
+% 	\begin{verbatim}
+% 	FROM where//expr[op="="]//strliteral AS T
+% 	WHERE T@old not equal T@new AND |T| = 1
+% 	MATCH change-where-equal(T)\end{verbatim}
+% 	\end{example}
+
+% 	\begin{example}
+% 	This PI-Lang query identifies pairs of queries that are only different in their project clauses. It matches the pair of query to project-subset when the project clauses of query 1 is a subset of query 2. The \emph{from} clause matches all projectclauses nodes that has a project node as its parent and binds them to the variable T. The \emph{where} clause checks if the subset operation, and the \emph{match} clause adds an edge between the two input ASTs with the label project-clause-add if the \emph{where} clause returns true.
+% 	\begin{verbatim}
+% 	FROM Project//ProjectClauses as T;
+% 	WHERE T@old subset T@new;
+% 	MATCH project-clause-add(T) \end{verbatim}
+% 	\end{example}
+% \fi
+
+
+
+\subsection{Executing and Writing \lang}
+\label{sec:tool}
+
+\lang statements are translated into SQL queries and executed over partitions of \difftable defined by a pair $(pid_1, pid_2)$.   The results over the partitions are unioned into a single table that we call \diffspil.  Section~\ref{s:opt} describes techniques that use \lang to reduce the tree matching and interface generation costs.
+
+\lang is intended for developers, and crafting \lang statements manually may be difficult for users with no experience with abstract syntax trees. To facilitate this process, we created a tool to detect the most common differences between pairs of trees and let the users chose the ones that interest them. The tool operates as follows. The users specify a range of possible transformations, by setting a number of allowable pairwise differences and a number of nodes that may differ. The tool takes a sample from the log, compares all pairs of trees in that sample and reports those that match the specified criteria. To report the differences, it unparses the trees and highlights the substrings that vary. For any transformation, the tool can create a \lang statement that checks for differences in the subtrees where it detected variations. To help users refine their search, the tool excludes all the changes that match an existing \lang statement from subsequent searches.

@@ -1,0 +1,965 @@
+\chapter{Learning Sparse High Dimensional Filters}
+\label{chap:bnn}
+
+\newcommand{\bv}{\mathbf{x}}
+\newcommand{\bw}{\mathbf{w}}
+
+In the Part-II of this thesis, we focus on inference in discriminative CNN models. Since \emph{inference}
+amounts to simple evaluation of the \emph{model} in discriminative models,
+we propose modifications to the original model itself for better inference.
+This is unlike the inference strategies proposed in Part-I of this
+thesis, where we proposed to learn a separate inference model that helps in the Bayesian inference
+of a given generative model. In this chapter, we propose a learning technique for general sparse
+high-dimensional filters and show how this can be used for generalizing standard spatial
+convolutions in CNNs to learnable bilateral convolutions with long-range image-adaptive connections.
+
+Bilateral filters have wide spread use due to their edge-preserving properties. The common
+use case is to manually choose a parametric filter type, usually a Gaussian filter. In this chapter,
+we will generalize the parametrization and in particular derive a gradient descent algorithm
+so the filter parameters can be learned from data. This derivation allows to learn
+high dimensional linear filters that operate in sparsely populated feature spaces. We build on
+the permutohedral lattice construction for efficient filtering.
+%
+The ability to learn more general forms of high-dimensional filters can be used in
+several diverse applications.
+First, we demonstrate the use in applications where single filter applications are desired for runtime reasons.
+Further, we show how this algorithm can be used to learn the pairwise potentials in
+densely connected conditional random fields and apply these to different image segmentation tasks.
+Finally, we introduce layers of bilateral filters in CNNs and propose
+\emph{bilateral neural networks} for the use of high-dimensional
+sparse data. This view provides new ways to encode model structure into network architectures. A diverse
+set of experiments empirically validates the usage of general forms of filters.
+
+%%%%%%%%% BODY TEXT
+\section{Introduction}
+\label{sec:intro-bnn}
+
+% Spatial convolution
+Image convolutions are basic operations for many image processing and computer vision applications. In this
+chapter, we will study the class of bilateral filter convolutions and
+propose a general image adaptive convolution that can be learned from data.
+
+ % Bilateral convolution
+The bilateral filter~\cite{aurich1995non, smith97ijcv, tomasi1998bilateral} was originally introduced for the task of image denoising as an edge preserving filter. Since the bilateral filter contains the spatial
+convolution as a special case, in the following, we will directly state the general case. Given an image $\bv=(\bv_1,\ldots,\bv_n), \bv_i\in\mathbb{R}^c$
+with $n$ pixels and $c$ channels,
+and for every pixel $i$, a $d$ dimensional feature vector $\f_i\in\mathbb{R}^d$ (\eg\ the $(x,y)$ position in the image $\f_i=(x_i,y_i)^{\top}$).
+The bilateral filter then computes
+\begin{equation}
+  \bv'_i = \sum_{j=1}^n \bw_{\f_i,\f_j} \bv_j.\label{eq:bilateral}
+\end{equation}
+for all $i$. Almost the entire literature refers to the bilateral filter as a synonym of the Gaussian parametric form
+$\bw_{\f_i,\f_j} = \exp{(-\frac{1}{2}(\f_i-\f_j)^{\top}\Sigma^{-1}(\f_i-\f_j))}$. The features $\f_i$ are most commonly chosen to be
+position $(x_i,y_i)$ and color $(r_i,g_i,b_i)$ or pixel intensity. To appreciate the edge-preserving effect of
+the bilateral filter, consider the five-dimensional feature $\f={(x,y,r,g,b)}^{\top}$.
+Two pixels $i,j$ have a strong influence $\bw_{\f_i,\f_j}$ on each other only if they are close in
+position \emph{and} color. At edges, the color changes, therefore pixels lying on opposite sides have low
+influence and thus this filter does not blur across edges. This behavior is
+sometimes referred to as \emph{image adaptive}, since the filter has a different shape when evaluated at
+different locations in the image. More precisely, it is the projection of the filter to the two-dimensional
+image plane that changes, the filter values $\bw_{\f,\f'}$ do not change. The filter itself can
+be of $c$ dimensions $\bw_{\f_i,\f_j}\in\mathbb{R}^c$,
+in which case the multiplication in Eq.~\ref{eq:bilateral} becomes an inner product. For the Gaussian case,
+the filter can be applied independently per channel. For an excellent review of image filtering, we refer
+to~\cite{milanfar2011tour}.
+
+% Sparse and High-D -- the main point of the paper
+The filter operation of Eq.~\ref{eq:bilateral} is a sparse high-dimensional convolution,
+a view advocated in~\cite{barash2002fundamental,paris2006fast}. An image $\bv$ is
+not sparse in the spatial domain, we observe pixels values for all locations $(x,y)$. However, when
+pixels are understood in a higher dimensional feature space, \eg $(x,y,r,g,b)$, the image becomes a sparse signal,
+since the $r,g,b$ values lie scattered in this five-dimensional space.
+This view on filtering is the key difference of the bilateral filter compared to the common spatial convolution.
+An image edge is not \emph{visible} for a filter in the spatial domain alone, whereas in the 5D space it is.
+The edge-preserving behavior is possible due to the higher dimensional operation. Other data can naturally
+be understood as sparse signals, \eg 3D surface points.
+
+The main contribution of this work is to propose a general and learnable sparse high dimensional convolution.
+Our technique builds on efficient algorithms
+that have been developed to approximate the Gaussian bilateral filter and re-uses them for
+more general high-dimensional filter operations. Due to its practical importance (see related work in
+Section~\ref{sec:related-bnn}), several efficient algorithms for computing Eq.~\ref{eq:bilateral}
+have been developed, including the bilateral grid~\cite{paris2006fast}, Gaussian
+KD-trees~\cite{adams2009gaussian}, and the permutohedral
+lattice~\cite{adams2010fast}. The design goal for these algorithms was to provide a) fast runtimes and b) small
+approximation errors for
+the Gaussian filter case. The key insight of this work is to use the permutohedral lattice and use it not as
+an approximation of a predefined kernel but to freely parametrize its values. We relax the separable Gaussian
+filter case from~\cite{adams2010fast} and show
+how to compute gradients of the convolution (Section~\ref{sec:learning}) in lattice space. This enables learning
+the filter from data.
+
+% Consequenses of this work with 3 different generalizations
+This insight has several useful consequences. We discuss applications where the bilateral filter has been used
+before: image filtering (Section~\ref{sec:filtering}) and CRF inference (Section~\ref{sec:densecrf}). Further we will demonstrate how the
+free parametrization of the filters enables us to use them in deep convolutional neural networks (CNN) and allow convolutions that go beyond the regular
+spatially connected receptive fields (Section~\ref{sec:bnn}). For all domains, we present various empirical evaluations with
+a wide range of applications.
+
+%------------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related-bnn}
+
+We categorize the related work according to the three different generalizations of this work.
+
+\paragraph{Image Adaptive Filtering:} The literature in this area is rich
+and we can only provide a brief overview. Important classes of image adaptive filters
+include the bilateral filters~\cite{aurich1995non, tomasi1998bilateral,
+smith97ijcv}, non-local means~\cite{buades2005non, awate2005higher}, locally
+adaptive regressive kernels~\cite{takeda2007kernel}, guided image
+filters~\cite{he2013guided} and propagation filters~\cite{chang2015propagated}.
+The kernel least-squares regression problem can serve as a unified view of many
+of them~\cite{milanfar2011tour}. In contrast to the present work that learns
+the filter kernel using supervised learning, all these filtering schemes use a
+predefined kernel.
+Because of the importance of bilateral filtering to many applications in
+image processing, much effort has been devoted to derive fast algorithms; most
+notably~\cite{paris2006fast, adams2010fast, adams2009gaussian, gastal2012adaptive}.
+Surprisingly, the
+only attempt to learn the bilateral filter we found is~\cite{hu2007trained} that
+casts the learning problem in the spatial domain by rearranging pixels. However,
+the learned filter does not necessarily obey the full region of influence of a
+pixel as in the case of a bilateral filter.
+The bilateral filter also has been proposed to regularize a large set of
+applications in~\cite{barron2015bilateral, barron2015defocus} and the respective
+optimization problems are parametrized in a bilateral space.
+In these works the filters are part of a learning system but unlike this work
+restricted to be Gaussian.
+
+\paragraph{Dense CRF:} The key observation of~\cite{krahenbuhl2012efficient} is
+that mean-field inference update steps in densely connected CRFs with Gaussian
+edge potentials require Gaussian bilateral filtering operations. This enables
+tractable inference through the application of a fast filter implementation
+from~\cite{adams2010fast}. This quickly found wide-spread use, \eg the combination of CNNs with
+a dense CRF is among the best performing segmentation
+models~\cite{chen2014semantic, zheng2015conditional, bell2015minc}. These works
+combine structured prediction frameworks on top of CNNs, to model the
+relationship between the desired output variables thereby significantly
+improving upon the CNN result. Bilateral neural networks, that are presented in
+this work, provide a principled framework for encoding the output relationship,
+using the feature transformation inside the network itself thereby alleviating
+some of the need for later processing. Several works~\cite{krahenbuhl2013parameter,
+domke2013learning,kiefel2014human,zheng2015conditional,schwing2015fully} demonstrate how to learn free parameters of
+the dense CRF model. However, the parametric form of the pairwise term always remains a
+Gaussian. Campbell \etal~\cite{campbell2013fully} embed complex pixel
+dependencies into an Euclidean space and use a Gaussian filter for pairwise connections.
+This embedding is a pre-processing step and can not directly be learned. In
+Section~\ref{sec:densecrf} we will discuss how to learn the pairwise
+potentials, while retaining the efficient inference strategy of~\cite{krahenbuhl2012efficient}.
+
+
+\paragraph{Neural Networks:} In recent years, the use of CNNs enabled tremendous progress in a wide
+range of computer vision applications. Most CNN architectures use
+spatial convolution layers, which have fixed local receptive fields. This work
+suggests to replace these layers with bilateral filters, which have a varying
+spatial receptive field depending on the image content. The equivalent
+representation of the filter in a higher dimensional space leads to sparse
+samples that are handled by a permutohedral lattice data structure. Similarly,
+Bruna \etal~\cite{bruna2013spectral} propose convolutions on irregularly sampled
+data. Their graph construction is closely related to the high-dimensional
+convolution that we propose and defines weights on local neighborhoods of nodes.
+However, the structure of the graph is bound to be fixed and it is not
+straightforward to add new samples. Furthermore, re-using the same filter
+among neighborhoods is only possible with their costly spectral construction.
+Both cases are handled naturally by our sparse convolution.
+Jaderberg \etal~\cite{jaderberg2015spatial} propose a spatial
+transformation of signals within the neural network to learn invariances for a
+given task. The work of~\cite{ionescu2015matrix} propose matrix back-propagation
+techniques which can be used to build specialized structural layers such as normalized-cuts.
+Graham \etal~\cite{graham2015sparse} propose extensions from 2D CNNs
+to 3D sparse signals. Our work enables sparse 3D filtering as a special case,
+since we use an algorithm that allows for even higher dimensional data.
+
+
+%------------------------------------------------------------------------
+\section{Learning Sparse High Dimensional Filters}\label{sec:learning}
+In this section, we describe the main technical contribution of
+this work, we generalize the permutohedral convolution~\cite{adams2010fast} and show how
+the filter can be learned from data.
+
+Recall the form of the bilateral convolution from Eq.~\ref{eq:bilateral}. A naive
+implementation would compute for every pixel $i$ all associated filter values $\bw_{\f_i,\f_j}$ and
+perform the summation independently. The view of $\bw$ as a linear filter in a higher dimensional
+space, as proposed by~\cite{paris2006fast}, opened the way for new algorithms. Here,
+we will build on the permutohedral lattice convolution developed
+in Adams \etal~\cite{adams2010fast} for approximate Gaussian filtering.
+The most common application of bilateral filters use photometric features (XYRGB).
+We chose the permutohedral lattice as it is particularly designed for this dimensionality,
+see Fig.~7 in~\cite{adams2010fast} for a speed comparison.
+
+\subsection{Permutohedral Lattice Convolutions}
+
+We first review the permutohedral lattice convolution for
+Gaussian bilateral filters from Adams \etal~\cite{adams2010fast} and
+describe its most general case.
+
+\begin{figure}[t]
+\begin{center}
+\centerline{\includegraphics[width=\columnwidth]{figures/permutohedral_illustration.pdf}}
+  \mycaption{Schematic of the permutohedral convolution}
+  {Left: splatting the input
+  points (orange) onto the lattice corners (black); Middle: The extent of a filter on the lattice
+   with a $s=2$ neighborhood (white circles), for reference we show a Gaussian filter,
+   with its values color coded. The general case has a free scalar/vector parameter per circle.
+    Right: The result of the convolution at the lattice corners (black) is projected back
+    to the output points (blue). Note that in general the output and input points may be different. \label{fig:ops}}
+\end{center}
+\end{figure}
+
+As before, we assume that every image pixel $i$ is associated with a $d$-dimensional
+feature vector $\f_i$. Gaussian bilateral filtering using a permutohedral lattice
+approximation involves 3 steps. We begin with an overview of the algorithm, then discuss each step
+in more detail in the next paragraphs. Figure~\ref{fig:ops} schematically shows
+the three operations for 2D features. First, interpolate the image signal on the
+$d$-dimensional grid plane of the permutohedral lattice, which is called
+\emph{splatting}. A permutohedral lattice is the tessellation of space into permutohedral simplices.
+We refer to~\cite{adams2010fast} for details of the lattice construction and its properties.
+In Fig.~\ref{fig:lattice}, we visualize
+the permutohedral lattice in the image plane, where every simplex cell receives a different color. All pixels of the same
+lattice cell have the same color. Second, \emph{convolve} the signal on the lattice.
+And third, retrieve the result by interpolating the signal at the original
+$d$-dimensional feature locations, called \emph{slicing}. For example, if
+the features used are a combination of position and color $\f_i = (x_i, y_i, r_i, g_i,
+b_i)^{\top}$, the input signal is mapped into the 5D cross product space of position and
+color and then convolved with a 5D tensor. Afterwards, the filtered result is mapped back to the
+original space. In practice we use a feature scaling $\Lambda \f$ with a diagonal matrix~$\Lambda$
+and use separate scales
+for position and color features. The scale determines the distance of points and thus the size
+of the lattice cells.
+More formally, the computation is written by $\bv' =
+S_{\text{slice}}BS_{\text{splat}} \bv$ and all involved matrices are
+defined below. For notational convenience we will assume scalar input signals $x_i$, the vector valued case
+is analogous, the lattice convolution changes from scalar multiplications to inner products.
+
+\begin{figure}[t]
+  \centering
+  \subfigure[\scriptsize Sample Image]{%
+    \includegraphics[width=.23\columnwidth]{figures/bird.jpg}\label{fig:bird}
+  }
+  \subfigure[\scriptsize Position]{%
+    \includegraphics[width=.23\columnwidth]{figures/bird_lattice_1.png}\label{fig:bird_lattice_1}
+  }
+  \subfigure[\scriptsize Color]{%
+    \includegraphics[width=.23\columnwidth]{figures/bird_lattice_2.png}\label{fig:bird_lattice_2}
+  }
+  \subfigure[\scriptsize Position, Color]{%
+    \includegraphics[width=.23\columnwidth]{figures/bird_lattice_3.png}\label{fig:bird_lattice_3}
+  }
+  \mycaption{Visualization of the permutohedral lattice}
+  {(a) Input image; Lattice visualizations for different feature spaces: (b) 2D position features: $0.01(x, y)$,
+  (c) color features: $0.01(r, g, b)$ and (d) position and color features: $0.01(x, y, r, g, b)$. All pixels
+  falling in the same simplex cell are shown with the same color.}
+\label{fig:lattice}
+\end{figure}
+
+\paragraph{Splat:} The splat operation (cf.\ left-most image in
+Fig.~\ref{fig:ops}) finds the enclosing simplex in $\mathcal{O}(d^2)$ on the
+lattice of a given pixel feature $\f_i$ and distributes its value $v_i$ onto the corners of the
+simplex. How strong a pixel contributes to a corner $j$ is defined by its
+barycentric coordinate $t_{i,j}\in\mathbb{R}$ inside the simplex.
+Thus, the value $\mathbf{\ell}_j \in \mathbb{R}$ at a lattice point
+$j$ is computed by summing over all enclosed input points; more precisely, we
+define an index set $J_i$ for a pixel $i$, which contains all the lattice points
+$j$ of the enclosing simplex
+\vspace{-0.7em}
+\begin{equation}
+  \label{eq:splat}
+  \mathbf{\ell} = S_{\text{splat}} \bv;%
+  {(S_{\text{splat}})}_{j, i} = t_{i, j}, \text{ if } j\in J_i, \text{ otherwise } 0.
+\vspace{-0.5em}
+\end{equation}
+
+\vspace{-0.3cm}
+\paragraph{Convolve:} The permutohedral convolution is defined on the
+lattice neighborhood $N_s(j)$ of lattice point $j$, \eg\ only $s$ grid hops away. More formally
+\vspace{-0.7em}
+\begin{equation}
+  \label{eq:blur}
+  \mathbf{\ell'} = B \mathbf{\ell}; {(B)}_{j', j} =  w_{j, j'},%
+  \text{ if } j' \in N_s(j), \text{ otherwise } 0.
+\vspace{-0.5em}
+\end{equation}
+An illustration of a two-dimensional permutohedral filter is shown in Fig.~\ref{fig:ops} (middle).
+Note that we already presented the convolution in the general form that we will make
+use of. The work of~\cite{adams2010fast} chooses the filter weights such that
+the resulting operation approximates a Gaussian blur, which is illustrated in Fig.~\ref{fig:ops}.
+Further, the algorithm of~\cite{adams2010fast} takes advantage of the
+separability of the Gaussian kernel. Since we are interested in the most general case, we
+extended the convolution to include non-separable filters $B$.
+
+\vspace{-0.3cm}
+\paragraph{Slice:} The slice operation (cf.\ right-most image in
+Fig.~\ref{fig:ops}) computes an output value $x'_{i'}$ for an output pixel $i'$
+again based on its barycentric coordinates $t_{i, j}$ and sums over the corner
+points $j$ of its lattice simplex
+\vspace{-0.7em}
+\begin{equation}
+  \label{eq:slice}
+  \bv' = S_{\text{slice}} \mathbf{\ell'}; %
+  {(S_{\text{slice}})}_{i, j} = t_{i, j}, \text{ if } j\in J_i, \text{ otherwise } 0
+\vspace{-0.5em}
+\end{equation}
+
+The splat and slice operations take a role of an interpolation between the
+different signal representations: the irregular and sparse distribution of
+pixels with their associated feature vectors and the regular structure of the
+permutohedral lattice points. Since high-dimensional spaces are usually sparse,
+performing the convolution densely on all lattice points is inefficient. So, for
+speed reasons, we keep track of the populated lattice points using a hash table
+and only convolve at those locations.
+
+\subsection{Learning Permutohedral Filters}\label{sec:backprop}
+The \emph{fixed} set of filter weights $\mathbf{w}$ from~\cite{adams2010fast} in
+Eq.~\ref{eq:blur} is designed to approximate a Gaussian filter. However, the
+convolution kernel $\mathbf{w}$ can naturally be understood as a general filtering
+operation in the permutohedral lattice space with free parameters. In the exposition above we
+already presented this general case. As we will show in more detail later,
+this modification has non-trivial consequences
+for bilateral filters, CNNs and probabilistic graphical models.
+
+The size of the neighborhood $N_s(k)$ for the blur in Eq.~\ref{eq:blur} compares
+to the filter size of a spatial convolution. The filtering kernel of a common
+spatial convolution that considers $s$ points to either side in all dimensions
+has ${(2s + 1)}^d\in\mathcal{O}(s^d)$ parameters. A comparable filter on the
+permutohedral lattice with an $s$ neighborhood is specified by ${(s+1)}^{d+1} -
+s^{d+1} \in\mathcal{O}(s^d)$ elements (cf. Appendix~\ref{sec:permconv}).
+Thus, both share the same asymptotic size.
+
+By computing the gradients of the filter elements, we enable the use
+of gradient based optimizers, \eg back-propagation for CNN in the same
+way that spatial filters in a CNN are learned. The gradients
+with respect to $\bv$ and the filter weights in $B$ of a
+scalar loss $L$ are:
+
+\begin{eqnarray}
+  \frac {\partial L} {\partial \bv} &=&
+  S'_{\text{splat}} %
+  B' %
+  S'_{\text{slice}} %
+  \frac {\partial L} {\partial \bv'}, \label{eq:dv}\\
+  \frac {\partial L} {\partial {(B)}_{i, j}} &=&
+  {\left(S'_{\text{slice}} \frac {\partial L} {\partial \bv}\right)}_i
+  {(S_{\text{splat}} \bv)}_j.\label{eq:db}
+\end{eqnarray}
+
+Both gradients are needed during back-propagation and in experiments,
+we use stochastic back-propagation for learning the filter kernel.
+The permutohedral lattice convolution is parallelizable, and scales linearly with the
+filter size. Specialized implementations run at interactive speeds in image
+processing applications~\cite{adams2010fast}.
+Our implementation in the Caffe deep learning framework~\cite{jia2014caffe}
+allows arbitrary filter parameters and the computation
+of the gradients on both CPU and GPU.
+The code is available at http://bilateralnn.is.tuebingen.mpg.de.
+
+%------------------------------------------------------------------------
+\section{Single Bilateral Filter Applications}\label{sec:filtering}
+
+In this section, we will consider the problems of joint bilateral up-sampling~\cite{kopf2007joint}
+and 3D body mesh denoising as prominent instances of single bilateral filter applications.
+See~\cite{paris2009bilateral} for a recent overview of other bilateral filter applications.
+Further experiments on image denoising are included in Appendix~\ref{sec:appendix-bnn},
+together with details about exact experimental protocols and more visualizations.
+
+\subsection{Joint Bilateral Upsampling}
+
+A typical technique to speed up computer vision algorithms is to compute results on a
+lower scale and up-sample the result to the full resolution. This up-sampling
+step may use the original resolution image as a guidance image. A joint bilateral up-sampling approach
+for this problem setting was developed in~\cite{kopf2007joint}. We describe the procedure
+for the example of up-sampling a color image. Given a high resolution gray scale image (the guidance image) and
+the same image on a lower resolution but with colors, the task is to up-sample the color image to the
+same resolution as the guidance image. Using the permutohedral lattice, joint bilateral up-sampling proceeds by
+splatting the color image into the lattice, using 2D position and 1D intensity as features and the 3D RGB values
+as the signal. A convolution is applied in the lattice and the result is read out at the features of the high
+resolution image, that is using the 2D position and intensity of the guidance image. The possibility of
+reading out (slicing) points that are not necessarily the input points is an appealing feature of the permutohedral lattice
+convolution.
+
+\begin{figure*}[t!]
+\centering
+\subfigure{%
+ \raisebox{2.0em}{
+  \includegraphics[width=.08\columnwidth]{figures/color_small.png}\label{fig:color_given}
+ }
+}
+\subfigure{%
+  \includegraphics[width=.16\columnwidth]{figures/color_guidance.pdf}\label{fig:color_guidance}
+}
+\subfigure{%
+  \includegraphics[width=.16\columnwidth]{figures/color_original.pdf}\label{fig:color_original}
+}
+\subfigure{%
+  \includegraphics[width=.16\columnwidth]{figures/color_bicubic.pdf}\label{fig:color_bicubic}
+}
+\subfigure{%
+  \includegraphics[width=.16\columnwidth]{figures/color_gauss.pdf}\label{fig:color_gauss}
+}
+\subfigure{%
+  \includegraphics[width=.16\columnwidth]{figures/color_learnt.pdf}\label{fig:color_learnt}
+}\\
+\setcounter{subfigure}{0}
+\subfigure[Input]{%
+\raisebox{2.0em}{
+  \includegraphics[width=.08\columnwidth]{figures/depth_bicubic.png}\label{fig:depth_given}
+ }
+}
+\subfigure[Guidance]{%
+  \includegraphics[width=.16\columnwidth]{figures/depth_image.png}\label{fig:depth_guidance}
+}
+ \subfigure[Ground Truth]{%
+  \includegraphics[width=.16\columnwidth]{figures/depth_gt.png}\label{fig:depth_gt}
+}
+\subfigure[Bicubic]{%
+  \includegraphics[width=.16\columnwidth]{figures/depth_bicubic.png}\label{fig:depth_bicubic}
+}
+\subfigure[Gauss-BF]{%
+  \includegraphics[width=.16\columnwidth]{figures/depth_gauss.png}\label{fig:depth_gauss}
+}
+\subfigure[Learned-BF]{%
+  \includegraphics[width=.16\columnwidth]{figures/depth_learnt.png}\label{fig:depth_learnt}
+}
+\mycaption{Guided up-sampling}{Color (top) and depth (bottom) $8\times$ up-sampling results
+using different methods: Bicubic - Bicubic interpolation; Gauss-BF - Gaussian bilateral
+upsampling; Learned-BF - Learned bialteral up-sampling (best viewed on screen).}
+\label{fig:upsample_visuals}
+\end{figure*}
+
+\begin{table}[t]
+  \scriptsize
+  \centering
+    \begin{tabular}{l c c c c c}
+      \toprule
+     & \textbf{Upsampling factor} & \textbf{Bicubic} & \textbf{Gaussian} & \textbf{Learned} \\ [0.1cm]
+      \midrule
+     \multicolumn{2}{l}\textbf{Color Upsampling (PSNR)} & & &\\
+     & \textbf{2x} & 24.19 / 30.59 & 33.46 / 37.93  & \textbf{34.05 / 38.74}  \\
+     & \textbf{4x} & 20.34 / 25.28 & 31.87 / 35.66  & \textbf{32.28 / 36.38}  \\
+     & \textbf{8x} & 17.99 / 22.12 & 30.51 / 33.92  & \textbf{30.81 / 34.41}  \\
+     & \textbf{16x} & 16.10 / 19.80 & 29.19 / 32.24  & \textbf{29.52 / 32.75}  \\
+      \midrule
+     \multicolumn{2}{l}\textbf{Depth Upsampling (RMSE)} & & &\\
+     & \textbf{8x} & 0.753 & 0.753 & \textbf{0.748}  \\
+      \bottomrule
+      \\
+    \end{tabular}
+      \vspace{-0.2cm}
+    \mycaption{Joint bilateral up-sampling} {(top) PSNR values corresponding to various up-sampling factors and
+    up-sampling strategies on the test images of the Pascal VOC12 segmentation / high-resolution 2MP dataset;
+    (bottom) RMSE error values corresponding to up-sampling depth images estimated using~\cite{eigen2014depth}
+    computed on the test images from the NYU depth dataset~\cite{silberman2012indoor}.}
+\label{tbl:upsample}
+\end{table}
+%
+
+\vspace{-0.2cm}
+\subsubsection{Color Up-sampling}
+
+For the task of color up-sampling, we compare the Gaussian bilateral filter~\cite{kopf2007joint} against
+a learned generalized filter. We experimented with two different datasets: Pascal VOC2012 segmentation~\cite{voc2012segmentation}
+using train, validation and test splits, and 200 higher resolution (2MP) images from
+Google image search~\cite{google_images} with 100 train, 50 validation and 50 test images.
+For training, we use the mean
+squared error (MSE) criterion and perform stochastic gradient descent with a
+momentum term of $0.9$, and weight decay of $0.0005$, found using the validation set.
+In Table~\ref{tbl:upsample} we report result in terms of Peak-Signal-to-Noise ratio (PSNR)
+for the up-sampling factors $2\times, 4\times, 8\times$ and $16\times$.
+We compare a standard bicubic interpolation, that does not use a guidance image, the Gaussian
+bilateral filter case (with feature scales optimized on the validation set), and the learned filter.
+All filters have the same support.
+For all up-sampling factors, joint bilateral Gaussian up-sampling outperforms bicubic interpolation and is in turn improved using a learned filter. A result of the up-sampling is shown in Fig.~\ref{fig:upsample_visuals} and
+more results are included in Section~\ref{sec:col_upsample_extra}.
+The learned filter recovers finer details in the images.
+
+We also performed the cross-factor analysis of training and testing at different up-sampling
+factors. Table~\ref{tbl:crossupsample} shows the PSNR results for this
+analysis. Although, in terms of PSNR, it is optimal to train and test at the
+same up-sampling factor, the differences are small when training and testing
+up-sampling factors are different.
+
+\begin{table}[t]
+  \scriptsize
+  \centering
+    \begin{tabular}{c c c c c c}
+      \toprule
+      & & \multicolumn{4}{c}{Test Factor} \\ [0.1cm]
+     & & \textbf{2$\times$} & \textbf{4$\times$} & \textbf{8$\times$} & \textbf{16$\times$} \\ [0.15cm]
+    \parbox[t]{3mm}{\multirow{4}{*}{\rotatebox[origin=c]{90}{Train Factor}}} & \textbf{2$\times$} & \textbf{38.45} & 36.12  & 34.06 & 32.43 \\ [0.1cm]
+     & \textbf{4$\times$} & 38.40 & \textbf{36.16} & \textbf{34.08} & 32.47 \\ [0.1cm]
+     & \textbf{8$\times$} & 38.40 & 36.15  & \textbf{34.08} & 32.47 \\ [0.1cm]
+     & \textbf{16$\times$} & 38.26 & 36.13  & 34.06 & \textbf{32.49} \\
+      \bottomrule
+      \\
+    \end{tabular}
+      \vspace{-0.2cm}
+    \mycaption{Color upsampling with different train and test up-sampling factors} {PSNR values corresponding to different up-sampling factors used at train and test times on the 2 megapixel image dataset, using our learned bilateral filters.}
+\label{tbl:crossupsample}
+\vspace{-0.4cm}
+\end{table}
+
+\subsubsection{Depth Up-sampling}
+We experimented with depth up-sampling as another joint up-sampling task. We use the dataset
+of~\cite{silberman2012indoor} that comes with pre-defined
+train, validation and test splits. The approach of~\cite{eigen2014depth} is a CNN
+model that produces a result at 1/4th of the input resolution due to down-sampling operations in
+max-pooling layers. Furthermore, the authors down-sample the $640\times 480$ images to $320\times 240$
+as a pre-processing step before CNN convolutions. The final depth result is bicubic interpolated to the
+original resolution. It is this interpolation that we replace with a Gaussian and learned joint
+bilateral up-sampling. The features are five-dimensional position
+and color information from the high resolution input image. The filter is learned using the same protocol
+as for color up-sampling minimizing MSE prediction error. The quantitative results
+are shown in Table~\ref{tbl:upsample}, the Gaussian filter performs equal to the bicubic interpolation,
+the learned filter is better. Qualitative results are shown in Fig~\ref{fig:upsample_visuals},
+both joint bilateral up-sampling respect image edges in the result. For this~\cite{ferstl2015b} and other tasks
+specialized interpolation algorithms exist, \eg deconvolution networks~\cite{zeiler2010deconvolutional}. Part of future work is to equip these approaches with bilateral filters. More qualitative results are
+presented in Appendix~\ref{sec:depth_upsample_extra}.
+
+\begin{figure}[h!]
+  \centering
+    \includegraphics[width=0.7\columnwidth]{figures/supplementary/sample_body_data.jpg}
+  \mycaption{Sample data for 3D mesh denoising}
+  {(top) Some 3D body meshes sampled from~\cite{SMPL:2015} and (bottom) the corresponding noisy meshes used in denoising experiments.}
+\label{fig:samplebody}
+\end{figure}
+
+\subsection{3D Mesh Denoising}\label{sec:mesh_denoising}
+
+Permutohedral convolutions can naturally be extended to higher ($>2$)
+dimensional data. To highlight this, we use the proposed convolution for the task
+of denoising 3D meshes.
+
+\begin{figure}[t!]
+  \centering
+    \includegraphics[width=0.8\columnwidth]{figures/supplementary/isomap_features.jpg}
+  \mycaption{4D isomap features for 3D human bodies}
+  {Visualization of 4D isomap features for a sample 3D mesh. Isomap feature values are overlaid onto mesh vertices.}
+  \label{fig:isomap}
+\end{figure}
+
+We sample 3D human body meshes using a
+generative 3D body model from~\cite{SMPL:2015}. To the clean meshes, we add Gaussian random
+noise displacements along the surface normal at each vertex location.
+Figure~\ref{fig:samplebody} shows some sample 3D meshes sampled
+from~\cite{SMPL:2015} and corresponding noisy meshes. The task is to take the noisy meshes as inputs and
+recover the original 3D body meshes. We create 1000 training, 200 validation and another 500
+testing examples for the experiments. Although we use synthetically generated meshes and noise for
+our experiments for the sake of training, our technique could be potentially used for
+denoising the noisy meshes arising from 3D scanning devices.
+
+\paragraph{Mesh Representation:} The 3D human body meshes from~\cite{SMPL:2015} are represented with
+3D vertex locations and the edge connections between the vertices. We found that this signal representation
+using global 3D coordinates is not suitable for denoising with bilateral filtering. Therefore, we first
+smooth the noisy mesh using mean smoothing applied to the face normals~\cite{yagou2002mesh} and represent the noisy
+mesh vertices as 3D vector displacements with respect to the corresponding smoothed mesh. Thus, the
+task becomes denoising the 3D vector displacements with respect to the smoothed mesh.
+
+\paragraph{Isomap Features:} To apply permutohedral convolution, we need to define features at each input
+vertex point. We use a 4 dimensional isomap embedding~\cite{tenenbaum2000global} of the given 3D mesh graph as features. The
+given 3D mesh is converted into a weighted edge graph with edge weights set to the Euclidean distance between the
+connected vertices and to infinity between the non-connected vertices. Then the 4 dimensional isomap embedding is
+computed for this weighted edge graph using a publicly available implementation~\cite{isomap_code}.
+Figure~\ref{fig:isomap} shows the visualization of isomap features on a sample 3D mesh.
+
+\setlength{\tabcolsep}{2pt}
+\newcolumntype{L}[1]{>{\raggedright\let\newline\\\arraybackslash\hspace{0pt}}b{#1}}
+\newcolumntype{C}[1]{>{\centering\let\newline\\\arraybackslash\hspace{0pt}}b{#1}}
+\newcolumntype{R}[1]{>{\raggedleft\let\newline\\\arraybackslash\hspace{0pt}}b{#1}}
+\begin{table}[t]
+  \scriptsize
+  \centering
+    \begin{tabular}{C{3.0cm} C{1.5cm} C{1.5cm} C{1.5cm} C{1.5cm}}
+      \toprule
+& \textbf{Noisy Mesh} & \textbf{Normal Smoothing} & \textbf{Gauss Bilateral} & \textbf{Learned Bilateral} \\ [0.1cm]
+      \midrule
+\textbf{Vertex Distance (RMSE)} &  5.774 & 3.183 & 2.872 & \textbf{2.825}  \\
+\textbf{Normal Angle Error} & 19.680  & 19.707 & 19.357 & \textbf{19.207}  \\
+      \bottomrule
+      \\
+    \end{tabular}
+      \vspace{-0.2cm}
+    \mycaption{Body denoising} {Vertex distance RMSE values and normal angle error (in degrees)
+    corresponding to different denoising strategies averaged over 500 test meshes.}
+\label{tbl:bodydenoise}
+\end{table}
+
+\paragraph{Experimental Results:} Mesh denoising with a bilateral filter proceeds by
+splatting the input 3D mesh vectors (displacements with respect to the smoothed mesh) into
+the 4D isomap feature space, filtering the signal in this 4D space and then slicing back
+into original 3D input space. The Table~\ref{tbl:bodydenoise} shows quantitative results as RMSE
+for different denoising strategies. The normal smoothing~\cite{yagou2002mesh} already reduces the RMSE. The Gauss bilateral filter
+results in significant improvement over normal
+smoothing and learning the filter weights again improves the result.
+A visual result is shown in Fig.~\ref{fig:bodyresult}.
+
+\begin{figure}[t!]
+  \centering
+    \includegraphics[width=0.7\columnwidth]{figures/supplementary/body_sample_result.jpg}
+  \mycaption{Sample denoising result}
+  {Ground truth mesh (left), corresponding given noisy mesh (middle) and the denoised result (right) using the learned bilateral filter.}
+  \label{fig:bodyresult}
+\end{figure}
+
+%------------------------------------------------------------------------
+\section{Learning Pairwise Potentials in Dense CRFs}\label{sec:densecrf}
+The bilateral convolution from Section~\ref{sec:learning} generalizes
+the class of DenseCRF models for which the mean-field inference from~\cite{krahenbuhl2012efficient}
+applies. The DenseCRF models have found wide-spread use in various
+computer vision applications~\cite{sun2013fully, bell2014intrinsic, zheng2015conditional, vineet12eccv, vineet12emmcvpr, bell2015minc}. Recall from Section~\ref{sec:example_modesl_crf},
+for a DenseCRF model with unary potentials $\psi_u$ and pairwise potentials $\psi^{ij}_p$,
+the mean-field inference results in a fixed point equation which
+can be solved iteratively to update the marginal distributions $Q_i$. In iteration $t$, we have:
+
+\begin{equation}
+Q^{t+1}_i(x_i) = \frac{1}{Z_i} \exp\{-\psi_u(x_i) - \sum_{l \in \mathcal{L}}\underbrace{\sum_{j \ne i}
+\psi^{ij}_p(x_i,l) Q^{t}_j(l)}_\text{bilateral filtering}\}.
+\label{eq:mfupdate-2}
+\end{equation}
+
+Thus bilateral filtering is used for fast mean-field inference in DenseCRF models.
+One of the fundamental limitations with the existing use of DenseCRFs is the
+confinement of pairwise potentials $\psi^{ij}_p(y_i,y_j)$ to be Gaussian as
+bilateral filtering is traditionally applied with Gaussian kernel.
+
+\subsection{Learning Pairwise Potentials}
+
+The proposed bilateral convolution generalizes the class of potential functions $\psi^{ij}_p$, since
+they allow a richer class of kernels $k(\f_i,\f_j)$ that furthermore can be learned from data. So far, all
+dense CRF models have used Gaussian potential functions $k$, we replace it with the
+general bilateral convolution and learn the parameters of kernel $k$, thus in effect
+learn the pairwise potentials of the dense CRF. This retains the desirable properties of this
+model class -- efficient inference through mean-field and the feature dependency of the pairwise
+potential.
+In order to learn the form of the pairwise potentials $k$ we make use of the
+gradients for filter parameters in $k$ and
+use back-propagation through the mean-field iterations~\cite{domke2013learning, li2014mean} to learn them.
+
+The work of~\cite{krahenbuhl2013parameter} derived gradients to learn the feature scaling $\Lambda$ but not the
+form of the kernel $k$, which still was Gaussian. In~\cite{campbell2013fully}, the features $\f_i$ were
+derived using a non-parametric embedding into a Euclidean space and again a Gaussian
+kernel was used. The computation of the embedding was a pre-processing step, not integrated in a
+end-to-end learning framework. Both aforementioned works are generalizations that are orthogonal
+to our development and can be used in conjunction.
+
+\subsection{Experimental Evaluation}
+
+We evaluate the effect of learning more general forms of potential functions on two
+pixel labeling tasks, semantic segmentation of VOC data~\cite{voc2012segmentation} and material
+classification~\cite{bell2015minc}. We use pre-trained models from the literature
+and compare the relative change when learning the pairwise potentials, as in the last section. For both
+the experiments, we use multinomial logistic classification loss and learn the filters via
+back-propagation~\cite{domke2013learning}. This has also been understood as recurrent neural
+network variants~\cite{zheng2015conditional},
+the following experiments demonstrate the learnability of bilateral filters.
+
+\begin{figure}[t]
+  \centering
+  \subfigure{%
+    \includegraphics[width=.23\columnwidth]{figures/2010_003531_given.jpg} \label{fig:seg_given}
+  }
+  \subfigure{%
+    \includegraphics[width=.23\columnwidth]{figures/2010_003531_gt.png} \label{fig:seg_gt}
+  }
+  \subfigure{%
+    \includegraphics[width=.23\columnwidth]{figures/2010_003531_cnn.png} \label{fig:seg_cnn}
+  }
+  \subfigure{%
+    \includegraphics[width=.23\columnwidth]{figures/2010_003531_learnt.png} \label{fig:seg_mf2steps}
+  }\\
+  \setcounter{subfigure}{0}
+  \subfigure[Input]{%
+    \includegraphics[width=.23\columnwidth]{figures/000006011_given.jpg} \label{fig:minc_given}
+  }
+  \subfigure[Ground Truth]{%
+    \includegraphics[width=.23\columnwidth]{figures/000006011_gt.png} \label{fig:minc_gt}
+  }
+  \subfigure[CNN]{%
+    \includegraphics[width=.23\columnwidth]{figures/000006011_cnn.png} \label{fig:minc_cnn}
+  }
+  \subfigure[+\textit{loose}MF]{%
+    \includegraphics[width=.23\columnwidth]{figures/000006011_learnt.png} \label{fig:minc_mf2steps}
+  }
+  \mycaption{Segmentation results}{An example result for semantic (top) and material (bottom) segmentation.
+  (c) depicts the unary results before application of MF, (d) after two steps of \textit{loose}-MF with
+  a learned CRF. More examples with comparisons to Gaussian pairwise potentials can be found in the supplementary material.}
+    \label{fig:seg_visuals}
+\end{figure}
+
+\subsubsection{Semantic Segmentation}
+Semantic segmentation is the task of assigning a semantic label
+to every pixel. We choose the DeepLab network~\cite{chen2014semantic}, a
+variant of the VGGnet~\cite{simonyan2014very} for obtaining unaries.
+The DeepLab architecture runs a CNN
+model on the input image to obtain a result that is down-sampled by a factor of
+8. The result is then bilinear interpolated to the desired resolution and serves
+as unaries $\psi_u(x_i)$ in a dense CRF. We use the same Pott's label
+compatibility function $\mu$, and also use two kernels $k^1(\f_i,\f_j) +
+k^2(p_i,p_j)$ with the same features $\f_i=(x_i,y_i,r_i,g_i,b_i)^{\top}$ and $\mathbf{p}_i=(x_i,y_i)^{\top}$
+as in~\cite{chen2014semantic}. Thus, the two filters operate in parallel on
+color \& position, and spatial domain respectively. We also initialize the
+mean-field update equations with the CNN unaries. The only change in the model
+is the type of the pairwise potential function from Gauss to a generalized form.
+
+We evaluate the result after 1 step and 2 steps of mean-field inference and
+compare the Gaussian filter versus the learned version (cf.
+Tab.~\ref{tbl:seg_results}). First, as in~\cite{chen2014semantic} we observe
+that one step of mean field improves the performance by 2.48\% in Intersection
+over Union (IoU) score. However, a learned potential increases the score by
+2.93\%. The same behavior is observed for 2 steps: the learned result again
+adds on top of the raised Gaussian mean field performance. Further, we tested a
+variant of the mean-field model that learns a separate kernel for the first and
+second step~\cite{li2014mean}. This `loose' mean-field model
+leads to further improvement of the performance. It is not obvious
+how to take advantage
+of a loose model in the case of Gaussian potentials.
+
+\begin{table}[t]
+\setlength{\tabcolsep}{2pt}
+  \scriptsize
+  \centering
+    \begin{tabular}{l c c c c}
+      \toprule
+&  & + \textbf{MF-1step} & + \textbf{MF-2 step} & + \textbf{\textit{loose} MF-2 step} \\ [0.1cm]
+      \midrule
+      \multicolumn{4}{l}{Semantic segmentation (IoU) - CNN~\cite{chen2014semantic}: 72.08 / 66.95} & \\
+      & Gauss CRF & +2.48 & +3.38  & +3.38 / +3.00   \\
+      & Learned CRF & +2.93 & +3.71  &  \textbf{+3.85 / +3.37} \\
+     \midrule
+     \multicolumn{4}{l}{Material segmentation (Pixel Accuracy) - CNN~\cite{bell2015minc}: 67.21 / 69.23 } & \\
+      & Gauss CRF & +7.91 / +6.28 & +9.68 / +7.35  &  +9.68 / +7.35  \\
+      & Learned CRF & +9.48 / +6.23 & +11.89 / +6.93  &  \textbf{+11.91 / +6.93} \\
+      \\
+    \end{tabular}
+    \mycaption{Improved mean-field inference with learned potentials} {(top) Average IoU score on Pascal VOC12
+    validation/test data~\cite{voc2012segmentation} for semantic segmentation; (bottom) Accuracy for
+    all pixels / averaged over classes on the MINC test data~\cite{bell2015minc} for material segmentation.}
+  \label{tbl:seg_results}
+\end{table}
+
+\subsubsection{Material Segmentation}
+
+We adopt the method and dataset from~\cite{bell2015minc} for the material segmentation task.
+Their approach
+proposes the same architecture as in the previous section; a CNN to predict the material labels (\eg\ wool, glass, sky, etc.)
+followed by a densely connected CRF using Gaussian potentials and mean-field inference.
+We re-use the pre-trained CNN and choose the
+CRF parameters and Lab color/position features as in~\cite{bell2015minc}.
+Results for pixel accuracy and class-averaged pixel accuracy are shown in Table~\ref{tbl:seg_results}.
+Following the CRF validation in~\cite{bell2015minc}, we ignored the label `other' for both the training and
+evaluation. For this dataset, the availability of training data is small, 928 images with
+only sparse segment annotations. While this is enough to cross-validate few hyper-parameters, we would
+expect the general bilateral convolution to benefit from
+more training data.
+Visual results are shown in Fig.~\ref{fig:seg_visuals} and more are included in
+Appendix~\ref{sec:semantic_bnn_extra}.
+
+%------------------------------------------------------------------------
+\section{Bilateral Neural Networks}\label{sec:bnn}
+
+Probably the most promising opportunity for the generalized bilateral filter is its
+use in Convolutional Neural Networks. Since we are not restricted to the Gaussian case,
+we can stack several filters in both parallel and sequential manner in the same way as filters are ordered in
+layers in typical spatial CNN architectures. Having the gradients available allows for end-to-end training
+with back-propagation, without the need for any change in CNN training protocols. We refer to the
+layers of bilateral filters as `bilateral convolution layers' (BCL). As discussed in the introduction,
+these can be understood as either linear filters in a high dimensional space or a filter with an
+image adaptive receptive field. In the remainder, we will refer to CNNs that include at least one bilateral
+convolutional layer as a bilateral neural network (BNN).
+
+\setlength{\tabcolsep}{4pt}
+\begin{table}[h]
+  \scriptsize
+  \centering
+    \begin{tabular}{l c c}
+      \toprule
+\textbf{Dim.-Features} & \textbf{d-dim caffe} & \textbf{BCL} \\ [0.1cm]
+      \midrule
+      2D-$(x, y)$ & \textbf{3.3 $\pm$ 0.3 / 0.5$ \pm$ 0.1} & 4.8 $\pm$ 0.5 / 2.8 $\pm$ 0.4  \\
+      3D-$(r,g,b)$ & 364.5 $\pm$ 43.2 / 12.1 $\pm$ 0.4 & \textbf{5.1 $\pm$ 0.7 / 3.2 $\pm$ 0.4}  \\
+      4D-$(x,r,g,b)$ & 30741.8 $\pm$ 9170.9 / 1446.2 $\pm$ 304.7 & \textbf{6.2 $\pm$ 0.7 / 3.8 $\pm$ 0.5}  \\
+      5D-$(x,y,r,g,b)$ & out of memory & \textbf{7.6 $\pm$ 0.4 / 4.5 $\pm$ 0.4}  \\
+      \\
+    \end{tabular}
+    \mycaption{Runtime comparison: BCL vs. spatial convolution} {Average CPU/GPU runtime (in ms)
+    of 50 1-neighborhood filters averaged over 1000 images from Pascal VOC. All scaled
+    features $(x,y,r,g,b)\in[0,50)$. BCL includes splatting and splicing operations which in layered networks
+    can be re-used.}
+\label{tbl:time}
+\end{table}
+
+What are the possibilities of a BCL compared to a standard spatial layer? First, we can define a
+feature space $\f_i\in\mathbb{R}^d$ to define proximity between elements to perform
+the convolution. This can include color or intensity as in the previous example.
+We performed a runtime comparison (Tab.~\ref{tbl:time}) between
+our current implementation of a BCL and the caffe~\cite{jia2014caffe} implementation of
+a $d$-dimensional convolution. For 2D positional features (first row), the
+standard layer is faster since the permutohedral algorithm comes with an overhead. For higher
+dimensions $d>2$, the runtime depends on the sparsity; but ignoring the sparsity is quickly
+leading to intractable runtimes for the regular $d$-dimensional convolution.
+The permutohedral lattice convolution is in effect a sparse matrix-vector product and thus
+performs favorably in this case. In the original work~\cite{adams2010fast}, it was presented
+as an approximation to the Gaussian case, here we take the viewpoint of it being the definition of
+the convolution itself.
+
+Next we illustrate two use cases of BNNs and compare against spatial CNNs.
+Appendix~\ref{sec:appendix-bnn} contains further explanatory experiments
+with examples on MNIST digit recognition.
+
+\begin{figure}[t!]
+  \centering
+  \subfigure[Sample tile images]{%
+    \includegraphics[width=0.6\columnwidth]{figures/sample_slate_images.jpg}\label{fig:slate_sample}
+  }\\
+  \subfigure[NN architecture]{%
+    \includegraphics[width=.3\columnwidth]{figures/slate_network.pdf}\label{fig:slate_network}
+  }
+  \subfigure[IoU versus Epochs]{%
+    \includegraphics[width=.3\columnwidth]{figures/slate_plots.pdf}\label{fig:slate_plots}
+  }
+  \mycaption{Segmenting Tiles}{(a) Example tile input images; (b) the 3-layer NN architecture used
+  in experiments. `Conv' stands for spatial convolutions, resp.~bilateral convolutions;
+  (c) Training progress in terms of validation IoU versus training epochs.}
+  \label{fig:slate_experiment}
+\end{figure}
+
+\subsection{An Illustrative Example: Segmenting Tiles}
+
+In order to highlight the model possibilities of using higher dimensional sparse feature
+spaces for convolutions through BCLs, we constructed the following illustrative problem. A randomly colored
+foreground tile with size $20\times 20$ is placed on a random colored background
+of size $64 \times 64$. Gaussian noise with standard deviation of $0.02$ is added and color values
+are normalized to $[0,1]$, example images
+are shown in Fig.~\ref{fig:slate_sample}.
+The task is to segment out the smaller tile. A pixel classifier can
+not distinguish foreground from background since the color is random. We train CNNs with three
+convolution/ReLU layers and varying
+filters of size $n \times n, n \in \{9, 13, 17, 21\}$.
+The schematic of the architecture is shown
+in Fig~\ref{fig:slate_network} ($32,16,2$ filters).
+We create 10k training, 1k validation and 1k test images and, use the
+validation set to choose learning rates. In
+Fig.~\ref{fig:slate_plots}, we plot the validation IoU against training epochs.
+
+Now, we replace all spatial convolutions with bilateral convolutions for a full BNN.
+The features are $\f_i=(x_i,y_i,r_i,g_i,b_i)^{\top}$ and the filter has a neighborhood of $1$.
+The total number of
+parameters in this network is around $40k$ compared to $52k$ for $9\times 9$ up to $282k$ for a $21\times 21$
+CNN. With the same training protocol
+and optimizer, the convergence rate of BNN is much faster. In this example
+as in semantic segmentation discussed in the last section, color is a discriminative information for
+the label. The bilateral convolutions \emph{see} the color difference, the points are already
+pre-grouped in the permutohedral lattice and the task remains to assign a label to the two groups.
+
+\vspace{-0.4cm}
+\subsection{Character Recognition}
+The results for tile, semantic, and material segmentation when using general bilateral
+filters mainly improved because the feature space was used to encode useful prior information about the
+problem (similar RGB of close-by pixels have the same label). Such prior knowledge is often available when
+structured predictions are to be made, but the input signal may also be in a sparse format to begin with.
+Let us consider handwritten character recognition, one of the prime cases for CNN use.
+
+The Assamese character dataset~\cite{bache2013uci} contains 183 different Indo-Aryan
+symbols with 45 writing samples per class. Some sample character images are shown in
+Fig.~\ref{fig:assamese_sample}. This dataset has been collected on a tablet PC using a pen
+input device and has been pre-processed to binary images of size $96 \times 96$.
+Only about $3\%$ of the pixels contain a pen stroke, which we will denote by $I_i=1$.
+
+\begin{figure}[t]
+  \centering
+  \subfigure[Sample Assamese character images (9 classes, 2 samples each)]{%
+    \includegraphics[width=0.6\columnwidth]{figures/sample_assamese.png}\label{fig:assamese_sample}
+  }\\
+  \subfigure[LeNet training]{%
+    \includegraphics[width=.3\columnwidth]{figures/lenet_plots.pdf}\label{fig:assamese_lenet}
+  }
+  \subfigure[DeepCNet training]{%
+    \includegraphics[width=.3\columnwidth]{figures/deepcnet_plots.pdf}\label{fig:assamese_deepcnet}
+  }
+  \mycaption{Character recognition}{ (a) Sample Assamese character images~\cite{bache2013uci};
+  and training progression of various models with (b) LeNet and (c) DeepCNet base networks.}
+\label{fig:assamese_experiment}
+  \vspace{-0.3cm}
+\end{figure}
+
+
+A CNN is a natural choice to approach this classification task. We experiment with two CNN
+architectures that have been used for this task, LeNet-7 from~\cite{lecun1998gradient}
+and DeepCNet~\cite{ciresan2012multi, graham2014spatially}. The LeNet is a shallower network with
+bigger filter sizes whereas DeepCNet is deeper with smaller convolutions.
+Both networks are fully specified in
+Appendix~\ref{sec:addresults}. In order to simplify the task for the networks we cropped the
+characters by placing a tight bounding box around them and providing the bounding boxes as input to the
+networks. We will call these networks
+Crop-LeNet and Crop-DeepCNet. For training, we randomly divided the data into 30 writers for training,
+6 for validation and the remaining 9 for
+test. Fig.\ref{fig:assamese_lenet} and Fig.~\ref{fig:assamese_deepcnet} show the training progress for various
+LeNet and DeepCNet models respectively. DeepCNet is a better choice for this problem and for both cases,
+pre-processing the data by cropping improves convergence.
+
+The input is spatially sparse and the BCL provides a natural way to take advantage of this. For
+both networks, we create a BNN variant (BNN-LeNet and BNN-DeepCNet) by replacing the
+first layer with bilateral convolutions using the features $\f_i = (x_i, y_i)^{\top}$ and we \emph{only}
+consider the foreground points $I_i=1$. The values $(x_i,y_i)$ denote the position of the pixel with respect
+to the top-left corner of the bounding box around the character. In effect, the lattice is very
+sparse which reduces runtime because the convolutions are only performed on $3\%$ of the
+points that are actually observed. A bilateral filter has $7$ parameters compared to a receptive field of $3\times 3$ for the first
+DeepCNet layer and $5\times 5$ for the first LeNet layer. Thus, a BCL with the same number of filters has fewer parameters.
+The result of the BCL convolution is then splatted at all points $(x_i,y_i)$ and
+passed on to the remaining spatial layers. The convergence behavior is shown in Fig.\ref{fig:assamese_experiment}
+and again we find faster convergence and also better validation accuracy. The empirical results of this
+experiment for all tested architectures are summarized in Table~\ref{tbl:assamese}, with BNN variants
+clearly outperforming their spatial counterparts.
+
+The absolute results can be vastly improved by making use of virtual examples, \eg
+by affine transformations~\cite{graham2014spatially}. The purpose of these experiments is to compare the networks on equal grounds while we
+believe that additional data will be beneficial for both networks. We have no reason to believe that a particular
+network benefits more.
+
+\setlength{\tabcolsep}{2pt}
+\newcolumntype{L}[1]{>{\raggedright\let\newline\\\arraybackslash\hspace{0pt}}b{#1}}
+\newcolumntype{C}[1]{>{\centering\let\newline\\\arraybackslash\hspace{0pt}}b{#1}}
+\newcolumntype{R}[1]{>{\raggedleft\let\newline\\\arraybackslash\hspace{0pt}}b{#1}}
+\begin{table}[t]
+  \scriptsize
+  \centering
+    \begin{tabular}{C{1.65cm} C{1.55cm} C{1.55cm} C{1.55cm} | C{1.55cm} C{1.55cm} C{1.55cm}}
+      \toprule
+ & \textbf{LeNet} & \textbf{Crop-LeNet} & \textbf{BNN-LeNet}  & \textbf{DeepCNet} & \textbf{Crop-DeepCNet} & \textbf{BNN-DeepCNet} \\ [0.2cm]
+      \midrule
+      Validation & 59.29 & 68.67 & \textbf{75.05}  & 82.24 & 81.88 & \textbf{84.15} \\
+      Test & 55.74 & 69.10 & \textbf{74.98}  & 79.78 & 80.02 & \textbf{84.21}  \\
+      \\
+    \end{tabular}
+    \mycaption{Results on Assamese character images} {Total recognition accuracy for the
+    different models.}
+  \label{tbl:assamese}
+\end{table}
+
+%------------------------------------------------------------------------
+\section{Discussion and Conclusions}
+We proposed to learn bilateral filters from data. In
+hindsight, it may appear obvious that this leads to performance improvements compared
+to a fixed parametric form, \eg the Gaussian. To understand algorithms that
+facilitate fast approximate computation of Eq.~\ref{eq:bilateral} as a parameterized
+implementation of a bilateral filter with free parameters is the key insight and
+enables gradient descent based learning. We relaxed the non-separability in the
+algorithm from~\cite{adams2010fast} to allow for more general filter functions.
+There is a wide range of possible applications for learned bilateral
+filters~\cite{paris2009bilateral} and we discussed some generalizations of
+previous work. These include joint bilateral
+up-sampling and inference in dense CRFs. We further demonstrated a use case of bilateral
+convolutions in neural networks.
+
+The bilateral convolutional layer allows for filters whose
+receptive field change given the input image. The feature space view provides a
+canonical way to encode similarity between any kind of objects, not only pixels, but \eg bounding boxes,
+segmentation, surfaces. The proposed filtering operation is then a natural candidate to
+define a filter convolutions on these objects, it takes advantage of sparsity and scales to higher dimensions.
+Therefore, we believe that this view will be useful for several problems where CNNs
+can be applied. An open research problem is whether the sparse higher dimensional
+structure also allows for efficient or compact representations for intermediate layers inside
+CNN architectures.
+
+In summary, the proposed technique for learning sparse high-dimensional filters
+results in a generalization of bilateral filters that helps in learning task-specific
+bilateral filters. In the context of inference, learnable bilateral filters can be used for better
+modeling and thus inference in neural network as well as DenseCRF models.

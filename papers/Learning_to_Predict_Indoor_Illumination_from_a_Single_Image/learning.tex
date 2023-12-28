@@ -1,0 +1,169 @@
+
+\section{Learning from LDR panoramas}
+\label{sec:learning}
+
+Now that we have the tools to extract accurate lighting information from LDR panoramas, we detail our approach for learning the relationship between a single photo and its lighting conditions. 
+
+
+\begin{table}
+\caption[]{The proposed CNN architecture. After a series of 7 convolutional layers (conv), some with residual connections (res), a fully-connected layer (FC) segues to two heads. The heads aim at reconstructing the light mask $\mathbf{y}_\text{mask}$ (left) and the RGB panorama $\mathbf{y}_\text{RGB}$ (right) through a series of deconvolutional layers (deconv). The ELU activation function~\cite{clevert-iclr-16} and batch normalization are used on all layers except the outputs, which are sigmoids for light mask and tangent hyperbolic for panorama prediction. The stride at each layer is indicated between parentheses. The ``res'' identifiers indicate residual layers~\cite{he-cvpr-16}. }
+\centering
+\begin{tabular}{c}
+\toprule
+\textbf{Layer (stride)} \\
+\midrule
+Input \\
+\midrule
+conv9-64 (2) \\
+conv4-96 (2) \\
+res3-96  (1) \\
+res4-128 (2) \\
+res4-192 (2) \\
+res4-256 (2) \\
+\midrule
+FC-1024 \\
+\end{tabular}
+\\
+\begin{tabular}{cc}
+\midrule
+FC-8192 & FC-6144 \\
+deconv4-256 (2) & deconv4-192 (2) \\
+deconv4-128 (2) & deconv4-128 (2) \\
+deconv4-96 (2) & deconv4-64 (2) \\
+deconv4-64 (2) & deconv4-32 (2) \\
+deconv4-32 (2) & deconv4-24 (2) \\
+conv5-1 (1) & conv5-3 (1) \\
+Sigmoid & Tanh \\*[-.5em]
+\noindent\rule{3.2cm}{.8pt} &
+\noindent\rule{3.2cm}{.8pt} \\
+Output: light mask $\mathbf{y}_\text{mask}$ &
+Output: RGB panorama $\mathbf{y}_\text{RGB}$ \\
+\end{tabular}
+\label{t:learning-architecture}
+\end{table}
+
+\subsection{Training data preparation}
+\label{sec:ldr-data-prep}
+
+For each SUN360 indoor panorama, we compute the light mask to represent ground truth during the learning process (sec.~\ref{sec:lightdetection}). We then take 8 crops from each panorama at random elevation between $-30^\circ$ and $30^\circ$ and make a projection of them as rectilinear photos. Using our recentering warp (sec.~\ref{sec:warping}), we generate a corresponding warped panorama (and light mask) for each rectilinear photo. We also rotate the warped panorama and corresponding light mask so that the crop region always sits at center azimuth (fig.~\ref{f:overview}).  At the end of this process, we have 96,000 input-output pairs, where the input is a photo, and the output is a pair of a warped panorama and its corresponding light mask.
+
+\subsection{Network architecture} 
+
+As shown in table~\ref{t:learning-architecture}, we use a convolutional neural network that takes the photo as input, produces a low-dimensional encoding of the input through a series of convolutions downstream and splits into two upstream expansions, with two distinct tasks: (1) intensity estimation / binary light mask prediction, and (2) RGB panorama prediction. The encoder is split into two standard convolution layers, followed by four residual layers~\cite{he-cvpr-16}. The two individual decoders are exclusively composed of deconvolution layers. The input photo is of size $256\times192$, whereas the panorama and light mask outputs are of size $256\times128$. Each time a stride of 2 is encountered with a convolution (deconvolution) layer, the resolution of its output feature map is divided (multiplied) by two. The output light mask $\mathbf{x}_\text{mask}$ represents the probability of light for each pixel in the environment map. The RGB panorama $\mathbf{x}_\text{mask}$ serves as a high level colored texture in the final environment map. Please see sec.~\ref{sec:experiments} for several examples of estimated light masks and RGB panoramas.
+
+
+\begin{figure}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{1pt}
+\begin{tabular}{ccc}
+\includegraphics[width=0.32\linewidth]{images/cosfilter/base.png} &
+\includegraphics[width=0.32\linewidth]{images/cosfilter/cos_1.png} &
+\includegraphics[width=0.32\linewidth]{images/cosfilter/cos_5.png} \\
+(a) Original & (b) $\alpha e=1$ & (c) $\alpha e=5$ \\
+\includegraphics[width=0.32\linewidth]{images/cosfilter/cos_10.png} &
+\includegraphics[width=0.32\linewidth]{images/cosfilter/cos_20.png} &
+\includegraphics[width=0.32\linewidth]{images/cosfilter/cos_80.png} \\
+(d) $\alpha e=10$ & (e) $\alpha e=20$ & (f) $\alpha e=80$ \\
+\end{tabular}
+\caption{Effect of the cosine blurring from eq.~(\ref{e:filter}) on the light mask at various blurring levels. Note how this simple, differentiable scheme allows a smooth progression towards higher frequency content over time, but without the ringing artifacts of spherical harmonics.}
+\label{f:learning-filter}
+\end{figure}
+
+\subsection{Loss function} 
+
+For the RGB panorama prediction task, we use an L2 distance on the pixel output:
+\begin{equation}
+    \mathcal{L}_\text{L2}(\mathbf{y}, \mathbf{t}) = \frac{1}{N}\sum_{i=1}^{N} \mathbf{s}_i (\mathbf{y}_i - \mathbf{t}_i)^2 \,,
+\label{e:rgbloss}
+\end{equation}
+where $N=\mathtt{width}\times\mathtt{height}\times 3$ is the total number of elements in the image, $\mathbf{y}$ is the network prediction, $\mathbf{t}$ the ground truth panorama and $\mathbf{s}_i$ the solid angle for pixel $i$.
+
+Designing the loss function for the light mask $\mathbf{y}_\text{mask}$ is not as straightforward. Take, for example, the standard L2 or binary cross entropy losses computed on the light mask directly. If a small bright spotlight is estimated to be located slightly off its ground truth location, a huge penalty will incur. Since pinpointing the exact location of all the light sources from a single photo is not necessary, we instead blur the target light mask with a filter and compute the L2 loss on the blurred version. The filter starts with a coarse, low-frequency representation of the target light mask and progressively sharpens it over training time. To this end, we design a filter based on the cosine distance, followed by an L2 loss for the light mask: 
+\begin{equation}
+    \mathcal{L}_\text{cos}(\mathbf{y}, \mathbf{t}, e) = \frac{1}{N}\sum_{i=1}^{N} (\mathcal{F}(\mathbf{y}, i, e) - \mathcal{F}(\mathbf{t}, i, e))^2 \,,
+    \label{e:maskloss}
+\end{equation}
+where $e$ is a real value corresponding to the current epoch (formally, $e=\textrm{\#epochs}+\textrm{\#current-mini-batch}/\textrm{\#total-mini-batches}$.). The filter $\mathcal{F}$ is defined as:
+\begin{equation}
+    \mathcal{F}(\mathbf{p}, i, e) = \frac{1}{K_i} \sum_{\omega \in \Omega_i} \mathbf{p}(\omega) s(\omega) \left( \omega \cdot n_i \right)^{\alpha e},
+    \label{e:filter}
+\end{equation}
+where $\Omega_i$ is the hemisphere centered at pixel $i$ on the panorama $\mathbf{p}$,  $n_i$ the unit normal at pixel $i$, and $K_i$ the sum of solid angles on $\Omega_i$. $\omega$ is a unit vector in a specific direction on $\Omega_i$ and $s(\omega)$ the solid angle for the pixel in the direction $\omega$. As seen before, we define $e\in\mathbb{R}$ as the real valued number of training samples collectively seen, normalized by the total number of training samples. 
+
+\begin{figure}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{1pt}
+\begin{tabular}{cc}
+\includegraphics[width=0.493\linewidth]{images/lossLDR.pdf} &
+\includegraphics[width=0.493\linewidth]{images/lossHDR.pdf} \\
+(a) LDR network & (b) HDR network
+\end{tabular}
+\caption{Evolution of training and test loss over the number of epochs for the (a) LDR and (b) HDR training.}
+\label{f:learning-curves}
+\end{figure}
+
+Since eq.~\ref{e:filter} is differentiable, back-propagation can be used to efficiently train our CNN. Fig.~\ref{f:learning-filter} shows a visual example of the effect of the cosine distance filter on a binary light mask. Note how the target light mask becomes progressively sharper over time. 
+
+\begin{figure*}[!t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{1pt}
+\begin{tabular}{cccc}
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_ajwmyarsmgyaxz-others-90-1.25792-0.96443_render}.jpg} & 
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_ajwmyarsmgyaxz-others-90-1.25792-0.96443_mask}.jpg} & 
+\hspace{.5em}
+%\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_abumqtqhptujdn-kitchen-135-1.06244-0.98464_render}.jpg} & 
+%\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_abumqtqhptujdn-kitchen-135-1.06244-0.98464_mask}.jpg} \\
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_agrayivbwqkxds-others-270-1.63912-0.96887_render}.jpg} & 
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_agrayivbwqkxds-others-270-1.63912-0.96887_mask}.jpg} \\
+%
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_adghmppfkzisfi-others-135-1.50414-0.96319_render}.jpg} & 
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_adghmppfkzisfi-others-135-1.50414-0.96319_mask}.jpg} & 
+\hspace{.5em}
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_ajxsprezaqhacq-restaurant-315-1.87811-1.08249_render}.jpg} & 
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_ajxsprezaqhacq-restaurant-315-1.87811-1.08249_mask}.jpg} \\
+%\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_aedlvoixsqeuog-others-315-1.05417-1.13734_render}.jpg} & 
+%\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_aedlvoixsqeuog-others-315-1.05417-1.13734_mask}.jpg} \\
+%
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_akpwzsghfylcvp-museum-270-1.56694-0.96451_render}.jpg} & 
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_akpwzsghfylcvp-museum-270-1.56694-0.96451_mask}.jpg} & 
+\hspace{.5em}
+%\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_akelvanxoywmql-workshop-180-1.44527-1.07197_render}.jpg} & 
+%\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_akelvanxoywmql-workshop-180-1.44527-1.07197_mask}.jpg} \\
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_ajzjecrfajjfdl-church-45-1.93004-1.12643_render}.jpg} & 
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_ajzjecrfajjfdl-church-45-1.93004-1.12643_mask}.jpg} \\
+%
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_ahffjewqynvufc-others-180-1.62782-1.18096_render}.jpg} & 
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_ahffjewqynvufc-others-180-1.62782-1.18096_mask}.jpg} & 
+\hspace{.5em}
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_alauchiodctyya-others-45-1.81179-1.15641_render}.jpg} & 
+\includegraphics[height=2.5cm]{{images/bunnyRenders/pano_alauchiodctyya-others-45-1.81179-1.15641_mask}.jpg} \\
+%
+(a) Relit with estimate & (b) Predicted light probability & 
+\hspace{.5em}
+(c) Relit with estimate & (d) Predicted light probability
+\end{tabular}
+\caption{Evaluation of the LDR network at predicting light source positions. For each example, we show a virtual bunny model inserted in a background image and relit with the LDR network estimate for that image ((a) and (c)), and the predicted lighting probabilities overlaid on the panorama ((b) and (d)). As can been seen, our method generalizes to a wide range of indoor scenes and illumination conditions. Many more examples are available in the supplementary material.}
+\label{f:relighting-bunnies}
+\end{figure*}
+
+The global loss function is then defined as:
+%
+\begin{equation}
+    \mathcal{L}(\mathbf{y}, \mathbf{t}, e) = w_1 \mathcal{L}_\text{L2}(\mathbf{y}_\text{RGB}, \mathbf{t}_\text{RGB})  
+    + w_2 \mathcal{L}_\text{cos}(\mathbf{y}_\text{mask}, \mathbf{t}_\text{mask}, e) \,.
+\label{e:globloss}
+\end{equation}
+%
+In our experiments, we use $w_1=100$, $w_2=1$, and $\alpha=3$.
+
+Our filtering scheme also has a rendering-based interpretation. It is well known that surface reflection for Lambertian objects can be modeled as low-pass filtering~\cite{ramamoorthi-sig-01}, while specular objects preserve more high frequencies of the illumination. In this sense, our loss function can be thought of evaluating the inferred illumination in terms of the resulting \emph{appearance} of spheres with increasingly glossy surface reflectance. In this vein, we experimented with directly representing the illumination with spherical harmonics (gradually increasing the number of coefficients to represent higher frequencies of illumination), but found that the network had a tendency to overfit to the ringing artifacts caused by high frequencies in the binary light mask.
+
+\subsection{Training details} 
+\label{sec:training-details}
+
+We use $85\%$ of the panoramas as training data, and $15\%$ as test data. Note that we generate the train-test split such that no crop of the test panoramas exist in the training set. Hence, all tests are performed for scenes and lighting conditions that have not been seen by the network before. We use the ADAM optimizer~\cite{kingma2014adam} with a minibatch size of $64$, learning rate of $0.005$, and momentum parameters of $\beta_1=0.9$, $\beta_2=0.999$. Fig.~\ref{f:learning-curves}-(a) shows the loss (from eq.~(\ref{e:globloss})) curves on the training and test set during training. Training takes roughly 40 hours on an Nvidia Titan X Pascal GPU. At test time, lighting inference (both mask and RGB) from a photo takes approximately 10ms. The batch size was selected so it fills the 12GB memory of the GPU.
+
+

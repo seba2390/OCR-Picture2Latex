@@ -1,0 +1,598 @@
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2018_conference,times}
+\usepackage{hyperref}
+\usepackage{url}
+
+% custom imports
+\usepackage{color}
+\usepackage{xspace}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx,wrapfig}
+\usepackage[hang,flushmargin]{footmisc}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\graphicspath{{./figures/}}
+
+% custom definitions
+\input{definitions}
+
+\usepackage{xcolor}
+\hypersetup{
+    colorlinks,
+    linkcolor={red!50!black},
+    citecolor={blue!50!black},
+    urlcolor={blue!80!black}
+}
+
+
+\title{\papertitle}
+
+\author{Caiming Xiong\footnotemark[1], Victor Zhong\thanks{Equal contribution}, Richard Socher  \\
+Salesforce Research \\
+Palo Alto, CA 94301, USA \\
+\texttt{\{cxiong, vzhong, rsocher\}@salesforce.com} \\
+}
+
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+Traditional models for question answering optimize using cross entropy loss, which encourages exact answers at the cost of penalizing nearby or overlapping answers that are sometimes equally accurate.
+We propose a mixed objective that combines cross entropy loss with self-critical policy learning. The objective uses rewards derived from word overlap to solve the misalignment between evaluation metric and optimization objective.
+In addition to the mixed objective, we improve dynamic coattention networks (DCN) with a deep residual coattention encoder that is inspired by recent work in deep self-attention and residual networks.
+Our proposals improve model performance across question types and input lengths, especially for long questions that requires the ability to capture long-term dependencies.
+On the Stanford Question Answering Dataset, our model achieves state-of-the-art results with~\emours exact match accuracy and~\fours F1, while the ensemble obtains~\emoursensemble exact match accuracy and~\foursensemble F1.
+\end{abstract}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Introduction}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Open domain question answering over unstructured text is an important problem in natural language processing, with a variety of applications in dialog agents~\nodo{cite}, information retrieval~\nodo{cite}, and relation extraction~\nodo{cite}.
+Existing state-of-the-art question answering models are trained to produce exact answer spans for a question and a document.
+In this setting, a ground truth answer used to supervise the model is defined as a start and an end position within the document.
+Existing training approaches optimize using cross entropy loss over the two positions.
+However, this suffers from a fundamental disconnect between the optimization, which is tied to the position of a particular ground truth answer span, and the evaluation, which is based on the textual content of the answer.
+This disconnect is especially harmful in cases where answers that are textually similar to, but distinct in positions from, the ground truth are penalized in the same fashion as answers that are textually dissimilar.
+For example, suppose we are given the sentence ``Some believe that the Golden State Warriors team of 2017 is one of the greatest teams in NBA history'', the question ``which team is considered to be one of the greatest teams in NBA history'', and a ground truth answer of ``the Golden State Warriors team of 2017''.
+The span ``Warriors'' is also a correct answer, but from the perspective of traditional cross entropy based training it is no better than the span ``history''.
+
+To address this problem, we propose a mixed objective that combines traditional cross entropy loss over positions with a measure of word overlap trained with reinforcement learning.
+We obtain the latter objective using self-critical policy learning in which the reward is based on word overlap between the proposed answer and the ground truth answer.
+Our mixed objective brings two benefits: 
+(i) the reinforcement learning objective encourages answers that are textually similar to the ground truth answer and discourages those that are not;
+(ii) the cross entropy objective significantly facilitates policy learning by encouraging trajectories that are known to be correct.
+The resulting objective is one that is both faithful to the evaluation metric and converges quickly in practice.
+
+In addition to our mixed training objective, we extend the Dynamic Coattention Network (DCN) by~\citet{xiong2016dynamic} with a deep residual coattention encoder.
+% This extension is inspired by work in self-attention by~\citet{Vaswani2017AttentionIA}, who show and allows the network to build richer representations of the input by enabling each input sequence to attend to previous attention contexts.
+This allows the network to build richer representations of the input by enabling each input sequence to attend to previous attention contexts.
+~\citet{Vaswani2017AttentionIA} show that the stacking of attention layers helps model long-range dependencies.
+We merge coattention outputs from each layer by means of residual connections to reduce the length of signal paths.
+~\citet{He2016DeepRL} show that skip layer connections facilitate signal propagation and alleviate gradient degradation.
+
+The combination of the deep residual coattention encoder and the mixed objective leads to higher performance across question types, question lengths, and answer lengths on the Stanford Question Answering Dataset (\squad)~\citep{Rajpurkar2016SQuAD10} compared to our DCN baseline.
+The improvement is especially apparent on long questions, which require the model to capture long-range dependencies between the document and the question.
+Our model, which we call~\modelname, achieves state-of-the-art results on \squad, with~\emours exact match accuracy and~\fours F1.
+When ensembled, the~\modelname obtains~\emoursensemble exact match accuracy and~\foursensemble F1.
+
+ 
+ 
+ 
+ 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+ 
+\section{\modelname}
+We consider the question answering task in which we are given a document and a question, and are asked to find the answer in the document.
+Our model is based on the DCN by~\citet{xiong2016dynamic},
+%with context vectors by~\nodo{cite DCN, bryan}
+%rs: Unclear here what they are, weird to include only in a subclause, better to include in your modification of encoder and give a proper paragraph there.
+%rs: nODO Give a high level overview of the modules of the DCN at least. encoders for q and d and then coattention. gives output to decoder, selects spans etc.
+which consists of a coattention encoder and a dynamic decoder.
+The encoder first encodes the question and the document separately, then builds a codependent representation through coattention.
+The decoder then produces a start and end point estimate given the coattention.
+The DCN decoder is dynamic in the sense that it iteratively estimates the start and end positions, stopping when estimates between iterations converge to the same positions or when a predefined maximum number of iterations is reached.
+We make two significant changes to the DCN by introducing a deep residual coattention encoder and a mixed training objective that combines cross entropy loss from maximum likelihood estimation and reinforcement learning rewards from self-critical policy learning.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Deep residual coattention encoder}
+
+% The original DCN consists of a coattentive encoder that captures the interactions between the question and the document.
+Because it only has a single-layer coattention encoder, the DCN is limited in its ability to compose complex input representations.
+~\citet{Vaswani2017AttentionIA} proposed stacked self-attention modules to facilitate signal traversal.
+They also showed that the network's ability to model long-range dependencies can be improved by reducing the length of signal paths.
+We propose two modifications to the coattention encoder to leverage these findings.
+First, we extend the coattention encoder with self-attention by stacking coattention layers.
+This allows the network to build richer representations over the input.
+%In addition to allowing the network to build richer representations over the input, the deepening of the coattention encoder allows each sequence to attend to both itself and the other sequence.
+Second, we merge coattention outputs from each layer with residual connections.
+This reduces the length of signal paths.
+Our encoder is shown in Figure~\ref{fig:coattention}.
+
+\begin{figure}[t!] 
+  %\vspace{-5mm}
+  \begin{center}
+	\includegraphics[width=\textwidth]{coattention.pdf}
+  \end{center}
+  \vspace{-2mm}
+  \caption{
+  Deep residual coattention encoder.
+}\label{fig:coattention}
+  \vspace{-2mm}
+\end{figure}
+
+Suppose we are given a document of $\ddocument$ words and a question of $\dquestion$ words.
+% Let $w^D = [w^D_1, w^D_2 \cdots w^D_\ddocument]$ denote words in the document, $w^Q  = [w^Q_1, w^Q_2 \cdots w^Q_\dquestion]$ the words in the question, and $\emb(w)$ denote the input representations for words $w$.
+Let $\lookup^D \in \real^{\demb \times \ddocument}$ and $\lookup^Q \in \real^{\demb \times \dquestion}$ respectively denote the word embeddings for the document and the question, where $\demb$ is the dimension of the word embeddings.
+We obtain document encodings $\encoded_1^D$ and question encodings $\encoded_1^Q$ through a bidirectional Long Short-Term Memory Network (LSTM)~\citep{Hochreiter1997LongSM}, where we use integer subscripts to denote the coattention layer number.
+
+\begin{eqnarray}
+\encoded_1^D &=& \bilstm_1 \left( \lookup^D \right) \in \real^{\dhid \times (\ddocument+1)}
+\\
+\encoded_1^Q &=& \text{tanh} \left( W~\hspace{2px}\bilstm_1 \left( \lookup^Q \right) + b \right) \in \real^{\dhid \times (\dquestion+1)}
+\end{eqnarray}
+
+Here, $\dhid$ denotes the hidden state size and the $+1$ indicates the presence of an additional sentinel word which allows the coattention to not focus on any part of the input.
+Like the original DCN, we add a non-linear transform to the question encoding.
+
+We compute the affinity matrix between the document and the question as $\affinity = 
+{\left( \encoded_1^Q \right)}^\intercal \encoded_1^D \in \real^{(\ddocument+1) \times (\dquestion+1)}$.
+Let $\softmax{X}$ denote the softmax operation over the matrix $X$ that normalizes $X$ column-wise.
+The document summary vectors and question summary vectors are computed as
+
+\begin{eqnarray}
+\label{eq:summary}
+\summary_1^D &=& \encoded_1^Q ~\softmax{\affinity^\intercal} \in \real^{\dhid \times (\ddocument + 1)}
+\\
+\summary_1^Q &=& \encoded_1^D ~\softmax{\affinity} \in \real^{\dhid \times (\dquestion + 1)}
+\end{eqnarray}
+
+We define the document coattention context as follows.
+Note that we drop the dimension corresponding to the sentinel vector -- it has already been used during the summary computation and is not a potential position candidate for the decoder.
+
+\begin{eqnarray}
+\label{eq:context}
+\context_1^D &=& \summary_1^Q ~\softmax{\affinity^\intercal} \in \real^{\dhid \times \ddocument}
+% \\
+% \context_1^Q &=& \summary_1^D ~\softmax{\affinity} \in \real^{\dhid \times \dquestion}
+\end{eqnarray}
+
+We further encode the summaries using another bidirectional LSTM.
+
+\begin{eqnarray}
+\encoded_2^D &=& \bilstm_2 \left( \summary_1^D \right) \in \real^{2 \dhid \times \ddocument}
+\\
+\encoded_2^Q &=& \bilstm_2 \left( \summary_1^Q \right) \in \real^{2 \dhid \times \dquestion}
+\end{eqnarray}
+
+Equation~\ref{eq:summary} to equation~\ref{eq:context} describe a single coattention layer.
+We compute the second coattention layer in a similar fashion.
+Namely, let $\coattn$ denote a multi-valued mapping whose inputs are the two input sequences $\encoded_1^D$ and $\encoded_1^Q$.
+We have
+
+\begin{eqnarray}
+\coattn_1 \left( \encoded_1^D, \encoded_1^Q \right) &\rightarrow& \summary_1^D, \summary_1^Q, \context_1^D
+\\
+\coattn_2 \left( \encoded_2^D, \encoded_2^Q \right) &\rightarrow& \summary_2^D, \summary_2^Q, \context_2^D
+\end{eqnarray}
+
+The output of our encoder is then obtained as
+
+\begin{equation}
+U = \bilstm \left(
+	\concat{
+		\encoded_1^D;
+		\encoded_2^D;
+        \summary_1^D;
+        \summary_2^D;
+        \context_1^D;
+        \context_2^D
+    }
+\right) \in \real^{2\dhid \times m}
+\end{equation}
+
+where $\concat{A, B}$ denotes the concatenation between the matrices $A$ and $B$ along the first dimension.
+%rs: I'd add a sentence on how that's different to the original DCN so readers can appreciate the novelty better
+
+This encoder is different than the original DCN in its depth and its use of residual connections.
+We use not only the output of the deep coattention network $\context_2^D$ as input to the final bidirectional LSTM, but add skip connections to initial encodings $\encoded_1^D$, $\encoded_2^D$, summary vectors $\summary_1^D$, $\summary_2^D$, and coattention context $\context_1^D$.
+This is akin to transformer networks~\citep{Vaswani2017AttentionIA}, which achieved state-of-the-art results on machine translation using deep self-attention layers to help model long-range dependencies, and residual networks~\citep{He2016DeepRL}, which achieved state-of-the-art results in image classification through the addition of skip layer connections to facilitate signal propagation and alleviate gradient degradation.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Mixed objective using self-critical policy learning}
+
+The DCN produces a distribution over the start position of the answer and a distribution over the end position of the answer.
+Let $s$ and $e$ denote the respective start and end points of the ground truth answer.
+Because the decoder of the DCN is dynamic, we denote the start and end distributions produced at the $t$th decoding step by $\pstart_t \in \real^{m}$ and $\pend_t \in \real^{m}$.
+For convenience, we denote the greedy estimate of the start and end positions by the model at the $t$th decoding step by $s_t$ and $e_t$.
+Moreover, let $\Theta$ denote the parameters of the model.
+
+Similar to other question answering models, the DCN is supervised using the cross entropy loss on the start position distribution and the end position distribution:
+\begin{equation}
+\label{eq:losscrossentropy}
+\loss_{ce}(\Theta) = - \sum_t \left( \log \pstart_t \left( s \mid s_{t-1}, e_{t-1} ; \Theta \right) + \log \pend_t \left( e \mid s_{t-1}, e_{t-1} ; \Theta \right) \right)
+\end{equation}
+
+Equation~\ref{eq:losscrossentropy} states that the model accumulates a cross entropy loss over each position during each decoding step given previous estimates of the start and end positions.
+
+The question answering task consists of two evaluation metrics.
+The first, exact match, is a binary score that denotes whether the answer span produced by the model has exact string match with the ground truth answer span.
+%rs: "One" of the ground truth answer spanS ?
+The second, F1, computes the degree of word overlap between the answer span produced by the model and the ground truth answer span.
+We note that there is a disconnect between the cross entropy optimization objective and the evaluation metrics. 
+For example, suppose we are given the answer estimates $A$ and $B$, neither of which match the ground truth positions.
+However, $A$ has an exact \emph{string} match with the ground truth answer whereas $B$ does not.
+The cross entropy objective penalizes $A$ and $B$ equally, despite the former being correct under both evaluation metrics.
+In the less extreme case where $A$ does not have exact match but has some degree of word overlap with the ground truth, the F1 metric still prefers $A$ over $B$ despite its wrongly predicted positions.
+
+We encode this preference using reinforcement learning, using the F1 score as the reward function.
+Let $\hat{s_t} \sim \pstart_t$ and $\hat{e_t} \sim \pstart_t$ denote the sampled start and end positions from the estimated distributions at decoding step $t$.
+We define a trajectory $\hat{\tau}$ as a sequence of sampled start and end points $\hat{s_t}$ and $\hat{e_t}$ through all $T$ decoder time steps.
+The reinforcement learning objective is then the negative expected rewards $R$ over trajectories.
+
+\begin{eqnarray}
+\loss_{rl}\left(\Theta\right) &=&
+- \mathbb{E}_{\hat{\tau} \sim p_{\tau}}
+\left[
+	R \left(s, e, \hat{s}_T, \hat{e}_T ; \Theta \right)
+\right]
+\\
+% &=&
+% - \mathbb{E}_{\hat{\tau} \sim p_{\tau}}
+% \left[
+% 	F_1
+%     \left(
+%     	\answer{\hat{s}_T}{\hat{e}_T},
+%         \answer{s}{e}
+%     \right)
+%     -
+%     \text{baseline}
+% \right]
+% \\
+&\approx&
+\label{eq:baseline}
+- \mathbb{E}_{\hat{\tau} \sim p_{\tau}}
+\left[
+	F_1
+    \left(
+    	\answer{\hat{s}_T}{\hat{e}_T},
+        \answer{s}{e}
+    \right)
+    -
+ 	F_1
+    \left(
+	    \answer{s_T}{e_T},
+        \answer{s}{e}
+    \right)
+\right]
+\end{eqnarray}
+
+We use $F_1$ to denote the F1 scoring function and $\answer{s}{e}$ to denote the answer span retrieved using the start point $s$ and end point $e$.
+In equation~\ref{eq:baseline}, instead of using only the F1 word overlap as the reward, we subtract from it a baseline.
+~\citet{Greensmith2001VarianceRT} show that a good baseline reduces the variance of gradient estimates and facilitates convergence.
+In our case, we employ a self-critic ~\citep{Konda1999ActorCriticA} that uses the F1 score produced by the current model during greedy inference without teacher forcing.
+
+For ease of notation, we abbreviate $R \left(s, e, \hat{s}_T, \hat{e}_T ; \Theta \right)$ as $R$.
+As per~\citet{Sutton1999PolicyGM} and~\citet{Schulman2015GradientEU}, the expected gradient of a non-differentiable reward function can be computed as
+
+\begin{eqnarray}
+\nabla_\Theta \loss_{rl}\left(\Theta\right) &=&
+- \nabla_\Theta
+\left(
+    \mathbb{E}_{\hat{\tau} \sim p_{\tau}}
+    \left[
+    R
+    \right]
+\right)
+\\
+&=&
+-
+\mathbb{E}_{\hat{\tau} \sim p_{\tau}}
+\left[
+R
+\nabla_\Theta
+\log p_\tau \left( \tau ; \Theta \right)
+\right]
+\\
+&=&
+-
+\mathbb{E}_{\hat{\tau} \sim p_{\tau}}
+\left[
+R
+\nabla_\Theta
+\left(
+    \sum_t^T
+    \left(
+        \log \pstart_t \left( \hat{s}_t \vert \hat{s}_{t-1}, \hat{e}_{t-1}; \Theta \right)
+        +
+        \log \pend_t \left( \hat{e}_t  \vert \hat{s}_{t-1}, \hat{e}_{t-1}; \Theta \right)
+    \right)
+\right)
+\right]
+\nonumber
+\\
+\label{eq:montecarlo}
+&\approx&
+-
+R
+\nabla_\Theta
+\left(
+    \sum_t^T
+    \left(
+        \log \pstart_t \left( \hat{s}_t \vert \hat{s}_{t-1}, \hat{e}_{t-1}; \Theta \right)
+        +
+        \log \pend_t \left( \hat{e}_t  \vert \hat{s}_{t-1}, \hat{e}_{t-1}; \Theta \right)
+    \right)
+\right)
+\end{eqnarray}
+
+In equation~\ref{eq:montecarlo}, we approximate the expected gradient using a single Monte-Carlo sample $\tau$ drawn from $p_\tau$.
+This sample trajectory $\tau$ contains the start and end positions $\hat{s}_t$ and $\hat{e}_t$ sampled during all decoding steps.
+
+One of the key problems in applying RL to natural language processing is the discontinuous and discrete space the agent must explore in order to find a good policy.
+For problems with large exploration space, RL approaches tend to be applied as fine-tuning steps after a maximum likelihood model has already been trained~\citep{Paulus2017ADR,wu2016google}.
+The resulting model is constrained in its exploration during fine-tuning because it is biased by heavy pretraining.
+We instead treat the optimization problem as a multi-task learning problem.
+The first task is to optimize for positional match with the ground truth answer using the the cross entropy objective.
+The second task is to optimize for word overlap with the ground truth answer with the self-critical reinforcement learning objective.
+In a similar fashion to ~\citet{Kendall2017MultiTaskLU}, we combine the two losses using homoscedastic uncertainty as task-dependent weightings.
+
+\begin{eqnarray}
+\loss = \frac{1}{2 \sigma_{ce}^2} \loss_{ce}\left(\Theta\right) + \frac{1}{2 \sigma_{rl}^2} \loss_{rl}\left(\Theta\right) + \log \sigma_{ce}^2 + \log \sigma_{rl}^2
+\end{eqnarray}
+
+Here, $\sigma_{ce}$ and $\sigma_{rl}$ are learned parameters.
+The gradient of the cross entropy objective can be derived using straight-forward backpropagation.
+The gradient of the self-critical reinforcement learning objective is shown in equation~\ref{eq:montecarlo}.
+Figure~\ref{fig:mixed_objective} illustrates how the mixed objective is computed.
+In practice, we find that adding the cross entropy task significantly facilitates policy learning by pruning the space of candidate trajectories - without the former, it is very difficult for policy learning to converge due to the large space of potential answers, documents, and questions.
+
+\begin{figure}[t!] 
+  %\vspace{-5mm}
+  \begin{center}
+	\includegraphics[width=0.9\textwidth]{mixed_objective.pdf}
+  \end{center}
+  \vspace{-2mm}
+  \caption{
+  Computation of the mixed objective.
+}\label{fig:mixed_objective}
+  \vspace{-2mm}
+\end{figure}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Experiments}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\vspace{-2mm}
+
+We train and evaluate our model on the Stanford Question Answering Dataset (\squad).
+We show our test performance of our model against other published models, and demonstrate the importance of our proposals via ablation studies on the development set.
+To preprocess the corpus, we use the reversible tokenizer from Stanford CoreNLP~\citep{Manning2014TheSC}.
+For word embeddings, we use GloVe embeddings pretrained on the 840B Common Crawl corpus~\citep{Pennington2014GloveGV} as well as character ngram embeddings by~\citet{Hashimoto2017AJM}.
+In addition, we concatenate these embeddings with context vectors (CoVe) trained on WMT~\citep{McCann2017Learned}.
+For out of vocabulary words, we set the embeddings and context vectors to zero.
+We perform word dropout on the document which zeros a word embedding with probability 0.075.
+In addition, we swap the first maxout layer of the highway maxout network in the DCN decoder with a sparse mixture of experts layer~\citep{shazeer2017outrageously}.
+This layer is similar to the maxout layer, except instead of taking the top scoring expert, we take the top $k = 2$ expert.
+The model is trained using ADAM~\citep{Kingma2014AdamAM} with default hyperparameters.
+Hyperparameters of our model are identical to the DCN.
+We implement our model using PyTorch.
+
+ 
+\subsection{Results}
+
+
+\begin{table}[ht!]
+\vspace{-3mm}
+\centering
+\begin{tabular}{lcccccc}
+\toprule
+    & \multicolumn{2}{c}{Single Model Dev} & \multicolumn{2}{c}{Single Model Test} & \multicolumn{2}{c}{Ensemble Test} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}
+Model & EM & F1 & EM & F1 & EM & F1 \\
+\midrule
+DCN+ (ours) & \textbf{\devemours} & \textbf{\devfours} & \textbf{\emours} & \textbf{\fours} & \textbf{\emoursensemble} & \textbf{\foursensemble} \\
+rnet & \devemrnet & \devfrnet & \emrnet & \frnet & \emrnetensemble & \frnetensemble \\
+DCN w/ CoVe (baseline) & \emcove & \fcove & -- & -- & -- & -- \\
+Mnemonic Reader & \devemmr & \devfmr & \emmr & \fmr & \emmrensemble & \fmrensemble \\
+Document Reader & \devemdocreader & \devfdocreader & \emdocreader & \fdocreader & -- & -- \\
+FastQA & \devemfastqa & \devffastqa & \emfastqa & \ffastqa & -- & -- \\
+ReasoNet & -- & -- & \emreasonet & \freasonet & \emreasonetensemble & \freasonetensemble \\
+SEDT & \devemsedtbidaf & \devfsedtbidaf & \emsedtbidaf & \fsedtbidaf & \emsedtbidafensemble & \fsedtbidafensemble \\
+BiDAF & \devembidaf & \devfbidaf & \embidaf & \fbidaf & \embidafensemble & \fbidafensemble \\
+DCN & \devemdcn & \devfdcn & \emdcn & \fdcn & \emdcnensemble & \fdcnensemble \\
+\bottomrule
+\end{tabular}
+\vspace{1mm}
+\caption{
+Test performance on \squad.
+The papers are as follows: rnet~\citep{rnet}, SEDT~\citep{LiuHWYN17}, BiDAF~\citep{Seo2016BidirectionalAF}, DCN w/ CoVe~\citep{McCann2017Learned}, ReasoNet~\citep{shen2017reasonet}, Document Reader~\citep{Chen2017ReadingWT},
+FastQA~\citep{Weissenborn2017MakingNQ}, DCN~\citep{xiong2016dynamic}.
+The CoVe authors did not submit their model, which we use as our baseline, for~\squad test evaluation.
+}
+\vspace{-2mm}
+\label{table:model-results}
+\end{table}
+
+
+The performance of our model is shown in Table~\ref{table:model-results}.
+Our model achieves state-of-the-art results on \squad dataset with~\emours exact match accuracy and~\fours F1.
+When ensembled, our model obtains~\emoursensemble exact match accuracy and~\foursensemble F1.
+To illustrate the effectiveness of our proposals, we use the DCN with context vectors as a baseline~\citep{McCann2017Learned}.
+This model is identical to the DCN by~\citet{xiong2016dynamic}, except that it augments the word representations with context vectors trained on WMT16.
+
+
+\paragraph{Comparison to baseline DCN with CoVe.}
+~\modelname outperforms the baseline by $\deltaemcove$ exact match accuracy and $\deltafcove$ F1 on the~\squad development set.
+Figure~\ref{fig:dcn_comp} shows the consistent performance gain of~\modelname over the baseline across question types, question lengths, and answer lengths.
+In particular,~\modelname provides a significant advantage for long questions.
+
+\begin{figure}[!htb]
+\includegraphics[width=\textwidth]{dcn_comp.pdf}
+\caption{
+  Performance comparison between~\modelname and the baseline DCN with CoVe on the~\squad development set.
+}\label{fig:dcn_comp}
+\vspace{-2mm}
+\end{figure}
+
+
+
+\paragraph{Ablation study.}
+The contributions of each part of our model are shown in Table~\ref{table:ablation}.
+We note that the deep residual coattention yielded the highest contribution to model performance, followed by the mixed objective.
+The sparse mixture of experts layer in the decoder added minor improvements to the model performance.
+
+\begin{table}[ht!]
+\vspace{-3mm}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Model                & EM & $\Delta$EM & F1 & $\Delta$F1 \\
+\midrule
+\modelname (ours) & \devemours & -- & \devfours & -- \\
+- Deep residual coattention  & \emnocoattention & -\deltaemcoattention & \fnocoattention & -\deltafcoattention \\
+- Mixed objective  & \emnomixedobjective & -\deltaemmixedobjective & \fnomixedobjective & -\deltafmixedobjective \\
+% - Word dropout  & \emnoworddropout & \deltaemworddropout & \fnoworddropout & \deltafworddropout \\
+- Mixture of experts  & \emnomoe & -\deltaemmoe & \fnomoe  & -\deltafmoe \\
+DCN w/ CoVe (baseline) & \emcove & -\deltaemcove & \fcove & -\deltafcove \\
+\bottomrule
+\end{tabular}
+\vspace{-2mm}
+\caption{
+Ablation study on the development set of~\squad.
+}
+\label{table:ablation}
+\end{table}
+
+
+\paragraph{Mixed objective convergence.}
+The training curves for~\modelname with reinforcement learning and~\modelname without reinforcement learning are shown in Figure~\ref{fig:rl_curve} to illustrate the effectiveness of our proposed mixed objective.
+In particular, we note that without mixing in the cross entropy loss, it is extremely difficult to learn the policy.
+When we combine the cross entropy loss with the reinforcement learning objective, we find that the model initially performs worse early on as it begins policy learning from scratch (shown in Figure~\ref{fig:rl_curve_zoom}).
+However, with the addition of cross entropy loss, the model quickly learns a reasonable policy and subsequently outperforms the purely cross entropy model (shown in Figure~\ref{fig:rl_curve_whole}).
+
+\begin{figure}
+\centering
+\begin{subfigure}{.5\textwidth}
+  \centering
+  \includegraphics[width=.95\linewidth]{convergence}
+  \caption{Entirety of the training curve.}
+  \label{fig:rl_curve_whole}
+\end{subfigure}%
+\begin{subfigure}{.5\textwidth}
+  \centering
+  \includegraphics[width=.95\linewidth]{convergence_zoom}
+  \caption{A closeup of the early stages of training.}
+  \label{fig:rl_curve_zoom}
+\end{subfigure}
+\caption{
+Training curve of~\modelname with and without reinforcement learning.
+In the latter case, only the cross entropy objective is used.
+The mixed objective initially performs worse as it begins policy learning from scratch, but quickly outperforms the cross entropy model.
+}
+\label{fig:rl_curve}
+\end{figure}
+
+
+
+\paragraph{Sample predictions.}
+Figure~\ref{fig:sample_pred} compares predictions by~\modelname and by the baseline on the development set.
+Both models retrieve answers that have sensible entity types.
+For example, the second example asks for ``what game'' and both models retrieve an American football game;
+the third example asks for ``type of Turing machine'' and both models retrieve a type of turing machine.
+We find, however, that~\modelname consistently make less mistakes on finding the correct entity.
+This is especially apparent in the examples we show, which contain several entities or candidate answers of the correct type.
+In the first example, Gasquet wrote about the plague and called it ``Great Pestilence''.
+While he likely did think of the plague as a ``great pestilence'', the phrase ``suggested that it would appear to be some form of ordinary Eastern or bubonic plague'' provides evidence for the correct answer -- ``some form of ordinary Eastern or bubonic plague''.
+Similarly, the second example states that Thomas Davis was injured in the ``NFC Championship Game'', but the game he insisted on playing in is the ``Super Bowl''.
+Finally, ``multi-tape'' and ``single-tape'' both appear in the sentence that provides provenance for the answer to the question.
+However, it is the ``single-tape'' Turing machine that implies quadratic time.
+In these examples,~\modelname finds the correct entity out of ones that have the right type whereas the baseline does not.
+
+
+\begin{figure}[!htb]
+\vspace{-3mm}
+\includegraphics[width=0.9\textwidth]{sample_pred.pdf}
+\vspace{-3mm}
+\caption{
+	Predictions by~\modelname ({\color{myred} red}) and DCN with CoVe ({\color{myblue} blue}) on the~\squad development set.
+}\label{fig:sample_pred}
+\vspace{-2mm}
+\end{figure}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Related work}
+\vspace{-2mm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\paragraph{Neural models for question answering.}
+Current state-of-the-art approaches for question answering over unstructured text tend to be neural approaches.
+\citet{Wang2016MachineCU} proposed one of the first conditional attention mechanisms in the Match-LSTM encoder.
+Coattention~\citep{xiong2016dynamic}, bidirectional attention flow~\citep{Seo2016BidirectionalAF}, and self-matching attention~\citep{rnet} all build codependent representations of the question and the document.
+These approaches of conditionally encoding two sequences are widely used in question answering.
+After building codependent encodings, most models predict the answer by generating the start position and the end position corresponding to the estimated answer span.
+The generation process utilizes a pointer network~\citep{Vinyals2015PointerN} over the positions in the document.
+\citet{xiong2016dynamic} also introduced the dynamic decoder, which iteratively proposes answers by alternating between start position and end position estimates, and in some cases is able to recover from initially erroneous predictions.
+% We build on previous work in coattention by demonstrating a method to stack coattention layers through the use of residual and skip connections and show that this produces a $\deltafcoattention$ improvement in F1 score.
+
+\paragraph{Neural attention models.}
+Neural attention models saw early adoption in machine translation~\citep{bahdanau2014neural} and has since become to de-facto architecture for neural machine translation models.
+Self-attention, or intra-attention, has been applied to language modeling, sentiment analysis, natural language inference, and abstractive text summarization~\citep{Chen2017ReadingWT,Paulus2017ADR}.
+\citet{Vaswani2017AttentionIA} extended this idea to a deep self-attentional network which obtained state-of-the-art results in machine translation.
+Coattention, which builds codependent representations of multiple inputs, has been applied to visual question answering~\citep{Lu2016HierarchicalQC}.
+\citet{xiong2016dynamic} introduced coattention for question answering.
+Bidirectional attention flow~\citep{Seo2016BidirectionalAF} and self-matching attention~\citep{rnet} also build codependent representations between the question and the document.
+
+
+\paragraph{Reinforcement learning in NLP.}
+Many tasks in natural language processing have evaluation metrics that are not differentiable.
+% For example, machine translation~\todo{cite mt eval}, summarization~\todo{cite summarization eval}, and question answering~\todo{cite squad eval} evaluate on some notion of word overlap between the generated answer and the ground truth answer;
+% task-oriented dialog systems evaluate using task completion rate~\todo{cite somebody};
+% knowledge base population systems evaluate using the overlap between the constructed knowledge base and the ground truth knowledge base~\todo{cite kbp};
+% game play, textual or otherwise, are evaluated using some non-differentiable score assigned via game mechanics.
+\citet{dethlefs2011combining} proposed a hierarchical reinforcement learning technique for generating text in a simulated way-finding domain.
+\citet{Narasimhan2015LanguageUF} applied deep Q-networks to learn policies for text-based games using game rewards as feedback.
+\citet{li2016deep} introduced a neural conversational model trained using policy gradient methods, whose reward function consisted of heuristics for ease of answering, information flow, and semantic coherence.
+\citet{Bahdanau2016AnAA} proposed a general actor-critic temporal-difference method for sequence prediction, performing metric optimization on language modeling and machine translation.
+Direct word overlap metric optimization has also been applied to summarization~\citep{Paulus2017ADR}, and machine translation~\citep{wu2016google}.
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Conclusion}
+\vspace{-2mm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+We introduced~\modelname, an state-of-the-art question answering model with deep residual coattention trained using a mixed objective that combines cross entropy supervision with self-critical policy learning.
+We showed that our proposals improve model performance across question types, question lengths, and answer lengths on the Stanford Question Answering Dataset (~\squad).
+On~\squad, the~\modelname achieves~\emours exact match accuracy and~\fours F1.
+When ensembled, the~\modelname obtains~\emoursensemble exact match accuracy and~\foursensemble F1.
+
+
+\bibliography{iclr2018_conference}
+\bibliographystyle{iclr2018_conference}
+
+\end{document}

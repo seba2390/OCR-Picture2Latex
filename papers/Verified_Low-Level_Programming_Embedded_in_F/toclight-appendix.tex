@@ -1,0 +1,2191 @@
+\section{From \cstar to CompCert C and beyond}
+
+To further back our claim that KreMLin offers a practical yet
+trustworthy way to preserve security properties of \fstar programs down to
+the executable code, we have to demonstrate that security guarantees
+can be propagated from \cstar down to assembly.
+
+Our idea here is to use the CompCert verified C compiler
+\cite{Leroy-Compcert-CACM,compcert-url}. CompCert formally proves the
+preservation of functional correctness guarantees from C down to
+assembly code (for x86, PowerPC and ARM platforms.)
+
+\ignore{
+\subsection{Side channels and verified compilation}
+
+Regarding side-channel security guarantees, one has to be careful
+because the compiler may very well introduce additional memory
+accesses due to register allocation. Thus, although we prove the
+preservation of the sequences of memory accesses from \lowstar to \cstar, as
+well as the preservation of branchings in the program counter model,
+it may very well be the case that compiled code accesses many more
+\emph{spilling locations} in one secret-controlled branch (PW: but
+there is no secret-controlled branch (TR: you are right in the source,
+but experiments should be performed to show that the compiler does not
+introduce any)) than in another, yielding potentially different cache
+behaviors, which an attacker could exploit to deduce some secrets.
+
+To mitigate this issue, there are several solutions. One by Barthe et
+al. \cite{barthe-ccs2014}, consists in performing a static analysis on
+the Mach code (after most CompCert passes, but just before assembly
+generation), with alias analysis to determine the sequence of memory
+accesses and prove that they do not change across different
+secret-controlled branches. This way, the security property is
+guaranteed, actually turning CompCert into a certifying compiler to
+this respect. That work has been extended to a full-scale LLVM static
+analysis in \cite{almeida-usenix2016}.
+
+Another solution (not explored yet, due to lack of time) would be to
+directly make all intermediate passes annotate the generated code with
+hints about memory accesses they are adding, and use those annotations
+to introduce a pass (just before assembly generation) adding unused
+spilling memory accesses to guarantee that those locations are always
+accessed across all secret-controlled branches. This way, we could
+actually avoid performing a full-scale static analysis on the code, by
+distinguishing between source-level memory accesses to stack-allocated
+variables (which are exactly preserved) and additional spilling memory
+accesses. In practice, this approach could avoid the risk of static
+analysis failures.
+
+We claim that the latter approach (although not modular, since it
+would require pervasive modifications across all passes of CompCert)
+is feasible because all additional memory accesses introduced by
+CompCert are at constant offsets within the stack block of the
+function; and we claim that those memory accesses are not leaked
+through function calls, neither directly nor by pointer arithmetics
+(if they were, then they would correspond to no valid operation in the
+source program.)
+
+However, generating Clight code (as we describe below) and then using
+Barthe et al.'s instrumented CompCert \cite{barthe-ccs2014} or Almeida
+et al.'s instrumented LLVM \cite{almeida-usenix2016} is already
+practical enough and, at least at the metatheoretical level, already
+gives enough guarantees about the preservation of side-channel
+security properties.
+}
+
+\subsection{Reminder: CompCert Clight}
+
+CompCert Clight \cite{Blazy-Leroy-Clight-09} is a subset of C with no
+side effects in expressions, and actual byte-level representation of
+values. Syntax in Figure~\ref{fig:clight-syntax}. Semantics
+definitions in Figure~\ref{fig:clight-semantics-defs}. Evaluation of
+expressions in Figure~\ref{fig:clight-expr}. Small-step semantics in
+Figure~\ref{fig:clight-stmts-reduction}.
+
+The semantics of a Clight program is given by the return value of its
+$\kw{main}$ function called with no arguments.\footnote{CompCert does
+  not support semantics preservation with system arguments.}  Thus,
+given a Clight program $p$, the initial configuration of a CompCert
+Clight transition from $p$ is $(\{ \}, [], [], [], \kw{int} ~ r =
+\kw{main}())$, and a configuration is final with return value $i$ if,
+and only if, it is of the form $(\{ \}, \_, \_V, \_, [])$ with $\_V(r)
+= i$.
+
+% TODO: move definition to main
+\newcommand{\claddr}[1]{\kw{\&}{#1}}
+\newcommand{\clderef}[1]{\kw{*}{#1}}
+\newcommand{\clread}[3]{{#1} =_{#2} \left\lbrack{#3} \right\rbrack}
+\newcommand{\clwrite}[3]{{#2} =_{#1} {#3}}
+\newcommand{\clvalloc}{\kw{valloc}}
+\newcommand{\clalloc}{\kw{Alloc}}
+\newcommand{\clunkn}{\kw{unkn}}
+\newcommand{\clannot}{\kw{annot}}
+
+\begin{figure}[h]
+\begin{center}
+  \begin{tabularx}{\columnwidth}{rlR}
+    $p ::= $ & & program \\
+      & $\ls d$                      & series of declarations \\[1.2mm]
+
+    $d ::= $ & & declaration \\
+    & $\ecfun fxtt{\ls{ad},ss}$                & top-level function \\
+    & & with stack-allocated local variables $\ls{ad}$ \\
+    & ${ad}$ & top-level value \\ [1.2mm]
+    
+    ${ad} ::= $ & & array declaration \\
+    & $\earray{t}{x}{n}{}$               & uninitialized global variable \\
+    [1.2mm]
+
+    $ss ::= $ & & statement lists \\
+    & $\ls{s}$                  &  \\
+    [1.2mm]
+    
+    $s ::= $ & & statements \\
+    & $\_x = e$ & assign rvalue to a non-stack-allocated local variable \\
+    & $\_x = {\eapply fe}$                  & application \\
+    & $\clread{\_x}{t}{e}$               & memory read from lvalue \\
+    & $\clwrite tee$               & memory write rvalue to lvalue \\
+    & $\clannot(\symread,t,e)$ & annotation to produce read event \\
+    & $\clannot(\symwrite,t,e)$ & annotation to produce write event \\
+    & $\eif{e}{ss}{ss}$ & conditional \\
+    & $\{\stmts\}$ &  block \\
+    & \ereturn e & return \\
+    [1.2mm]
+    
+    $e ::= $ & & expressions \\
+    & $n$    & integer constant (rvalue) \\
+      & $x$                           & stack-allocated variable (lvalue) \\
+      & $\_x$                           & non-stack-allocated variable (rvalue) \\ 
+     & $e_1+_te_2$                        & pointer add (rvalue, $e_1$ is a rvalue pointer to a value of type $t$ and $e_2$ is a rvalue $\kw{int}$) \\
+    & $e._tfd$ & struct field projection (lvalue, $e$ lvalue) \\
+    & $\claddr{e}$ & address of a lvalue (rvalue, $e$ lvalue) \\
+    & $\clderef{e}$ & pointer dereference (lvalue, $e$ rvalue)
+  \end{tabularx}
+\end{center}
+\caption{Clight Syntax}
+\label{fig:clight-syntax}
+\end{figure}
+
+Just like C, there are two ways to evaluate Clight expressions: in
+lvalue position or in rvalue position. Roughly speaking, in an
+expression assignment $\clwrite t{e_l}{e_r}$, expression $e_l$ is said to be at
+lvalue position and thus must evaluate into a memory location, whereas
+$e_r$ is said to be at rvalue position and evaluates into a value
+(integer or pointer to memory location). The operation $\claddr{e}$
+takes an lvalue $e$ and transforms it into a rvalue, namely the
+pointer to the memory location $e$ designates as an
+lvalue. Conversely, $\clderef{e}$ takes an rvalue $e$, which must
+evaluate to a pointer, and turns it into the corresponding memory
+location as an lvalue.
+
+\paragraph{Memory accesses in the trace}
+To account for memory accesses in the trace, we make each statement
+perform at most one memory access in our generated Clight code. Then,
+we prepend each such memory access statement with a \emph{built-in
+  call}, a no-op annotation $\clannot(\mathit{ev},t,e)$ whose
+semantics is merely to produce the corresponding memory access event
+$\mathit{ev}(b, n)$ in the trace, where $e$ evaluates to the pointer
+to offset $n$ within block $e$.
+
+\begin{figure}[h]
+\begin{small}
+\begin{center}
+  \begin{tabularx}{\columnwidth}{rlR}
+    $v ::= $ & & values \\
+    & $n$    & integer constant \\
+    & $(b, n)$                        & memory location \\
+    & $\clunkn{}$                        & defined but unknown value \\
+    [1.2mm]
+
+    ${vf} ::= $ & & value fragments \\
+    & $n$    & byte constant \\
+    & $((b,n), n')$ & $n'$-th byte of pointer value $(b,n)$ \\
+    & $\clunkn{}$                        & defined but unknown value fragment \\
+    [1.2mm]
+    
+    $V ::=$ & & stack-allocated variable assignments \\
+    & $x\sympartial b$ & map from variable to memory block identifier \\
+    [1.2mm]
+
+    $\_V ::=$ & & non-stack-allocated variable assignments \\
+    & $\_x\sympartial v$ & map from variable to value \\
+    [1.2mm]
+
+    $E ::=$ & & evaluation ctx (plug expr to get stmts) \\
+    & $\symhole; ss$ & discard returned value \\
+    & $\_x=\symhole; ss$ & receive returned value \\
+    [1.2mm]
+
+    $F ::=$ & & frames \\
+    & $(V, \_V, E)$ & stack frame \\
+    [1.2mm]
+    
+    $S ::=$ & & stack \\
+    & $\ls{F}$ & list of frames \\
+    [1.2mm]
+
+    $M ::=$ & & memory \\
+    & $(b, n) \sympartial vf$ & map from block id and offset to value fragment \\
+    [1.2mm]
+
+    $C ::=$ & & configuration \\
+    & $(S, V, \_V, M, ss)$ &  \\
+    [1.2mm]
+  \end{tabularx}
+\end{center}
+\end{small}
+\caption{Clight Semantics Definitions}
+\label{fig:clight-semantics-defs}
+\end{figure}
+
+% TODO: move to main.tex
+\newcommand{\cllv}[2]{\kw{lv}({#1}, {#2})}
+\newcommand{\clrv}[2]{\kw{rv}({#1}, {#2})}
+
+\begin{figure*}[h]
+\begin{scriptsize}
+\begin{flushleft}
+  \fbox{$\cllv{e}{(p, V, \_V)}=(b,n)$} \quad \text{and} \quad
+  \fbox{$\clrv{e}{(p, V, \_V)}=v$}
+\end{flushleft}
+\begin{mathpar}
+\inferrule* [Right=Var]
+{
+  V(x) = b
+}
+{
+  \cllv{x}{(p,V, \_V)}=(b, 0)
+} 
+
+\quad
+\quad
+\quad
+
+\inferrule* [Right=GVar]
+{
+  x \not\in V \\
+  p(x) = b
+}
+{
+  \cllv{x}{(p,V, \_V)}=(b, 0)
+} 
+
+\\
+
+\inferrule* [Right=PtrFd]
+{
+  \cllv{e}{(p,V, \_V)} = (b, n) \\
+}
+{
+  \cllv{e._t{fd}}{(p,V, \_V)}=(b, n + \textsf{offsetof}(t, fd))
+}
+
+\quad
+\quad
+\quad
+\quad
+\quad
+
+\inferrule* [Right=PtrDeref]
+{
+  \clrv{e}{(p,V,\_V)} = (b,n)
+}
+{
+  \cllv{\clderef{e}}{(p,V,\_V)} = (b,n)
+}
+
+\\
+
+\inferrule* [Right=RVar]
+{
+  \_V(\_x) = v
+}
+{
+  \clrv{\_x}{(p,V,\_V)}=v
+} 
+
+\quad
+\quad
+\quad
+
+\inferrule* [Right=PtrAdd]
+{
+  \clrv{e_1}{(p,V,\_V)} = (b, n) \\
+  \clrv{e_2}{(p,V,\_V)} = n' \\
+}
+{
+  \clrv{e_1+e_2}{(p,V)}=(b, n+n')
+} 
+
+\quad
+\quad
+\quad
+\quad
+
+\inferrule* [Right=AddrOf]
+{
+  \cllv{e}{(p,V,\_V)}= (b, n)
+}
+{
+  \clrv{\claddr{e}}{(p,V,\_V)}= (b,n)
+}
+\end{mathpar}
+\end{scriptsize}
+\caption{\label{fig:clight-expr}Clight Expression Evaluation}
+\end{figure*}
+
+
+\begin{figure*}[h]
+\begin{scriptsize}
+\begin{flushleft}
+  \fbox{$p \vdash C\step_\olabel C'$}
+\end{flushleft}
+\begin{mathpar}
+\inferrule* [Right=Read]
+{
+  \cllv{e}{(p, V, \_V)} = (b, n) \\
+  \symget(M, (b, n), \kw{sizeof}(t)) = v
+}
+{
+  p \vdash (S, V, \_V, M, \clread{\_x}{t}{e}; ss) \step (S, V, \_V[\_x\mapsto v], M, ss)
+} 
+
+\quad
+\quad
+\quad
+\quad
+
+\\
+
+\inferrule* [Right=Write]
+{
+  \cllv{e_1}{(p, V, \_V)} = (b, n) \\
+  \clrv{e_2}{(p, V, \_V)} = v \\
+  \symset(M, (b, n), \kw{sizeof}(t), v) = S'
+}
+{
+  p \vdash (S, V, \_V, M, \clwrite{t}{e_1}{e_2}; ss) \step (S', V, \_V, M, ss)
+} 
+
+\\
+
+\inferrule* [Right=Annot]
+{
+  \cllv{e}{(p, V, \_V)} = (b, n) \\
+}
+{
+  p \vdash (S, V, \_V, M, \clannot{\mathit{ev}, e}; ss) \step_{\mathit{ev}\;(b,n)}(S, V, \_V, M, SS)
+}
+
+\\
+
+\inferrule* [Right=Ret]
+{
+  \clrv{e}{(p,V,\_V)}=v
+}
+{
+  p \vdash (S;(V', \_V',E), V, M, \ereturn\;e; ss) \step (S, V', \_V', M, \fplug{E}{v})
+}
+
+\\
+
+\inferrule* [Right=Call]
+{
+  p(f)=\ecfuntwo{\_y}{t_1}{t_2}{ads; ss_1} \\
+  \clrv{e}{(p,V,\_V)}=v \\
+  \clvalloc{}(ads, \None, M) = (V', M')
+}
+{
+  p \vdash (S, V, \_V, M, \_x=f\;e; ss) \step (S;(V, \_V, \_x=\symhole;ss), V', \{\}[\_y\mapsto v], M', ss_1)
+} 
+
+\\
+
+\inferrule* [Right=AllocNil]
+{
+}
+{
+  \clvalloc{}([], V, M) = (V, M)
+}
+
+\quad
+\quad
+\quad
+\quad
+\quad
+
+\inferrule* [Right=AllocCons]
+{
+  \clalloc(M,n \times \kw{sizeof}(t)) = (b,M_1) \\
+  \clvalloc{}(ads, V[x \mapsto (b,0)], M_1) = (V', M')
+}
+{
+  \clvalloc{}((\earray{t}{x}{n}{}; ads), V, M) = (V', M')
+}
+  
+\\
+
+\inferrule* [Right=Expr]
+{
+  \clrv{e}{(p,V,\_V)} = v
+}
+{
+  p \vdash (S, V, \_V, M, e; ss) \step (S, V, \_V, M, ss)
+} 
+
+\quad
+\quad
+\quad
+
+\inferrule* [Right=Empty]
+{
+  \;
+}
+{
+  p \vdash (S, V, \_V, M, []) \step (S, V, \_V, M, \ereturn\;\clunkn{})
+} 
+
+\\
+
+\inferrule* [Right=Block]
+{
+  \;
+}
+{
+  p \vdash (S, V, \_V, M, \{ss_1\};ss_2) \step (S; V, \_V, M, ss_1; ss_2)
+} 
+
+\\
+
+\inferrule* [Right=IfT]
+{
+  \clrv{e}{(p, V, \_V)} = v \\
+  v \not= 0 \\
+  v \not= \clunkn{}
+}
+{
+  p \vdash (S, V, \_V, M, \eif{e}{ss_1}{ss_2};ss) \step_\brt (S, V, ss_1;ss)
+} 
+
+\quad
+\quad
+\quad
+
+\inferrule* [Right=IfF]
+{
+  \clrv{e}{(p, V, \_V)} = 0
+}
+{
+  p \vdash (S, V, \_V, M, \eif{e}{ss_1}{ss_2};ss) \step_\brf (S, V, \_V, M, ss_2;ss)
+} 
+\end{mathpar}
+\end{scriptsize}
+\caption{\label{fig:clight-stmts-reduction}Clight Configuration Reduction}
+\end{figure*}
+
+\paragraph{The CompCert memory model}
+The semantics of CompCert Clight statements depends on the CompCert
+memory model \cite{Leroy-Blazy-memory-model}. Here we need three
+operations: $\symget$, $\symset$ and $\clalloc$, whose description
+follows.\footnote{In the current version of CompCert and its memory
+  model \cite{2012-Leroy-Appel-Blazy-Stewart}, each memory location is
+  equipped with a \emph{permission} to more faithfully model the fact
+  that the memory locations of a local variable cannot be read or
+  coincidentally reused in a Clight program after exiting the scope of
+  the variable. To this end, thanks to this permission model, the
+  CompCert memory model also defines a $\kw{free}$ operation which
+  invalidates memory accesses while preventing from reusing the memory
+  block for further allocations; although we do not describe it here,
+  CompCert Clight actually uses this operator to free all local
+  variables upon function exit. Thus, it is also necessary to amend
+  the semantics of \cstar in a similar way.}
+
+$\symget(M, (b, n), n')$ reads $n'$ bytes from memory $M$ at offset
+$n$ within block $b$, and decodes the obtained byte fragments into a
+value. It fails if not all locations from $(b, n)$ to $(b, n'-1)$ are
+defined. It returns $\clunkn$ if all locations are defined but the
+decoding fails.
+
+$\symset(M, (b, n), n', v)$ writes $n'$ bytes from memory $M$ at
+offset $n$ within block $b$ corresponding to encoding value $v$ into
+$n'$ value fragments. It fails if not all locations from $(b, n)$ to
+$(b, n'-1)$ are defined.
+
+$\clalloc{}(M, n)$ returns a pair $(b, M')$ where $b \not\in M$ is a
+fresh block identifier and all locations from $(b,0)$ to $(b,n-1)$ in
+$M'$ contain $\clunkn$.
+
+\subsection{Issues}
+
+\paragraph{Local structures}
+
+The main difference between \cstar and Clight is that \cstar allows structures
+as values. Although converting a \cstar value into a Clight value is no
+problem in terms of memory representation (since the layout of Clight
+structures\footnote{which can be chosen when configuring CompCert with
+  a suitable platform} is already formalized in CompCert with basic
+proofs such as the fact that two distinct fields of a structure
+designate disjoint sets of memory locations), local structures cause
+issues in terms of managing memory accesses (due to our desire for
+noninterference in terms of memory accesses), as we describe in
+Section~\ref{sec:local-struct}.
+
+\paragraph{Stack-allocated local variables}
+
+Another difference between \cstar and Clight is that, whereas \cstar allows
+the user to stack-allocate local variables on the fly, Clight mandates
+all local variables of a function to be hoisted to the beginning of
+the function (in fact, the list of all stack-allocated variables of a
+function is actually part of the function definition), and so they are
+allocated all at once when entering the function.
+
+Hoisting local variables is not supported in the verified part of
+CompCert.
+\ignore{
+In practice, when compiling a piece of C code with CompCert,
+an unverified elaboration pass performs this operation.\footnote{See
+  \cite{compcert-url}, section ``Architecture of the compiler''. By
+  reading the source code of the unverified elaborator in
+  \texttt{cparser/Unblock.ml}, we figured out the hoisting strategy
+  adopted by CompCert 2.7.1, as we describe it here.} This unverified
+phase of CompCert hoists all local variables of a function, without
+trying to merge two local variables belonging to disjoint C code
+blocks, contrary to GNU GCC
+\footnote{If we were to follow the GNU GCC hoisting strategy, then we
+  would have to think about how to merge two variables of different
+  types. However, type annotations are present in CompCert until
+  Clight, and CompCert then erases those type annotations in a pass
+  from Clight to C$\sharp$minor, which is very similar to Clight
+  except that it no longer has any C-style types (structs, unions,
+  etc.) so that a stack-allocated variable only designates a memory
+  block of some constant size in bytes. So, in that case, I claim that
+  hoisting could and should be done at the level of C$\sharp$minor,
+  rather than in Clight or KreMLin. However, this would require
+  modifying CompCert Clight so that local variable allocation sites
+  would be attached to code blocks rather than functions.}  Regardless
+of the hoisting strategy, verifying this pass may be an interesting
+problem within CompCert itself.
+
+Instead of trying to prove hoisting on Clight or any language of
+CompCert, we could perform this phase at the \cstar level. We propose a
+solution in Section~\ref{sec:hoisting}.
+
+However,
+}
+
+Consider the following \cstar example, for a given conditional expression
+$e$:
+  \[
+  \eifthenelse
+      {e}
+      {\earray{\kint}{x}{1}{18}; }
+      {\{ \earray{\kword}{x}{1}{42}; \ewrite{x+0}{1729} \} }
+   \]
+After hoisting, following the same strategy as the corresponding
+unverified pass of CompCert, \cstar code will look like this:
+    \[
+  \earray{\kint}{x_1}{1}{};
+  \earray{\kword}{x_2}{1}{};
+  \]
+  \[
+  \eifthenelse
+      {e}
+      {\ewrite{x_1+0}{18}; }
+      {\{ \ewrite{x_2+0}{42}; \ewrite{x_2+0}{1729} \} }
+  \]
+This example shows the following issue:
+when producing the trace, the
+  memory blocks corresponding to the accessed memory location will
+  differ between the non-hoisted and the hoisted \cstar code. Indeed, in
+  the non-hoisted \cstar code, only one variable $x$ is allocated in the
+  stack, whereas in the hoisted \cstar code, two variables $x_1$ and $x_2$
+  corresponding to both branches will be allocated anyway, regardless
+  of the fact that only one branch is executed. Thus, in the \cstar code
+  before hoisting, allocating $x$ will create, say, block 1, whereas
+  after hoisting, two variables will be allocated, $x_1$ at block 1,
+  and $x_2$ at block 2. Thus, the statement $\ewrite{x+0}{1729}$ in
+  the \cstar code before hoisting will produce $\symread\;(1,0,[])$ on the
+  trace, whereas its corresponding translation after hoisting,
+  $\ewrite{x_2+0}{1729}$, will produce
+  $\symread\;(2,0,[])$.
+
+\ignore{
+Anyway, a similar problem of discrepancy of traces of memory accesses
+will also exist in CompCert passes after Clight, this time because the
+structure of the stack will change across intermediate languages of
+CompCert (in particular, at some point, all stack-allocated variables
+of one function call will be merged into one single stack block for
+the entire stack frame.) Thus, so far, CompCert will very well
+preserve functional correctness down to the assembly, but will require
+more work to \emph{preserve} security guarantees beyond Clight, unless
+we instrument it as described before.
+}
+
+One quick solution to ensure that those event traces are exactly
+preserved, is to replace the actual pointer $(b, n,
+\mathit{fd})$ on $\symread$ and $\symwrite$ events with $(f, i, x, n,
+\mathit{fd})$ where $f$ is the name of the function, $i$ is the
+recursion depth of the function (which would be maintained as a global
+variable, increased whenever entering the function, and decreased
+whenever exiting) and $x$ is the local variable being accessed. (In
+concurrent contexts, one could add a parameter $\theta$ recording the
+identifier of the current thread within which $f$ is run, and so the
+global variable maintaining recursion depth would become an array
+indexed by thread identifiers.)
+
+\ignore{
+[Catalin: Isn't this much weakening the attacker model though?
+          And how does this new model apply to machine code?]
+
+[Tahina: This abstract trace model is only for the purpose of proofs
+  of memory transformations, beginning with the \cstar to Clight
+  proof. This model also applies to C$\sharp$minor (exact
+  preservation, the only difference being the erasure of C-style type
+  information), and it can also be applied to Cminor (where all local
+  variables are merged into one single stack frame) when translating
+  from C$\sharp$minor. Then, from Cminor on, it becomes useless. In
+  fact, from Cminor on, the local variable region becomes contiguous
+  for a given function call, and (with the notable exception of in the
+  function inlining pass, which may very well merge several stack
+  frames of inlined callees into one single one. Anyway, function
+  inlining requires special treatment.) there are no pointer
+  transformations until the time spilling locations are introduced in
+  memory when generating assembly code.
+
+  Once again, the ultimate trace model that we want for our final
+  side-effect security correctness statement will definitely be the
+  one with concrete pointer values, and abstract pointer values are
+  only for the purpose of compiler verification.]
+}
+
+Finally, we adopted this solution as we describe in
+Section~\ref{sec:norm-traces}, and we heavily use it to prove the
+correctness of hoisting within \cstar in Section~\ref{sec:hoisting}.
+
+\subsection{Summary: from \cstar to Clight}
+
+Given a \cstar program $p$ and an entrypoint $ss$, we are going to
+transform it into a CompCert Clight program in such a way that both
+functional correctness and noninterference are preserved.
+
+This will not necessarily mean that traces are exactly preserved
+between \cstar and Clight, due to the memory representation discrepancy
+described before. Instead, by functional correctness, we mean that a
+safe \cstar program is turned into a safe Clight program, and for such
+safe programs, termination, I/O events and return value are preserved;
+and by noninterference, we mean that if two executions with different
+secrets produce identical (whole) traces in \cstar, then they will also
+produce identical traces in CompCert Clight (although the trace may
+have changed between \cstar and Clight.)
+
+\begin{enumerate}
+\item In section \ref{sec:unambiguous-variables}, we transform a \cstar
+  programs into a program with unambiguous variable names, and we take
+  advantage of such a syntactic property by enriching the
+  configuration of \cstar with more information regarding variable names,
+  thus yielding the \cstar2 language.
+\item In section \ref{sec:norm-traces-detail}, we execute the obtained \cstar2
+  program with a different, more abstract, trace model, as proposed
+  above. This is not a program transformation, but only a
+  reinterpretation of the same \cstar program with a different operational
+  semantics, which we call \cstar3.
+\item In section \ref{sec:hoisting}, we transform the \cstar3 program into
+  a \cstar3 program where all local arrays are hoisted from block-scope to
+  function-scope. The abstract trace model critically helps in the
+  success of this proof where memory state representations need to
+  change.
+\item In section \ref{sec:struct-return}, we transform the obtained
+  \cstar3 program into a \cstar3 program where functions returning structures
+  are replaced with functions taking a pointer to the return location
+  as additional argument. Thus, we need to account for an additional
+  memory access, which we do through the \cstar4 intermediate semantics,
+  another reinterpretation of the source \cstar3 program producing new
+  events at functions returning structures. Then, our reinterpreted
+  \cstar4 program is translated back to \cstar3 with those additional memory
+  accesses made explicit.
+\item In section \ref{sec:struct-events}, we reinterpret our obtained
+  \cstar3 program with a different event model where memory access events
+  of structure type are replaced by the sequences of memory access
+  events of all their non-structure fields. We call this new language
+  \cstar5.
+\item In section \ref{sec:local-struct-detail}, we transform our \cstar5
+  program back into \cstar3 by erasing all local structures that are not
+  local arrays, replacing them with their individual non-structure
+  fields. Thus, the more ``elementary'' memory accesses introduced in
+  the \cstar3 to \cstar5 reinterpretation are made concrete.
+\item We then reinterpret the obtained \cstar3 program back into \cstar2 as
+  described in \ref{sec:norm-traces-detail}, reverting to the traces
+  with concrete memory locations at events, thus accounting for all
+  memory accesses.
+\item Finally, in section \ref{sec:clight-gen}, we compile the
+  obtained \cstar2 program, now in the desired form, into CompCert Clight.
+\end{enumerate}
+
+\subsection{Normalized event traces in \cstar} \label{sec:norm-traces}
+
+As described above, traces where memory locations explicitly appear
+are notoriously hard to reason about in terms of semantics
+preservation for verified compilation. Thus, it becomes desirable to
+find a common representation of traces that can be preserved between
+different memory layouts across different intermediate languages.
+
+In particular here, we would like to replace concrete pointers into
+abstract pointers representing the local variable being modified in a
+given nested function call.
+
+\subsubsection{Disambiguation of variable names} \label{sec:unambiguous-variables}
+
+To this end, we first need to disambiguate the names of the local
+variables of a \cstar function:
+
+\begin{definition}[Unambiguous local variables]
+  We say that a list of \cstar instructions has \emph{unambiguous local
+    variables} if, and only if, it contains no two distinct array
+  declarations with the same variable name, and does not contain both
+  an array declaration and a non-array declaration with the same
+  variable name.
+  
+  We say that a \cstar program has unambiguous local variables if, and
+  only if, for each of its functions, its body has unambiguous local
+  variables.
+
+  We say that a \cstar transition system $\sys(p, V, ss)$ has unambiguous
+  local variables if, and only if, $p$ has unambiguous local
+  variables, $ss$ has unambiguous local variables, and $V$ does not
+  define any variable with the same name as an array declared in $ss$.
+\end{definition}
+
+\begin{lemma}[\label{lemma-cstar-alpha} Disambiguation]
+  There exists a transformation $T$ on lists of instructions (extended
+  to programs by morphism) such that, for any \cstar program $p$, and for
+  any list of \cstar instructions $ss$, %
+  %% TODO taramana 2016-10-11: clarify any additional properties
+  %% required for noninterference
+  %%
+  %% for any set of variables $D'$, there
+  %% is a set of variables $D$ such that
+  for any variable mapping $V'$ %with domain $D'$
+  such that $\sys(T(p),V',T(ss))$ has unambiguous local variables,
+  there exists a variable mapping $V$ % with domain $D$  
+  such that $\sys(p,V,ss)$ and $\sys(T(p),V',T(ss))$ have the same
+  execution traces.
+\end{lemma}
+\begin{proof} $\alpha$-renaming. \end{proof}
+
+The noninterference property can be proven to be stable by such
+$\alpha$-renaming:
+
+%% \begin{lemma}
+%%   For any \cstar program $p$ and list of instructions $ss$, if $\dom V
+%%   \subseteq \dom V'$ and if $\sys(p,V,ss)$ is safe, then
+%%   $\sys(p,V,ss)$ and $\sys(p,V',ss)$ have the same execution traces.
+%% \end{lemma}
+%% \begin{proof}
+%%   Considering $n$ steps of execution of each of the two systems, by
+%%   induction over $n$ (lock-step bisimulation.)
+%% \end{proof}
+
+\begin{lemma}
+  Let $p$ be a \cstar program and $ss$ be a list of instructions. Assume
+  that for any $V_1, V_2$ such that $\sys(p, V_1, ss)$ and $\sys(p,
+  V_2, ss)$ are both safe, then they have the same execution
+  traces.
+
+  Then, for any $V_1', V_2'$ such that $\sys(T(p), V_1', T(ss))$ and
+  $\sys(T(p), V_2', T(ss))$ are both safe, they have the same
+  execution traces.
+\end{lemma}
+\begin{proof}
+  By Lemma~\ref{lemma-cstar-alpha}, there is some $V_1$ such that
+  $\sys(p, V_1, ss)$ and $\sys(T(p), V_1', T(ss))$ have the same
+  execution traces, thus in particular, $\sys(p, V_1, ss)$ is
+  safe. Same for some $V_2$. By hypothesis, $\sys(p, V_1, ss)$ and
+  $\sys(p, V_2, ss)$ have the same execution traces, thus the result
+  follows by transitivity of equality.
+\end{proof}
+
+Thus, we can now restrict our study to \cstar programs whose functions
+have no two distinct array declarations with the same variable names.
+
+Let us first enrich the configuration $(S, V, ss)$ of \cstar small-step
+semantics with additional information recording the current function
+$f$ being executed (or maybe $\None$) and the set $A$ of the variable
+names of local arrays currently declared in the scope. Thus, a \cstar
+stack frame $(\None, V, E)$ becomes $(\None, V, E, f, A)$ where $f$ is
+the caller, a block frame $(M, V, E)$ becomes $(M, V, E, f, A)$ where
+$f$ is the enclosing function of the block, and the configuration $(S,
+V, ss)$ becomes $(S, V, ss, f, A)$ where $f$ is the current function
+(with the frames of $S$ changed accordingly.) Let us then change some
+rules accordingly as described in Fig.~\ref{fig:cstar-2}, leaving
+other rules unchanged except with the corresponding $f$ and $A$
+components preserved.
+
+\begin{figure*}
+\begin{small}
+  \begin{mathpar}
+\inferrule* [Right=$\text{ArrDecl}_2$]
+{
+  \eval{e}{(p,V)}=v \\
+  S = S'; (M, V, E, f', A') \\
+  b\not\in S
+}
+{
+  p \vdash (S, V, t\;x[n]=e; ss, f, A) \step (S';(M[b\mapsto v^n], V, E, f', A'), V[x\mapsto (b, 0, [])], ss, f, A\cup\{x\})
+}
+
+\\
+
+\inferrule* [Right=$\text{Ret}_2$]
+{
+  \eval{e}{(p,V)}=v
+}
+{
+  p \vdash (S;(\None, V',E, f', A'), V, \ereturn\;e; ss, f, A) \step (S, V', \fplug{E}{v}, f', A')
+}
+
+\\
+    
+\inferrule* [Right=$\text{Call}_2$]
+{
+  p(f)=\ecfuntwo{y}{t_1}{t_2}{ss_1} \\
+  \eval{e}{(p,V)}=v
+}
+{
+  p \vdash (S, V, t\;x=f\;e; ss, f', A') \step (S;(\None, V, t\;x=\symhole;ss, f', A'), \{\}[y\mapsto v], ss_1, f, \{\})
+} 
+
+  \end{mathpar}
+\end{small}
+\caption{\cstar2 Amended Configuration Reduction} \label{fig:cstar-2}
+\end{figure*}
+
+Let us call \cstar2 the obtained language where the initial state of the
+transition system $\sys(p, V, ss)$ shall now be $([], V, ss, \None,
+[])$.
+
+Then, it is easy to prove the following:
+\begin{lemma}[\label{lemma-cstar-to-cstar-2]}\cstar to \cstar2]
+    If $\sys(p, V, ss)$ has unambiguous local variables and is safe in
+    \cstar, then it has the same execution traces in \cstar as in \cstar2 (and in
+    particular, it is also safe in \cstar2.)
+
+    Thus, both functional correctness and noninterference are
+    preserved from \cstar to \cstar2.
+\end{lemma}
+\begin{proof}
+  Lock-step bisimulation where the common parts of the configurations
+  (besides the \cstar2-specific $f, A$ parts) are equal between \cstar and
+  \cstar2.
+\end{proof}
+
+Then, we can prove an invariant over the small-step execution of a \cstar2
+program:
+\begin{lemma}[\label{lemma-cstar-2-invar}\cstar2 invariant]
+Let $p$ be a \cstar2 program and $V$ a variable environment such that
+$\sys(p,V,ss)$ has unambiguous local variables.
+
+Let $n \in \mathbb N$. Then, for any \cstar2 configuration $(S, V', ss',
+f, A)$ obtained after $n$ \cstar2 steps from $(\{\}, V, ss, \None, \{\})$,
+the following invariants hold:
+\begin{enumerate}
+\item for any variable or array declaration $x$ in $ss'$, it does not
+  appear in $A_1$
+\item any variable name in $A$ or in an array declaration of $ss'$ is
+  in an array declaration of $ss$ (if $f = \None$) or the body of $f$
+  (otherwise.)
+\item for each frame of $S$ of the form $(\_, \_, E, f'', A'')$, then
+  any variable name or array declaration in $E$ does not appear in
+  $A''$, and any variable name in $A''$ or in an array declaration of
+  $E$ is in an array declaration in $ss$ (if $f'' = \None$) or the
+  body of $f''$ (otherwise.)
+\item \label{cstar-2-invar-memory-block-nil} if $S = S'; (M, \_, \_,
+  f', A')$ with $M \not= \None$, then $f' = f$, $A' \subseteq A$ and
+  for all block identifiers $b$ defined in $M$, there exists a unique
+  variable $x \in A$ such that $V'(x) = b$
+\item \label{cstar-2-invar-memory-block-cons} for any two consecutive
+  frames $(M, \_, \_, f_1, A_1)$ just below $(\_, V_2, \_, f_2, A_2)$
+  with $M \not= \None$, then $f_1 = f_2$ and $A_1 \subseteq A_2$ and
+  $V_1(x) = V_2(x)$ for all variables $x \in A_1$, and for all block
+  identifiers $b$ defined in $M$, there exists a unique variable $x
+  \in A_2$ such that $V_2(x) = b$
+\item \label{cstar-2-invar-memory-disjoint} for any two different
+  frames of $S$ of the form $(M_1, \_, \_, \_, \_)$ and $(M_2, \_, \_,
+  \_, \_)$ with $M_1 \not= \None$ and $M_2 \not= \None$, the sets of
+  block identifiers of $M_1$ and $M_2$ are disjoint
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+  By induction on $n$ and case analysis on $\step$.
+\end{proof}
+
+Then, we can prove a strong invariant between two executions of
+the same \cstar2 program with different secrets. This strong invariant
+will serve as a preparation towards changing the event traces of \cstar2.
+
+\begin{lemma}[\label{lemma-cstar-2-noninterference-invar} \cstar2 noninterference invariant]
+Let $p$ be a \cstar2 program, and $V_1, V_2$ be two variable environments
+such that $\sys(p, V_1, ss)$ and $\sys(p, V_2, ss)$ have unambiguous
+local variables, are both safe and produce the same traces in \cstar2.
+
+Let $n \in \mathbb N$. Then, for any two \cstar2 configurations $(S_1,
+V_1', ss_1, f_1, A_1)$ and $(S_2, V_2', ss_2, f_2, A_2)$ obtained
+after $n$ \cstar2 execution steps, the following invariants hold:
+\begin{itemize}
+\item $ss_1 = ss_2$
+\item $S_1, S_2$ have the same length
+\item $f_1 = f_2$
+\item $A_1 = A_2$
+\item $V_1(x) = V_2(x)$ for each $x \in A_1$
+\item for each $i$, if the $i$-th frames of $S_1, S_2$ are $(M_1,
+  V_1'', E_1, f_1'', A_1'')$ and $(M_2, V_2'', E_2, f_2'', A_2'')$,
+  then $E_1 = E_2$, $f_1'' = f_2''$ and $A_1'' = A_2''$ and $V_1''(x)
+  = V_2''(x)$ for any $x \in A_1''$. Moreover, $M_1 = \None$ if and
+  only if $M_2 = \None$, and if $M_1 \not= \None$, then $M_1$ and
+  $M_2$ have the same block domain.
+\end{itemize}
+Thus, the $n+1$-th step in both executions applies the same \cstar2 rule.
+\end{lemma}
+\begin{proof}
+  By induction on $n$ and case analysis on $\step$, also using the
+  invariant of Lemma~\ref{lemma-cstar-2-invar}. In particular the
+  equality of codes is a consequence of the fact that there are no
+  function pointers in \cstar.\footnote{If we were to allow function
+    pointers in \cstar, then we would have to add function call/return
+    events into the \cstar trace beforehand, and assume that traces with
+    those events are equal before renaming = prove that they are equal
+    on the \lowstar program as well. This might have consequences in the
+    proof of function inlining in the \fstar-to-\cstar translation.} Then,
+  both executions apply the same \cstar2 rules since \cstar2 small-step rules
+  are actually syntax-directed.
+\end{proof}
+
+\subsubsection{Normalized traces} \label{sec:norm-traces-detail}
+
+Now, consider an execution of \cstar2 from some initial state. In fact,
+for any block identifier $b$ defined in $S$, it is easy to prove that
+it actually corresponds to some variable defined in the scope. The
+corresponding \textsc{VarOfBlock} algorithm is shown in
+Figure~\ref{fig:cstar-2-block-to-variable}. \ignore{ \textbf{FIXME: global
+  variables}\footnote{Global variables (top-level values) are not
+  allocated anywhere in the memory of a \cstar program, so \cstar cannot
+  access them. \cstar can only access the local variables of the
+  entrypoint list of statements, which is not part of the program.}}
+
+\begin{figure}
+  \textbf{Algorithm:} \textsc{VarOfBlock}
+  
+  \textbf{Inputs:}
+  \begin{itemize}
+    \item \cstar2 configuration $(S, V, \_, \_, A)$ such that the invariants
+      of Lemma~\ref{lemma-cstar-2-invar} hold
+    \item Memory block $b$ defined in $S$
+  \end{itemize}
+  \textbf{Output:} function, recursion depth and local variable
+  corresponding to the memory block
+
+  Let $S = S_1 ; (M, \_, \_, f, \_) ; S_2$ such that $b$ defined in
+  $M$. (Such a decomposition exists and is unique because of
+  Invariant~\ref{cstar-2-invar-memory-disjoint}. $f$ may be $\None$.)
+
+  Let $n$ be the number of frames in $S_1$ of the form $(\None, \_,
+  \_, f', \_)$ with $f' = f$.
+
+  Let $V'$ and $A'$ such that $S_2 = (\_, V', \_, \_, A) ; \_$, or $V'
+  = V$ and $A' = A$ if $S_2 = \{\}$.
+
+  Let $x$ such that $V'(x) = (b, 0)$ (exists and is unique because of
+  Invariants~\ref{cstar-2-invar-memory-block-nil}
+  and~\ref{cstar-2-invar-memory-block-cons}.)
+
+  \textbf{Result:} $(f, n, x)$
+  
+  \caption{\cstar2: retrieving the local variable corresponding to a
+    memory block}
+  \label{fig:cstar-2-block-to-variable}
+\end{figure}
+
+Then, let \cstar3 be the \cstar2 language where the \textsc{Read} and
+\textsc{Write} rules are changed according to
+Figure~\ref{fig:cstar-3}, with event traces where the actual pointer
+is replaced into an abstract pointer obtained using the
+\textsc{VarOfBlock} algorithm above.
+
+
+\begin{figure*}
+\begin{small}
+  \begin{mathpar}
+\inferrule* [Right=$\text{Read}_3$]
+{
+  C = (S, V, t\;x=*[e]; ss, f, A) \\
+  \eval{e}{(p, V)} = (b, n, \ls{fd}) \\
+  \symget(S, (b, n, \ls{fd})) = v \\
+  \ell = \textsc{VarOfBlock}(C, b)
+}
+{
+  p \vdash C \step_{\symread\;(\ell,n,\ls{fd})} (S, V[x\mapsto v], ss, f, A)
+} 
+
+\\
+
+\inferrule* [Right=$\text{Write}_3$]
+{
+  C = (S, V, *e_1=e_2; ss, f, A) \\
+  \eval{e_1}{(p, V)} = (b, n, \ls{fd}) \\
+  \eval{e_2}{(p, V)} = v \\\\
+  \symset(S, (b, n, \ls{fd}), v) = S' \\
+  \ell = \textsc{VarOfBlock}(C, b)
+}
+{
+  p \vdash C \step_{\symwrite\;(\ell,n,\ls{fd})} (S', V, ss, f, A)
+} 
+  \end{mathpar}
+\end{small}
+\caption{\cstar3 Amended Configuration Reduction} \label{fig:cstar-3}
+\end{figure*}
+
+\begin{lemma}[\label{lemma-cstar-2-to-cstar-3-correct}\cstar2 to \cstar3 functional correctness]
+  If $\sys(p, V, ss)$ has no unambiguous variables, then $\sys(p, V,
+  ss)$, has the same behaviors in \cstar2 with event traces with
+  $\symread, \symwrite$ removed, as in \cstar3 with event traces with
+  $\symread, \symwrite$ removed.
+\end{lemma}
+\begin{proof}
+  Lock-step bisimulation with equal configurations. Steps
+  \textsc{Read} and \textsc{Write} need the invariant of
+  Lemma~\ref{lemma-cstar-2-invar} on \cstar2 to prove that \cstar3 does not
+  get stuck (ability to apply \textsc{VarOfBlock}.)
+\end{proof}
+
+\begin{lemma}[\label{lemma-cstar-2-varofblock-invert}\textsc{VarOfBlock} inversion]
+  Let $C_1, C_2$ two \cstar2 configurations such that invariants of
+  Lemma~\ref{lemma-cstar-2-invar} and
+  Lemma~\ref{lemma-cstar-2-noninterference-invar} hold. Then, for any
+  block identifiers $b_1, b_2$ such that $\textsc{VarOfBlock}(C_1,
+  b_1)$ and $\textsc{VarOfBlock}(C_2, b_2)$ are both defined and
+  equal, then $b_1 = b_2$.
+\end{lemma}
+\begin{proof}
+   Assume $\textsc{VarOfBlock}(C_1, b_1) = \textsc{VarOfBlock}(C_2,
+   b_2) = (f, n, x)$. When applying $\textsc{VarOfBlock}$, consider
+   the frames $F_1, F_2$ holding the memory states defining $b_1,
+   b_2$. Consider the variable mapping $V'_2$ in the frame just above
+   $F_2$ (or in $C_2$ if such frame is missing.) Then, it is such that
+   $V'_2(x) = b_2$.
+  \begin{itemize}
+  \item If $F_1$ and $F_2$ are at the same level in their respective
+    stacks, then the variable mapping $V'_1$ in the frame directly
+    above $F_1$ (or in $C_1$ if such frame is missing) is such that
+    $V'_1(x) = b_1$, and also $V'_1(x) = V'_2(x)$ by the invariant, so
+    $b_1 = b_2$.
+  \item Otherwise, without loss of generality (by symmetry), assume
+    that $F_2$ is strictly above $F_1$ (i.e. $F_2$ is strictly closer
+    to the top of its own stack than $F_1$ is in its own stack.) Thus,
+    in the stack of $C_1$, all frames in between $F_1$ and the frame
+    $F_1''$ corresponding to $F_2$ are of the form $(M', V', \_, f',
+    \_)$ with $f' = f$ and $M' \not= \None$ (otherwise the functions
+    and/or recursion depths would be different.) By
+    invariant~\ref{cstar-2-invar-memory-block-cons} of
+    Lemma~\ref{lemma-cstar-2-invar}, it is easy to prove that $V'(x) =
+    b_1$, and thus also for the variable mapping $V'_1$ in the frame
+    just above $F_1''$ (or in $C_1$ directly if there is no such
+    frame.) By invariants of
+    Lemma~\ref{lemma-cstar-2-noninterference-invar}, we have $V'_1(x)
+    = V'_2(x)$, thus $b_1 = b_2$.
+  \end{itemize}
+\end{proof}
+  
+\begin{lemma}[\label{lemma-cstar-2-to-cstar-3-noninterference}\cstar2 to \cstar3 noninterference]
+  Assume that $\sys(p, V_1, ss)$ and $\sys(p, V_2, ss)$ have no
+  unambiguous variables. Then, they are both safe in \cstar2 and produce
+  the same traces in \cstar2, if and only if they are both safe in \cstar3 and
+  produce the same traces in \cstar3.
+\end{lemma}
+\begin{proof}
+  Use the invariants of Lemma~\ref{lemma-cstar-2-invar} and
+  Lemma~\ref{lemma-cstar-2-noninterference-invar}. In fact, the
+  configurations and steps are the same in \cstar2 as in \cstar3, only the
+  traces differ between \cstar2 and \cstar3. \textsc{Read} and \textsc{Write}
+  steps match between \cstar2 and \cstar3 thanks to
+  Lemma~\ref{lemma-cstar-2-varofblock-invert}.
+\end{proof}
+
+\begin{lemma}[\cstar3 invariants]
+  The invariants of Lemma~\ref{lemma-cstar-2-invar} and
+  Lemma~\ref{lemma-cstar-2-noninterference-invar} also hold in \cstar3.
+\end{lemma}
+
+\subsection{Local variable hoisting} \label{sec:hoisting}
+
+On \cstar3, hoisting can be performed, which will modify the structure of
+the memory (namely the number of memory blocks allocated), which is
+fine thanks to the fact that event traces carry abstract pointer
+representations instead of concrete pointer values.
+
+\paragraph{Memory allocator and dangling pointers}
+However, we have to cope with dangling pointers whose address should
+not be reused. Consider the following \cstar code:
+\[
+\begin{array}{l}
+  \earray{\kint}{x}{1}{18}; \\
+  \earray{\kint *}{p}{1}{x}; \\
+  \{ \\
+  ~ \earray{\kint}{y}{1}{42}; \\
+  ~ \ewrite{p}{y}; \\
+  \} \\
+  \{ \\
+  ~ \earray{\kint}{z}{1}{1729}; \\
+  ~ \evardecl{\kint *}{q}{\eread{p}}; \\
+  ~ f(q) \\
+  \} \\
+\end{array}
+\]
+With a careless memory allocator which would reuse the space of $y$
+for $z$, the above program would call $f$ not with a dangling pointer
+to $y$, but instead with a valid pointer to $z$, which might not be
+expected by the programmer. Then, if $f$ uses its argument to access
+memory, what should the \textsc{VarOfBlock} algorithm compute? I claim
+that such a \cstar3 program generated from a safe \fstar program should never
+try to access memory through dangling pointers.
+
+As far as I understood, a \lowstar program obtained from a well-typed \fstar
+program should be safe \emph{with any memory allocator}, including
+with a memory allocator which never reuses previously allocated block
+identifiers, as in CompCert.\footnote{Formally, a \lowstar (or \cstar)
+  configuration should be augmented with a state $\Sigma$ so that the
+  \lowstar \textsc{NewBuf} rule (or the \cstar \textsc{ArrDecl} rule), instead
+  of picking a block identifier $b$ not in the domain of the memory,
+  call an allocator $\kw{alloc}$ with two parameters, the domain $D$
+  of the memory and the state $\Sigma$, and returning the fresh block
+  $b \not\in D$ and a new state $\Sigma'$ for future
+  allocations. Then, a CompCert-style allocator would, for instance,
+  use $\mathbb N$ as the type of block identifiers, as well as for the
+  type of $\Sigma$, so that if $\kw{alloc}(D, \Sigma) = (b, \Sigma')$,
+  then it is ensured that $b \not\in D$, $\Sigma \leq b$ and $b <
+  \Sigma'$. In that case, the domain of the memory being always within
+  $\Sigma$, could then be easily proven as an invariant of \lowstar (or
+  \cstar).} In particular, a \lowstar program safe with such a CompCert-style
+allocator will actually never try to access memory through a dangling
+pointer to a local variable no longer in scope.
+
+Then, traces with concrete pointer values are preserved from \lowstar to
+\cstar2 \emph{with the allocator fixed} in advance in all of \lowstar, \cstar and
+\cstar2; and functional correctness and noninterference are also
+propagated down to \cstar3 using the same memory allocator.
+
+There should be a way to prove the following:
+\begin{lemma}
+  If a \cstar3 program is safe with a CompCert-style memory allocator,
+  then it is safe with any memory allocator and the traces (with
+  abstract pointer representations) are preserved by change of memory
+  allocator.
+\end{lemma}
+\begin{proof}
+  Lock-step simulation where the configurations have the same
+  structure but a (functional but not necessarily injective) renaming
+  of block identifiers from a CompCert-style allocator to any
+  allocator is maintained and augmented throughout the execution. In
+  particular, we have to prove that \textsc{VarOfBlock} is stable
+  under such renaming.
+\end{proof}
+
+If so, then for the remainder of this paper, we can consider a
+CompCert-style allocator.
+
+\paragraph{Hoisting}
+
+\begin{definition}[Hoisting]
+  For any list of statements $\mathit{ss}$ with unambiguous local
+  variables, the \emph{hoisting} operation $\kw{hoist}(\mathit{ss}) =
+  (\mathit{ads}, \mathit{ss}')$ is so that $\mathit{ads}$ is the list
+  of all array declarations in $\mathit{ss}$ (regardless of their
+  enclosing code blocks) and $\mathit{ss}'$ is the list of statements
+  $\mathit{ss}$ with all array declarations replaced with $()$.
+
+  Then, hoisting the local variables in the body $ss$ of a function is
+  defined as replacing $ss$ with the code block $\{ \mathit{ads};
+  \mathit{ss}' \} $ where $\kw{hoist}(\mathit{ss}) = (\mathit{ads},
+  \mathit{ss}')$; and then, hoisting the local variables in a program
+  $p$, $\kw{hoist}(p)$, is defined as hoisting the local variables in
+  each of its functions.
+\end{definition}
+
+\begin{definition}[Renaming of block identifiers] \label{def:cstar-3-rename-blocks}
+  Let $C_1, C_2$ be two \cstar3 configurations. Block identifier $b_1$ is
+  said to \emph{correspond} to block identifier $b_2$ from $C_1$ to
+  $C_2$ if, and only if, either $\textsc{VarOfBlock}(C_1, b_1)$ is
+  undefined, or $\textsc{VarOfBlock}(C_1, b_1)$ is defined and equal
+  to $\textsc{VarOfBlock}(C_2, b_2)$.
+
+  Then, value $v_1$ corresponds to $v_2$ from $C_1$ to $C_2$ if, and
+  only if, either they are equal integers, or they are pointers $(b_1,
+  n_1, fd_1)$, $(b_2, n_2, fd_2)$ such that $fd_1 = fd_2$, $n_1 = n_2$
+  and $b_1$ corresponds to $b_2$ from $C_1$ to $C_2$, or they are
+  structures with the same field identifiers and, for each field $f$,
+  the value of the field $f$ in $v_1$ corresponds to the value of the
+  field $f$ in $v_2$ from $C$ to $C'$.
+\end{definition}
+
+\begin{theorem}[Correctness of hoisting]
+  If $\sys(p, V, ss)$ is safe in \cstar3 with a CompCert-style allocator,
+  then $\sys(p, V, ss)$ and $\sys(\kw{hoist}(p), V, \kw{hoist}(ss))$
+  have the same execution traces (and in particular, the latter is
+  also safe) in \cstar3 using the same CompCert-style allocator.
+\end{theorem}
+\begin{proof}
+  Forward downward simulation from \cstar3 before to \cstar3 after hoisting,
+  where one step before corresponds to one step after, except at
+  function entry where at least two steps are required in the compiled
+  program (function entry, followed by entering the enclosing block
+  that was added at function translation, then allocating all local
+  variables if any), and at function exit, where two steps are
+  required in the compiled program (exiting the added block before
+  exiting the function.)
+
+  Then, since \cstar3 is deterministic, the forward downward simulation is
+  flipped into an upward simulation in the flavor of CompCert; thus
+  preservation of traces.
+
+  For the simulation diagram, we combine the invariants of
+  Lemma~\ref{lemma-cstar-2-invar} with the following invariant between
+  configurations $C = (S, V, ss, f, A)$ before hoisting and $C' = (S',
+  V', ss', f', A')$ after hoisting:
+  \begin{itemize}
+  \item for all variables $x$ defined in $V$, $V(x)$, if defined,
+    corresponds to $V'(x)$ from $C$ to $C'$
+  \item $ss'$ is obtained from $ss$ by replacing all array
+    declarations with $()$
+  \item $f' = f$
+  \item $A \subseteq A'$
+  \item the set of variables declared in $ss$ is included in $A'$
+  \item if a block identifier $b$ corresponds to $b'$ from $C$ to
+    $C'$, then the value $\symget(S, b, n, fds)$, if defined, corresponds
+    to $\symget(S', b', n, fd)$ from $C$ to $C'$
+  \end{itemize}
+  Each frame of the form $(\None, V_1, E, f_1, A_1)$ in $S$ is
+  replaced with two frames in $S'$, namely $(\None, V_1', E, f_1,
+  A_1') ; (M', V_2', \symhole, f_2, A_2')$ where:
+  \begin{itemize}
+  \item for all variables $x$ defined in $V_1$, $V_1(x)$ corresponds to
+    $V'_1(x)$ from $C$ to $C'$
+  \item all array declarations of $E$ are present in $A_1'$
+  \item $E'$ is obtained from $E$ by replacing all array
+    declarations with $()$
+  \item $f_1' = f_1$
+  \item $A_1 \subseteq A_1'$
+  \item $A_2'$ contains all variable names of arrays declared in
+    $f_2$, and is the block domain of $M'$
+  \item $V_2'$ is defined for all variable names in $A_2'$ as a block
+    identifier valid in $M'$
+  \item all memory locations of arrays declared in $f_2$ are valid in
+    $M'$
+  \end{itemize}
+  Each frame of the form $(M, V_1, E, f_1, A_1)$ in $S$ with $M \not=
+  \None$ is replaced with one frame in $S'$, namely $(\{ \}, V_1', E',
+  f_1', A_1')$ where:
+  \begin{itemize}
+  \item all blocks of $M$ are defined in $A_1'$
+  \item for all variables $x$ defined in $V_1$, $V_1(x)$, if defined,
+    corresponds to $V_1'(x)$ from $C$ to $C'$
+  \item all array declarations of $E$ are present in $A_1'$
+  \item $E'$ is obtained from $E$ by replacing all array declarations
+    with $()$
+  \item $f_1' = f_1$
+  \item $A_1 \subseteq A_1'$
+  \end{itemize}
+
+  The fact that we are using a CompCert-style memory allocator is
+  crucial here to ensure that, once a source block identifier $b$
+  starts corresponding to a target one, it remains so forever, in
+  particular after its block has been freed (i.e. after its
+  corresponding variable has fallen out of scope), since in the latter
+  case, it corresponds to any block identifier and nothing has to be
+  proven then (since accessing memory through it will fail in the
+  source, per the fact that the CompCert-style memory allocator will
+  never reuse $b$.)
+\end{proof}
+
+\subsection{Local structures} \label{sec:local-struct}
+
+\cstar has structures as values, unlike CompCert C and Clight, which both
+need all structures to be allocated in memory. With a naive \cstar-to-C
+compilation phase, where \cstar structures are compiled as C structures
+and passed by value to functions, we experienced more than 60\%
+slowdown with CompCert compared to GCC -O1, using the \lamstar
+benchmark in Figure~\ref{fig:struct-erase-benchmark}, extracted to C as Figure~\ref{fig:struct-erase-before}. This
+is because, unlike GCC, CompCert cannot detect that a structure is
+never taken its address, which is mostly the case for local structures
+in code generated from \cstar. This is due to the fact that, even at the
+level of the semantics of C structures in CompCert, a field access is
+tantamount to reading in memory through a constant offset. In other
+words, CompCert has no view of C structures other than as memory
+regions. To solve this issue, we replace local structures with their
+individual non-compound fields, dubbed as \emph{structure erasure}. Our
+benchmark after structure erasure is shown in Figure~\ref{fig:struct-erase-after}.
+
+\begin{figure}
+\begin{lstlisting}[language=fstar]
+module StructErase
+open FStar.Int32
+open FStar.ST
+
+type u = { left: Int32.t; right: Int32.t }
+
+let rec f (r: u) (n: Int32.t): Stack unit (fun _ -> true) (fun _ _ _ -> true)  =
+ push_frame();
+ (
+  if lt n 1l
+  then ()
+  else
+   let r' : u = { left = sub r.right 1l ; right = add r.left 1l } in
+   f r' (sub n 1l)
+ );
+ pop_frame()
+
+let test () = 
+ let r : u = { left = 18l ; right = 42l } in
+ let z2 = mul 2l 2l in
+ let z4 = mul z2 z2 in
+ let z8 = mul z4 z4 in
+ let z16 = mul z8 z8 in
+ let z24 = mul z8 z16 in
+ let z = mul z24 2l in
+ f r z  (* without structure erasure, CompCert segfaults
+           if replaced with 2*z *)
+\end{lstlisting}
+\caption{\lowstar benchmarking for structure erasure}
+\label{fig:struct-erase-benchmark}
+\end{figure}
+
+\begin{figure}
+\end{figure}
+
+\begin{figure}
+\begin{lstlisting}
+typedef struct {
+  int32_t left;
+  int32_t right;
+} StructErase_u;
+
+void StructErase_f(StructErase_u r, int32_t n) {
+  if (n < (int32_t )1) { } else {
+    StructErase_u r_ = {
+      .left = r.right - (int32_t )1,
+      .right = r.left + (int32_t )1
+    };
+    StructErase_f(r_, n - (int32_t )1);
+  }
+}
+
+void StructErase_test() {
+  StructErase_u r = {
+    .left = (int32_t )18,
+    .right = (int32_t )42
+  };
+  int32_t z2 = (int32_t )4;
+  int32_t z4 = z2 * z2;
+  int32_t z8 = z4 * z4;
+  int32_t z16 = z8 * z8;
+  int32_t z24 = z8 * z16;
+  int32_t z = z24 * z2;
+  StructErase_f(r, z);
+  return;
+}
+\end{lstlisting}
+\caption{Extracted C code, before structure erasure}
+\label{fig:struct-erase-before}
+\end{figure}
+
+\begin{figure}
+\begin{lstlisting}
+void StructErase_f(int32_t r_left, int32_t r_right, int32_t n) {
+  if (n < (int32_t )1) { } else {
+    int32_t r__left = r_right - (int32_t )1
+    int32_t r__right = r_left + (int32_t )1;
+    StructErase_f(r__left, r__right, n - (int32_t )1);
+  }
+}
+
+void StructErase_test() {
+  int32_t r_left = (int32_t )18;
+  int32_t r_right = (int32_t )42;
+  int32_t z2 = (int32_t )4;
+  int32_t z4 = z2 * z2;
+  int32_t z8 = z4 * z4;
+  int32_t z16 = z8 * z8;
+  int32_t z24 = z8 * z16;
+  int32_t z = z24 * z2;
+  StructErase_f(r_left, r_right, z);
+  return;
+}
+\end{lstlisting}
+\caption{Extracted C code, after structure erasure}
+\label{fig:struct-erase-after}
+\end{figure}
+
+In our noninterference proofs where we prove that memory accesses are
+the same between two runs with different secrets, treating all local
+structures as memory accesses would become a problem, especially
+whenever a field of a local structure is read as an expression (in
+addition to the performance decrease using CompCert.)  This is another
+reason why, in this paper (although a departure from our current
+KreMLin implementation), we propose an easier proof based on the fact
+that \cstar local structures should not be considered as memory regions in
+the generated C code.
+
+In addition to buffers (stack-allocated arrays), \cstar uses local
+structures in three ways: as local expressions, passed as an argument
+to a function by value, and returned by a function. Here we claim that
+it is always possible to not take them as memory accesses, except for
+structures returned by a function: in the latter case, it is necessary
+for the caller to allocate some space on its own stack and pass a
+pointer to it to the callee, which will use this pointer to store its
+result; then, the caller will read the result back from this memory
+area. Thus, we claim that, at the level of CompCert Clight, the only
+additional memory accesses due to local structures are structures
+returned by value.
+
+So we extend \cstar3 with the ability for functions to have several
+arguments, all of which shall be passed at each call site (there shall
+be no partial applications.)
+
+\subsubsection{Structure return} \label{sec:struct-return}
+To handle structure return, we also have to account for their memory
+accesses by adding corresponding events in the trace. Instead of
+directly adding the memory accesses and trying to prove both program
+transformation and trace transformation at the same time, we will
+first add new $\symread$ and $\symwrite$ events at function return,
+without those events corresponding to actual memory accesses yet;
+then, in a second pass, we will actually introduce the corresponding
+new stack-allocated variables.
+
+We assume given a function $\kw{FunResVar}$ such that for any list of
+statements $ss$ and any variable $x$, $\kw{FunResVar}(ss, x)$ is a
+local variable that does not appear in $ss$ and is distinct from
+$\kw{FunResVar}(ss, x')$ for any $x' \not= x$.
+
+Let $p$ be a program $p$ and $ss$ be an entrypoint list of statements,
+so we define $\kw{FunResVar}(f, x) = \kw{FunResVar(ss', x)}$ if $f
+(\_) \{ ss' \}$ is a function defined in $p$, and
+$\kw{FunResVar}(\None, x) = \kw{FunResVar}(ss,x)$.
+
+Then, we define \cstar4 as the language \cstar3 where the $\textsf{Ret}_2$
+function return rule is replaced with two rules following
+Figure~\ref{fig:cstar-4}, adding the fake $\symread$ and
+$\symwrite$. We do not produce any such memory access event if the
+result is discarded by the caller; thus, we also need to check in the
+callee whether the caller actually needs the result. To prepare for
+the second pass where this check will be done by testing whether the
+return value pointer argument is null, we need to account for this
+test in the event trace in \cstar4 as well.
+
+\begin{figure*}
+\begin{small}
+  \begin{mathpar}
+\inferrule* [Right=$\text{Ret}_4\text{Some}$]
+{
+  \eval{e}{(p,V)}=v \\
+  \kw{FunResVar}(f', x) = x' \\
+  \theta = \brt ; \symwrite\;(x', 0, []);\symread\;(x',0,[])
+}
+{
+  p \vdash (S;(\None, V', t ~ x = \symhole; ss', f', A'), V, \ereturn\;e; ss, f, A) \step_{\theta}(S, V', t ~ x = v ; ss', f', A')
+}
+
+\\
+
+\inferrule* [Right=$\text{Ret}_4\text{None}$]
+{
+  \eval{e}{(p,V)}=v
+}
+{
+  p \vdash (S;(\None, V', \symhole; ss', f', A'), V, \ereturn\;e; ss, f, A) \step_{\brf}(S, V', ss', f', A')
+}
+  \end{mathpar}
+\end{small}
+\caption{\cstar4 Amended Configuration Reduction} \label{fig:cstar-4}
+\end{figure*}
+
+\begin{theorem}[\cstar3 to \cstar4 functional correctness]
+  If $\sys(p, V, ss)$ is safe in \cstar3 and has unambiguous local
+  variables, then it has the same behavior and trace as in \cstar4 with
+  $\brt$, $\brf$, $\symread$ and $\symwrite$ events removed.
+\end{theorem}
+\begin{proof}
+  With all such events removed, \cstar3 and \cstar4 are actually the same
+  language.
+\end{proof}
+
+\begin{lemma}[\cstar4 invariants]
+  The \cstar3 invariants of Lemma~\ref{lemma-cstar-2-invar}
+  and~\ref{lemma-cstar-2-noninterference-invar} also hold on \cstar4.
+\end{lemma}
+\begin{proof}
+  This is true because the invariants of
+  Lemma~\ref{lemma-cstar-2-invar} actually do not depend on the traces
+  produced; and it is obvious to prove that, if two executions have
+  the same traces in \cstar4, then they have the same traces in \cstar3
+  (because in \cstar3, some events are just removed.)
+\end{proof}
+
+\begin{theorem}[\cstar3 to \cstar4 noninterference]
+  If $\sys(p, V_1, ss)$ and $\sys(p, V_2, ss)$ are safe in \cstar3, have
+  unambiguous local variables, and produce the same traces in \cstar3, then
+  they also produce the same traces in \cstar4.
+\end{theorem}
+\begin{proof}
+  Two such executions actually make the same \cstar4 steps.
+\end{proof}
+
+Then, we define the $\kw{StructRet}$ structure return transformation
+from \cstar4 to \cstar3 in Figure~\ref{fig:cstar-3-struct-ret}, thus removing
+all structure returns from \cstar3 programs.
+
+\begin{figure*}
+\begin{small}
+\[
+\kw{StructRet}(\_, \kw{return}\; e, x) = \left\{
+\begin{array}{ll}
+  \eif{x}{ *[x] = e}{()} ; \kw{return}\;() & \text{if} ~ x \not= \None \\
+  \kw{return}\; e & \text{otherwise}
+\end{array}
+\right.
+\]
+
+\[
+\kw{StructRet}(f', t ~ x = f(e), \_) = \left\{
+\begin{array}{ll}
+  t ~ x'[1]; f(x', e); t ~ x = *[x'] & \text{if} ~ t ~ \text{is a} ~ \kw{struct} \\
+  & \text{and} ~ x' = \kw{FunRetVar}(f', x) \\
+  t ~ x = f(e) & \text{otherwise}
+\end{array}
+\right.
+\]
+
+\[
+\kw{StructRet}(\_, f(e), \_) = \left\{
+\begin{array}{ll}
+  f(0, e) & \text{if the return type of } ~ f ~ \text{is a} ~ \kw{struct} \\
+  f(e) & \text{otherwise}
+\end{array}
+\right.
+\]
+
+\newcommand{\ecfuntwoargs}[7]                {%
+  \ensuremath{\kw{fun}\;#1\,(#2:#3,#4:#5):#6\,\{\;#7\}}%
+}
+
+\[
+\kw{StructRet}(\ecfun{f}{x}{t}{t'}{ss}) = \left\{
+\begin{array}{ll}
+  \ecfuntwoargs{f}{r}{t'*}{x}{t}{\kw{unit}}{\{ \kw{StructRet}(f, ss, r) \} } &
+  \text{if} ~ t' ~ \text{is a} ~ \kw{struct} \\
+  & (r ~ \text{fresh}) \\
+  \ecfun{f}{x}{t}{t'}{\{ \kw{StructRet}(f, ss, \None) \} } & \text{otherwise}
+\end{array}
+\right.
+\]
+\end{small}
+\caption{\cstar4 to \cstar3 structure return
+  transformation} \label{fig:cstar-3-struct-ret}
+\end{figure*}
+
+Then, the transformation back to \cstar3 exactly preserves the traces of
+\cstar4 programs, so that we obtain both functional correctness and
+noninterference at once:
+
+\begin{theorem}[$\kw{StructRet}$ correctness]
+  If $\sys(p, V, ss)$ is safe in \cstar4 and has unambiguous local
+  variables, then it has the same behavior and trace as
+  $\sys(\kw{StructRet}(p), V, \kw{StructRet}(ss, \None))$.
+\end{theorem}
+\begin{proof}
+  Forward downward simulation, where the compilation invariant also
+  involves block identifier renaming from
+  Definition~\ref{def:cstar-3-rename-blocks} due to the new local
+  arrays introduced by the transformed program.
+
+  Each \cstar4 step is actually matched by the same \cstar3 step, except for
+  function return and return from block: for the $\textsc{RetBlock}$
+  rule, the simulation diagram has to stutter as many times as the
+  level of block nesting in the source program before the actual
+  application of a $\textsc{Ret}_4$ rule. Then, when the
+  $\textsc{RetSome}_4$ rule applies, the trace events are produced by
+  the transformed program, the $\brt$ and the $\symwrite$ events from
+  within the callee, then the callee blocks are exited, and finally
+  the $\symread$ event is produced from within the caller.
+
+  Then, the diagram is turned into bisimulation since \cstar3 is
+  deterministic.
+\end{proof}
+
+After a further hoisting pass, we can now restrict our study to those
+\cstar3 programs with unambiguous local variables, functions with multiple
+arguments, function-scoped local arrays, and no functions returning
+structures.
+
+\subsubsection{Events for accessing structure buffers} \label{sec:struct-events}
+
+Now, we transform an access to one structure into the
+sequence of accesses to all of its individual atomic (non-structure)
+fields.
+
+\ignore{
+\textbf{NOTE:} we need to have some typing information added to the
+$\symread$, $\symwrite$ events of \cstar and each of \cstar$n$: whenever we
+read or write from a buffer, we need to mark the type of the data
+read/written. This makes sense in the context of observing memory
+accesses, since without this data, two programs accessing the same
+memory location but reading data of different types, thus of
+potentially different lengths, would still be considered as having the
+same trace, which we would like to rule out.  So, in the remaining
+parts of this document, we assume that $\symread$ and $\symwrite$
+events carry the type of the data read or written.
+}
+
+Consider the following transformation for \cstar3 $\symread$ (and
+similarly for $\symwrite$) events:
+
+\[
+\begin{array}{ll}
+  \multicolumn{2}{l}{\llbracket \symread\;(f, i, x, j, \ls{fd}, t) \rrbracket} \\
+  = & \llbracket \symread\; (f, i, x, j, \ls{fd};fd_1, t_1) \rrbracket \\
+  ; & \dots \\
+  ; & \llbracket \symread\; (f, i, x, j, \ls{fd};fd_n, t_n) \rrbracket \\
+  \text{if} & t = \kw{struct} \{ fd_1: t_1, \dots, fd_n: t_n \} \\
+\\
+  \multicolumn{2}{l}{\llbracket \symread\;(f, i, x, j, \ls{fd}, t) \rrbracket} \\
+  = & \symread\; (f, i, x, j, \ls{fd}, t) \\
+  \multicolumn{2}{l}{\text{otherwise}}
+\end{array}
+\]
+
+Then, let \cstar5 be the \cstar3 language obtained by replacing each
+$\symread$, $\symwrite$ event with its translation. Then, it is easy
+to show the following:
+\begin{lemma}[\cstar3 to \cstar5 correctness]
+  Let $p$ be a \cstar3 program. Then, $p$ has a trace $t$ in \cstar5 if, and
+  only if, there exists a trace $t'$ such that $p$ has trace $t'$ in
+  \cstar3 and $\llbracket t' \rrbracket = t$.
+\end{lemma}
+
+Thus, this trace transformation preserves functional correctness; and,
+although this trace transformation is not necessarily injective (since
+it is not possible to disambiguate between an access to a 1-field
+structure and an access to its unique field), noninterference is also
+preserved.
+
+After such transformation, all $\symread$ and $\symwrite$ events now
+are restricted to atomic (non-structure) types.
+
+\subsubsection{Local structures} \label{sec:local-struct-detail}
+
+Now, we are removing all local structures, in such a way that the only
+remaining structures are those of local arrays, and all structures are
+accessed only through their atomic fields. In particular, we are
+replacing every local (non-array) variable $x$ of type struct with the
+sequence of variable names $x\_\ls{fds}$ for all field name sequences
+$\ls{fds}$ valid from $x$ such that $x.\ls{fds}$ is of
+non-$\kw{struct}$ type. (We omit the details as to how to construct
+names of the form $x\_\ls{fds}$ so that they do not clash with other
+variables; at worst, we could also rename other variables to avoid
+clashes as needed.)
+
+Using our benchmark in Figure~\ref{fig:struct-erase-benchmark}, with C
+code after structure erasure in Figure~\ref{fig:struct-erase-after},
+on a 4-core Intel Core i7 1.7 GHz laptop with 8 Gb RAM, structure
+erasure saves 20\% time with CompCert 2.7.
+
+If we assume that we know about the type of a \cstar expression, then it
+can be first statically reduced to a normal form as in
+Figure~\ref{fig:cstar-expr-struct-erase}.
+
+\begin{figure*}
+\begin{scriptsize}
+  \begin{mathpar}
+\inferrule*
+    [Right=Int]
+    {~}
+    {
+      \Gamma \vdash n \downarrow^{\kw{Int}} n
+    }
+
+\inferrule*
+    [Right=Var]
+    {
+      (x : t) \in \Gamma
+    }
+    {
+      \Gamma \vdash x \downarrow^t x
+    }
+
+\inferrule*
+    [Right=PtrAdd]
+    {
+      \Gamma \vdash e_1 \downarrow^{t*} e_1' \\
+      \Gamma \vdash e_2 \downarrow^{\kw{int}} e_2'
+    }
+    {
+      \Gamma \vdash e_1 + e_2 \downarrow^{t*} e_1' + e_2'
+    }
+
+\\
+
+\inferrule*
+    [Right=PtrFd]
+    {
+      \Gamma \vdash e \downarrow^{\kw{struct} \{ fd : t; \dots \} *} e' \\
+    }
+    {
+      \Gamma \vdash \eptrfd{e}{fd} \downarrow^{t*} \eptrfd{e'}{fd}
+    }
+    
+\inferrule*
+    [Right=StructFieldName]
+    {
+      \Gamma \vdash e \downarrow^{\kw{struct} \{ fd : t ; \dots \}} x.\ls{fds} \\
+      t ~ \text{is a} ~ \kw{struct}
+    }
+    {
+      \Gamma \vdash e.fd \downarrow^t x.\ls{fds}.fd
+    }
+
+\\
+
+\inferrule*
+    [Right=ScalarFieldName]
+    {
+      \Gamma \vdash e \downarrow^{\kw{struct} \{ fd : t ; \dots \}} x.\ls{fds} \\
+      t ~ \text{is not a} ~ \kw{struct}
+    }
+    {
+      \Gamma \vdash e.fd \downarrow^t x\_\ls{fds}\_fd
+    }
+
+    \\
+
+\inferrule*
+    [Right=FieldProj]
+    {
+      \Gamma \vdash e \downarrow^{\kw{struct} \{ fd : t ; \dots \}} \{ f = e' ; \dots \}
+    }
+    {
+      \Gamma \vdash e.fd \downarrow^t e'
+    }
+
+\inferrule*
+    [Right=Struct]
+    {
+      \ls{\Gamma \vdash e_i \downarrow^{t_i} e'_i}
+    }
+    {
+      \Gamma \vdash \{ \ls{fd_i = e_i} \} \downarrow^{\kw{struct} \{ \ls{fd_i : t_i} \} } \{ \ls{fd_i = e'_i} \}
+    }
+\end{mathpar}
+\end{scriptsize}
+  \caption{\cstar Structure Erasure: Expressions}
+  \label{fig:cstar-expr-struct-erase}
+\end{figure*}
+
+\begin{lemma}[\label{lemma-cstar-expr-struct-erase-correct} \cstar structure erasure in expressions: correctness]
+  For any value $v$ of type $t$, if $\llbracket e \rrbracket_{(p,V)} =
+  v$ and $\Gamma \vdash e \downarrow^t e'$ and $V'$ is such that:
+  \begin{itemize}
+  \item for any $(x': t') \in \Gamma$,  $V(x')$ exists, is of type $t'$ and is equal to $V(x)$
+  \item for any $(x': t') \in \Gamma$ that is a struct and for any $\ls{fds}$ such that $x.\ls{fds}$ is not a struct, then $V'(x\_\ls{fds}) = V(x)(\ls{fds})$
+  \end{itemize}
+  Then, $\llbracket e' \rrbracket_{(p,V')} = v$
+\end{lemma}
+\begin{proof}
+  By structural induction on $\downarrow$.
+\end{proof}
+
+\begin{definition}[\cstar expression without structures]
+  A \cstar expression $e$ is said to be of type $t$ without structures if, and only
+  if, one of the following is true:
+  \begin{itemize}
+  \item $e$ contains neither a structure field projection nor a structure expression
+  \item $e$ is of the form $x.\ls{fds}$ where $x$ is a variable such
+    that $x.\ls{fds}$ is of $\kw{struct}$ type
+  \item t is of the form $\{ \ls{fd_i : t_i} \}$ and $e$ is of the form $\{ \ls{fd_i = e_i} \}$ where for each $i$, $e_i$ is of type $t_i$ without structures
+  \end{itemize}
+\end{definition}
+
+\begin{lemma}[\label{lemma-cstar-expr-struct-erase-shape}\cstar expression reduction: shape]
+  If $\Gamma \vdash e \downarrow^t e'$, then $e'$ is of type $t$
+  without structures.
+\end{lemma}
+\begin{proof}
+  By structural induction on $\downarrow$.
+\end{proof}
+
+Then, once structure expressions are reduced within an expression
+computing a non-structure value, we can show that evaluating such a
+reduced expression no longer depends on any local structures:
+
+\begin{lemma} \label{lemma-cstar-expr-struct-erase-non-struct}
+  If $\llbracket e \rrbracket_{(p,V)} = v$ for some value $v$, and $e$
+  is of type $t$ without structures, and $t$ is not a $\kw{struct}$
+  type, then, for any variable mapping $V'$ such that $V'(x) = V(x)$
+  for all variables $x$ of non-$\kw{struct}$ types, $\llbracket e
+  \rrbracket_{(p,V')} = v$.
+\end{lemma}
+\begin{proof}
+  By structural induction on $\llbracket e \rrbracket_{(p,V)}$.
+\end{proof}
+
+Now, we take advantage of this transformation to transform \cstar5
+statements into \cstar3 statements without structure assignments.  This
+$\downarrow$ translation is detailed in
+Figure~\ref{fig:cstar-5-to-cstar-3}
+
+In particular, each function parameter of structure type passed by
+value is replaced with its recursive list of all non-structure
+fields.\footnote{Our solution, although semantics-preserving as we
+  show further down, yet causes ABI compliance issues. Indeed, in the
+  System V x86 ABI, structures passed by value must be replaced not
+  with their fields, but with their sequence of bytes, some of which
+  may correspond to padding related to no field of the original
+  structure. CompCert does support this feature but as an
+  \textbf{unverified} elaboration pass over source C code. So, we
+  should investigate whether we really need to expose functions taking
+  structures passed by value at the interface level.}
+
+\begin{figure*}
+\begin{footnotesize}
+  \begin{mathpar}
+    \inferrule*
+    [Right=ReadScalar]
+    {
+      t ~ \text{not a} ~ \kw{struct} \\
+      \Gamma \vdash e \downarrow^{t*} e'
+    }
+    {
+      p,\Gamma \vdash t ~ x = \eread{e} \downarrow t ~ x = \eread{e'} \\\\
+      \Gamma[x] \leftarrow t
+    }
+
+    \quad
+    \quad
+    
+    \inferrule*
+    [Right=WriteScalar]
+    {
+      t ~ \text{not a} ~ \kw{struct} \\\\
+      \Gamma \vdash e_1 \downarrow^{t*} e'_1 \\
+      \Gamma \vdash e_2 \downarrow^{t} e'_2 \\
+    }
+    {
+      p,\Gamma \vdash \ewrite{e_1}{e_2} \downarrow \ewrite{e'_1}{e'_2}
+    }
+
+    \\    
+    
+\inferrule*
+    [Right=ReadStruct]
+    {
+      t = \kw{struct} \{ \ls{\mathit{fd_i} : t_i} \} \\
+      \Gamma \vdash e \downarrow^{t*} e' \\
+      (x, \_) \not\in \Gamma \\
+      (x', \_) \not\in \Gamma \\\\
+      \ls{p,\Gamma \cup (x' : t*) \cup (x\_{\mathit{fd}_i} : t_i) \vdash x\_{\mathit{fd}_i} = \eread{\eptrfd{x'}{\mathit{fd}_i}} \downarrow \mathit{ss}_i}
+    }
+    {
+      p,\Gamma \vdash t ~ x = \eread{e} \downarrow t* ~ x' = e'; \ls{\mathit{ss}_i} \\
+      \Gamma[x] \leftarrow t
+    }
+
+    \\    
+    
+\inferrule*
+    [Right=WriteStruct]
+    {
+      t = \kw{struct} \{ \ls{\mathit{fd_i} : t_i} \} \\
+      \Gamma \vdash e_1 \downarrow^{t*} e'_1 \\
+      \Gamma \vdash e_2 \downarrow^{t} e'_2 \\
+      (x', \_) \not\in \Gamma \\\\
+      \ls{p,\Gamma \cup (x' : t*) \vdash \ewrite{\eptrfd{x'}\mathit{fd}_i}{e'_2.\mathit{fd}_i} \downarrow \mathit{ss}_i}
+    }
+    {
+      p,\Gamma \vdash \ewrite{e_1}{e_2} \downarrow t* ~ x' = e'_1 ; \ls{\mathit{ss}_i}
+    }
+
+    \\
+
+    \inferrule*
+    [Right=Ret]
+    {
+      t ~ \text{not a} ~ \kw{struct} \\
+      \Gamma \vdash e \downarrow^{t} e'
+    }
+    {
+      p,\Gamma \vdash \kw{return} ~ e \downarrow \kw{return} ~ e'
+    }
+
+\inferrule* [Right=Block]
+{
+  p,\Gamma \vdash ss \downarrow ss'
+}
+{
+  p,\Gamma \vdash \{ ss \} \downarrow \{ ss' \}
+}
+
+    \inferrule* [Right=Call]
+    {
+      p(f)= \kw{fun} (\ls{\_ : t_i}) : t \{ \_ \} \\
+      t ~ \text{not a} ~ \kw{struct} \\
+      p,\Gamma \vdash (\ls{t_i}, \mathit{el}) \downarrow \mathit{el}'
+    }
+    {
+      p,\Gamma \vdash t\;x=f\;(\mathit{el}) \downarrow t\;x = f(\mathit{el}') \\
+      \Gamma[x] \leftarrow t
+    } 
+
+    \\
+    
+    \inferrule*
+    [Right=ArgNil]
+    {~}
+    {
+      p,\Gamma \vdash ([],[]) \downarrow []
+    }
+
+    \inferrule*
+        [Right=ArgCons]
+        {
+          p,\Gamma \vdash (t, e) \downarrow \mathit{el}_1 \\
+          p,\Gamma \vdash (\mathit{tl}, \mathit{el}) \downarrow \mathit{el}_2
+        }
+        {
+          p,\Gamma \vdash (t; \mathit{tl}, e; \mathit{el}) \downarrow \mathit{el}_1; \mathit{el}_2
+        }
+
+        \\
+        
+    \inferrule*
+        [Right=ScalarArg]
+        {
+          t ~ \text{not a} ~ \kw{struct} \\
+          \Gamma \vdash e \downarrow^t e'
+        }
+        {
+          p, \Gamma \vdash (t, e) \downarrow [e']
+        }
+
+    \inferrule*
+        [Right=StructArg]
+        {
+          t = \kw{struct} \{ \ls{\mathit{fd}_i : t_i} \} \\
+          \Gamma \vdash e \downarrow^t e' \\\\
+          \ls{p,\Gamma \vdash (t_i, e'.\mathit{fd}_i) \downarrow \mathit{el}_i}
+        }
+        {
+          p, \Gamma \vdash (t, e) \downarrow \ls{\mathit{el}_i}
+        }
+
+    \\
+
+
+\inferrule* [Right=If]
+{
+  t ~ \text{not a} ~ \kw{struct} \\
+  \Gamma \vdash e \downarrow^t e' \\
+  \ls{p,\Gamma \vdash ss_i \downarrow ss'_i}
+}
+{
+  p,\Gamma \vdash \eif{e}{ss_1}{ss_2} \downarrow \eif{e'}{ss_1'}{ss_2'}
+} 
+
+\\    
+        
+    \inferrule*
+    [Right=ScalarParam]
+    {
+      t ~ \text{not a} ~ \kw{struct} \\
+    }
+    {
+      (x : t) \downarrow (x : t)
+    }
+
+    \inferrule*
+    [Right=StructParam]
+    {
+      t = \kw{struct} \{ \ls{\mathit{fd}_i : t_i} \} \\\\
+      \ls{ (x\_\mathit{fd}_i : t_i) \downarrow \mathit{vt}_i }
+    }
+    {
+      (x : t) \downarrow \ls{\mathit{vt}_i}
+    }
+    \\
+
+    
+    \inferrule* [Right=Fun]
+    {
+      \mathit{vt} \downarrow \mathit{vt}' \\
+      p, (\mathit{vt} \cup \ls{x_i : t_i*}) \vdash \mathit{ss} \downarrow \mathit{ss}'
+    }
+    {
+      \kw{fun} (\mathit{vt}) : t \{ \ls{t_i ~ x_i[\_] = \{ \} } ; \mathit{ss} \}
+      \downarrow
+      \kw{fun} (\mathit{vt}') : t \{ \ls{t_i ~ x_i[\_] = \{ \} } ; \mathit{ss}' \}
+    }
+\end{mathpar}
+\end{footnotesize}
+  \caption{\cstar5 to \cstar3 Structure Erasure: Statements}
+  \label{fig:cstar-5-to-cstar-3}
+\end{figure*}
+
+\begin{theorem}[\cstar5 to \cstar3 structure erasure: shape]
+  If $p \downarrow p'$ following Figure~\ref{fig:cstar-5-to-cstar-3},
+  then $p'$ no longer has any variables of local structure type, and no
+  longer has any structure or field projection expressions.
+\end{theorem}
+\begin{proof}
+  By structural induction over $\downarrow$, also using
+  Lemma~\ref{lemma-cstar-expr-struct-erase-shape}.
+\end{proof}
+
+\begin{theorem}[\cstar5 to \cstar3 structure erasure: correctness]
+  If $p$ is a \cstar5 program (that is, syntactically, a \cstar program with
+  unambiguous local variables, no block-scoped local arrays other than
+  function-scoped, and no functions returning structures) such that
+  $p$ is safe in \cstar5 and $p \downarrow p'$ following
+  Figure~\ref{fig:cstar-5-to-cstar-3}, then $p$ and $p'$ have the same
+  execution traces.
+\end{theorem}
+\begin{proof}
+  Forward downward simulation where one \cstar5 step triggers one or
+  several \cstar3 steps. Then, determinism of \cstar3 turns this forward
+  downward simulation into bisimulation.
+
+  The compilation invariant is as follows: the code fragments are
+  translated using $\downarrow$, and variable maps $V$ in source \cstar5
+  vs. their compiled \cstar3 counterparts $V'$ follow the conditions of
+  Lemma~\ref{lemma-cstar-expr-struct-erase-correct}, also using
+  Lemma~\ref{lemma-cstar-expr-struct-erase-non-struct}. Memory states
+  $M$ are exactly preserved, as well as the structure of the stack.
+\end{proof}
+
+Then, after a further $\alpha$-renaming pass, we obtain
+a \cstar3 program that no longer has any local (non-stack-allocated)
+structures at all, and where all memory accesses are of non-structure
+type. The shape of this program is now suitable for translation to a
+CompCert Clight program in a straightforward way, which we describe
+in the next subsection.
+
+\subsection{Generation of CompCert Clight code} \label{sec:clight-gen}
+
+Recall that going from \cstar3 (with abstract pointer events) back to \cstar2
+(with concrete pointer events) is possible thanks to the fact that
+Lemma~\ref{lemma-cstar-2-to-cstar-3-correct} and
+Lemma~\ref{lemma-cstar-2-to-cstar-3-noninterference} are actually
+equivalences.
+
+Recall that a \cstar$n$ transition system is of the form $\sys(p, V,
+\mathit{ss})$ where $p$ is a list of functions\footnote{and global
+  variables, although the semantics of \cstar says nothing about how to
+  actually initially allocate them in memory}, $\mathit{ss}$ is a list
+of \cstar statements with undeclared local variables, the values of which
+shall be taken from the map $V$. $\mathit{ss}$ is actually taken as
+the entrypoint of the program, and $V$ is deemed to store the initial
+values of secrets, ensuring that $p$ and $\mathit{ss}$ are
+syntactically secret-independent.
+
+In CompCert Clight, it is not nominally possible to start with a set
+of undeclared variables and a map to define them. So, when translating
+the \cstar entrypoint into Clight, we have to introduce a
+\emph{secret-independent} way of representing $V$ and how they are
+read in the entrypoint. Fortunately, CompCert introduces the notion of
+\emph{built-in functions}, which are special constructs whose
+semantics can be customized and that are guaranteed to be preserved by
+compilation down to the assembly.
+
+Thus, we can populate the values of local non-stack-allocated
+variables of a \cstar entrypoint by uniformly calling builtins in Clight,
+and only the semantics of those builtins will depend on secrets, so
+that the actually generated Clight code will be syntactically
+secret-independent.
+
+Translating \cstar2 expressions with no structures or structure field
+projections into CompCert Clight is straightforward, as shown in
+Figure~\ref{fig:cstar-2-to-clight-expr}. For any \cstar2 expression $e$ of
+type $t$, assuming that $A$ is a set of local variables to be
+considered as local arrays, we define $\mathbb C^t_A(e)$ to be the
+compiled Clight expression corresponding to $e$.
+
+\begin{figure}
+  \[
+  \begin{array}{lcl}
+    \mathbb C^{\kw{int}}_A (n) & = & n \\
+    \mathbb C^{\kw{unit}}_A (()) & = & 0 \\
+    \mathbb C^t_A (x) & = & \&x \\
+     & \text{if} & x \in A \\
+    \mathbb C^t_A (x) & = & \_x \\
+     & \text{if} & x \not\in A \\
+    \mathbb C^{t*}_A (e_1 + e_2) & = & \mathbb C^{t*}_A (e_1) +_t \mathbb C^{\kw{int}}_A (e_2) \\
+    \mathbb C^{t*}_A (\eptrfd{e}{fd}) & = & \&(*\mathbb C^{t'*}_A (e) ._{t'}\mathit{fd}) \\
+    & \text{if} & t' = \kw{struct}\{ \mathit{fd} : t, \dots \}
+  \end{array}
+  \]
+  \caption{\cstar2 to Clight: Expressions}
+  \label{fig:cstar-2-to-clight-expr}
+\end{figure}
+
+\begin{lemma}
+  Let $V$ be a \cstar2 local variable map, and $A$ be a set of local
+  variables to be considered as local arrays. Assume that, for all $x
+  \in A$, there exists a block identifier $b$ such that $V(x) = (b,
+  0)$, and define $V'(x)$ be such block identifier $b$. Then, define
+  $\_V'(\_x) = V(x)$ for all $x \not\in A$.
+
+  Then, for any expression $e$ with no structures or structure
+  projections, $\kw{rv}(\mathbb C^t_A (e), (p, V', \_V')) = \llbracket
+  e \rrbracket_{(p, V)}$.
+\end{lemma}
+\begin{proof}
+  By structural induction on $e$. \ignore{\textbf{TODO:} global variables.}
+\end{proof}
+
+Translating \cstar2 statements with no local array declarations, no read
+or write of structure type and no functions returning structures into
+Clight is straightforward as well, as shown in
+Figure~\ref{fig:cstar-2-to-clight-stmt}.
+
+\begin{figure}
+  \[
+  \arraycolsep=1pt
+  \begin{array}{lcl}
+    \mathbb C_A (t ~ x = e) & = & t ~ x = C^t_A(e) \\
+    \mathbb C_A (t ~ x = f(\ls{e_i})) & = & t ~ x = f(\ls{C^{t_i}_A(e_i)}) \\
+    & & \text{if} ~ f ~ \text{is} ~ \kw{fun}(\ls{(\_ : t_i)}) : \_ \{ \_ \} \\
+    \mathbb C_A (t ~ x = \eread{e}) & = & \clannot(\symread,t,e) ; t ~ x = [*\mathbb C^{t*}_A (e) ] \\
+    \mathbb C_A (\ewrite{e_1}{e_2}) & = & \clannot(\symwrite,t,e) ; *\mathbb C^{t*}_A(e_1) = \mathbb C^{t}_A(e_2) \\
+    \mathbb C_A (\eifthenelse{e}{ss_1}{ss_2}) & = & \eifthenelse{\mathbb C^t_A (e) }{\mathbb C_A(ss_1)}{\mathbb C_A(ss_2)} \\
+    & & \text{for some} ~ t ~ \text{not} ~ \kw{struct} \\
+    \mathbb C_A ( \{ ss \} ) & = & \{ \mathbb C_A (ss) \} \\
+    \mathbb C_A ( \kw{return} ~ e ) & = & \kw{return} ~ \mathbb C^t_A(e) \\
+  \end{array}
+  \]
+  \caption{\cstar2 to Clight: Statements}
+  \label{fig:cstar-2-to-clight-stmt}
+\end{figure}
+
+Let $p$ be a \cstar2 program, and $ss$ be a \cstar2 entrypoint sequence of
+statements. Assume that $p$ and $ss$ have unambiguous local variables,
+no functions returning structures, no local arrays other than
+function-scoped arrays, and no local structures other than local
+arrays. Further assume that $p$ has no function called $\kw{main}$,
+and no function with the same name as a built-in function. Then, we
+can define the compiled CompCert Clight program $\mathbb C(p, ss)$ as
+in Figure~\ref{fig:cstar-2-to-clight-prog}.
+\begin{figure}
+\[
+\begin{array}{lcl}
+  \mathbb C(p, ss)(f) & = & \kw{fun} ~ (\ls{x : t}) : t' \{ \ls{t_i ~ x_i[n_i]} ; \mathbb C_{\ls{x_i}}(ss') \} \\
+  & \text{if} & p(f) = \kw{fun} ~ (\ls{x : t}) : t' \{ \ls{t_i ~ x_i[n_i]} ; ss' \} \\
+  \mathbb C(p, ss)(\kw{main}) & = & \kw{fun} () : \kw{int} \{ \\
+  & & ~ \ls{t_i ~ x_i[n_i]} ; \\
+  & & ~ \ls{\_y_i = \kw{get}\_y_i()} ; \\
+  & & ~ \mathbb C_{\ls{x_i}}(ss') \\
+  & & \} \\
+  & \text{if} & \mathit{ss} = \{ \ls{t_i ~ x_i[n_i]} ; ss' \} \\
+  & & \text{with free variables} ~ \ls{y_i}
+\end{array}
+\]
+\caption{\cstar2 to Clight: Program and Entrypoint}
+\label{fig:cstar-2-to-clight-prog}
+\end{figure}
+
+\begin{theorem}[\cstar2 to Clight: correctness]
+  If $\sys(p, V, ss)$ is safe in \cstar2, then it has the same execution
+  trace as $\mathbb C(p, ss)$ in Clight, when the semantics of the
+  built-in functions $\kw{get}\_x$ are given by $V$.
+\end{theorem}
+\begin{proof}
+  Forward downward simulation where one \cstar2 step corresponds to one or
+  several Clight steps. Then, since Clight is deterministic, the
+  forward downward simulation diagram is turned into a bisimulation.
+
+  The structure of the Clight stack is the same as in the \cstar2 stack,
+  and the values of variables are the same, as well as the memory
+  block identifiers. The only change is in the Clight representation
+  of \cstar2 structure values . A \cstar2 memory state $M$ is said to
+  correspond to a Clight memory state $M'$ if, for any block
+  identifier $b$, for any array index $i$, and for any field sequence
+  $\mathit{fds}$ leading to a non-structure value, $M'(b, n +
+  \kw{offsetof}(\mathit{fds})) = M(b, n)(\mathit{fds})$.
+\end{proof}
+
+Thus, since both \cstar2 and Clight records all memory accesses in their
+traces, this theorem entails both functional correctness and
+preservation of noninterference.

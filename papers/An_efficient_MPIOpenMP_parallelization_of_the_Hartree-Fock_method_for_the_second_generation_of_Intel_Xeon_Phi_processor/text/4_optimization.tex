@@ -1,0 +1,178 @@
+\section{Optimization and parallelization of the Hartree-Fock method}
+\label{sec:optandpar}
+
+
+% -------------------  GAMESS original HF algorithm ------------------------
+\begin{algorithm}[t]
+\caption{MPI parallelization of SCF in stock GAMESS}\label{alg:mpi}
+\begin{algorithmic}[1]
+\For {$i$ = 1, $NShells$}
+	\For {$j$ = 1, $i$}
+    \State \textbf{call} ddi\_dlbnext($ij$)		\Comment MPI DLB: check I and J indices
+    	\For {$k = 1, i$}
+        	\State $k$==$i$ ? $l_{max}\gets k$ : $l_{max}\gets j$
+            \For {$l$ = 1, $l_{max}$}
+            	\LeftComment Schwartz screening:
+                \State $screened\gets$ schwartz($i,j,k,l$)
+                \If {\textbf{not} $screened$}
+                	\State \textbf{call} eri($i,j,k,l,X_{ijkl}$) \Comment Calculate $(i,j|k,l)$
+                    \LeftComment Update process-local 2e-Fock matrix:
+            		\State $Fock_{ij,kl,ik,jl,il,jk}$ += 
+                    \Statex[7] $X_{ijkl}\cdot D_{kl,ij,jl,ik,jk,il}$
+                \EndIf
+            \EndFor
+        \EndFor
+    \EndFor
+\EndFor
+\LeftComment 2e-Fock matrix reduction over MPI ranks:
+\State \textbf{call} ddi\_gsumf($Fock$)
+\end{algorithmic}
+\end{algorithm}
+
+
+\subsection{General considerations and design}
+\label{ssec:general}
+
+In this section, three implementations of the HF algorithm are presented: the original MPI algorithm \cite{schmidt1993general} and two new hybrid MPI/OpenMP algorithms. As mentioned earlier, the most expensive steps in HF are the computation of ERIs and the contribution of ERIs multiplied by corresponding density elements during construction of the Fock matrix. The symmetry-unique ERIs are labeled in four dimensions over $i$, $j$, $k$, $l$ shell\footnote{By term \textit{shell} we mean a group of basis set functions related to the same atom and sharing same set of internal parameters. Grouping basis functions into shells is a common technique in Gaussian-based quantum chemistry codes like GAMESS.} indices. The symmetry-unique quartet shell indices are traversed during Fock matrix construction. Parallelization over the four indices is complicated by the high order of permutational symmetry for shell indices. In addition, many integrals are very small in magnitude and are screened out using the Cauchy-Schwarz inequality equation (see e.q. \citep[p. 118]{janssen2008}). Each ERI is used to construct six elements of the Fock matrix shown in \crefrange{eqn:fockupd:a}{eqn:fockupd:f} where $(i,j|k,l)$ corresponds to a single ERI:
+
+\begin{subequations}
+	\label{eqn:fockupd}
+	\begin{align}
+		F_{ij} &\gets (i,j|k,l)\cdot D_{kl}; \label{eqn:fockupd:a} \\
+		F_{kl} &\gets (i,j|k,l)\cdot D_{ij}; \label{eqn:fockupd:b}\\
+		F_{ik} &\gets (i,j|k,l)\cdot D_{jl}; \label{eqn:fockupd:c}\\
+		F_{jl} &\gets (i,j|k,l)\cdot D_{ik}; \label{eqn:fockupd:d}\\
+		F_{il} &\gets (i,j|k,l)\cdot D_{jk}; \label{eqn:fockupd:e}\\
+		F_{jk} &\gets (i,j|k,l)\cdot D_{il}; \label{eqn:fockupd:f}
+	\end{align}
+\end{subequations}
+
+The irregular storage and access of ERIs during Fock matrix construction is a significant computational challenge. Also, the Fock matrix construction is distributed among ranks, and the final Fock matrix is summed up by a reduction. A detailed explanation of the SCF implementation in GAMESS can be found elsewhere~\cite{schmidt1993general}.
+
+\subsection{MPI-based Hartree-Fock algorithm}
+\label{ssec:mpi}
+The MPI parallelization in the official release of the GAMESS code is shown in \Cref{alg:mpi}. While this implementation has been remarkably successful, it has the disadvantage of a very high memory footprint. This is because a number of data structures (including the density matrix, the atomic orbital overlap matrix, and the one- and two-electron contributions to the Fock matrix) are replicated across MPI ranks. It is a major issue for processors which have a large number of cores (like the Intel Xeon Phi). For example, running~256~MPI ranks on a single Intel Xeon Phi processor increases the memory footprint for both density and Fock matrices by a factor of 256 times. This implementation is therefore severely restricted when it comes to the size of the chemical systems that can be made to fit in memory. 
+
+In a typical calculation, the number of shells (see $NShells$ in \Cref{alg:mpi}) is less than one thousand. Most often, the number can be on the order of a few hundred shells. Thus, parallelization over a two shell indices (\Cref{alg:mpi}) frequently results in  load imbalances. The HF algorithm in GAMESS was originally designed for small- to medium-sized x86 CPU architecture clusters when load balancing is not such a significant issue. However, switching to computer systems with larger parallelism (large number of compute nodes) requires a change of approach for load balancing. Multiple solutions exist for this problem. Perhaps the simplest one is to use more shell indices to increase the iteration space and improve the load balance or introduce multilevel load balancing schemes.
+
+\subsection{Hybrid OpenMP/MPI Hartree-Fock algorithm}
+\label{ssec:omp}
+In this section, the hybrid MPI/OpenMP two-electron Fock matrix code implementations of the current work are described. The main goal of this implementation is to reduce the memory footprint of the MPI-based code and to improve the load balancing by utilizing the OpenMP runtime library.
+
+Modern computational cluster nodes can have a large number of cores operating on a single random access memory. In order to efficiently utilize all of the available CPU cores, it is necessary to run many threads of execution. The major disadvantage of an MPI-only HF code is that all of the data structures are replicated across MPI processes (ranks) -- since to spawn a process is the only way to use a CPU core. In practice, it is found that the memory footprint gets prohibitive rather quickly as the chemical system is scaled up. It follows from \Cref{alg:mpi} that only the Fock matrix update incurs a potential race-condition (write dependencies) when leveraging multiple threads. Other large memory objects like the density matrix, the atomic orbital overlap matrix, and others do not exhibit this problem, because they are read-only matrices, and as a result they can be safely shared across all threads for each MPI rank.
+
+% -------------------  Private Fock matrix HF algorithm ------------------------
+\begin{algorithm}[t]
+\caption{Hybrid MPI-OpenMP SCF algorithm; Fock matrix is replicated across all threads i.e. Fock matrix is private.}\label{alg:omp}
+\begin{algorithmic}[1]
+
+\State !\$omp parallel private($j,k,l,l_{max},X_{ijkl}$) shared($I$) 
+\Statex[1] reduction($+:Fock$)
+\Loop
+\State !\$omp master
+    \State \textbf{call} ddi\_dlbnext($i$)		\Comment MPI DLB: get new I index
+\State !\$omp end master
+\State !\$omp barrier
+\State !\$omp do collapse(2) schedule(dynamic,1)
+	\For {$j$ = 1, $i$}
+    	\For {$k$ = 1, $i$}
+        	\State $k$==$i$ ? $l_{max}\gets k$ : $l_{max}\gets j$
+            \For {$l$ = 1, $l_{max}$}
+            	\LeftComment Schwartz screening:
+                \State $screened\gets$ schwartz($i,j,k,l$) 
+                \If {\textbf{not} $screened$}
+                	
+                    \State \textbf{call} eri($i,j,k,l,X_{ijkl}$) \Comment Calculate $(i,j|k,l)$
+                    \LeftComment Update private 2e-Fock matrix:
+            		\State $Fock_{ij,kl,ik,jl,il,jk}$ += 
+                    \Statex[7] $X_{ijkl}\cdot D_{kl,ij,jl,ik,jk,il}$
+                            
+                \EndIf
+            \EndFor
+            \EndFor
+    \EndFor
+\State !\$omp end do
+\EndLoop
+\State !\$omp end parallel
+\State \textbf{call} ddi\_gsumf($Fock$) \Comment 2e-Fock matrix reduction over MPI
+\end{algorithmic}
+\end{algorithm}
+
+In a first attempt, a hybrid MPI/OpenMP Hartree-Fock code was developed with the Fock matrix replicated across threads (\mbox{\Cref{alg:omp}}). This is what is referred to as the private Fock (hybrid) version of the code. In the first loop, the master thread of each MPI rank updates the $i$ index. This operation is protected by implicit and explicit barriers. OpenMP parallelization is implemented over combined $j$ and $k$ shell loops. Joining loops provides a much larger pool of tasks and thereby alleviates any load balancing issues that may arise. To lend credence to this idea, static and dynamic schedules of OpenMP were tested for the collapsed loop. No significant difference between the various OpenMP load balancer modes was observed. The $l$ loop is the same as in the original implementation of GAMESS. The last step is the same as in the MPI-based algorithm: reduction of the Fock matrix over MPI processes.
+
+Sharing all of the large matrices except the Fock matrix saves an enormous amount of memory on the multicore systems. The observed memory footprints on the latest Xeon and Xeon Phi CPUs were reduced about 5 times. However, the ultimate goal of this work is to move all of the large data structures to shared memory.
+
+It is not straightforward to remove Fock matrix write dependencies in the OpenMP region. As shown in \crefrange{eqn:fockupd:a}{eqn:fockupd:f}, up to six Fock matrix elements are updated at one time by each thread. The ERI contribution is added to the three shell column-blocks of the Fock matrix simultaneously -- namely the $i$, $j$, and $k$ blocks. Each block corresponds to one shell and to all basis set functions associated with this shell. The main idea of the present approach is to use thread-private storage for each of these blocks. They are used as a buffer accumulating partial Fock matrix contribution and help to avoid write dependency. Partial Fock matrix contributions are flushed to the full matrices when the corresponding shell index changes.
+
+% -------------------  Shared Fock matrix HF algorithm ------------------------
+\begin{algorithm}[t]
+\caption{Hybrid MPI-OpenMP SCF algorithm; Fock matrix is shared across all threads.}\label{alg:ompsh}
+\begin{algorithmic}[1]
+
+%\State $\textit{Unpack triangle 2e-Fock matrix to square form}$
+\State $mxsize \gets$ ubound($Fock$)$\cdot shellSize$
+\State $nthreads \gets$ omp\_get\_max\_threads()
+\State allocate($F_I(mxsize,nthreads, F_J(mxsize,nthreads)$)
+
+\State !\$omp parallel shared($F_I, F_J, Fock$) \&
+\Statex[1] private($i,j,k,l,ithread$)
+\State $ithread \gets$ omp\_get\_thread\_num()
+\Loop
+	\State !\$omp master
+    
+    \State \textbf{call} ddi\_dlbnext($ij$) \Comment MPI DLB: get new combined IJ index
+	\State !\$omp end master
+	\State !\$omp barrier
+    \State $i,j\gets ij$ 			\Comment Deduce I and J indices
+    \State ${kl}_{max}\gets i,j$ 	\Comment Deduce KL-loop limit
+    \State $screened\gets$ schwartz($i,j,i,j$) \Comment I and J prescreening 
+    \If {\textbf{not} $screened$}
+    
+    	\If {$i \ne i_{old}$} \Comment If $i$ was changed flush $F_I$
+    		\State $Fock(:,i)$+=$\sum F_I(:,1$:$nthreads)$
+            \State !\$omp barrier
+   		\EndIf
+    	\State !\$omp do schedule(dynamic,1)
+    	\For {$kl$ = 1, ${kl}_{max}$}
+    		\State $k,l\gets kl$ \Comment Deduce K and L indices
+       		\State $screened\gets$ schwartz($i,j,k,l$) \Comment Schwartz screening
+           		\If {\textbf{not} $screened$}
+                	\State \textbf{call} eri($i,j,k,l,X_{ijkl}$) \Comment Calculate $(i,j|k,l)$
+                    \LeftComment {Update private partial Fock matrices:}
+                	\State $F_I(:,ithread)_{j,k,l}$+=$X_{ijkl}\cdot D_{kl,jl,jk}$ 	\label{alg:ompsh:fi}
+                	\State $F_J(:,ithread)_{k,l}$+=$X_{ijkl}\cdot D_{il,ik}$
+                    \LeftComment {Update shared Fock matrix:} 						\label{alg:ompsh:fj}
+                	\State $Fock(k,l)$+=$X_{ijkl}\cdot D(i,j)$ 						\label{alg:ompsh:fk}
+           		\EndIf
+		\EndFor
+    	\State !\$omp end do
+		\State $Fock(:,j)$+=$\sum F_J(:,1$:$nthreads)$		\Comment Flush $F_J$	\label{alg:ompsh:iflush}
+        \State !\$omp barrier
+    	\State $i_{old} \gets i$													\label{alg:ompsh:iold}
+    \EndIf
+
+\EndLoop
+
+\LeftComment Flush remainder $F_i$ contribution to $Fock$:
+\State $Fock(:,i)$+=$\sum F_I(:,1$:$nthreads)$
+\State !\$omp end parallel
+
+%\State $\textit{Pack 2e-Fock matrix to triangular form}$
+\State \textbf{call} ddi\_gsumf($Fock$) \Comment 2e-Fock matrix reduction over MPI
+\end{algorithmic}
+\end{algorithm}
+
+The access pattern of the Fock matrix by $k$ index corresponds to only one Fock matrix element. If threads have different $k$ and $l$ shell indices, it would be possible to skip saving data to the $k$ buffer and instead, to directly update the corresponding parts of the full Fock matrix. This condition will be satisfied if OpenMP parallelization over $k$ and $l$ loops is used. In this case, private storage is necessary for only the $i$ and $j$ blocks of the Fock matrix.
+
+In the shared Fock matrix algorithm (\Cref{alg:ompsh}) the original four loops (\Cref{alg:mpi}) are arranged into two merged index loops. The first and second loops correspond to the combined $ij$ and $kl$ indices, respectively. MPI parallelization is executed over the top~($ij$) loop, while OpenMP parallelization is accomplished over the inner ($kl$) loop. In contrast to the private Fock matrix algorithm (\Cref{alg:omp}), this partitioning favors computer systems with a large number of MPI ranks and is the preferred strategy because this implementation of MPI iteration space is larger and the load balance is finer. By using this partitioning, it is also possible to utilize Schwarz screening across the $i$ and $j$ indices. Partitioning is especially important for very large jobs with very sparse ERI tensor because it allows the user to completely skip the most costly top-loop iterations.
+
+Another difference from the private Fock matrix algorithm is that the ERI contribution is now added in three places (\Cref{alg:ompsh:fi}, lines~\ref{alg:ompsh:fi}-\ref{alg:ompsh:fk}): to the private $i$ buffer ($F_{ij}$, $F_{ik}$, $F_{il}$), the private $j$ buffer ($F_{jk}$, $F_{jl}$), and the shared Fock matrix ($F_{kl}$). At the end of the joint $kl$-loop, the partial Fock matrix contribution from $i$ and $j$ buffers needs to be added to the full Fock matrix. It is computationally expensive for a multithreaded environment because it requires explicit thread synchronization. However, it is possible to reduce the frequency of $i$ buffer flushing. After each $kl$ loop, the $i$ index very likely remains the same and there will be no need for $i$ buffer flushing. In the present algorithm, the old $i$ index is saved after the $kl$ loop (\Cref{alg:ompsh:fi}, line~\ref{alg:ompsh:iold}). The flushing of the $i$ buffer contribution to the Fock matrix is only done if the $i$ index were changed since the last iteration. Flushing the $j$ buffer is still required after each $kl$ loop (\Cref{alg:ompsh}, line~\ref{alg:ompsh:iflush}).
+
+\begin{figure}
+	\includegraphics[width=\columnwidth]{Figure1}
+	\caption{I and J Fock vectors update (A) and summing up all Fock elements for each Fock element in the vectors (B).
+    		 ``bf'' means basis function and ``thr'' means thread.}
+    \label{fig:buffer}
+\end{figure}
+
+A special array structure is needed for flushing and reducing buffers for the $i$ and $j$ blocks. Buffers are organized as two-dimensional arrays. The outer dimension of these arrays corresponds to threads, and the inner dimension corresponds to the data. Using Fortran notation, data is stored in matrix columns, with each thread displayed in its own column. This (column-wise) access pattern is used when threads add an ERI contribution to the buffers (\Cref{fig:buffer}~(A)). The access pattern is different when it is necessary to flush a buffer into the full Fock matrix. The tree-reduction algorithm is used to sum up the contribution from different columns and add them to the full Fock matrix. In this case, the access of threads to this matrix is row-wise (\Cref{fig:buffer}~(B)). Padding bytes were added to the leading dimension of the array and chunking was used on the reduction step to prevent false sharing. After the buffer is flushed into the Fock matrix, it is filled in with zeroes and is ready for the next cycle.
