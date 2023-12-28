@@ -1,0 +1,297 @@
+\section{Multi Query Execution}
+\label{sec:sw}
+
+In this section, we first give an intuitive overview of how shared query
+execution works.  Then we formalize this approach in the \emph{query-data model}
+and define the relational operators for the model.
+
+\subsection{Opportunities for shared execution}
+\label{sec:opps_sexecution}
+
+% a general sentence and then a specific thing
+Sharing opportunities can be exploited whenever multiple queries need to access
+the same base relations.  For example, performing a query in a search engine for
+flight tickets is translated into a set of parameterized queries that
+translate into potentially hundreds of individual queries \cite{Giannikis:2010:CRE:1807167.1807326} to offer
+multiple options to the user.
+In this scenario, we
+could use work sharing across multiple queries by 
+creating a batch out of them and then executing the batch in
+one go. This optimizes data access and shares common computation among queries
+at the expense of potentially increasing latency for individual queries.
+
+Let us consider as a simpler example the two queries from Listing~\ref{ls:sw:sp_queries}.  They both
+join the \lstinline[style=sql]{employees} table with the
+\lstinline[style=sql]{departments} table on \lstinline[style=sql]{dept_id}, but
+have different predicates.  
+The two queries do not have common subexpressions.  However, there may still be
+a large overlap among the tuples processed by the different queries, both in the
+input and in intermediate results.
+
+\begin{lstlisting}[
+     caption={Set of individual queries.},
+     captionpos=b,
+     label=ls:sw:sp_queries,
+     style=ssql
+     ]
+-- Query 1
+SELECT * FROM employees E JOIN departments D
+ON E.dept_id = D.dept_id
+WHERE E.age = ? AND D.city = ?
+-- Query 2
+SELECT * FROM employees E JOIN departments D
+ON E.dept_id = D.dept_id
+WHERE E.name = ? AND D.address = ?
+\end{lstlisting}
+
+%\begin{figure}[H]
+%  \includegraphics[width=0.3\textwidth,height=4cm]{images/SWO_Gen_Plan_q2}
+%  \centering
+%  \caption{Shared query processing of two concurrent queries.}
+%  \label{fig:sw:squeries}
+%\end{figure}
+
+Thus to exploit more sharing opportunities, a single shared access plan can be
+generated where the scan operation selects the \emph{union} of the input of both
+queries, a single join of the respective results is carried out, and a
+postprocessing step is done to extract the respective end results for each
+individual query.  The benefit is that tuples relevant for the two queries are
+processed only once.  Even though the total amount of tuples is larger than in
+any single query, it is potentially much lower than the sum of the tuples needed
+for each query.  It is thus often less work to run a single large plan than many
+smaller plans.  In order to make sharing work, tuples needed by the shared plan
+are annotated with the queries they are relevant to. To do this correctly
+relational operators need to be adapted.
+
+\subsection{Data-query model}
+\label{sec:dq_model}
+
+Shared query plans can be formalized using the \emph{data-query model}
+\cite{Giannikis:2012:SKO:2168651.2168654}.
+The main idea is to enhance
+the relational data model with an extra attribute that tracks for which queries
+each tuple is relevant.  We distinguish two different ways to do this
+annotation: with atomic query identifiers and with sets of query identifiers.
+
+When using atomic query identifiers,
+we extend a relation $R$ with schema $R(A_1, A_2, A_3, \dots, A_n)$
+by an additional attribute \qid:
+%
+\begin{equation}
+  R'(A_1, A_2, A_3,\dots, A_n, \text{\qid}),
+\end{equation}
+%
+where a tuple with $q = \text{\qid}$ is relevant for query%
+\footnote{Where appropriate, we treat a query~$q$
+         synonymously with its identifier.}~$q$
+and tuples relevant for several queries are replicated once for each of them.
+Any part of a shared query plan followed by a selection on $\text{\qid} = q$
+and projection to $R$ is thus equivalent to the query plan of that of query~$q$.
+
+When using sets of query identifiers,
+we extend a relation $R$ with schema $R(A_1, A_2, A_3, \dots, A_n)$
+by an additional attribute \qset:
+%
+\begin{equation}
+  R'(A_1, A_2, A_3,\dots, A_n, \text{\qset}),
+\end{equation}
+%
+where a tuple with $q \in \text{\qid}$ is relevant for query~$q$ and tuples
+relevant for several queries occur only once.  Again, any part of a shared query
+plan with the appropriate selection and projection is equivalent to that of a
+query~$q$.  Relations may also not include any additional attribute, in which
+case all tuples are relevant to all queries.
+
+\begin{table}[t]
+  \centering
+  \begin{tabular}{cccc}
+    \toprule
+    \textbf{row\_id} & \textbf{Name} & \textbf{Other attr.} & \textbf{\qid} \\
+    \midrule
+    1                & EUROPE        & \dots                & 3             \\
+    1                & EUROPE        & \dots                & 4             \\
+    1                & EUROPE        & \dots                & 5             \\
+    2                & AMERICA       & \dots                & 2             \\
+    2                & AMERICA       & \dots                & 3             \\
+    \bottomrule
+  \end{tabular}
+  \caption{Relation with a \qid attribute.}
+  \label{tbl:dq-model-qid}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \begin{tabular}{cccc}
+    \toprule
+    \textbf{row\_id} & \textbf{Name} & \textbf{Other attr.} & \textbf{\qset} \\
+    \midrule
+    1                & EUROPE        & \dots                & 3,4,5         \\
+    2                & AMERICA       & \dots                & 2,3           \\
+    \bottomrule
+  \end{tabular}
+  \caption{Relation with a \qset attribute.}
+  \label{tbl:dq-model-qset}
+\end{table}
+
+Tables~\ref{tbl:dq-model-qid} and \ref{tbl:dq-model-qset} show the same relation
+in the data-query model using \qid and \qset attributes, respectively.  In both
+cases, Queries~3 to 5 ``see'' the tuple with \texttt{row\_id} 1 and Queries~2
+and 3 ``see'' the tuple with \texttt{row\_id} 2.
+
+In this work, we annotate tuples first using a \qset attribute
+and switching to use a \qid for the final
+postprocessing step.
+
+\subsection{Shared operators}
+\label{sec:design}
+
+To enhance relational operators to work in the data-query model, they have to
+preserve the invariant that the tuples annotated with $q$
+as well as those without \qid or
+\qset attribute are the tuples relevant for query~$q$.  Operators on relations
+without annotations do not need to be modified.
+
+\subsubsection{Shared scan operator}
+
+We start with the scan operator.  We call a scan operator a selection operator
+whose input is not yet annotated with query identifiers, which is the case for
+base tables.  Let $R$ be such a relation and $\sigma^{q_i} : R \rightarrow
+\{\top,\bot\}$ the predicates for the queries in the batch $Q = \{q_1, \ldots,
+q_n\}$.  The shared scan operator then works as follows:
+%
+\begin{equation}
+  %\begin{split}
+      %$\sigma^Q(R) = \big\{& (t_R, \{q_i : \sigma^{q_i}(t_R)  = \top \} ) \; | \\
+      %& t_R \in R \; : \exists q_i : \sigma^{q_i}(t_R)  = \top \big\}$
+  %\end{split}
+  \resizebox{.9\hsize}{!}{
+      $\sigma^Q(R) = \big\{ (t_R, \{q_i : \sigma^{q_i}(t_R)  = \top \} ) \; | \; t_R \in R \; : \exists q_i : \sigma^{q_i}(t_R)  = \top \big\}$
+    }
+  \label{eqn:shared_scan}
+\end{equation}
+%
+and the schema of $\sigma^Q(R)$ is that of $R$ extended by a \qset attribute.
+The value of this attribute is the set of query identifiers whose selection
+predicate $\sigma^{q_i}$ evaluates to $\top$ on a particular tuple and
+$\sigma^Q(R)$ only contains tuples where this is the case for at least one
+query.
+
+A selection operator on a relation with annotated tuples can be defined by
+replacing the conditions $\sigma^{q_i}$ with ${\sigma'}^{q_i} = \sigma^{q_i}
+\wedge q_i \in \text{\qset}$ or ${\sigma}'^{q_i} = \sigma^{q_i} \wedge q_i =
+\text{\qid}$ for set-valued and atomic annotations, respectively.  Intuitively,
+a tuple is in the result of query $q_i$ if it satisfies $q_i$'s predicate
+$\sigma^{q_i}$ \emph{and} was relevant to $q_i$ before the selection.
+
+\subsubsection{Shared join operator}
+
+For the join operator, only the case
+where both inputs are annotated is interesting.
+In the other cases, a regular join can be used,
+treating the \qid or \qset attribute like any other attribute (if present).
+Let $R$ and $S$ thus be two relations with \qset attributes,
+$f_{\bowtie} : R \times S \rightarrow \{\top,\bot\}$ a join condition for $R$ and $S$,
+and $Q$ defined as above.
+A join on these two relations is then defined as follows:
+%
+{
+\begin{equation}
+  \begin{alignedat}{3}
+        R & \bowtie^Q S = \big\{ \rlap{$(t_R, t_S, R.\text{\qset} \cap S.\text{\qset} ) \; |$} && \\
+        & t_R \in R, \; t_S \in S \; : \; && f_{\bowtie}(t_R, t_S) = \top \text{~and~} \\
+        &                                 && R.\text{\qset} \cap S.\text{\qset} \neq \emptyset \}
+  \end{alignedat}
+  \label{eqn:shared_join}
+\end{equation}
+}
+%
+and the schema of $R \bowtie^Q S$ is that of $R \bowtie S$
+extended by a \qset attribute.
+The value of this attribute is the intersection
+of the same attribute in R and S, respectively,
+of tuples that match the join condition
+and the result consists of those joined tuples
+where this intersection is not empty.
+
+A shared join on relations with \qid or mixed \qset/\allowbreak \qid attributes
+can be defined in a similar way.
+If both relations have a \qid attribute,
+then $f_{\bowtie}$ is simply replaced by
+\mbox{$f'_{\bowtie} = f_{\bowtie} \wedge t_R.\text{\qid} = t_S.\text{\qid}$}.
+If they have mixed \texttt{query\_\allowbreak set}/\qid attributes,
+the comparison in $f'_{\bowtie}$
+is $t_R.\text{\qid} \in\allowbreak t_S.\text{\qset}$ or $t_R.\text{\qset} \ni t_S.\text{\qid}$.
+In all three possible cases, the result has a \qid attribute.
+
+\subsubsection{Shared grouping operator}
+\label{sec:shared_groupby_op}
+
+The grouping operator with aggregation
+is slightly different than the ones above.
+Since it computes new tuples out of several tuples from the input
+(namely from those in the same group),
+different queries generally only share a tuple in the output
+if they already shared \emph{all} tuples in the input
+that were used to compute that resulting tuple.
+Since this is rather unlikely (and difficult to detect),
+we define the shared grouping operator
+such that no tuples are shared in the output,
+i.e., we define it such that it always produces atomic \qid annotations.
+
+Specifically, let $R$ be a relation with a \qset attribute,
+$G \subset R$ a set of grouping attributes,
+$F_i$ a set of aggregation functions on $R$,
+and the query set $Q$ defined as above.
+The grouping operator is defined as follows:
+%
+\begin{equation}
+  \prescript{}{G}{\Gamma}^Q_{F_1,\ldots,F_k}(R) = \prescript{}{G,\text{\qid}}{\Gamma}_{F_1,\ldots,F_k}(R')
+  \label{eqn:shared_grouping}
+\end{equation}
+where
+\begin{equation}
+    \resizebox{.9\hsize}{!}{
+        $R' = \{ (t_R,q) \;|\; (t_R, \text{\qset}) \in R, q \in \text{\qset} \; \},$
+    }
+  \label{eqn:unnest_operator}
+\end{equation}
+%
+which has the same schema as $R$,
+except that it has a \qid instead of the \qset attribute,
+and $\Gamma$ is the regular grouping operator from relational algebra.
+We thus simply unnest the query identifiers in the \qset attribute
+and group by the resulting \qid attribute in addition to $G$.
+The grouping operator on \qid attributes
+obviously works the same way, without prior unnesting.
+
+\subsubsection{Shared operators in terms of regular operators}
+
+In order to be able to express the above shared operators in \sql, the following
+observation is crucial: all of them can be expressed in terms of unmodified
+relational operators if an unnest operator is available.  For example, the
+shared scan from Equation~\ref{eqn:shared_scan} can be re-phrased as follows:
+%
+\begin{equation}
+    \resizebox{.9\hsize}{!}{
+        $\sigma^Q(R) = \sigma_{\qset \neq \emptyset}\left(
+            \Pi_{R, \qset \rightarrow \{q_i : \sigma^{q_i}(t_R)  = \top \}}(R) \right)$
+    }
+\end{equation}
+%
+Similarly, the definition of the shared join in Equation~\ref{eqn:shared_join}
+can be expressed as a regular join that ignores the annotations of the input
+followed by an appropriate projection and a filter dealing with the annotations.
+Finally, the grouping operator from Equation~\ref{eqn:shared_grouping} is
+already expressed using the regular grouping operator together with the
+unnesting operator known from nested relational algebra~\cite{Colby1989}, which
+is equivalent to Equation~\ref{eqn:unnest_operator}.
+
+\subsection{Shared query plans}
+\label{sec:shared_plans}
+
+Producing a shared execution plan out of a group of queries has been studied in
+the past. For example, the {\it Shared Workload Optimization algorithm} (SWO),
+proposed by Giannikis et. al.~\cite{Giannikis:2014:SWO:2732279.2732280}, takes
+an entire workload and produces a globally shared access plan. Similar
+approaches for generating a shared execution plan is applicable in
+our setting, thus they are not studied in this paper.

@@ -1,0 +1,126 @@
+
+
+
+\subsection{Policy Architecture}
+
+
+Many of the randomizations we employ persist across an episode, and thus it should be possible for a memory augmented policy to identify properties of the current environment and adapt its own behavior accordingly.
+For instance, initial steps of interaction with the environment can reveal the weight of the object or how fast the index finger can move.
+We therefore represent the policy as a recurrent neural network with memory, namely an LSTM~\citep{lstm}
+with an additional hidden layer with ReLU~\citep{relu} activations inserted
+between inputs and the LSTM.
+
+The policy is trained with Proximal Policy Optimiztion (PPO)~\citep{ppo}.
+We provide background on reinforcement learning and PPO in greater detail in~\autoref{sec:rl}.
+PPO requires the training of two networks --- a policy network, which maps observations to actions, and a value network, which predicts the discounted sum of future rewards starting from a given state.
+Both networks have the same architecture but have independent parameters.
+Since the value network is only used during training, we use an Asymmetric Actor-Critic~\citep{pinto2017asymmetric} approach.
+Asymmetric Actor-Critic exploits the fact that the value network can have access to information that is not available on the real robot system.\footnote{This includes noiseless observation and additional observations like joint angles and angular velocities, which we cannot sense reliably but which are readily available in simulation during training.}
+This potentially simplifies the problem of learning good value estimates since less information needs to be inferred.
+The list of inputs fed to both networks can be found in \autoref{table:policy-inputs}.
+
+
+
+\makesavenoteenv{table}
+\makesavenoteenv{tabular}
+\begin{table}[h!]
+    \footnotesize
+    \centering
+    \caption{Observations of the policy and value networks, respectively.}
+    \renewcommand{\arraystretch}{1.3}
+    \begin{tabular}{@{}llcc@{}}
+        \toprule
+        \textbf{Input} & \textbf{Dimensionality} & \textbf{Policy network} & \textbf{Value network} \\
+        \midrule
+        fingertip positions & 15D & \checkmark & \checkmark \\
+        object position & 3D & \checkmark & \checkmark \\
+        object orientation & 4D (quaternion) & $\times$\footnote{We accidentally did not include the current object orientation in the policy observations but found that it makes little difference since this information is indirectly available through the relative target orientation.} & \checkmark \\
+        target orientation & 4D (quaternion) & $\times$ & \checkmark \\
+        relative target orientation & 4D (quaternion) & \checkmark & \checkmark \\
+        hand joints angles & 24D & $\times$ & \checkmark \\
+        hand joints velocities & 24D & $\times$ & \checkmark \\
+        object velocity & 3D & $\times$ & \checkmark \\
+        object angular velocity & 4D (quaternion) & $\times$ & \checkmark \\
+        \bottomrule
+    \end{tabular}
+\label{table:policy-inputs}
+\end{table}
+
+
+\newcommand{\link}[5]{
+    \draw[->,flow,#3] ([xshift=-5pt]#1.south) -- node[left]{#4} ([xshift=-5pt]#2.north);
+    \draw[->,flow,#3] ([xshift=5pt]#2.north) -- node[right]{#5} ([xshift=5pt]#1.south);
+}
+
+\newcommand{\optthread}[2]{
+    \begin{scope}
+      \node [thread,#2] (train#1) {optimizer};
+      \node [physical,below=0.5cm of train#1] (gpu#1) {GPU};
+      \node [thread,below=0.5cm of gpu#1] (stager#1) {stager};
+      \node [physical,below=0.5cm of stager#1] (ram#1) {RAM};
+      \node [thread,below=0.5cm of ram#1] (puller#1) {puller};
+      \link{train#1}{gpu#1}{}{}{}
+      \link{gpu#1}{stager#1}{}{}{}
+      \link{stager#1}{ram#1}{}{}{}
+      \link{ram#1}{puller#1}{}{}{}
+    \end{scope}
+}
+
+\newcommand{\redis}[1]{
+    \node[db,below=1.5cm of puller#1] (redis#1) {redis};
+    \link{puller#1}{redis#1}{dashed}{parameters}{experience}
+      
+    \node[thread,below=1.5cm of redis#1] (w1) {worker};
+    \node[thread,below right=0.1cm and 0.1cm of w1.north west] (w2) {worker};
+    \node[thread,below right=0.1cm and 0.1cm of w2.north west] (w3) {worker};
+    \node[thread,below right=0.1cm and 0.1cm of w3.north west] (w4) {worker};
+    \node[thread,below right=0.1cm and 0.1cm of w4.north west] (w5) {worker};
+    \link{redis#1}{w1}{dashed}{parameters}{experience}
+      
+}
+
+\subsection{Actions and Rewards}
+
+Policy actions correspond to desired joints angles relative to the current ones\footnote{The reason
+for using \emph{relative} targets is that it is hard to precisely measure absolute joints angles
+on the physical robot. See Appendix~\ref{app:hardware} for more details.}
+(e.g. rotate this joint by $10$ degrees).
+While PPO can handle both continuous and discrete action spaces, we noticed that
+discrete action spaces work much better. This may be because a discrete probability distribution is more expressive than a multivariate Gaussian or because discretization of actions makes learning a good advantage function potentially simpler.
+We discretize each action coordinate into $11$ bins.%\footnote{The action distribution
+
+The reward given at timestep $t$ is $r_t=d_t-d_{t+1}$, where
+$d_t$ and $d_{t+1}$ are the rotation angles between the desired 
+and current object orientations before and after the transition, respectively.
+We give an additional reward of $5$ whenever a goal is achieved and a reward of $-20$ (a penalty) whenever the object is dropped.
+More information about the simulation environment
+can be found in Appendix~\ref{app:sim}.
+
+
+\subsection{Distributed Training with Rapid}
+We use the same distributed implementation of PPO that was used to train OpenAI Five~\citep{five} without any modifications.
+Overall, we found that PPO scales up easily and requires little hyperparameter tuning. %, and transferred successfully to a broad variety of environments.
+The architecture of our distributed training system is depicted in~\autoref{fig:rapid}.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.7\textwidth]{figures/policy2}
+    \caption{Our distributed training infrastructure in Rapid. Individual threads are depicted as blue squares. Worker machines randomly connect to a Redis server from which they pull new policy parameters and to which they send new experience. The optimizer machine has one MPI process for each GPU, each of which gets a dedicated Redis server. Each process has a \emph{Puller} thread which pulls down new experience from Redis into a buffer. Each process also has a \emph{Stager} thread which samples minibatches from the buffer and stages them on the GPU. Finally, each \emph{Optimizer} thread uses a GPU to optimize over a minibatch after which gradients are accumulated across threads and new parameters are sent to the Redis servers.}
+    \label{fig:rapid}
+\end{figure}
+
+In our implementation, a pool of $384$ worker machines, each with $16$ CPU cores, generate experience by rolling out the current version of the policy in a sample from distribution of randomized simulations.
+Workers download the newest policy parameters from the optimizer at the beginning of every epoch,
+generate training episodes, and send the generated episodes back to the optimizer.
+The communication between the optimizer and workers is implemented using the
+Redis in-memory data store.
+We use multiple Redis instances for load-balancing, and workers are assigned to an instance randomly.
+This setup allows us to generate about $2$ years of simulated experience per hour.
+
+The optimization is performed on a single machine with $8$ GPUs.
+The optimizer threads pull down generated experience from Redis
+and then stage it to their respective GPU's memory for processing.
+After computing gradients locally, they are averaged across all threads using MPI, which we then use to update
+the network parameters.
+
+The hyperparameters that we used can be found in Appendix~\ref{app:hyper-ppo}.

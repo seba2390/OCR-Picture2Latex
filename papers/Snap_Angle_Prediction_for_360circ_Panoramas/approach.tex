@@ -1,0 +1,165 @@
+\vspace*{-0.1in}
+\section{Approach} \label{sec:approach}
+\vspace*{-0.05in}
+We first formalize  snap angle prediction as an optimization problem (Sec.~\ref{sec:snap_angle}). Then present our learning framework and network architecture for snap angle prediction (Sec.~\ref{sec:model}).
+
+We concentrate on the cubemap projection~\cite{greene1986environment}.
+Recall that a cubemap maps the sphere to a cube with rectilinear projection (where each face captures a 90$^{\circ}$ FOV) and then unfolds the six faces of the cube.  The unwrapped cube can be visualized as an unfolded box, with the lateral strip of four faces being spatially contiguous in the scene (see Fig.~\ref{fig:intro}, bottom).  We explore our idea with cubemaps for a couple reasons.  First, a cubemap covers the entire 360$^{\circ}$ content and does not discard any information.  Secondly, each cube face is very similar to a conventional 
+%field-of-view image
+\BX{FOV}, and therefore relatively easy for a human to view \KGthree{and/or} edit.
+
+
+\vspace*{-0.05in}
+\subsection{Problem Formulation}\label{sec:snap_angle}
+
+We first formalize snap angle prediction as an optimization problem.  %  and then we will describe each component in detail.
+Let $P(I,\theta)$ denote a projection function that takes a panorama image $I$ and a projection angle $\theta$ as input and outputs a cubemap \KG{after rotating the sphere (or equivalently the cube) by $\theta$}. Let function $F$ be an objective function that takes a cubemap as input and outputs a score to measure the quality of the cubemap. Given a novel panorama image $I$, our goal is to minimize $F$ by predicting the snap angle $\theta^\ast$:
+\begin{equation}
+\begin{matrix}
+\displaystyle \KG{\theta^\ast}  = \argmin_\theta & F(P(I,\theta)).  \\
+\end{matrix}
+\end{equation}
+The projection function $P$ first transforms the coordinates of each point in the panorama based on the snap angle $\theta$ and then produces a cubemap in the standard manner.
+
+Views from a horizontal camera position (elevation 0$^{\circ}$) are more informative than others due to human recording bias. The bottom and top cube faces often align with the sky (above) and  ground (below); ``stuff'' regions like sky, ceiling, and floor are thus common in these faces and foreground objects are minimal. \KGthree{Therefore, rotations in azimuth tend to have greater influence on the disruption caused by cubemap edges.}  Hence, without loss of generality, we focus on snap angles in azimuth only, and jointly optimize the front/left/right/back faces of the cube.
+
+The coordinates for each point in a panorama can be represented by a pair of 
+\BX{latitude and longitude}
+%longitude and latitude 
+$(\lambda,\varphi)$.  Let $L$ denote a coordinate transformation function that takes the snap angle $\theta$ and a pair of coordinates as input.  We define the coordinate transformation function $L$ as:
+\begin{equation}
+\begin{matrix}
+L((\lambda,\varphi),\theta)=(\lambda,\varphi-\theta).
+  \\
+\end{matrix}
+\label{eq:L}
+\end{equation}
+Note when the snap angle is 90$^{\circ}$, the orientation of the cube is the same as the default cube except the order of front, back, right, and left is changed. We therefore restrict $\theta \in [0,\pi /2]$. We discretize the space of candidate angles for $\theta$ into a uniform \KG{$N=20$} azimuths grid, \BX{which we found offers fine enough camera control.}
+
+
+
+
+
+\begin{figure*}[t]
+\centering
+\renewcommand{\tabcolsep}{0pt}
+\includegraphics[width=0.95\columnwidth]{images/supp_pixel.pdf}
+%\vspace*{-0.2in}
+%change to qual_pdf for a larger one
+\caption{Pixel objectness~\cite{jain2017pixel} foreground map examples. White pixels in the pixel objectness map indicate foreground.  \KGthree{Our approach learns to find cubemap orientations where the foreground objects are not disrupted by cube edges, i.e., each object falls largely within one face.}}%\vspace*{-0.15in}
+\label{fig:pixel}
+\vspace{-0.2in}
+\end{figure*}
+
+
+
+
+
+We next discuss our choice of the objective function $F$.  
+A cubemap in its default orientation has two disadvantages: 1) It does not guarantee to project each important object onto the same cube face; 2) Due to the nature of the perspective projection, objects projected onto cube boundaries will be distorted more than objects in the center.  Motivated by these shortcomings, our goal is to produce cubemaps that \emph{place each important object in a single face} and avoid placing objects at the cube boundaries/edges. 
+
+In particular, we propose to minimize the area of foreground objects near or on cube boundaries. 
+Supposing each pixel in a cube face is \boc{automatically} labeled as either object or background, our objective $F$ measures \emph{the fraction of pixels that are labeled as \BX{foreground} near cube boundaries.}  A pixel is near cube boundaries if it is less than \KG{$A$}\% of the cube length away from the left, right, or top boundary. We do not penalize objects near the bottom boundary since it is common to place objects near the bottom boundary in photography (e.g., potraits).
+
+To infer which pixels belong to the foreground, we use ``pixel objectness''~\cite{jain2017pixel}.  Pixel objectness is a CNN-based foreground estimation approach that returns pixel-wise estimates for all foreground object(s) in the scene, no matter their category.  While other foreground methods are feasible (e.g.,~\cite{zitnick2014edge,carreira2012cpmc,jiang2013,pinheiro2015learning,liu2011learning}), we choose pixel objectness due to its accuracy in detecting foreground objects of any category, as well as its ability to produce a single \BX{pixel-wise foreground map which can contain multiple objects.}
+%foreground hypothesis.
+\KGthree{Figure~\ref{fig:pixel} shows example pixel objectness foreground maps on cube faces.}
+%%We see it can segment diverse foreground objects.}
+\KGthree{We apply pixel objectness to a given projected cubemap to obtain its pixel objectness score.}
+In conjunction, other measurements for photo quality, such as interestingness~\cite{gygli2013interestingness}, memorability~\cite{isola2011makes}, or aesthetics~\cite{dhar2011high}, could be employed within $F$.  
+
+
+
+%\vspace*{-0.15in}
+\subsection{Learning to Predict Snap Angles}\label{sec:model}
+
+
+
+
+On the one hand, a direct regression solution would attempt to infer $\theta^\ast$ directly from $I$.  However, this is problematic because good snap angles can be multi-modal, \boc{i.e.,} available at multiple directions in the sphere, and thus poorly suited for regression.  
+On the other hand, a brute force solution would require projecting the panorama to a cubemap and then evaluating $F$ for every possible projection angle $\theta$, which is costly.
+
+We instead address snap angle prediction with reinforcement learning.  The task is a time-budgeted sequential decision process---an iterative adjustment of the (virtual) camera rotation that homes in on the least distorting viewpoint for cubemap projection.  Actions are cube rotations and rewards are improvements to the pixel objectness score $F$.  Loosely speaking, this is reminiscent of how people take photos with a coarse-to-fine refinement towards the desired composition.  \KGthree{However, unlike a naive coarse-to-fine search, our approach learns to trigger different search strategies depending on what is observed, as we will demonstrate in results.}
+
+
+
+Specifically, let $T$ represent the budget given to our system, indicating the number of rotations it may attempt.  We maintain a history of the model's previous predictions. At each time step $t$, our framework takes a relative snap prediction $s_t$ (for example, $s_{t}$ could  signal to update the azimuth by 45$^{\circ}$) and updates its previous snap angle $\theta_{t}=\theta_{t-1}+s_t$. Then, \KG{based on its current observation}, our system makes a prediction $p_t$, which is used to update the snap angle in the next time step. That is, we have $s_{t+1}=p_t$. Finally, we choose the snap angle 
+with the lowest pixel objectness objective score from the history as our final prediction $\hat{\theta}$:
+
+\begin{equation}
+\hat{\theta}=\argmin_{\theta_t=\theta_1,...,\KG{\theta_T}} F(\KG{P}(I,\theta_t)).
+\end{equation}
+
+
+\KGthree{To further improve efficiency, one could compute pixel objectness \emph{once} on a cylindrical panorama rather than recompute it for every cubemap rotation, and then proceed with the iterative rotation predictions above unchanged.  However, learned foreground detectors~\cite{jain2017pixel,jiang2013,carreira2012cpmc,pinheiro2015learning,liu2011learning} are trained on Web images in rectilinear projection, and so their accuracy can degrade with different distortions.  Thus we simply recompute the foreground for each cubemap reprojection.  See Sec.~\ref{sec:pred_angle} for run-times.}
+% If other metrics like interestingness~\cite{gygli2013interestingness}, memorability~\cite{isola2011makes}, or aesthetics~\cite{dhar2011high} were employed, computing features on a cylindrical panorama is 
+
+
+
+
+\begin{figure*}[t]
+\centering
+\renewcommand{\tabcolsep}{0pt}
+\includegraphics[width=1\columnwidth]{images/net.pdf}%change to network_2 for a single column version
+\caption{We show the rotator (left), our model (middle), and a series of cubemaps produced by our sequential predictions (right). Our method iteratively refines the best snap angle, targeting a given budget of allowed computation.
+}%Our goal is to predict snap angle so the resulting cubemap can preserve object integrity.}
+\label{fig:net}
+\vspace{-0.15in}
+\end{figure*}
+
+
+
+\vspace*{-0.1in}
+\paragraph{Network}  We implement our reinforcement learning task \boc{with} deep recurrent and convolutional neural networks.    
+Our framework consists of four modules: a \textit{rotator}, a \textit{feature extractor}, an \textit{aggregator}, and a \textit{snap angle predictor}. At each time step, it processes the data and produces a cubemap (\textit{rotator}), extracts learned features (\textit{feature extractor}), integrates information over time (\textit{aggregator}), and predicts the next snap angle (\textit{snap angle predictor}).
+
+At each time step $t$, the \textit{rotator} takes as input a panorama $I$ in equirectangular projection and a relative snap angle prediction $s_{t}=p_{t-1}$, which is the prediction from the previous time step. The \textit{rotator} updates its current snap angle prediction with $\theta_t=\theta_{t-1}+s_{t}$. We set $\theta_1=0$ initially.
+Then the \KGtwo{\textit{rotator}} applies the projection function $P$ to $I$ based on $\theta_t$ with Eq~\ref{eq:L} to produce a cubemap. 
+Since our objective is to minimize the total amount of foreground straddling cube face boundaries, it is more efficient for our model to learn directly from the pixel objectness map than from raw pixels. 
+Therefore, we apply pixel objectness~\cite{jain2017pixel} to each of the four lateral cube faces to obtain a binary objectness map per face. %Since we only consider front, right, left and back faces, we stack the four objectness map as output.
+The rotator has the form:
+%\begin{equation}
+%\begin{matrix}
+%\textrm{Rotator}:
+$\mathbb{I} ^{W \times H \times 3}\times \Theta \rightarrow \mathbb{B}^{W_c \times W_c \times 4}$,
+%
+% \\
+%\end{matrix}
+%\end{equation}
+where $W$ and $H$ are the width and height of the input panorama in equirectangular projection and $W_c$ denotes the side length of a cube face. The \textit{rotator} does not have any learnable parameters since it is used to preprocess the input data.
+
+At each time step $t$, the \textit{feature extractor} then applies a sequence of convolutions to the output of the \textit{rotator} to produce a feature vector $f_t$, which is then fed into the \textit{aggregator} to produce an aggregate feature vector $a_t=A(f_1,...,f_t)$ over time. Our \textit{aggregator} is a recurrent neural network (RNN), which also maintains its own hidden state.
+
+Finally, the \textit{snap angle predictor} takes the aggregate feature vector as input, and produces a relative snap angle prediction $p_{t}$. In the next time step $t+1$, the relative snap angle prediction is fed into the \textit{rotator} to produce a new cubemap. The \textit{snap angle predictor} contains two fully connected  layers, each followed by a ReLU, and then the output is fed into a softmax function \KG{for the $N$ azimuth candidates}. 
+The $N$ candidates here are relative, and range from decreasing azimuth by $\frac{N}{2}$ to increasing azimuth by $\frac{N}{2}$.  
+The \emph{snap angle predictor} first produces a multinomial probability density function $\pi(p_t)$ over all candidate relative snap angles, then it samples one snap angle prediction proportional to the probability density function.  See Figure~\ref{fig:net} for an overview of the network, and \BX{Supp.} %Supplementary File 
+ for all architecture details.
+
+
+
+
+\vspace*{-0.1in}
+\paragraph{Training}
+The parameters of our model consist of parameters of the \textit{feature extractor}, \textit{aggregator}, and \textit{snap angle predictor}: $w=\{w_f, w_a, w_p\}$.  We learn them to maximize the total reward (defined below) our model can expect when predicting snap angles. The \textit{snap angle predictor} contains stochastic units and therefore cannot be trained with the standard backpropagation method.  We therefore use REINFORCE~\cite{williams1992simple}.  Let $\pi(p_t|I, w)$ denote the parameterized policy, which is a pdf over all possible snap angle predictions. REINFORCE iteratively increases weights in the pdf $\pi(p_t|I, w)$ on those snap angles that have received higher rewards. Formally, given a batch of training data $\{I_i:i=1,\dots,M\}$, we can approximate the gradient as \boc{follows}:
+\begin{equation}
+%a+b
+\sum_{i=1}^{\KG{M}} \sum_{t=1}^{T} \nabla_w \log \pi(p^i_t| I_{i}, w)R^i_t
+\end{equation}
+\KG{where $R^i_t$ denotes the reward at time $t$ for instance $i$.}
+
+
+
+\vspace*{-0.1in}
+\paragraph{Reward}
+
+At each time step $t$, we compute the objective.  Let $\hat\theta_t=\argmin_{\theta=\theta_1,\dots \theta_t}F(P(I, \theta))$ denote the snap angle with the lowest pixel objectness until time step $t$. Let $O_t=F(P(I, \hat\theta_t))$ denote its corresponding objective value.  The reward for time step $t$ is
+\begin{equation}
+  \hat{R_t}=\min(O_{t}-F(P(I, \theta_t+p_t)),0).
+\end{equation}
+Thus, the model receives a reward proportional to the decrease in edge-straddling foreground pixels whenever the model updates the snap angle.
+To speed up training, we use a variance-reduced version of the reward
+$R_t = \hat{R_t}-b_t$ where $b_t$ is the average amount of decrease in pixel objectness coverage with a random policy at time $t$.
+
+ 
+
+

@@ -1,0 +1,686 @@
+\section{Evaluation}
+\label{sec:exp_env}
+
+To assess the behaviour of shared execution,
+we benchmark shared operators in isolation to understand
+how sharing impacts monetary cost of the system and query runtime
+and evaluate the end-to-end behaviour by implementing a complete TPC-H
+query workload.
+
+
+\subsection{Experimental environment}
+
+\textbf{Systems under test.} We evaluate two mainstream \qaasl systems,
+\athena and \bigquery.
+
+\athena uses a {\it pay-per-processed-byte} pricing model.
+It consist of a fixed price for every byte read from \sss (S3) disregarding
+how computationally expensive a query is or the size of intermediate results.
+Thus, the chosen storage format has an impact on the actual query execution
+cost. If the underlying data is stored in a row-oriented format, then the cost
+for accessing a single attribute is the same as accessing all attributes. On
+the other hand, if a column-oriented format (Apache Parquet or Apache ORC)
+is used, then only the accessed attributes are relevant for the cost.
+
+\bigquery uses a {\it pay-per-processed-byte} pricing model
+that consists of a fixed price for every byte in the columns used by a query.
+This is somewhat independent of how much bytes are actually read---%
+if a column is used by a query, the query is billed
+as if the column was read in its entirety.
+Furthermore, similarly to \athena,
+the storage format impacts directly the query execution cost
+in that using a row-oriented format means that all columns are always used.
+
+\textbf{Setup.} For each system under test, we use the recommended storage
+format for obtaining the best possible results both in terms of execution time
+and cost: Apache Parquet compressed columnar format stored in \sss for \athena
+and \bigquery's native uncompressed columnar format.
+
+For both systems and all experiments, we use a single connection,
+such that queries (or query batches) are executed consecutively.
+Both systems support multiple concurrent connections.
+However, in experiments not shown here, we always observed
+an ideal or near-ideal throughput improvement.
+Furthermore, parallel execution could be applied to all approaches
+shown in this section.
+The effects shown in our experiments thus indicate \emph{efficiency}
+that applies both to sequential and parallel execution.
+
+In all experiments, we show the median of three runs. We perform two additional
+warm-up runs for \athena, but omit them for \bigquery, as they had no effect.  
+Moreover, we measure execution time and monetary costs of executing queries. We
+do not measure the post-processing step for separating each query results
+because filtering them is trivial in terms of size
+and complexity compared to solving an actual query.
+
+
+\subsection{Microbenchmarks of shared operators}
+\label{sec:exp:sscan}
+
+We first evaluate shared operators in isolation
+in order to understand how various parameters
+like the number of queries grouped together and their selectivities
+influence their performance.
+Due to space constraints,
+we only show the results of the scan operator,
+which---due to the pricing model---%
+is the most relevant for monetary costs.
+%In the extended version of this paper,%
+%\footnote{To be published depending on acceptance decision.}
+%we also show the results of other operators.
+
+
+\subsubsection{Shared scan performance}
+\label{sec:exp:sscan:impact_sel}
+
+We use selection-only queries to observe how
+the amount of data read and processed affects running time and monetary costs.
+We use indexed predicate evaluation right away,
+but quantify the impact of this optimization below.
+For this experiment, we extend the LINEITEM table of TPC-H
+with a column consisting of densely increasing integers
+and run batches of queries,
+each with a single, random predicate of a fixed selectivity using only that column.
+At scale factor 100,
+this table requires \SI{21}{\gibi\byte} and \SI{84.3}{\gibi\byte}
+in \athena and \bigquery, respectively.
+We use a selectivity of 99\% instead of 100\%
+in order to prevent \athena
+from skipping entire blocks based on Parquet metadata.
+
+\textbf{Execution time.} Figure~\ref{fig:exp:sscans:exp1:sel:at} shows
+the query execution times for \athena.
+The execution time stays constant for batches of up to eight queries
+and the running time is not affected by the selectivity.
+This suggests that some constant costs such as job start-up
+dominate the cost of the actual work.
+In experiments not shown here, we tried with larger datasets
+    but we observed the same effect.
+
+
+\begin{figure*}[bt]
+    \centering
+    \begin{subfigure}{.5\textwidth}
+      \centering
+      \includegraphics[width=0.9\linewidth]{plots/scan1_etime_at}
+      \caption{\athena}
+      \label{fig:exp:sscans:exp1:sel:at}
+    \end{subfigure}%
+    \begin{subfigure}{.5\textwidth}
+      \centering
+      \includegraphics[width=0.9\linewidth]{plots/scan1_etime_bq}
+      \caption{\bigquery}
+      \label{fig:exp:sscans:exp1:sel:bq}
+    \end{subfigure}
+    \caption{Shared scan execution time for various selectivities.}
+    \label{fig:exp:sscans:exp1:sel}
+\end{figure*}
+
+With larger batches,
+the running time increases
+because (1) data volume and (2) computational complexity increase:
+First, the more queries there are in a batch,
+the greater their \emph{combined} selectivity
+given a fixed \emph{per-query} selectivity.
+Assuming $Q$ uncorrelated queries of selectivity $S$,
+their combined selectivity is $(1 - (1 - S)^Q ) \cdot 100\% $.
+This term approaches 100\% as the batch size increases
+even if the per-query selectivity is small.
+Second, each query in the batch may add computations for predicate evaluation,
+even with predicate indexing,
+which makes the scan compute-heavy for large batch sizes.
+However, in most cases the running time increases
+by a much lesser factor than the batch size,
+suggesting an increase of efficiency due to a higher degree of sharing.
+
+Similarly, the running time increases with the selectivity and the batch size,
+which is particularly visible for the selectivity of 99\%.
+Since the amount of data is virtually unaffected by the batch size,
+this increase must be due to higher computational costs.
+We explain this with the fact that,
+for higher selectivities, each tuple is selected by more queries,
+so the \qset attributes computed by the scan is larger.
+
+Notice that the running time with a selectivity below 1\%
+is almost 3x higher than that of selectivity 1\% for batches of 128 queries.
+This is unexpected and does not fit the remaining observations.
+We were able to reproduce a similar behaviour
+in a local PrestoDB v0.170 installation,
+but could not determine the root cause for the behaviour.
+Further analysis and contacting support is required for this.
+
+The fact that larger batch sizes
+increase the execution time only by little or not at all
+has a great effect on throughput:
+If executing a batch of queries takes the same time as executing just one,
+the throughput of a workload running in batches
+is improved by the batch size
+compared to the traditional query-at-a-time approach.
+From the numbers show in Figure~\ref{fig:exp:sscans:exp1:sel:at},
+this improvement reaches 12x to 50x for \athena.
+
+Figure~\ref{fig:exp:sscans:exp1:sel:bq} shows the results
+for \bigquery.
+The observations are similar, but more pronounced:
+Queries with a higher selectivity take longer
+for the same reasons as discussed above.
+Furthermore, the running time increases with the batch size
+due to the larger data volume and higher computational costs
+caused by a higher \emph{combined selectivity}.
+However, it increases less than the batch size,
+thus yielding a considerably higher throughput.
+For selectivities smaller than 1\%,
+throughput improves by up to 17x,
+and for the others, up to 10x.
+
+
+\textbf{Cost.} The effect of selectivity and batch size on the monetary cost
+depends heavily on the pricing model.
+For \bigquery, it is a constant \SI{0.011}USD per query batch
+for all data points shown in Figure~\ref{fig:exp:sscans:exp1:sel:bq}.
+This is due to the fact that
+only the number of bytes \emph{of the selected columns} is billed,
+which is independent of how many tuples have been selected.
+For the above experiments, \SI{4.47}{\gibi\byte} are billed per batch.
+The price \emph{per query} hence decreases linearly with the batch size.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/cost_batch_varsel_at}
+    \caption{Shared scan query cost in \athena.}
+    \label{fig:exp:sscans:exp1:cost:at}
+\end{figure}
+
+In \athena, selectivity does affect the monetary costs.
+Figure~\ref{fig:exp:sscans:exp1:cost:at} shows how.
+Similarly to the discussions about running time,
+the cost increases with increasing combined selectivity
+of the queries in the batch.
+However, unlike above,
+the monetary costs do not increase beyond some constant,
+namely the cost of reading the entire column.
+This corresponds to the constant cost
+of the queries with a selectivity of 99\%.
+These observations match exactly what the pricing model would suggest,
+namely that we pay for the number of bytes read from the storage layer,
+which increase with the number of selected tuples
+up to the point where all tuples are read.
+
+As a side note, the cost of queries with selectivities of 0.1\% and 0.01\%
+jumps to the maximum cost for batches of 128 queries.
+These configurations correspond to the unexplainable behaviour
+in terms of running time discussed above.
+The assumed bug hence also affects monetary costs,
+which raises questions about whether the pricing model is fair:
+Should users pay more for suboptimal behaviour of the \qaasl system?
+This discussion is out of the scope in the paper,
+so it is not pursued further.
+
+From the perspective of a single query,
+the monetary savings depend on the degree of sharing:
+Few queries with low selectivities might not overlap any tuples
+and thus cost the same as if executed in isolation,
+but for big batches and high selectivites,
+the per-query cost may be divided by the batch size.
+
+
+\subsubsection{Computing the \qset attribute}
+\label{sec:exp:sscan:pred_idx}
+
+We now quantify the impact of index predicate evaluation.
+To that aim, we generate batches of selection-only queries
+using predicates on three different attributes of the LINEITEM table
+(l\_discount, l\_quantity, and l\_shipdate).
+We compare three approaches how the \qset column is computed:
+(1) linear predicate evaluation,
+(2) indexed predicate evaluation where only one attribute is indexed
+(which corresponds to what dedicated shared execution systems
+from prior work~\cite{Unterbrunner:2009:PPU:1687627.1687707} do),
+and (3) indexed predicate evaluation where all attributes are indexed.
+To show the impact of predicate evaluation,
+we do not perform the pre-filtering optimization
+described in Section~\ref{sec:shared_scan}.
+
+The results for \athena  are shown in Figure~\ref{fig:exp:sscans:exp2:at}. These
+results contain a lot of variation for smaller batch sizes, so there is no
+clear advantage among the different approaches. However, when batching many
+queries together, multi-attribute indexing does pay-off compared
+to linearly checking each predicate. When grouping larger number of queries
+together, some of the generated queries do
+not run and only a generic error is obtained without further explanation or
+suggestion indicating what is happening. This might be related to the final size of the
+generated \sql queries which in some cases are almost as big as the maximum
+allowed limit size, \SI{256}{\kibi\byte}.
+
+Figure~\ref{fig:exp:sscans:exp2:bq} shows the execution time for these different
+approaches using \bigquery. We observe that using predicate indexing on a single
+attribute does not improve the query execution time because the execution
+time is still dominated by the linear predicate evaluation of the other
+attributes. Thus, although the first attribute is logarithmic in the number of
+queries, the remaining number of comparisons is still linear.  However,
+multi-dimensional predicate indexing helps in keeping the number of comparison
+logarithmic in the number of queries. This, in combination with the constant
+input size, results in an almost constant execution time. 
+
+\begin{figure*}[ht]
+    \centering
+    \begin{subfigure}{.5\textwidth}
+      \centering
+      \includegraphics[width=0.9\linewidth]{plots/scan2_etime_at}
+      \caption{\athena}
+      \label{fig:exp:sscans:exp2:at}
+    \end{subfigure}%
+    \begin{subfigure}{.5\textwidth}
+      \centering
+      \includegraphics[width=0.9\linewidth]{plots/scan2_etime_bq}
+      \caption{\bigquery}
+      \label{fig:exp:sscans:exp2:bq}
+    \end{subfigure}
+    \caption{Execution time of the shared scan.}
+    \label{fig:exp:sscans:exp2:sel}
+\end{figure*}
+
+%\subsection{Other shared operators}
+%\label{sec:exp:oshared_ops}
+%Other shared operators such as the shared join and the shared group-by were also
+%evaluated. The results for the shared join operator show that when more queries
+%are grouped together, the total aggregated amount of work is almost the same as
+%performing a full join between the relations. These results match the
+%observations made in related work. Additionally, it is interesting to note that
+%the execution time of the shared group-by operator only increases with hundreds
+%of queries where each is creating thousands of groups, and remaining fairly
+%constant otherwise. For a detailed evaluation of such operators, we refer the
+%reader to the extended version of our paper \cite{extended_paper}.
+
+\subsection{TPC-H workload}
+\label{sec:exp:tpch}
+
+We now evaluate the impact of our approach
+on end-to-end query performance and monetary cost
+on a complex workload derived from TPC-H~\cite{TPCH2018},
+a standard database benchmark for decision support queries.
+
+
+\subsubsection{Workload definition}
+
+We define the workload to consist of 128 instances
+of each of the 22 queries defined by the standard,
+each with query parameters drawn independently as per the specifications.
+We use scale factor 100, which requires \SI{27}{\gibi\byte} in \athena
+and \SI{107}{\gibi\byte} in \bigquery.
+Unlike the official benchmark, we assume that
+the $22 \cdot 128$ queries are ready for execution at once
+such that they can be executed jointly.
+This mirrors interactive search systems where a search request is translated
+into hundreds of parameterized queries for different search attributes.
+
+We show different ways to produce an execution plan for the workload.  One would
+expect that a single logical plan for the entire workload is most efficient
+because all available sharing opportunities can be exploited.  However, on the
+systems we are using, this does not hold due to practical limitations.  Thus, we
+show two different alternatives: (1) producing a single logical plan in the form
+of a DAG for the entire workload as described in Section~\ref{sec:shared_plans}
+(which needs to be executed as several tree-structured plans as explained in
+Section~\ref{sec:shared_qplans}) or (2) splitting the workload into one logical
+plan for each of the 22 query templates such each batch consists of queries of
+the same form.  We concentrate on the latter approach first and give performance
+numbers of the other approach later.
+
+For both approaches, we manually produce shared query plans
+for the entire workload as described in Section~\ref{sec:sw}
+and translate them back to SQL as described in Section~\ref{sec:rewriting}.
+We adapted the TPC-H query generator such that it generates
+these SQL statements for batches of a configurable number of queries
+(while respecting how the query parameters are drawn).
+Unlike previous work~\cite{mqjoin,Makreshanski2017}, we preserve the full semantics of TPC-H queries.
+
+
+\subsubsection{Impact of batch size}
+\label{sec:exp:tpch:bsz}
+
+Figure~\ref{fig:in:tpch:throughput:batchsz}
+shows throughput improvements thanks to our approach
+over the traditional \emph{query-at-a-time} execution,
+which consists of running each query independently one after the other.
+We execute the workload in batches of both 32 or 128 queries.
+While larger batches usually yield a better throughput,
+\athena cannot execute all queries at the largest batch size,
+so we show the numbers of batch size 32,
+which is the largest batch size that works for all queries on both systems.
+
+The upper plot shows the throughput improvement
+for \athena for different batch sizes, with indexed predicate evaluation and
+without it, compared to executing each query independently. For executing some queries, using a large batch size is actually
+not beneficial, e.g., Queries 7 and 10, because replicating the tuples
+of the final result set for the final aggregation is compute-bound when a
+large number of queries are involved.
+
+The lower plot shows the results for \bigquery,
+which are similar to the ones obtained from \athena, except for Query 22.  This
+query does not benefit from a larger batch size as \athena does. The reason is
+the substring comparisons predicates that are linearly evaluated making it
+compute-bound in \bigquery for large batch sizes.  TPC-H Query 10 cannot be run
+on \bigquery because it requires sorting on a computed column. Doing so for a
+single query does not become memory-bound and \bigquery completes it
+successfully.  However, for batches of queries, the order-by operation has to be
+carried out for the union of all queries output results which is not
+supported by \bigquery.  The sorting operator for large inputs is not available
+by design~\cite{resources_exceeded_bq}. 
+
+In general, we can say that a bigger batch of queries improves the overall
+throughput if predicate indexing helps in making queries remain disk-bound
+(e.g., Queries 4, 6, 17, and 18). If a shared aggregation is needed over a
+large input, replicating tuples for the queries in the batch dominates the query
+execution.
+
+\begin{figure*}[tb]
+    \centering
+    \begin{subfigure}[b]{\textwidth}
+        \includegraphics[width=0.9\textwidth]{plots/thr_imp_at}
+        \centering
+        \caption{\athena}
+        \label{fig:in:tpch:throughput:batchsz:at}
+    \end{subfigure}
+    \begin{subfigure}[b]{\textwidth}
+        \includegraphics[width=0.9\textwidth]{plots/thr_imp_bq}
+        \centering
+        \caption{\bigquery}
+        \label{fig:in:tpch:throughput:batchsz:bq}
+    \end{subfigure}
+    \caption{TPC-H throughput improvement of shared execution over query-at-a-time.}
+    \label{fig:in:tpch:throughput:batchsz}
+\end{figure*}
+
+\subsubsection{Predicate indexing}
+\label{sec:exp:tpch:pred_idx}
+
+All queries shown use predicate indexing wherever possible. There are queries,
+however, that contain predicate types we cannot currently index  (Queries 7, 9,
+12, 13, 16, 19, and 22) as previously explained.
+
+Figures~\ref{fig:in:tpch:throughput:batchsz} show the throughput improvement
+when doing a \textit{linear evaluation} of all predicates, and when using
+\textit{indexed predicates}, for computing the \qset column for a batch of
+TPC-H queries.
+
+In general, queries benefit the most from predicate indexing if it is applied
+when scanning the largest relations. For instance, in Query 3 we are able to
+index the predicates used over the three largest relations (CUSTOMERS, ORDERS,
+and LINEITEM). However, there is not a bigger improvement because it
+still requires replicating tuples for each query in the batch for the final
+aggregation.
+
+The predicates of Queries 4 and 5 are over the second largest relation (ORDERS).
+For these queries, we do early tuple replication before carrying out the
+joins to avoid having to replicate even more tuples resulting from
+the join. After that, queries can continue as regular non-batched statements.
+
+Query 6 presents the biggest improvement. It basically consists on scanning the
+largest relation (LINEITEM) where the different predicates are on multiple
+attributes but with rather small attribute ranges. This makes each predicate
+index structure shallow, which results in a lower total number of
+comparisons for generating the \qset column. This is the best scenario for using
+indexed predicates.
+
+Executing Query 10 does not work on \bigquery as discussed above. In \athena, this query can be
+successfully executed and its runtime improvement comes from using indexed
+predicates and from doing an early tuple replication for avoiding to replicate
+even more tuples after performing the query joins.
+
+Queries 14, 15, 17, and 18 are also improved by using indexed predicates on their
+large relations due to the fact that computing the \qset column can
+dominate the overall execution. In general, queries using indexed predicates
+over large relations benefit the most from it.
+
+    \begin{table*}[tb]
+        \centering
+        %\ra{1.0}
+        \resizebox{\textwidth}{!}{
+            \begin{tabular}{@{}rrrrrrrrrrrrrrrrrrrrrrr@{}}
+                \toprule
+                \textbf{TPC-H Query}&1&2&3&4&5&6&7&8&9&10&11&12&13&14&15&16&17&18&19&20&21&22\\ 
+                \midrule
+    
+                \textbf{BatchSz.}
+                & 128  & 128  & 128  & 128 & 128 &128 & 32  &64 & 128 &64& 128 &64 & 32
+                & 128 & 128 & 64  &128& 128 &32 & 64  &128& 128\\
+    
+                \textbf{Pred.Idx}
+                & \cmark  & \xmark & \cmark  &\cmark & \cmark  &\cmark & \cmark &\xmark
+                & \xmark  &\cmark& \xmark  &\xmark & \cmark & \cmark &\cmark & \xmark
+                &\cmark& \cmark &\xmark & \cmark &\cmark& \cmark\\
+    
+                \midrule
+    
+                \textbf{SINGLE} Qry.Exec. [s]
+                &5.78    &14.24   &7.43   &7.13&  11.49&  5.51&  18.84&  10.86
+                &14.58   &7.85    &6.24   &6.68&  8.68 &  6.28&  6.76 &  3.11
+                &16.11   &12.09   &5.89   &7.20&  40.50&  5.03\\
+                \midrule
+    
+                Runtime [s]
+                &142.7   & 147.9    &83.13  & 15.41   & 169.8  &10.61
+                &808.3   & 57.29    &137.4  & 171.3 & 75.32    &77.41     
+                &187.6    & 29.06   &60.7   & 131.8   & 21.05   & 12.23  & 31.20   &322.0
+                &163.1   & 37.28\\
+    
+                Thr.Imp.
+                &5.179    &11.91  & 11.43&   59.24& 8.658 & 66.48
+                &2.984    &27.20  & 13.26&   5.864 &9.087  & 9.880   &5.917 &27.64
+                &14.24    &2.455   &97.90&  126.4& 25.82& 2.862   &31.76&17.26 \\
+    
+                \midrule
+                SharedExec. [\$]
+                &0.027&  0.005&  0.031&  0.026&  0.029&  0.028&  0.147&  0.077
+                &0.041&  0.049&  0.006&  0.073&  0.046&  0.033&  0.063&  0.003
+                &0.035&  0.017&  0.477&  0.133&  0.081&  0.004\\
+    
+                Query-at-a-time [\$] 
+                &3.417  &0.630&  3.936&  3.388&  3.697&  3.593
+                &4.705  &4.955&  5.259&  3.159&  0.711&  4.654&  1.463 & 4.166
+                &8.060  &0.178&  4.434&  2.199&  3.819&  4.269&  10.35&  0.505 \\
+    
+                \bottomrule
+            \end{tabular}
+        }
+        \caption{Best configurations for \athena}
+        \label{tab:bconfig:at}
+    \end{table*}
+
+    \begin{table*}[tb]
+        \centering
+        %\ra{1.0}
+        \resizebox{\textwidth}{!}{
+            \begin{tabular}{@{}rrrrrrrrrrrrrrrrrrrrrrr@{}}
+                \toprule
+                \textbf{TPC-H Query}&1&2&3&4&5&6&7&8&9&10&11&12&13&14&15&16&17&18&19&20&21&22\\ 
+                \midrule
+                \textbf{BatchSz.}
+                &32 &   64  &128    &128    &128    &128 &32    &128    &128 &1  &   128 &128    &64
+                &128&   128 &128    &128    &128    &128 &128   &128    &32 \\
+    
+                \textbf{Pred.Idx}
+                &\xmark &\xmark &\cmark &\cmark &\cmark 
+                &\cmark &\xmark& \cmark &\xmark &\xmark 
+                &\cmark &\cmark &\xmark &\cmark &\cmark
+                &\xmark &\cmark &\cmark &\xmark &\cmark 
+                &\cmark &\xmark \\
+    
+                \midrule
+                \textbf{SINGLE} Qry.Exec. [s]
+                &5.53   &11.77&  51.14&  4.90 &  12.37& 1.97&  8.55 &   36.52&   9.20
+                &9.90   &4.96 &  3.49 &  10.66&  2.68 & 4.02&  18.78&   10.03
+                &13.54  &2.03 &  11.99&  82.89&  10.00\\
+    
+                \midrule
+    
+                Runtime [s]
+                &145.7&    81.17 &   133.0&    30.17&    26.08&    9.166&    95.88&    83.85
+                &71.17&    1267.2&    64.7&    23.61&    205.7&    13.65&    47.77&    180.3
+                &17.68&    13.53 &   4.026&    205.3&    107.6&    69.60\\
+    
+                Thr.Imp.
+                &4.318   & 17.85&    49.21&    20.79&    60.68
+                &27.48   & 10.97&    55.73&    16.43&    1    &   9.796 &   18.91
+                &6.000   & 25.16&    10.77&    19.57&    72.59&   128.03&   64.69
+                &7.473   & 98.55&    17.36\\
+    
+                \midrule
+                SharedExec. [\$]
+                &0.502&  0.029&  0.110&  0.083&  0.105&  0.087&  0.485&  0.129
+                &0.155&  12.94&  0.012&  0.117&  0.092&  0.090&  0.088&  0.011
+                &0.068&  0.067&  0.146&  0.100&  0.095&  0.031\\
+    
+                Query-at-a-time [\$] 
+                &16.07    &1.84    &14.14    &10.69  & 13.42 &   11.18
+                &15.52    &16.57   &19.79    &12.94  &  1.50 &   14.98&    5.88&
+                11.53 &11.22    &1.35    &8.70     &8.63   & 18.68 &   12.83&
+                12.16& 0.99\\
+    
+                \bottomrule
+            \end{tabular}
+        }
+        \caption{Best configurations for \bigquery}
+        \label{tab:bconfig:bq}
+    \end{table*}
+
+%\subsection{Shared operators composition}
+%\label{sec:exp:tpch:shared_ops}
+%
+%In general, queries using a final shared group-by operator are dominated by it
+%if predicate indexing is not used for scanning the large input relations.
+%Remember that the shared group-by operator needs as input the unnested \qset
+%which implies replicating each tuple for each query participating in the batch. 
+%
+%For instance, Query 1 uses indexed predicates over the largest relation
+%(LINEITEM), but its runtime is dominated by the final shared group-by operator
+%in \athena. It is interesting to note that for this query in \bigquery, the best
+%configuration is not using the largest batch size possible, but a batch of 64
+%queries and performing a linear predicate evaluation instead of an indexed
+%predicate evaluation
+%(Table~\ref{tab:bconfig:bq}).  This is related to the fact that, in \bigquery, the
+%shared scan operator becomes compute bound with a large input and a large batch
+%of queries. Additionally, the shared group-by operator runtime also is dominated
+%by the size of the input data to replicate and aggregate.
+%
+%Query 2 uses indexed predicates but only over the REGION relation which does not
+%yield major improvements. For other predicates we currently not support (string
+%similarity predicates), we fall back to do a linear evaluation of each query
+%predicate.  Additionally, this query requires a window operation for ordering
+%the results for each query participating on the batch besides the final
+%aggregation. This is the reason why for this query also using the largest batch
+%size does not yield the fastest execution time
+%(Tables~\ref{tab:bconfig:at},~\ref{tab:bconfig:bq}).
+%
+%In \athena, running Query 8 in batches with 64 queries instead of larger ones
+%yields a faster execution time due to the final shared group-by operation.  This
+%query also uses predicate indexing on smaller relations, which does not lead to
+%a big end-to-end runtime improvement.  Now, in \bigquery, predicate indexing
+%does improve the end-to-end runtime of this query with larger batch sizes. This
+%is related to the fact that computing the \qset column is actually shared among
+%more queries in such cases. Thus, the best throughput improvement is obtained
+%for large batch size of 128 queries.   
+%
+%\athena cannot run Query 20 with a batch size of 128 queries and the batch size
+%used (64 queries) does not produce a considerable runtime improvement (Table
+%~\ref{tab:bconfig:at}). This query consists in joining several midsize relations
+%and aggregating the final result. Thus, when doing a shared execution of them,
+%the intermediate join result has to be replicated before the final aggregation.
+%This operation dominates the query runtime and leads to a smaller throughput
+%improvement. Query 20 execution shows similar patterns in \bigquery, i.e., a
+%larger batch size does no improve it.  Finally, Query 21 does not benefit much
+%either from larger batch sizes in either system because it requires an expensive
+%window statement for ordering the results of each query participating on the
+%batch.
+
+\subsubsection{TPC-H cost analysis}
+\label{sec:exp:tpch:cost_analysis}
+
+For the TPC-H workload, varying the number of queries grouped does not
+increase the monetary cost significantly, i.e.,
+executing a single query is as expensive as executing a group of queries sharing
+the same execution plan.
+
+Tables~\ref{tab:bconfig:at} and ~\ref{tab:bconfig:bq} show the best
+configuration (batch size, and \qset attribute computation method), query
+execution time, and cost for obtaining the fastest execution time of the
+workload. Although throughput increases with the batch size, individual query
+latency also increases as they have to be grouped. The best execution
+time is not always achieved with the largest batch size. For instance, executing
+Query 7 with batch sizes of 32 is faster than executing a batch of 128
+queries in both systems, but it is also 4x times more expensive, i.e.,
+executing 4 times a batch of 32 queries.
+
+The workload execution with sharing yields a lower execution cost
+compared to executing queries one at the time.  For \athena, running this
+workload  without sharing costs 81.54 USD. With sharing using large batches
+it costs 0.759 USD, i.e., it is 107x cheaper. This cost saving relates directly
+to the batch size of 128 queries used. Further monetary cost improvements could
+be achieved if larger batch sizes were used. For \bigquery, running a complete
+TPC-H run without sharing costs 240.59 USD and with sharing using large batches
+it costs 14.72 USD, including  Query 10 which we cannot optimize, i.e., it is
+16x cheaper. If Query 10 is not taken into account, it is 128x cheaper.
+%, so we
+%pay the price of exactly one query for executing the entire batch.
+
+\subsubsection{Global shared plan}
+\label{sec:exp:tpch:global_splan}
+
+
+We now show how to execute the workload using a single logical plan.
+This has a higher sharing potential than executing them grouped by
+type as in the previous experiments.
+We thus produce a single logical plan in the form
+of a DAG for the entire workload as described in Section~\ref{sec:shared_plans}.
+Note that this global logical plan produces 22 results,
+one for each of TPC-H queries.
+We transform this plan into several tree-structured plans as explained in
+Section~\ref{sec:shared_qplans}. 
+Since a cost-based optimizer is out of the scope of this paper,
+we do the transformation manually.
+As general strategy, we materialized the joins with large results used by multiple
+    queries, and recompute the ones with smaller results.
+
+Furthermore, we do not include the \qset attribute
+in the materialized intermediate results
+because recomputing it would not incur in extra monetary costs, but reading it would.
+
+We carry on this experiment only
+in \bigquery as \athena does not support reusing intermediate results in
+columnar format (it only supports row-oriented text format for intermediate
+results) which would make this approach extremely inefficient and expensive.
+We compare our two approaches for describing the limitations of the current
+implementation.
+
+
+\begin{figure}[b]
+    \centering
+        \includegraphics[width=0.8\linewidth]{plots/thr_imp_pt_sppdf}
+        \caption{Throughput improvement of execution modes.}
+        \label{fig:exp:th_imp_over_qat}
+\end{figure}
+
+Figure \ref{fig:exp:th_imp_over_qat} shows the throughput improvement of both
+approaches.  The lower throughput improvement achieved by the global shared plan
+is due to (1) the materialization step of common intermediate results and (2)
+queries accessing more data than required because the materialized common
+results might be larger than needed for a given query.  In spite of this, there
+is a throughput improvement once there are enough queries to group and execute
+afterwards.  
+
+\begin{figure}[!hb]
+    \centering
+        \includegraphics[width=0.9\linewidth]{plots/sp_mat_vs_query}
+        \caption{Execution time breakdown}
+        \label{fig:exp:exec_time_breakdown}
+\end{figure}
+
+Figure \ref{fig:exp:exec_time_breakdown} shows how much of the overall execution
+time goes into materializing intermediate results when using groups of 32
+queries each. The materialization time accounts for 21\% of the time of
+executing a workload of 32 x 22 queries. For this workload, it results in a 5x
+and 9.7x throughput and cost improvement, respectively. The absolute time of
+materializing intermediate results does not go down with more queries being
+grouped because with just a few queries of different types we end up requiring
+most of the data from the base tables.
+

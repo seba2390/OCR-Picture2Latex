@@ -1,0 +1,89 @@
+\section{Approach}
+In this work, we model scene graphs as graphs consisting of image regions, relationships, and their labellings. More formally, 
+let $I$ denote an image, $V$ be a set of nodes corresponding to localized object regions in $I$, $E \in {V \choose 2}$ denote the relationships (or edges) between objects, and $O$ and $R$ denote object and relationship labels respectively. Thus, the goal is to build a model for $P(S = (V, E, O, R) | I)$. In this work, we factorize the scene graph generation process into three parts:
+\begin{eqnarray}
+P(\mathcal{S}|\bm{I}) = \overbrace{P(\bm{V}|\bm{I})}^{\substack{\text{Object Region}\\ \text{Proposal}}}\underbrace{P(\bm{E}|\bm{V},\bm{I})}_{\substack{\text{Relationship} \\ \text{Proposal}}} \overbrace{P(\bm{R},\bm{O}|\bm{V}, \bm{E}, \bm{I})}^{\text{Graph Labeling}}
+\label{Eq:SGG_Factorized}
+\end{eqnarray}
+which separates graph construction (nodes and edges) from graph labeling. The intuition behind this factorization is straightforward. First, the object region proposal $P(\bm{V}|\bm{I})$ is typically modeled using an off-the-shelf object detection system such as \cite{ren2015faster} to produce candidate regions. Notably, existing methods typically model the second relationship proposal term $P(\bm{E}|\bm{V},\bm{I})$ as a uniform random sampling of potential edges between vertices $\bm{V}$. In contrast, we propose a relationship proposal network (RePN) to directly model $P(\bm{E}|\bm{V},\bm{I})$ -- making our approach the first that allows for learning the entire generation process end-to-end. Finally, the graph labeling process $P(\bm{R},\bm{O}|\bm{V}, \bm{E}, \bm{I})$ is typically treated as an iterative refinement process \cite{li2017vip,xu2017scene,dai2017detecting}. A brief pipeline is shown in Fig.~\ref{fig:framework}.
+
+In the following, we discuss the components of our proposed Graph R-CNN model corresponding to each of the terms in Eq.~\ref{Eq:SGG_Factorized}. First, we discuss our use of Faster R-CNN \cite{ren2015faster} for node generation in Section \ref{sec:rpn}. Then in Section \ref{sec:repn} we introduce our novel relation proposal network architecture to intelligently generate edges. Finally, in Section \ref{sec:agcn} we present our graph convolutional network \cite{kipf2016semi} with learned attention to adaptively integrate global context for graph labeling.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=1\textwidth, trim=0 0 0 1.2cm, clip]{figures/Fig2.pdf}
+\caption{The pipeline of our proposed Graph R-CNN framework. Given an image, our model first uses RPN to propose object regions, and then prunes the connections between object regions through our relation proposal network (RePN). Attentional GCN is then applied to integrate contextual information from neighboring nodes in the graph. Finally, the scene graph is obtained on the right side.}
+\label{fig:framework}
+\end{figure}
+
+\subsection{Object Proposals}
+\label{sec:rpn}
+In our approach, we use the Faster R-CNN \cite{ren2015faster} framework to extract a set of $n$ object proposals from an input image. Each object proposal $i$ is associated with a spatial region $r^o_i =[x_i,y_i,w_i,h_i]$, a pooled feature vector $x^o_i$, and an initial estimated label distribution $p^o_i$ over classes $C{=}\{1,\dots,k\}$. We denote the collection of these vectors for all $n$ proposals as the matrices $R^o {\in}~\mathbb{R}^{n \times 4}$ , $X^o {\in}~ \mathbb{R}^{n \times d}$, and $P^o{\in}~\mathbb{R}^{n \times |C|}$ respectively.
+
+\subsection{Relation Proposal Network}
+\label{sec:repn}
+
+Given the $n$ proposed object nodes from the previous step, there are $O(n^2)$ possible connections between them; however, as previously discussed, most object pairs are unlikely to have relationships due to regularities in real-world object interactions. To model these regularities, we introduce a relation proposal network (RePN) which learns to  efficiently estimate the \emph{relatedness} of an object pair.  By pruning edges corresponding to unlikely relations, the RePN can efficiently sparsify the candidate scene graph -- retaining likely edges and suppressing noise introduced from unlikely ones.
+
+In this paper, we exploit the estimated class distributions ($P^o$) to infer relatedness -- essentially learning soft class-relationships priors. This choice aligns well with our intuition that certain classes are relatively unlikely to interact compared with some other classes. Concretely, given initial object classification distributions $P^o$, we score all $n*(n-1)$ directional pairs $\{\bm{p}^o_i, \bm{p}^o_j | i\neq j\}$, computing the relatedness as $s_{ij} = f(\bm{p}^o_i, \bm{p}^o_j) ~$ where $f(\cdot, \cdot)$ is a learned relatedness function. One straightforward implementation of $f(\cdot,\cdot)$ could be passing the concatenation $[\bm{p}^o_i, \bm{p}^o_j]$ as input to a multi-layer perceptron which outputs the score. However, this approach would consume a great deal of memory and computation given the quadratic number of object pairs. To avoid this, we instead consider an asymmetric kernel function:
+\begin{equation}
+\mathit{f}(\bm{p}^o_i, \bm{p}^o_j) = \langle\Phi(\bm{p}^o_i), \Psi(\bm{p}^o_j)\rangle, i \neq j
+\end{equation}
+where $\Phi(\cdot)$ and $\Psi(\cdot)$ are projection functions for subjects and objects in the relationships respectively\footnote{We distinguish between the first and last object in a relationship as subject and object respectively, that is, $\langle \mathtt{subject, relationship, object}\rangle$.}. This decomposition allows the score matrix $S=\{s_{ij}\}^{n \times n}$ to be computed \emph{with only two projection processes for ${X}^o$ followed by a matrix multiplication}. We use two multi-layer perceptrons (MLPs) with identical architecture (but different parameters) for $\Phi(\cdot)$ and $\Psi(\cdot)$. We also apply a sigmoid function element-wise to $S$ such that all relatedness scores range from 0 to 1.
+
+After obtaining the score matrix for all object pairs, we sort the the scores in descending order and choose top $K$ pairs. We then apply non-maximal suppression (NMS) to filter out object pairs that have significant overlap with others. Each relationship has a pair of bounding boxes, and the combination order matters. We compute the overlap between two object pairs $\{u, v\}$ and $\{p, q\}$ as:
+\begin{equation}
+\small
+IoU(\{u, v\}, \{p, q\}) = \frac{I({r}^o_u, {r}^o_p) + I({r}^o_v, {r}^o_q)}{U({r}^o_u, {r}^o_p) + U({r}^o_v, {r}^o_q)}
+\end{equation}
+
+\noindent where operator $I$ computes the intersection area between two boxes and $U$ the union area. The remaining $m$ object pairs are considered as candidates having meaningful relationships $\bm{E}$. With $\bm{E}$, we obtain a graph $\mathcal{G} =\left( \bm{V}, \bm{E} \right)$, which is much sparser than the original fully connected graph. Along with the edges proposed for the graph, we get the visual representations $X^r=\{\bm{x}^r_1,...,\bm{x}^r_m\}$ for all $m$ relationships by extracting features from the union box of each object pair.
+
+\subsection{Attentional GCN}
+\label{sec:agcn}
+To integrate contextual information informed by the graph structure, we propose an attentional graph convolutional network (aGCN). Before we describe our proposed aGCN, let us briefly recap a `vanilla' GCN in which each node $i$ has a representation $z_i \in \mathbb{R}^d$, as proposed in \cite{kipf2016semi}. 
+Briefly, for a target node $i$ in the graph, the representations of its neighboring nodes $\{z_j ~|~ j \in \mathcal{N}(i)\}$ are first transformed via a learned linear transformation $W$. Then, these transformed representations are gathered with predetermined weights $\alpha$, followed by a non-linear function $\sigma$ 
+(ReLU \cite{nair2010rectified}). %(usually a ReLU \cite{nair2010rectified}). 
+This layer-wise propagation can be written as:
+\begin{equation}
+\bm{z}_{i}^{(l+1)} = \sigma \left( \bm{z}_i^{(l)} + \sum_{j \in \mathcal{N}(i)} \alpha_{ij} W \bm{z}_{j}^{(l)} \right)
+\label{Eq:gcn_orig}
+\end{equation}
+or equivalently we can collect node representations into a matrix $Z\in\mathbb{R}^{d{\times}Tn}$
+\begin{equation}
+\bm{z}_{i}^{(l+1)} = \sigma \left( W Z^{(l)} \bm{\alpha}_i \right)
+\label{Eq:gcn_orig_sparse}
+\end{equation}
+for $\bm{\alpha}_i\in [0,1]^{n}$ with 0 entries for nodes not neighboring $i$ and $\bm{\alpha}_{ii}=1$. In conventional GCN, the connections in the graph are known and coefficient vector $\bm{\alpha}_i$ are preset based on the symmetrically normalized adjacency matrix of features.
+
+In this paper, we extend the conventional GCN to an attentional version, which we refer to as aGCN, by learning to adjust $\bm{\alpha}$. To predict attention from node features, we learn a 2-layer MLP over concatenated node features and compute a softmax over the resulting scores. The the attention for node $i$ is
+\begin{align}
+u_{ij} &= w_{h}^T \sigma(W_{a} [\bm{z}_i^{(l)}, \bm{z}_j^{(l)}])\\
+\bm{\alpha}_{i} &= \textrm{softmax}(\bm{u}_{i}), 
+\label{Eq:gcn_alpha}
+\end{align}
+where $w_{h}$ and $W_{a}$ are learned parameters and $[\cdot,\cdot]$ is the concatenation operation. By definition, we set $\bm{\alpha}_{ii}=1$ and $\bm{\alpha}_{ij}=0 ~\forall j \notin \mathcal{N}(i)$. As attention is a function of node features, each iteration results in altered attentions which affects successive iterations.
+
+\xhdr{aGCN for Scene Graph Generation.} Recall that from the previous sections we have a set of $N$ object regions and $m$ relationships. From these, we construct a graph $G$ with nodes corresponding to object and relationship proposals. We insert edges between relation nodes and their associated objects. We also add skip-connect edges directly between all object nodes. These connections allow information to flow directly between object nodes. Recent work has shown that reasoning about object correlation can improve detection performance \cite{hu2018relation}.
+We apply aGCN to this graph to update object and relationship representations based on global context.
+
+Note that our graph captures a number of different types of connections (\ie $\mathtt{object}\leftrightarrow\mathtt{relationship}$, $\mathtt{relationship}\leftrightarrow\mathtt{subject}$ and $ \mathtt{object}\leftrightarrow\mathtt{object}$). In addition, the information flow across each connection may be asymmetric ( the informativeness of \texttt{subject} on \texttt{relationship} might be quite different from \texttt{relationship} to \texttt{subject}). We learn different transformations for each type and ordering -- denoting the linear transform from node type $a$ to node type $b$ as $W^{ab}$ with $s{=}$subjects, $o{=}$objects, and $r{=}$relationships.
+Using the same notation as in Eq.~\ref{Eq:gcn_orig_sparse} and writing object and relationship features as $Z^o$ and $Z^r$, we write the representation update for object nodes as
+%
+\begin{equation}
+\bm{z}_{i}^o = \sigma ( 
+\overbrace{W^{\mathtt{skip}} Z^o \bm{\alpha}^{\mathtt{skip}}}^{\substack{\text{Message from}\\ \text{Other Objects}}} + 
+\overbrace{W^{sr} Z^r\bm{\alpha}^{sr} + W^{or} Z^r\bm{\alpha}^{or}}^{\substack{\text{Messages from}\\ \text{Neighboring Relationships}}}) 
+\end{equation}
+%
+with $\bm{\alpha}^{\mathtt{skip}}_{ii}{=}1$ and similarly for relationship nodes as
+%
+\begin{equation}
+\bm{z}_{i}^r = \sigma (\bm{z}_{i}^r + \underbrace{W^{rs} Z^{o} \bm{\alpha}^{rs} +  W^{ro} Z^{o} \bm{\alpha}^{ro}}_{\text{Messages from Neighboring Objects}}).
+\end{equation}
+where $\bm{\alpha}$ are computed at each iteration as in Eq.~\ref{Eq:gcn_alpha}.
+
+One open choice is how to initialize the object and relationship node representations $z$ which could potentially be set to any intermediate feature representation or even the pre-softmax output corresponding to class labels. In practice, we run both a visual and semantic aGCN computation -- one with visual features and the other using pre-softmax outputs. In this way, we can reason about both lower-level visual details (\ie two people are likely talking if they are facing one another) as well as higher-level semantic co-occurrences (\ie cars have wheels). Further, we set the attention in the semantic aGCN to be that of the visual aGCN -- effectively modulating the flow of semantic information based on visual cues. This also enforces that real-world objects and relationships represented in both graphs interact with others in the same manner.
+
+\subsection{Loss Function}
+In Graph R-CNN, we factorize the scene graph generation process into three sub-processes: $P(\bm{R},\bm{O}|\bm{V}, \bm{E}, \bm{I})$, $P(\bm{E}|\bm{V},\bm{I})$, $P(\bm{V}|\bm{I})$, which were described above. During training, each of these sub-processes are trained with supervision. For $P(\bm{V}|\bm{I})$, we use the same loss as used in RPN, which consists of a binary cross entropy loss on proposals and a regression loss for anchors. For $P(\bm{E}|\bm{V}, \bm{I})$, we use another binary cross entropy loss on the relation proposals. For the final scene graph generation $P(\bm{R},\bm{O}|\bm{V}, \bm{E}, \bm{I})$, two multi-class cross entropy losses are used for object classification and predicate classification.

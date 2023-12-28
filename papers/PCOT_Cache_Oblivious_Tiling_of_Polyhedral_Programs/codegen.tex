@@ -1,0 +1,380 @@
+\section{Code Generation of PCOT}
+\label{sec:pcot}
+
+%% Comment: I assume that by this point we have already explained the
+%% transformations by tiling hyperplanes and the iteration space can be tiled
+%% along canonic directions.
+
+In this section, we describe our generalization of the cache oblivious code
+generation to polyhedal programs: Polyhedral Cache Oblivious Tiling (PCOT).
+
+\subsection{Approach Overview}
+The input is any polyhedral loop nest that is fully permutable and hence
+tiling it with hyper-rectangular tiles is a legal transformation.  We first
+(in Section~\ref{sec:perfect}) describe the case for tiling all dimensions of a
+perfect loop nest.  Other cases can be handled with additional pre-processing,
+which we describe in Section~\ref{sec:codegen_ext}.
+
+Figure~\ref{fig:sample_code} illustrates the structure of our generated code.
+The input loop nest is replaced by a call to start the recursion as shown in 
+Figure~\ref{fig:sample_code}a. The computation of the bounding box from loop nests 
+are discussed in Section~\ref{sec:computingBB}.
+
+\begin{figure*}
+  \centering
+    \includegraphics[width=0.98\textwidth]{codegen-example}
+    \caption{The structure of generated code for Heat2D stencils, which has
+      loop depth $d=3$. (a) The tileable loop nest is replaced by a call to
+      start the recursion. The input is the bounding box of the loop nest. (b)
+      Structure of the recursive function. The input bounding box is split
+      into $2^d$ new orthants by dividing each dimention in half, and the same
+      function is recursively called for each new orthant. When the orthant
+      reaches the input tile size, the recursion is terminated by a call to
+      the base function. (c) Code for the base function that
+      performs the computation of a tile in lexicographic order.  }
+  \label{fig:sample_code}
+\end{figure*}
+
+
+
+\subsection{Codegen for Perfect Loop Nests}
+\label{sec:perfect}
+
+Given a perfectly nested loop with all $d$ dimensions tilable, we seek to
+generate,
+\begin{inlinelist}
+	\item a call to recursive function to start the recursion,
+	\item a recursive function, and
+	\item a base function.
+\end{inlinelist}  
+The recursive function takes origin and the size of the orthant as inputs,
+which are $d$ dimensional vectors. For the initial call to the recursive
+function, the origin and the orthant size correspond to the bounding box of
+the input loop nest.  Bounding box of a domain is the smallest
+hyper-rectangular shaped domain which encloses the given domain.
+
+The recursive function visits the iteration domain in divide-and-conquer
+order.  It recursively divides iteration domain into orthants until they are
+smaller than an input parameter.
+%The body of the recursive function has 2 main parts (
+%Figure~\ref{fig:sample_code}.c), \begin{inlinelist}
+%\item a call to the base function if the orthant is small enough, and
+%\item divide the orthant into $2^d$ number of new orthants by dividing each
+%dimension by 2 and generate recursive function call to visit each new orthant.
+%\end{inlinelist}
+The call to the base function is wrapped by a condition to check whether the
+size of the current orthant is less than or equal to the base case threshold. 
+%explaining the execution order without using wavefronts
+
+The orthants are visited sequentially in the lexicographic order.  For
+parallel execution the tasks are executed with wave-front parallelism.  We use
+the OpenMP tasks for parallel execution, where each recursive function call is
+annotated with {\tt omp task} pragma, and the wave-front time boundaries are
+synchronized with {\tt omp taskwait}.
+
+% To describe the execution order of orthants, let us represent new orthants
+% with a hypercube of $d$ dimensions. Each subcube can be labeled using $d$
+% bits.  When $d=3$, subcubes are (0,0,0),(0,0,1),...,(1,1,1). Sum of three
+% bits represent the ``distance'' from (0,0,0) subcube. If the difference of
+% ``distance'' of two subcubes is one, then those two subcubes are adjacent to
+% and has a dependence between them.  For the sequential execution, subcubes
+% can be executed in an increasing order of ``distance'' which satisfy the
+% order imposed due to the dependences among subcubes. In the generated code,
+% this is a sequence of recursive function calls in the increasing order of
+% ``distance'' of subcubes. The recursive function call takes the origin and
+% size of subcube as inputs (Figure~\ref{fig:sample_code}.c).
+%
+% For the parallel execution, subcubes are executed in the increasing order of
+% ``distance'' where the subcubes with the same ``distance'' can be executed
+% in parallel. i.e., we start with (0,0,0) after that (0,0,1), (0,1,0), and
+% (1,0,0) can be executed in parallel. We spawn parallel tasks using
+% \texttt{OpenMP task} directives. Then use \texttt{taskwait} directive to
+% enforce the increasing order of ``distance''.
+
+% We generate $2^d$ recursive calls with origin and size of the orthant as
+% parameters to each call.  The canonic directions are legal tiling
+% hyperplanes (since hyper-rectangular tiling is legal), therefore the 45
+% degree wavefronts is a legal schedule to execute new orthants. All the
+% orthants within the wavefront can be run in parallel. To generate parallel
+% code, we group together the recursive calls within the same wavefront. Then
+% insert an OpenMP \texttt{\#pragma omp task} before each recursive call and a
+% \texttt{\#pragma omp taskwait} after each group to act as a thread barrier
+% before moving on to the next group of tasks.
+%
+% This makes sure that after each group, worker threads wait till all the
+% tasks in the group are finished before moving on to the next group of tasks.
+
+The base function visits all points in the intersection of leaf orthant and
+the input loop nest iteratively in lexicographical order.  The loop nest in
+the base function is identical to the loop nest for a tile in SLT with
+parametric tile sizes we use.  One can use any one of the available
+parametrically tiled code generators~\cite{sanjay-lcpc2009,
+  sanjay-kim-dtilingTR-2010,baskaran-etal-cgo10,iooss:hal2015} to generate
+parametrically tiled loops and then extract the point loops.
+%% removed since double-blind
+% We use the point loops generated by
+% DTiling~\cite{sanjay-lcpc2009,sanjay-kim-dtilingTR-2010} code generator in
+% AlphaZ~\cite{yuki2013alphaz} system\footnote{Since we use the same code to
+% iterate a tile in single-level tiling code and to iterate base case in cache
+% oblivious code, the underlying compiler is capable of performing same set of
+% optimizations for both codes.}.
+%% Following is removed since this is not a feature but kind of a bug
+% In divide-and-conquer style codes, size of the base case at run time can be
+% less than or equal to the tuned size of the base case. When the problem size
+% (at runtime) is a power of 2 of tuned base case size, then the actual base
+% case size is equal to the tuned base case size, otherwise, base case size is
+% smaller than the tuned base case size.  The actual base case size depends on
+% the problem size parameter, therefore, it is important to use a
+% parametrically tiled code generator to extract the point loops from.
+
+
+\subsection{Optimizations}
+\label{sec:codegen:opt}
+We implement a number of optimizations to improve the speed of code.  In this
+section we explain two important optimizations to exit the recursion early.
+
+\subsubsection{Early Exit for Zero Orthants}
+
+The zero orthants surface when we have tile sizes that are cubic bounding box with
+hyper-rectangular tiles and vise versa. In this case, orthant size along all
+the dimensions reaches the leaf size in different levels of the recursion. But
+still our code generator generates $2^d$ sequence of recursive calls where
+size some of the new orthants may be zero along dimensions where the input
+orthant size is already smaller than the leaf threshold.  This is a simple
+optimization where we check whether a width along anyone of the dimensions of
+the orthant is zero. If it is zero then exit the recursion.
+%In the recursive function, we only divide a
+%dimension by two, if the size of the orthant along this dimension is larger
+%than that of the tuned base case size. Therefore, it is possible that some
+%dimensions are not divided in the middle, leading to new orthants with zero
+%width along some dimensions. Lets assume that the origin of the orthant is
+%$(0,0)$, the size of the orthant is $(32\times32)$ and the base case threshold
+%is $(16\times32)$. In this case, we only divides the first dimension by 2
+%(because 32 $>$ 16) and we do not divide the second dimension. This introduce
+%only 2 new orthants where origin is $(0,0)$, size $(16\times32)$ and origin is
+%$(16,0)$, size $(16\times32)$. But in the recursive function there are $2^2$
+%recursive calls (or new orthants). The two of them corresponds to the two new
+%orthants mentioned above and other two recursive calls have size of the 2nd
+%dimension as 0 since we did not divide it by two because the size of it is
+%already matches the base threshold. Hence, there are two recursive calls with
+%the size of the orthant is 0. This optimization filter these orthants out.
+
+\subsubsection{Early Exit for Empty Orthants}
+Second optimization is due to the fact we visit the bounding box of the input
+loop nest instead of the actual domain. Some kernels operate on
+non-hyper-rectangular domains(i.e, Cholesky  operates on triangular domains)
+and some kernels need iteration space skewing to enable hyper-rectangular
+tiling (i.e., Heat2D). If the actual domain is not a hyper-rectangle then the
+bounding box will have points where no computations are defined.  This may
+lead to orthants outside of the original iteration space, analogous to empty
+tiles in iteration space tiling. 
+
+For example, a loop nest whose iteration space is triangular, the boundingbox
+is a rectangle where the half of the points has no computation defined. When
+we visit this rectangular box in divide-and-conquer order, we will end up
+visiting empty orthants and we want to identify these orthants.  We generate
+conditions to check whether all vertices of the orthant remain outside of the
+original iteration space using \emph{isl} library~\cite{verdoolaege2010isl}.
+%If that is the case, we exit the recursion early 
+
+%We generate code to check whether the current orthant is completely outside
+%the actual domain of the loop nest.  We check whether all the vertices of the
+%orthant unsatisfy at least one of the constraints of the actual domain of the
+%input loop nest.  If that is the case we exit the recursion early.  The
+%conditions are generated and simplified using the \emph{isl}
+%library~\cite{verdoolaege2010isl}.
+
+The \texttt{checkEmpty} method at the top of the
+Figure~\ref{fig:sample_code}c implements both optimizations.  Without them,
+the code produces correct answers but visits many base cases which are empty.
+The recursion ends either when \texttt{checkEmpty} method returns true or when
+the orthant reaches its input tile size.
+
+%\subsubsection{Optimization 3}
+%If an orthant is smaller than or equal to the base size parameter, it will
+% exit the recursion and compute all the points in the orthant. In this case,
+% base size parameter act as an threshold.  The actual orthant size can be
+% less than or equal to the provided threshold.  The actual base size depends
+% on the problem size. For example if the problem size is 1024 then the
+% orthant sizes are 1024, 512, 256, 128, 64, 32,... For any base size
+% parameter from 32 to 63, the actual base size going to be 32. If the problem
+% size is 1100, then the orthant sizes are 1100, 550, 275, 137, 68, 34,... For
+% any base size parameter from 34 to 67, the actual base size going to be
+% 34. Therefore, the base size we want to use may not be the actual base size
+% and it heavily depend on the problem size and out of our control.
+%
+% We want the generated code to have the exact base case size we provide as a
+% parameter(s). The solution is simple, we pad the bounding box of the
+% iteration domain so that size of each dimension is multiple of its base size
+% parameter and some power of two. If the size of the $i_{th}$ dimension is
+% $N_i$, base case size parameter is $b_i$ then the new padded size is the
+% minimum value of $b_i\times2^{k} \ge N_i$ where $k$ is an integer and
+% $k \ge 0$. When you use the padded bounding box as the starting orthant,
+% after $k$ levels of recursion, we reach orthants with size corresponds to
+% the base case parameter sizes and then exit the recursion to compute the
+% points within the orthant.  The extra points without any computations due to
+% the padding is optimized by the Optimization 2.
+
+% \subsubsection{Other optimizations}
+% In addition to the main optimizations discussed above, we added
+% \emph{restrict} keyword to the declarations of pointer variables. This helps
+% the compiler to optimize code knowing that pointer variables are not
+% referred using other aliases.
+%
+% We only transform the loop nests which are dominant in computations.  The
+% input loop nests may contain loop nests of different dimensions (depths).
+% The number of computations in the loop nests with smaller number of
+% dimensions are significantly smaller than the main-loop which is the loop
+% nest(s) with higher number of dimensions. We optimize only the main-loop(s)
+% which is the hotspot of the input loop nest.
+%
+% The generated code is parametric in problem size and base case size. Base
+% case size is a vector that specify the size along all the tilable
+% dimensions. The parameters of recursive and base functions are passed using
+% C structs to reduce the number of function parameters in higher dimensional
+% programs.
+
+\subsection{Handling Imperfect Loop Nests}
+\label{sec:codegen_ext}
+The discussion so far assumed perfectly nested loops as inputs.  We now extend
+this to imperfect loop nests, and loop nests where subset of the $d$
+dimensions are marked as tilable.
+
+%\subsection{Handling imperfectly nested loops}
+The input imperfect loop nests are converted to perfect loop nests with a
+pre-processing.  This is called the embedding transformation that are used to
+handle imperfectly nested loops in parametric tiled code
+generation~\cite{sanjay-kim-dtilingTR-2010}. 
+It involves, bringing all the statements into the same loop depth by adding
+loops with one iteration as necessary. Then affine guards are added to
+eliminate sequence of inner loops, which lead to ``perfect loop nest with
+affine guards''.
+
+% The conversion process includes
+%the following high level steps.  First, we bring all statements in the
+%imperfect loop nest into the same loop depth.  This may result in a sequence
+%of inner loops.  Then, we use affine guards to eliminate the sequence of
+%loops, and we call it ``perfect loop nest with affine guards''.
+%%We specify options to Cloog so that the generated loop nest is already perfectly nested.
+
+When a subset of the loops are marked as tilable, we first extract the marked
+band of loops parameterized by both program input parameters as well
+as untiled outer loop iterators. We apply the techniques we have discussed so
+far to generate code for the extracted loop nest. In this case, the function
+call to start the recursion is added as the body of outer untiled loop nest.
+The inner untiled loop nests are added as the body of the point loop in the
+base function.
+%For the case where a subset of the loops are marked as tilable, let us assume
+%that a band of loops from depth $i$ to $k$ are tilable, and loops from depth 0
+%to $i-1$ and $k+1$ to $d$ are not tilable.  The first step is to extract the
+%tilable band of loops from depth $i$ to $k$.  Now, we have a loop nest where
+%all the dimensions are tilable therefore, we can apply the above techniques to
+%generate a recursive function, base function and a function call to start the
+%recursion.  The function call to start the recursion is added as the body of
+%outer untiled loops nest at depth $i-1$. The inner untiled loops from depth
+%$k+1$ to $d$ are set as the body of the innermost loop in the base function.
+
+% Let's consider that we want to tile only the space dimensions (inner 2
+% dimensions) of Heat-2D stencil. We extract the inner two loops and generate
+% new recursive function and a base function as described in the beginning of
+% this section. Now, there is a recursive function call for each outer time
+% step. Therefore, we place the function call to start the recursion as the
+% body of the untiled outer loop.
+
+% Let's go through an example.  Let's consider adding another outer loop to
+% the program in Listing~\ref{lst:motiv_fully}. The resulting loop nest is
+% shown in Lising~\ref{lst:motiv_band}. Lets also assume that only the inner 2
+% loops are tilable. In this case we extract the tilable loop nests (from
+% lines \ref{lst:motiv_band:1s}-\ref{lst:motiv_band:1e}) and provide it as the
+% input to the PCOT code generator. This ends up generating a recursive
+% function similar to Listing~\ref{lst:motiv_recur}. The base function is
+% similar to Listing~\ref{lst:motiv_base}. The recursive function call to
+% start recursion will be the body of outer most untiled-loop as shown in
+% Listing~\ref{lst:motiv_band_start}. The bounding box (orthant size) is a
+% function of the outer loop iterator $c0$.
+%
+
+\subsection{Computing the Bounding Box}
+\label{sec:computingBB}
+The bounding box is a hyper-rectangle containing the iteration space of the
+loop nest. It is computed by eliminating the outer loop indices from the loop
+bound expressions.  There can be infinitely many bounding boxes for a given
+loop nest, but we start with the tightest (smallest) bounding box among all
+the possibilities.
+
+The bounding box also plays an important role in deciding the leaf tile size.
+We want the leaf tile size to have the exact value as the input tile size
+parameter to the generated code. Therefore, we pad the size of bounding box
+along each dimension to the minimum value of $b_i\times2^{k_i} \ge N_i$ where
+$b_i$ input leaf size parameter, $N_i$ the size along the $i^{th}$ dimension
+of bounding box and $k_i \ge 0$ is an integer. Now, at $k_i$th level of
+recursion the orthant size along the $i$th dimension will be $b_i$. The
+padding of the bounding box introduces iteration points outside of original
+iteration space.  These empty points get optimized away by the optimizations
+described in Section~\ref{sec:codegen:opt}
+
+
+%
+%The loop bounding expressions of the inner loop indices may be functions of
+%outer loop indices.  We eliminate outer loop indices from bounding expressions
+%starting from the outer most loop.  In lower bound expressions, we replace
+%outer index with its lower bound if the sign of the index is negative, upper
+%bound if the sign is positive.  In upper bound expressions, we replace index
+%with its upper and lower bound if the sign is positive and negative
+%respectively.  At the end all the bounding expressions are functions of input
+%parameters and iterators of the loops surrounding bounding box.
+%
+% Let's consider the scenario where only a subset of the loops are tilable,
+% then the bounding box is a function of both input parameters and indices of
+% outer untiled loops. In other words, for each instance of outer untiled
+% iteration, there is a instance of the bounding box. The approach is same as
+% above except, we do not eliminate outer untiled loop indices in the bounding
+% expressions.
+%
+% For a given loop nest, tilable band specifies band of loops which are
+% tilable or permutable. Usually, the band is specified by the start loop
+% depth and end loop depth.  Bounding box is a cuboid (or hyper-rectangle)
+% containing the iteration space of the tilable band.  There can be infinitely
+% many bounding boxes for a given tilable band, but we chose the tightest
+% bounding box among all the possibilities. Since there are outer loops
+% surrounding the tilable band of loops, the bounding box is parameterised by
+% outer loop iterators. In other words, there is a bounding box for each
+% instance of outer loops.
+%
+%When the input is a sequence of perfectly nested loops, the corresponding
+%domain can be an union of polyhedra.  In this case, we compute the bounding
+%box of each polyhedra individually as described above.  Then, we compute the
+%upper bound along a given dimension by taking the maximum of upper bounds of
+%all the polyhedra along the same dimension.  Lower bound is computed similarly
+%by taking the minimum of lower bounds of all the polyhedra along a given
+%dimension.  The resulting upper bounds and lower bounds define the bounding
+%box of the union of polyhedra.
+%
+%
+% Simply using the bounding box as the input orthant size to start the
+% recursion may leads to issues with the actual base case size. For example,
+% lets assume a cubic bounding box with size 512 along each dimension. Then
+% the subsequent orthant sizes are 512, 256, 128, 64, 32, ... For any base
+% size parameter from 32 to 63, the actual base size going to be 32. If the
+% problem size is 550, the orthant sizes are 550, 275, 137, 68, 34,... For any
+% base size parameter from 34 to 67, the actual base size going to be
+% 34. Therefore, the base size we want to use may not be the actual base size
+% and it heavily depends on the size of the bounding box and out of our
+% control.  We can get control of it, if
+%
+% In this work, we use parametric tile sizes for cache oblivious tiling code.
+% Existing techniques for parametric tiling~\cite{sanjay-lcpc2009,
+% baskaran-etal-cgo10} have demonstrated that the parameterization does not
+% incur significant performance overhead when compared to tiling by
+% compile-time constants. We implemented our cache oblivious tiling code
+% generator using Cloog and ISL libraries.
+%
+
+% We implemented our cache oblivius tiling code generator in the AlphaZ
+% system~\cite{alphaz} which is capable of generating parametrically tiled
+% code using D-Tiling~\cite{sanjay-lcpc2009}.
+
+% Local Variables: ***
+% TeX-master: "TACO2017.tex" ***
+% fill-column: 78 ***
+% End: ***

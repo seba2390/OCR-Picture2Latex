@@ -1,0 +1,412 @@
+\section{Multi Query Execution as \sql}
+\label{sec:rewriting}
+
+%This section outlines how queries which process similar input relations can be
+%rewritten in order to be executed as a single \sql query. First, we describe
+%queries which share the same query plan but require different subsets of the
+%input relations. Then, we outline the query rewriting process for queries that
+%do not share the same query plan. 
+%
+%\subsection{Queries sharing a execution plan}
+%
+%Queries sharing the same execution plan are amenable to be grouped into a single
+%more complex execution plan. The sharing opportunities arise due to the fact
+%that different queries access different subsets of the same input relations but
+%might be carrying out the same computation. Thus, the entire execution plan can
+%be shared across all queries grouped together. For instance, the parameterized
+%queries used for verifying the existence of users could be grouped together in a
+%single query execution and check the existence of multiple users at the same
+%time. This same notion can be extended to more complex analytical queries used
+%in business applications, data exploration, among many other different use
+%cases.
+%
+%In order to allow a group of queries to share their execution plan each
+%relational operator used has to process now not only the data for a single query
+%but for the entire group. To accomplish this, in this work we tag intermediate
+%data as belonging to a corresponding query by using the previously described
+%{\it data-query model}. Section \ref{sec:exp_shared_ops_sql} describes
+%how the different relational operators are expressed in \sql to be shared by
+%multiple queries.
+
+In this section, we show how to express shared query plans as \sql.  The fact
+that this is at all possible is based on the observation that we can express
+shared operators in terms of standard relational operators.  Thus, we first
+describe how shared operators can be expressed and further optimized in \sql and
+then explain how such global plan can be successfully executed in \qaasl
+systems.
+
+\subsection{Shared operators}
+\label{sec:exp_shared_ops_sql}
+
+%In this section, we show how to express shared query plans as \sql.
+%The fact that this is at all possible is based on the observation
+%that we can express the shared operators from the previous section
+%in terms of the standard relational operators.
+
+In the following, we show what data type to choose for the \qid and \qset
+attributes, how to express the shared operators using \sql constructs, and how
+to optimize some of the computations to increase efficiency.
+
+\subsubsection{Tuple annotations}
+
+We store a single query identifier as the smallest integer type
+that can hold the largest number of queries in a batch,
+e.g., \lstinline[style=sql]{TINYINT} for batches with up to 255 queries.
+We use this type directly for \qid attributes.
+
+For \qset attributes, standard \sql offers several ways for set-valued
+attributes: \lstinline[style=sql]{ARRAY} (SQL:99 and up),
+\lstinline[style=sql]{MULTISET} (SQL:2003 and up), \lstinline[style=sql]{BIGINT}
+interpreted as bitset (any version), and possibly more.  The question of which
+of them can be used depends on which set operations are supported by each type.
+We need (1) construction of sets from atomics for the scan, (2) test for
+emptiness for the scan and the join, (3) intersection for the join, and (4)
+unnesting for the grouping operator.  While the standard defines all four
+operations on \lstinline[style=sql]{MULTISET}s, most systems implement them for
+\lstinline[style=sql]{ARRAY}s instead.  We thus use \lstinline[style=sql]{ARRAY}
+as the type for \qset attributes in this paper.  In a related
+thesis~\cite{Wolf2017}, we have explored how far one can get using
+\lstinline[style=sql]{BIGINT}.
+
+\subsubsection{Shared scan operator}
+\label{sec:shared_scan}
+
+As discussed in the previous section,
+a shared scan operator is equivalent
+to a projection computing a \qset attribute
+followed by a selection to remove empty \qset{}s.
+We propose a first way to achieve that in \sql
+and an optimization in Section~\ref{sec:indexed-predicate-evaluation}.
+
+Listing~\ref{ls:sscan_example} shows an example.
+For each of the predicates $\sigma^{q_i}$ of the queries in the batch,
+we create one \lstinline[style=sql]{CASE WHEN} statement
+returning the query identifier if the predicate is fulfilled and 0 otherwise.
+We store the result of these expressions in an array,
+of which we remove the entries with 0,
+thus obtaining only the desired identifiers
+for the set of queries for which the tuple is relevant.
+Since we evaluate one predicate after the other,
+we call this approach \emph{linear predicate evaluation}.
+
+\begin{lstlisting}[
+    caption={Example of shared scan using linear predicate evaluation.},
+    captionpos=b,
+    label=ls:sscan_example,
+    style=ssql
+    ]
+SELECT *,
+   ARRAY_REMOVE(
+     ARRAY[
+       CASE WHEN id > 35              THEN 1 ELSE 0 END,
+       CASE WHEN id BETWEEN 10 AND 20 THEN 2 ELSE 0 END,
+       CASE WHEN id < 51              THEN 3 ELSE 0 END,
+       CASE WHEN id BETWEEN 40 AND 50 THEN 4 ELSE 0 END
+     ], 0) AS query_set
+FROM employees
+WHERE
+   (id > 35) OR (id BETWEEN 10 AND 20) OR
+   (id < 51) OR (id BETWEEN 40 AND 50);
+\end{lstlisting}
+
+For the selection of empty \qset{}s, we do a small optimization:
+Instead of testing the arrays for emptiness,
+we ``push the filter through the projection''
+by testing instead for the disjunction of all predicates
+before the arrays are even computed.
+With linear predicate evaluation,
+this was almost always faster in our preliminary evaluations,
+in particular when this allows the database engine
+to use min-max pruning.
+
+The expression for computing the \qset attribute
+could also be performed using user-defined functions (UDF).
+Their performance heavily depends on implementation details
+of the different systems.
+UDFs can be beneficial in a system where they are Just-in-Time compiled
+while expressions are interpreted.
+However, UDFs might as well have an overhead
+due to a function call for each evaluated tuple,
+or not be supported at all.
+%Among the systems where we evaluate our approach,
+For instance,
+\athena does not support UDFs
+and \bigquery currently supports JavaScript UDFs
+with certain limitations~\cite{bq_udfs_limits}.
+
+
+\subsubsection{Shared join operator}
+
+\begin{lstlisting}[
+    caption={Example of a shared join.},
+    captionpos=b,
+    label=ls:sjoin_example,
+    style=ssql
+    ]
+WITH R AS (...),        -- shared left subplan
+S AS (...),             -- shared right subplan
+sjoin_helper AS (       -- join and compute query_set
+    SELECT
+        R.A1, ..., R.An, S.A1, ..., S.Am,
+        ARRAY_INTERSECT(
+            R.query_set, S.query_set) AS query_set
+    FROM R JOIN S ON R.key = S.key)
+SELECT *                -- filter out irrelevant tuples
+FROM sjoin_helper  
+WHERE CARDINALITY(query_set) > 0
+\end{lstlisting}
+
+As discussed above, a shared join can be expressed by a regular join followed by
+a projection and a selection.  This can be done in a relatively straight-forward
+manner in \sql.  Listing~\ref{ls:sjoin_example} shows an example.  We express
+the join as a \lstinline[style=sql]{JOIN ... ON}, but other syntaxes can be
+used.  The approach also extends beyond the equality join from the example.  In
+order to compute the \qset attribute of the result, we use the array
+\lstinline[style=sql]{ARRAY_INTERSECT} function.  Finally, we remove irrelevant
+tuples by testing for emptiness of the computed \qset attribute.
+
+The operations on arrays used in this example are vendor-specific.
+However, as discussed above, the standard does define equivalent operations
+and many database vendors implement some similar functionality.
+Note that by using a \lstinline[style=sql]{BIGINT} representation
+for \qset and bitwise $\varname{and}$ for set intersection,
+it is possible to reimplement approaches like MQJoin~\cite{mqjoin} in \sql~\cite{Wolf2017}.
+
+\subsubsection{Shared grouping and other operators}
+
+\begin{lstlisting}[
+    caption={Example of a shared grouping.},
+    captionpos=b,
+    label=ls:sgroupb_example,
+    style=ssql
+    ]
+WITH sscan_emp AS (...),        -- shared scan
+unnested_sscan AS (             -- unnest query_set
+    SELECT * FROM sscan_emp
+    WHERE CARDINALITY(query_set) > 0
+    CROSS JOIN UNNEST(query_set) AS t(query_id))
+SELECT   query_id, dept_id, COUNT(id) 
+FROM     unnested_sscan
+GROUP BY query_id, dept_id;     -- shared group-by
+\end{lstlisting}
+
+As discussed in Section~\ref{sec:shared_groupby_op}, a shared grouping operator
+can be expressed as an \mbox{unnesting} operator on the \qset attribute followed by a
+regular grouping operator where the resulting \qid attribute is added to the
+grouping attributes.  Listing~\ref{ls:sgroupb_example} shows the implementation
+of an example query in \sql.  The join on
+\lstinline[style=sql]{UNNEST(query_set)} \lstinline[style=sql]{AS t(query_id)} replicates every tuple
+once for each element in \qset and calls that element \qid.  The final grouping
+is then a regular \lstinline[style=sql]{GROUP BY} clause.
+
+Note that the unnesting of query identifiers increases the
+size of the result of a shared subplan to the total aggregated result size of
+each individual query subplans, i.e., no tuples are shared anymore.  This is
+intrinsic to grouping with aggregation where every query requires its own tuples
+and not specific to implementing sharing in \sql. In spite of this, a shared
+grouping operator is still useful because the grouping result is small
+compared to the input and also because the unnesting operation can be
+efficiently implemented without the need to materialize a very large
+intermediate result.
+
+%A shared grouping operator is still very useful: First, in many
+%real-world queries, the grouping result is small compared to the input, so the
+%work done on its result is comparatively insignificant.  Second, the unnesting
+%can happen on the fly while reading the shared input (if the system supports
+%it), so the much larger input does not need to be unnested and materialized.
+%Finally, a shared grouping operator allows us to express queries as complex as
+%those of TPC-H just in \sql without the need for complex client-side
+%post-processing.
+
+%\subsubsection{Other operators}
+
+In case the original queries have an \lstinline[style=sql]{ORDER BY} operator,
+we just prepend the \qset attribute to the ordering attributes.  Even
+\lstinline[style=sql]{LIMIT}/\lstinline[style=sql]{TOP} clauses for shared plans
+can be expressed in \sql using windowing functions, i.e., using a
+\lstinline[style=sql]{PARTITION BY query_id} clause and number the records
+within the partition of each query to then filter by that number.  This approach
+works (and is required) for both computed and non-computed attributes.
+
+%A few more \sql constructs require attention.  First, to ease division of
+%results among the different queries, we use an \lstinline[style=sql]{ORDER BY
+%    query_id} clause in the outermost level (which potentially needs unnesting
+%of a \qset attribute first).  In case the original queries already have an
+%\lstinline[style=sql]{ORDER BY} we just prepend the \qset attribute to the
+%ordering attributes.
+
+%\begin{lstlisting}[
+%    caption={Example of a top-k implementation in \sql.},
+%    captionpos=b,
+%    label=ls:order_by:post,
+%    style=ssql
+%    ]
+%WITH sscan_emp AS (...),
+%unnested_sscan_emp AS (...),
+%sgrouping AS (      -- shared upstream plan
+%    SELECT   query_id, dept_id, COUNT(id) AS cnt
+%    FROM     unnested_sscan_emp
+%    GROUP BY query_id, dept_id)
+%numbered_sgrouping AS (
+%    SELECT *,
+%        ROW_NUMBER() OVER (
+%            PARTITION BY query_id ORDER BY cnt DESC
+%        ) AS row_number
+%    FROM sgrouping)
+%SELECT * FROM numbered_sgrouping
+%WHERE row_number <= 10
+%\end{lstlisting}
+
+%Second, even \lstinline[style=sql]{LIMIT}/\lstinline[style=sql]{TOP} clauses for
+%shared plans can be expressed in \sql using windowing functions.
+%Listing~\ref{ls:order_by:post} shows an example.  The trick is to use a
+%\lstinline[style=sql]{PARTITION BY query_id} clause and number the records
+%within the partition of each query, which allows subsequent filtering by that
+%number.  This approach works (and is required) for both computed and
+%non-computed attributes.
+
+\subsection{Shared scan with indexed predicate evaluation}
+\label{sec:indexed-predicate-evaluation}
+
+Shared scans using linear predicate evaluation
+allows to share disk bandwidth,
+saves work in downstream operators,
+and can be expressed in \sql.
+However, it has the same computational complexity
+as a query-at-a-time approach:
+each tuple is checked against the predicates of all queries.
+In Crescando, Unterbrunner et al.~\cite{Unterbrunner:2009:PPU:1687627.1687707}
+propose to index the constants of predicates
+of the form $c_{\varname{lower}} < \varname{attribute} < c_{\varname{upper}}$
+in order to evaluate the batch of predicates faster.
+
+At first sight, implementing such an index in \sql seems impossible.
+Interestingly, we can build a tree of \emph{expressions}
+to evaluate all predicates of a batch
+using a number of comparisons
+that is proportional to the logarithm of the number of queries.
+Like a ``real'' index, this reduces the evaluation cost of predicates
+to a lower complexity class.
+We call this approach \emph{indexed predicate evaluation}.
+
+Building such an expression tree works as follows%
+\footnote{The procedure essentially corresponds to building an interval tree.}:
+We take all predicates as intervals of two constants
+annotated by the query they belong to.
+The root of the tree is a \lstinline[style=sql]{CASE WHEN} statement
+testing for $\varname{attribute} < m$,
+where $m$ is the median of the distinct interval bounds.
+Then, we split up predicate intervals containing $m$ in two
+and recurse using the intervals smaller than $m$
+to build the expression tree for the $\varname{true}$ case
+and the constants greater than $m$ for the other case.
+For each subtree, we track the interval of possible values
+that an attribute can have if that subtree is evaluated at scan time.
+The recursion ends when the entire interval of the subtree
+coincides with the predicate intervals in that subtree.
+In this case, we know exactly the queries
+whose predicates match the current tuple,
+so we return an array with their identifiers.
+
+\begin{lstlisting}[
+    caption={Expression tree for indexed predicate evaluation.},
+    captionpos=b,
+    label=ls:predidx_example,
+    style=ssql
+    ]
+(CASE WHEN id <= 35 THEN
+    CASE WHEN id < 10 THEN ARRAY[3]
+    ELSE
+        CASE WHEN id <= 20 THEN ARRAY[2,3]
+        ELSE ARRAY[3] END
+    END
+ELSE
+    CASE WHEN id <= 50 THEN
+        CASE WHEN id < 40 THEN ARRAY[1,3]
+        ELSE ARRAY[1,3,4] END
+    ELSE
+        CASE WHEN id < 51 THEN ARRAY[1,3]
+        ELSE ARRAY[1] END
+    END
+END) AS query_set
+\end{lstlisting}
+
+Listing~\ref{ls:predidx_example} shows the expression tree
+that computes the \qset attribute of the shared scan
+from Listing~\ref{ls:sscan_example}.
+The outermost \lstinline[style=sql]{CASE WHEN} statement
+tests for \lstinline[style=sql]{id <= 35},
+which is the median of the constants ${10, 20, 35, 40, 50, 51}$.
+If the $\varname{true}$ case is taken, we know that $\varname{id} < 35$,
+which excludes the interval
+\lstinline[style=sql]{BETWEEN 40 and 50} of query~4,
+but includes some interval of all other queries,
+in particular, the one-sided interval
+\lstinline[style=sql]{id < 51} of query~1.
+In the $\varname{true}$ case of the outer-most expression,
+the next test is \lstinline[style=sql]{id < 10}.
+From the remaining queries, only query~3 can satisfy this condition
+and it does so for all possible values (namely for any $\varname{id} < 10$).
+Hence, recursion ends and \lstinline[style=sql]{ARRAY[3]} is returned.
+The other subtrees are built analogously.
+
+Indexed evaluation is applicable to many types of predicates.
+First, it works for any predicate based on the total order of a domain.
+This includes equality, open and closed intervals, and one-sided intervals.
+It also includes strings,
+even with \lstinline[style=sql]{LIKE} expressions
+as long as there is no wildcard in the beginning of the constant.
+Second, it works for disjunctive predicates as well.
+We simply treat each term in the disjunction of a query
+like we treat an entire query in the procedure explained above,
+but return the same query identifier for all of these terms in the leaves.
+
+Last but not least, we can use indexed evaluation
+for predicates on several attributes.
+In this respect, our approach to handle several attributes is more general than the indexes of Crescando.
+We pick a first attribute and build the expression tree
+for predicates on that attribute as explained above.
+In the leaves of the tree, we cannot return query identifiers yet
+because we did not evaluate the predicates on the other attributes.
+Instead, we continue building an expression tree,
+but using the other attributes.
+We recurse until the previous stopping condition is met
+or the remaining predicates cannot be indexed,
+in which case we do linear predicate evaluation.
+
+One downside of indexed predicate evaluation
+is the increased length of the query string.
+It increases with the number of queries
+depending how much their predicates overlap.
+The two systems on which we evaluate our approach
+both have a limit on the query string of \SI{256}{\kibi\byte}.
+However, we do not reach that limit for any of the TPC-H queries
+with batches of up to 128 queries.
+
+
+\subsection{Shared query plans}
+\label{sec:shared_qplans}
+
+The shared access plan is a DAG-structured query plan, which assumes an engine
+capable of executing and producing multiple outputs from a query execution.
+However, current \qaasl are closer
+to traditional execution engines in which queries are executed following a
+Volcano-style processing \cite{Graefe:1993:VOG:645478.757691}, i.e., queries are
+executed as tree-structured query plans.  This means that although queries can
+be expressed as a single global plan, such a DAG-structured plan cannot be
+directly executed.
+
+To support the execution of DAG-structured query plans,
+we convert a DAG into a set of tree-structured plans,
+each of which can be executed as a single query.
+To that aim, we identify operators in the execution DAG
+whose output is used by multiple other operators.
+For each of these operators, we have two options:
+either we duplicate the operator including the tree of operators that it uses
+(recursively)
+or we materialize its output such that it can be read several times.
+Which of the two is better can be decided
+by using a cost-based optimizer as studied
+by \cite{Neumann2009, Finkelstein:1982:CEA:582353.582400}.
+Building such an optimizer is out of the scope of this paper,
+so we do not discuss this aspect further.

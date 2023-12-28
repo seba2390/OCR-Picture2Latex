@@ -1,0 +1,265 @@
+%!TEX root = main.tex
+\section{The Story Forest System}
+\label{sec:system}
+
+
+\begin{figure*}
+\includegraphics[width=6.7in]{figure/System}
+\caption{An overview of the system architecture of \textit{Story Forest}.}
+\label{fig:system}
+\vspace{-0mm}
+\end{figure*}
+
+%In this section, we provide an overview of the proposed \textit{Story Forest} system.
+%Then we describe our detailed procedures of extracting events from a news corpus of large amounts of real-world text data in each time period, organizing related events into stories, and modeling stories' evolutionary structure by story trees.
+
+
+
+%\subsection{System Overview}
+%\label{subsec:system-overview}
+
+An overview of our \textit{Story Forest} system is shown in Fig.~\ref{fig:system}, which mainly consists of three components: preprocessing, document clustering and story tree update, divided into 5 steps. First, the input news document stream will be processed by a variety of NLP and machine learning tools, mainly including document filtering, word segmentation and keyword extraction. Second, steps 2--3 will cluster documents into events in a novel 2-layer procedure as follows.
+For news corpus $\mathcal D_t$ in each time period $t$, we form a keyword graph \cite{sayyadi2013graph} from these documents based on keyword co-occurrence, and extract topics as subgraphs from the keyword graph using community detection algorithms. The topics with few keywords will be discarded. After each topic is found, we find all the documents associated with the topic, and further cluster these documents into events through a semi-supervised document clustering procedure aided by a pre-trained document-pair relationship classifier.
+Finally, in steps 4--5 we update the story trees (formed previously) by either inserting each discovered event into an existing story tree at the right place, or creating a new story tree if the event does not belong to any existing story. Note that each topic may contain multiple story trees and each story tree consists of logically connected events.
+We will explain the design choices of each component in detail in the following.
+
+
+\subsection{Preprocessing}
+\label{subsec:preprocessing}
+When a new set of news documents arrives,  we need to clean, filter documents, and extract features that will be helpful to the steps that follow. 
+Our preprocessing module mainly includes the following three steps, which are critical to the overall system performance:
+
+\textbf{Document filtering}: unimportant documents with content length smaller than a threshold (20 characters) will be discarded.
+
+\textbf{Word segmentation}: we segment the title and body of each document using Stanford Chinese Word Segmenter \textit{Version 3.6.0} \cite{chang2008optimizing}, which has proved to yield excellent performance on Chinese word segmentation tasks. Note that for data in a different language, the corresponding word segmentation tool in that language can be used instead. 
+
+% \textbf{Document topic classification}: we trained SVM classifiers to classify each document into one of $30$ different topic categories,  including politics, sociology, entertainment, finance, etc., based on the document's TF-IDF feature. The one with the maximum classification score will be selected.
+
+\textbf{Keyword extraction}: extracting keywords from each document to represent the main concepts of the document is quite critical to the performance and efficiency of the entire system. We found that traditional keyword extraction approaches, such as TF-IDF based keyword extraction and TextRank \cite{mihalcea2004textrank}, are not sufficient to achieve good performance for real-world news data. For example, the TF-IDF based method measures each word's importance by frequency information; it cannot detect keywords that yet have a relatively low frequency. The TextRank algorithm utilizes the word co-occurrence information and is able to handle such cases. However, its efficiency is relatively low, with time cost increasing significantly as the document length increases.
+% Alternatively, we may manually design a fine-tuned rule-based system to combine different strategies based on the observed results. However, such type of systems highly relies on the rule design, and often introduces other systematic errors.
+
+
+\begin{table}
+  \caption{Features for the classifier to extract keywords.}
+  \label{tab:features}
+  \begin{tabular}{lp{5.5cm}}
+    \toprule
+    Type & Features\\
+    \midrule
+    Word feature & Named entity or not, location name or not, contains angle brackets or not. \\
+    Structural feature & TF-IDF, whether appear in title, first occurrence position in document, average occurrence position in document, distance between first and last occurrence positions, average distance between word adjacent occurrences, percentage of sentences that contains the word, TextRank score.\\
+    Semantic feature & LDA\tablefootnote{We trained a $1000$-dimensional LDA model based on news data collected from January 1, 2016 to May 31, 2016 that contains $300,000+$ documents.
+    % The training process costs $30$ hours.
+    }\\
+    \bottomrule
+  \end{tabular}
+  \vspace{-3mm}
+\end{table}
+
+\begin{figure}
+\includegraphics[width=3.0in]{figure/KeywordClassify}
+\caption{The classifier to extract keywords.}
+\vspace{-1mm}
+\label{fig:keywordClassify}
+\vspace{-3mm}
+\end{figure}
+
+To efficiently and accurately extract keywords, we constructed a supervised learning system to classify whether a word is a keyword or not for a document.
+% In particular, we trained an $1000$-dimensional LDA model based on 6 months of news documents (the dataset here is not the one we used in the evaluation in Sec.~\ref{sec:eval}).
+In particular, we manually labeled the keywords of $10,000+$ documents, including $20,000+$ positive keyword samples and $350,000+$ negative samples.
+Table~\ref{tab:features} lists the main features that we found critical to the binary classifier.
+
+%As we combined different types of features, feature preprocessing must be carefully designed to improve the performance of classifiers such as Logistic Regression (LR) or Support Vector Machine (SVM).
+A straightforward idea is to input the raw features listed above to a Logistic Regression (LR). However, as a linear classifier, LR relies on careful feature engineering.
+To reduce the impact of human judgement in feature engineering, we combine a Gradient Boosting Decision Tree (GBDT) with the LR classifier to get the binary yes/no classification result, as shown in Fig. \ref{fig:keywordClassify}. GBDT, as a nonlinear model, can automatically discover useful cross features or feature combinations from raw features and discretize continuous features. 
+The output of the GBDT will serve as the input of the LR classifier. Finally, the LR classifier will determine whether a word is a keyword or not for the document in question. We also tried SVM as the classifier in the second layer instead of LR and observed similar performance. Our final keyword extraction precision and recall rate are $0.83$ and $0.76$, while they are $0.72$ and $0.76$ respectively if we don't add the GBDT component.
+
+\subsection{Document Clustering and Event Extraction}
+\label{subsec:eventClustering}
+
+% \begin{algorithm}
+% \caption{Graph-based Document Clustering to Obtain Events}\label{alg:graph-cluster}
+% \KwIn{A set of news documents $\mathcal{D} = \{ d_1, d_2, ..., d_{|\mathcal{D}|}\}$, with extracted features described in Sec. \ref{subsec:preprocessing}. }
+% \KwOut{A set of events $E = \{ \mathcal{E}_1, \mathcal{E}_2, ..., \mathcal{E}_{|E|} \}$.}
+
+% \begin{algorithmic}[1]
+% 	\STATE Construct a keyword co-occurrence graph $\mathcal{G}$ of all documents' keywords $w_i$. There is an edge $e_{i,j} = <w_i, w_j>$ if the times that the keywords $w_i$ and $w_j$ co-occur exceed a certain threshold, and $\Pr\{w_j | w_i\},\ \Pr\{w_i | w_j\}$ are bigger than another threshold. 
+	
+% 	\STATE Split $\mathcal{G}$ into a set of small and strongly connected keyword communities $C = \{\mathcal{C}_1, \mathcal{C}_2, ..., \mathcal{C}_{|C|} \}$, based on the community detection algorithm \cite{ohsawa1998keygraph}. The algorithm keeps splitting a graph by iteratively delete edges with high betweenness centrality score, until a stop condition is satisfied. 
+
+% 	\FOR{each keyword community $\mathcal{C}_i,\ i= 1,\ldots,|C|$}
+% 		\STATE Retrieve a subset of documents $D_i$ which is highly related to this keyword community by calculating the cosine similarity between the TF-IDF vector of each document and that of the keyword community, and comparing it to a  threshold.
+
+% 		\STATE Divide $D_i$ into clusters according to the document topics.
+
+% 		\STATE Further split each cluster into events by comparing the titles of each pair of documents, after word segmentation and dropping stop words.
+		
+% 		%each pair of documents' title keywords. %Until this step, each document cluster is an event $\mathcal{E}$.
+% 	\ENDFOR
+
+% \end{algorithmic}
+% \end{algorithm}
+
+After document preprocessing, we need to extract events. Event extraction here is essentially a fine-tuned document clustering procedure to group conceptually similar documents into events. Although clustering studies are often subjective in nature, we show that our carefully designed procedure can significantly improve the accuracy of event clustering, conforming to human understanding, based on a manually labeled news dataset.
+% Algorithm~\ref{alg:graph-cluster} shows the detailed steps of such document clustering.
+To handle the high accuracy requirement for long news text clustering, we propose a $2$-layer clustering approach based on both keyword graphs and document graphs.
+
+\textit{First}, we construct a large keyword co-occurrence graph \cite{sayyadi2013graph} $\mathcal{G}$. Each node in $\mathcal{G}$ is a keyword $w$ extracted by the scheme described in Sec.~\ref{subsec:preprocessing}, and each undirected edge $e_{i,j}$ indicates that $w_i$ and $w_j$ have ever co-occured in a same document. 
+Edges that satisfy two conditions will be kept and other edges will be dropped: the times of co-occurrence shall be above a minimum threshold (we use $3$ in our system), and the conditional probabilities of the occurrence $\Pr\{w_j| w_i\}$ and $\Pr\{w_i | w_j\}$ also need to be bigger than a predefined threshold (we use $0.15$), where the conditional probability $\Pr\{w_j| w_i\}$ represents the probability that $w_j$ occurs in a document if the document contains word $w_i$.
+
+\textit{Second}, we perform community detection in the constructed keyword graph. This step aims to split the whole keyword graph $\mathcal{G}$ into communities $C = \{\mathcal{C}_1, \mathcal{C}_1, ..., \mathcal{C}_{|C|}\}$, where each community $\mathcal{C}_i$ contains the keywords for a certain topic (to which multiple stories may be associated). 
+The benefit of using community detection in the keyword graph is that each keyword can appear in multiple communities, which makes sense in reality. 
+We also tried another method of clustering keywords by \textit{Word2Vec}.
+However, the performance is worse than community detection based on co-occurrence graphs. The reason is that using word vectors tends to cluster the words with similar semantic meanings. However, unlike articles in a specialized domain, in long news documents in the open domain, it is highly possible that keywords with different semantic meanings can co-occur in the same event.
+
+To detect keyword communities, we utilize the \emph{betweenness centrality score} \cite{sayyadi2013graph} of edges to measure the strength of each edge in the keyword graph. An edge's betweenness score is defined as the number of shortest paths between all pairs of nodes that pass through it. An edge between two communities is expected to achieve a high betweenness score. Edges with high betweenness score will be removed iteratively to extract communities. The iterative splitting process will stop until the number of nodes in each sub-graph is smaller than a predefined threshold, or until the maximum betweenness score of all edges in the sub-graph is smaller than a threshold that depends on the sub-graph's size. We refer interested readers to \cite{sayyadi2013graph} for more details about community detection.
+
+After we obtain the keyword communities, we calculate the cosine similarity between each document and a keyword community.  The documents are represented by TF-IDF vectors. As a keyword community is a bag of words, it can also be considered as a document. We assign each document to the keyword community which gives the highest similarity and the similarity is above a predefined threshold. Up to now, we have finished document clustering in the first layer, i.e., the documents are grouped according to topics. 
+
+\textit{Third}, we further perform the second-layer document clustering within each topic to obtain fine-grained events. We also call this process \emph{event clustering}. An event only contains documents that talk about the same semantic event. To yield fine-grained event clustering, unsupervised learning is not sufficient. 
+Instead, we adopt a supervised-learning-guided clustering procedure in the second layer.
+
+
+Specifically, we train an SVM classifier to determine whether a pair of documents are talking about the same event or not using a bunch of document-pair features as the input, including the cosine similarities of content TF-IDF and TF vectors, the cosine similarities of title TF-IDF and TF vectors, the similarity of the first sentences in the two documents, etc.
+
+For each pair of documents within a same topic, we decide whether to connect them or not according to the prediction made by the document-pair relationship classifier mentioned above. Hence, the documents in each topic will form a document graph. We then apply the same community detection algorithm mention above to such document graphs. 
+Note that the graph-based clustering on the second layer is highly efficient, since the number of documents contained in each topic is significantly smaller after the first-layer document clustering. 
+
+In a nutshell, our 2-layer scheme groups documents into topics based on keyword community detection and further groups the documents within each topic into fine-grained events. For each event $\mathcal{E}$, we also record the set of keywords $\mathcal{C}_{\mathcal{E}}$ of the topic (keyword community) which it belongs to, which will be helpful in the subsequent story tree development.
+
+
+%!TEX root = main.tex
+\subsection{Growing Story Trees Online}
+\label{sec:tree}
+
+
+% According to our observations on real-world news data, a tree structure is sufficient to capture the evolving structures of most stories for breaking news and trending topics which often last for a constrained time period. Besides, as the number of event nodes increase, a graph structure will be too complex to clearly reveal the main logic flows in the stories, while a tree structure provides a clearer view of different story paths, including branches and the main thread. Furthermore, when grow trees in an online manner, it will be easy for users to identify the online change of a story, where a tree update operation is simply inserting a new event node on the right branch.
+
+
+% \begin{algorithm}
+% \caption{Online Story Forest Growing}\label{alg:story-structure}
+% \KwIn{A stream of documents $D = \{ \mathcal{D}_1, \mathcal{D}_2, ..., \mathcal{D}_T\}$ incoming by time. Event compatibility threshold $\delta$.}
+% \KwOut{A story forest $\mathcal{F} = \{\mathcal{S}_1, \mathcal{S}_2, ..., \mathcal{S}_{|\mathcal{F}|}\}$ that dynamically changes with time.}
+
+% \begin{algorithmic}[1]
+% 	\STATE Perform event clustering on the first batch of documents $\mathcal{D}_1$ to get events $E_1 = \{\mathcal{E}_1, \mathcal{E}_2, ..., \mathcal{E}_{|E_1|}\}$. 
+
+% 	\STATE Create a story tree $\mathcal{S}_1$ from $\mathcal{E}_1$. Iteratively processing other events in $E_1$ using the same steps as described below. Then we get initial story forest $\mathcal{F}_1 = \{\mathcal{S}_1, \mathcal{S}_2, ..., \mathcal{S}_{|\mathcal{F}_1|}\}$  
+
+% 	\WHILE{a new batch of documents $\mathcal{D}_t$ comes at time slot $t$}
+% 		\STATE Perform event clustering and get a set of events $E_t = \{\mathcal{E}_1, \mathcal{E}_2, ..., \mathcal{E}_{|E_t|}\}$.
+
+% 		\FOR{each event $\mathcal{E} \in E_t$}
+
+% 			\STATE Match $\mathcal{E}$ with each story $\mathcal{S} \in \mathcal{F}_{t-1}$.
+
+% 			\IF{$\mathcal{E}$ belongs to story $\mathcal{S}$}
+% 				\STATE Compare $\mathcal{E}$ with each story node $\mathcal{E}_{\mathcal{S}, i} \in \mathcal{S}$ to check whether they are describing the same event. If yes, $\mathcal{E}_{\mathcal{S}, i} = merge(\mathcal{E}_{\mathcal{S}, i},\ \mathcal{E})$, and continue to process the next event. Otherwise, continue the following steps.
+
+% 				\STATE Set $matchIdx \leftarrow -1,\ \text{linkScore}_{max} \leftarrow -1$
+
+% 				\FOR{Each event $\mathcal{E}_{\mathcal{S}, j} \in \mathcal{S}$}
+
+% 					\STATE Calculate $\text{linkScore}(\mathcal{E}, \mathcal{E}_{\mathcal{S}, j})$ according to Equation \ref{eqn:linkScore}.
+
+% 					\IF{$\text{linkScore}_{max} < \text{linkScore}(\mathcal{E}, \mathcal{E}_{\mathcal{S}, j})$}
+
+%                     	\STATE $\text{linkScore}_{max} \leftarrow \text{linkScore}(\mathcal{E}, \mathcal{E}_{\mathcal{S}, j}),\ matchIdx \leftarrow j$
+
+% 					\ENDIF
+
+% 				\ENDFOR
+
+% 				 \IF{$\text{linkScore}_{max} \geq \delta$}
+% 				 	\STATE Insert $\mathcal{E}$ into $\mathcal{S}$, and add link $<E_{\mathcal{S}, matchIdx},\ E>$ to $\mathcal{S}$.
+% 				 \ELSE
+
+% 				 	\STATE Insert $\mathcal{E}$ into $\mathcal{S}$, and add link $<ROOT,\ E>$ to $\mathcal{S}$.
+
+% 				 \ENDIF
+% 			\ELSE
+% 				\STATE Create a new story tree $\mathcal{S}$ from $\mathcal{E}$ and add it to story forest $\mathcal{F}_t$.
+% 			\ENDIF
+% 		\ENDFOR
+% 	\ENDWHILE
+
+% \end{algorithmic}
+% \end{algorithm}
+
+Given the set of extracted events for a particular topic, we further organize these events into multiple stories under this topic in an online manner. Each story is represented by a \textit{Story Tree} to characterize the evolving structure of that story.
+% Algorithm \ref{alg:story-structure} describes how we organize events into story trees in an online manner.
+Upon the arrival of a new event and given an existing story forest, our online algorithm to grow the story forest mainly involves two steps: a) identifying the story tree to which the event belongs; b) updating the found story tree by inserting the new event at the right place. 
+If this event does not belong to any existing story, we create a new story tree.
+
+
+{\bf a) Identifying the related story tree.} 
+Given a set of new events $E_t = \{\mathcal{E}_1, \mathcal{E}_2, ..., \mathcal{E}_{|E_t|}\}$ at time period $t$ and an existing story forest $\mathcal{F}_{t-1} = \{ \mathcal{S}_1, \mathcal{S}_2, ..., \mathcal{S}_{|\mathcal{F}_{t-1}|}\}$ that has been formed during previous $t-1$ time periods, our objective is to assign each new event $\mathcal{E} \in E_t$ to an existing story tree $\mathcal{S} \in \mathcal{F}_{t-1}$. If no story in the current story forest matches that event, a new story tree will be created and added to the story forest. %otherwise, we continue the steps after matching stories.
+%also explain same event filtering.
+
+We apply a two-step strategy to decide whether a new event $\mathcal{E}$ belongs to an existing story tree $\mathcal{S}$ formed previously.
+% Specifically, we measure 1) keyword graph similarity, 2) document similarity and 3) title similarity sequentially to make a final decision about whether an event matches a certain story tree.
+First, as described at the end of Sec. \ref{subsec:eventClustering}, event $\mathcal{E}$ has its own keyword set $\mathcal{C}_{\mathcal{E}}$.
+Similarly, for the existing story tree $\mathcal{S}$, there is an associated keyword set $\mathcal{C}_{\mathcal{S}}$ that is a union of all the keyword sets of the events in that tree.
+
+Then, we can calculate the compatibility between event $\mathcal{E}$ and story tree $\mathcal{S}$ as the Jaccard similarity coefficient between $\mathcal{C}_{\mathcal{S}}$ and $\mathcal{C}_{\mathcal{E}}$: 
+$
+  \text{compatibility}(\mathcal{C}_{\mathcal{S}}, \mathcal{C}_{\mathcal{E}}) = \frac{|\mathcal{C}_{\mathcal{S}} \cap \mathcal{C}_{\mathcal{E}}|}{|\mathcal{C}_{\mathcal{S}} \cup \mathcal{C}_{\mathcal{E}}|}.
+$
+If the compatibility is bigger than a threshold, we further check whether at least a document in event $\mathcal{E}$ and at least a document in story tree $\mathcal{S}$ share $n$ or more common words in their titles (with stop words removed). If yes, we assign event $\mathcal{E}$ to story tree $\mathcal{S}$. Otherwise, they are not related. In our experiments, we set $n=1$. 
+% Notice that the document frequencies (DFs) of words change while news documents keep arriving. We maintain a time window of length $T_{df}$ days to update the document frequencies of words. In our case, we set $T_{df}=2$.
+If the event $\mathcal{E}$ is not related to any existing story tree, a new story tree will be created.
+
+
+\begin{figure}
+\includegraphics[width=3.3in]{figure/NodeOperation}
+\caption{Three types of operations to place a new event into its related story tree.}
+\label{fig:nodeOperations}
+\vspace{-2mm}
+\end{figure}
+
+{\bf b) Updating the related story tree.} After a related story tree $\mathcal{S}$ has been identified for the incoming event $\mathcal{E}$, we perform one of the 3 types of operations to place event $\mathcal{E}$ in the tree: \textit{merge}, \textit{extend} or \textit{insert}, as shown in Fig.~\ref{fig:nodeOperations}.
+The \textit{merge} operation merges the new event $\mathcal{E}$ into an existing event node in the tree. The \textit{extend} operation will append event $\mathcal{E}$ as a child node to an existing event node in the tree. Finally, the \textit{insert} operation directly appends event $\mathcal{E}$ to the root node of story tree $\mathcal{S}$. Our system chooses the most appropriate operation to process the incoming event based on the following procedures.
+
+{\bf \emph{Merge}}: we merge $\mathcal{E}$ with an existing event in the tree, if they essentially talk about the same event.
+This can be achieved by checking whether the centroid documents of the two events are talking about the same thing using the document-pair relationship classifier described in Sec.~\ref{subsec:eventClustering}. The centroid document of an event is simply the concatenation of all the documents in the event.
+% If yes, we merge the new incoming event with the existing event node. Otherwise, we continue the procedures below.
+
+{\bf\emph{Extend}} \emph{and} {\bf \emph{Insert}}: if event $\mathcal{E}$ does not overlap with any existing event, we will find the parent event node in $\mathcal{S}$ to which it should be appended.
+We calculate the \emph{connection strength} between the new event $\mathcal{E}$ and each existing event $\mathcal{E}_j \in \mathcal{S}$ based on three factors: 1) the time distance between $\mathcal{E}$ and $\mathcal{E}_j$, 2) the compatibility of the two events, and 3) the \emph{storyline coherence} if $\mathcal{E}$ is appended to $\mathcal{E}_j$ in the tree, i.e., 
+\begin{align}
+\label{eqn:linkScore} 
+\begin{split}
+  \text{ConnectionStrength}(\mathcal{E}_j, \mathcal{E})  :=\ \text{compatibility}(\mathcal{E}_j, \mathcal{E}) \times \\
+  \text{coherence}(\mathcal{L}_{\mathcal{S}\to\mathcal{E}_j\to \mathcal{E}}) \times \text{timePenalty}(\mathcal{E}_j, \mathcal{E}).
+\end{split}
+\end{align}
+
+Now we explain the three components in the above equation one by one. \emph{First}, the compatibility between two events $\mathcal{E}_i$ and $\mathcal{E}_j$ is given by
+\begin{equation}
+  \text{compatibility}(\mathcal{E}_i, \mathcal{E}_j) = \frac{\text{TF}(d_{c_i}) \cdot \text{TF}(d_{c_{j}})}{\|\text{TF}(d_{c_i})\| \cdot \|\text{TF}(d_{c_{j}})\|},
+\end{equation}
+where $d_{c_i}$ is the centroid document of event $\mathcal{E}_i$.
+% Notice that here we use the term frequency (TF) vector of each document rather than TF-IDF, since this choice leads to better performance in practice.
+
+Furthermore, the storyline of $\mathcal{E}_j$ is defined as the path in $\mathcal{S}$ starting from the root node of $\mathcal{S}$ ending at $\mathcal{E}_j$ itself, denoted by $\mathcal{L}_{\mathcal{S}\rightarrow \mathcal{E}_j}$. Similarly, the storyline of $\mathcal{E}$ appended to $\mathcal{E}_j$ is denoted by $\mathcal{L}_{\mathcal{S}\rightarrow \mathcal{E}_j\rightarrow\mathcal{E}}$.
+% Previous works on online event threading \cite{wang2016socially} usually just measure the similarities between event pairs to determine whether a event belongs to an existing story line, and then attach into the line if some criteria is satisfied. However, such kind of approaches doesn't consider the \textit{coherence} \cite{xu2013summarizing} of the whole story line.
+For a storyline $\mathcal{L}$ represented by a path
+$\mathcal{E}^0\to \ldots \to \mathcal{E}^{|\mathcal{L}|}$, where $\mathcal{E}^0 := \mathcal S$, its \textit{coherence} \cite{xu2013summarizing} measures the theme consistency along the storyline, and is defined as
+\begin{equation}
+  \text{coherence}(\mathcal{L}) = \frac{1}{|\mathcal{L}|}\sum_{i=0}^{|\mathcal{L}|-1} \text{compatibility}(\mathcal{E}^i, \mathcal{E}^{i+1}),
+\end{equation}
+
+Finally, the bigger the time gap between two events, the less possible that the two events are connected. We thus calculate time penalty by
+\begin{align}
+  \text{timePenalty}(\mathcal{E}_j, \mathcal{E}) = \begin{cases}
+  e^{\delta \cdot (t_{\mathcal{E}_j} - t_{\mathcal{E}})}
+   &\ \text{if } t_{\mathcal{E}_j} - t_{\mathcal{E}} < 0\\
+  0 &\ \text{otherwise}\\
+  \end{cases}
+\end{align}
+where $t_{\mathcal{E}_j}$ and  $t_{\mathcal{E}}$ are the timestamps of event $\mathcal{E}_j$ and $\mathcal{E}$ respectively. The timestamp of an event is the minimum timestamp of all the documents in the event.
+
+We calculate the connection strength between the new event $\mathcal{E}$ and every event node $\mathcal{E}_j \in \mathcal{S}$ using \eqref{eqn:linkScore}, and append event $\mathcal{E}$ to the existing $\mathcal{E}_j$ that leads to the maximum connection strength. 
+If the maximum connection strength is lower than a threshold value, we \textit{insert} $\mathcal{E}$ into story tree $\mathcal{S}$ by directly appending it to the root node of $\mathcal{S}$. In other words, \emph{insert} is a special case of \emph{extend}.
+
+

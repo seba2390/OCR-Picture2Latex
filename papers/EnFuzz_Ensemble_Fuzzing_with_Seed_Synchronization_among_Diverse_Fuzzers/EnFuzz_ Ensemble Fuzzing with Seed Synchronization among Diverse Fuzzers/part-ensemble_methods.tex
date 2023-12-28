@@ -1,0 +1,152 @@
+%% 详细介绍base fuzzers 的多样性
+
+After choosing base fuzzers, we need to implement a suitable architecture to integrate them together. As presented in Figure \ref{fig:framework_of_ensemble_fuzzing}, 
+%to make those fuzzers cooperate with each other,
+inspired by the seed synchronization of AFL in parallel mode, 
+one core mechanism is designed --- the globally asynchronous and locally synchronous (GALS) based seed synchronization mechanism. 
+The main idea is to identify the interesting seeds (seeds that can cover new paths or new branches or can detect new unique crashes) from different base fuzzers asynchronously and share those interesting seeds synchronously among all fuzzing processes. %In the future, we will also support dynamic core allocation and different local synchronization periods adaption for different fuzzer instance with GALS design.  %This is consistent with the traditional GALS system design \cite{muttersbach2000practical}. 
+%Here, we propose two core ensemble mechanism: 
+
+%\vspace{0 cm}
+\begin{figure}[!htb]
+ \centering
+ \includegraphics[width=0.5\textwidth]{img/ensemble_data_struct.pdf}
+ \vspace{-1.5 cm}
+ \caption{The data  structure of global asynchronous and local synchronous based seed synchronization mechanism.}
+ \label{fig:ensemble_architecture}
+\end{figure}
+
+\IncMargin{1em}
+\begin{algorithm}
+\SetAlgoLined
+\SetKwData{Left}{left}
+\SetKwFunction{Mutate}{Mutate}
+\SetKwFunction{Run}{Run}
+\SetKwFunction{push}{push}
+
+\SetKwFunction{causeCrash}{causeCrash}
+\SetKwFunction{haveNewCoverage}{haveNewCoverage}
+\SetKw{Continue}{continue}
+\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+
+\Input{Local seed pool of base fuzzer $queue$}
+
+%\BlankLine
+
+\Repeat{timeout or abort-signal}{
+    \ForEach{\textrm{seed} $s$ \textrm{of the} queue}{\
+    	$s'=\Mutate{s}$\;
+    	$Cover=\Run{s'}$\;\
+    	{\color{gray} // if seeds $s'$ causes new crash or have new \newline
+    				// coverage, then store it in own seed pool and \newline
+    				// push it to the global seed pool asynchronously\;}
+        \uIf{$Cover$.\causeCrash{}}{
+           $crashes.\push{s'}$\;
+           $queue.\push(s')$\;
+           $GlobalSeedPool.\push(s')$\;
+        }
+        \ElseIf{$Cover$.\haveNewCoverage{}} {
+           $queue.\push(s')$\;
+           $GlobalSeedPool.\push(s')$\;
+        }
+    }
+}
+\Output{Global crashing seeds $crashes$}
+\caption{Action of local base fuzzer}\label{sync_baseFuzzer}
+\end{algorithm}\DecMargin{1em}
+
+This seed synchronization mechanism employs a global-local style data structure as shown in Figure \ref{fig:ensemble_architecture}. The local seed queue is maintained by each base fuzzer, while the global pool is maintained by the monitor for sharing interesting seeds among all base fuzzers. In ensemble fuzzing, the union of these base fuzzers' results is needed to identify interesting seeds during the whole fuzzing process. Accordingly, the global coverage map is designed, and any new paths or new branches covered by the interesting seeds will be added into this global map. This global map can not only help decide which seeds to be synchronized, but also help de-duplicate and triage the results. Furthermore, to output the final fuzzing report after completing all fuzzing jobs, any interesting seeds which contribute to triggering unique crashes will be stored in the global crashes list.
+
+
+First, let us take a look at the seed synchronization solution of the base fuzzer, which mainly describes how base fuzzers contribute the interesting seeds asynchronously to the global pool. As presented in lines 2-4 of algorithm \ref{sync_baseFuzzer}, 
+for each single base fuzzer, it works with a local input seed queue and runs a traditional continuous fuzzing loop. It has three main steps: (1) Select input seeds from the queue, (2) mutate the selected input seeds to generate new candidate seeds, (3) run the target program with the candidate seeds, track the coverage and report vulnerabilities. Once the candidate seeds have new coverage or cause unique crashes, they will be regarded as interesting seeds and be pushed asynchronously into the global seed pool, as presented in lines 6-12. %of Algorithm \ref{sync_baseFuzzer}. 
+
+
+
+
+
+\vspace{-0.2cm}
+\IncMargin{1em}
+\begin{algorithm}
+\SetAlgoLined
+\SetKwData{Left}{left}
+\SetKwFunction{setup}{setup}
+\SetKwFunction{initial}{initial}
+\SetKwFunction{push}{push}
+\SetKwFunction{isSync}{isSync}
+\SetKwFunction{setSync}{setSync}
+\SetKwFunction{sleep}{sleep}
+\SetKwFunction{run}{run}
+\SetKwFunction{isEmpty}{isEmpty}
+\SetKwFunction{causeCrash}{causeCrash}
+\SetKw{Continue}{continue}
+\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+
+\Input{Base fuzzers list $BaseFuzzers[]$ \newline
+		Initial seeds $S$ \newline
+		Synchronization period $period$}
+
+%\BlankLine
+\
+{\color{gray} // set up each base fuzzers \;}
+\ForEach{\textrm{base fuzzer} $f$ \textrm{of the} $BaseFuzzers[]$}{\
+		$fuzzer.\setup{}$\;
+}\
+{\color{gray} // set up thread monitor for monitoring \;}
+$monintor.\setup()$\;
+$GlobalCover.\initial{}$\;
+$GlobalSeedPool.\initial{}$\;
+$GlobalSeedPool.\push{S}$\;
+\Repeat{timeout or abort-signal}{
+    \ForEach{\textrm{seed} $s$ \textrm{of the} $GlobalSeedPool$}{\
+    	{\color{gray} // Skip synchronized seeds \;}
+        \uIf{ $s.\isSync{}$ == $False$ }{
+        	\ForEach{\textrm{base fuzzer} $f$ \textrm{of the} $BaseFuzzers[]$}{\
+			 	$Cover=f.\run{s}$ \;\ 	
+			 	{\color{gray} // update the global coverage \;}\
+				$newCover=(Cover \cup GlobalCover)-GlobalCover$ \;\
+				$GlobalCover=Cover \cup GlobalCover$\;\
+				{\color{gray} // synchronize the seed $s$ to base fuzzer $f$ \;}\
+				\uIf{$Cover$.\causeCrash{} and $!newCover.\isEmpty{}$}{
+					$crashes.\push{s}$\;
+					$f.queue.\push{s}$\;
+				}\uElseIf{$!newCover.\isEmpty{}$ }{
+					$f.queue.\push{s}$\;
+				}
+				\Else {
+            		\Continue\;
+        		}
+			}
+        }
+        \Else {
+            \Continue\;
+        }
+        $s.\setSync{True}$\;
+    }\
+    {\color{gray} // waiting until next seed synchronization \;}
+    $\sleep{period}$\;
+}
+\Output{Crashing seeds $crashes$}
+\caption{Action of global monitor $sync$}\label{sync_monitor}
+\end{algorithm}\DecMargin{1em}
+
+
+Second, let us see the seed synchronization solution of the monitor process, which mainly describes how the monitor process synchronously dispatches the interesting seeds in the global pool to the local queue of each base fuzzer.
+When all base fuzzers are established, a thread named \texttt{monitor} will be created for monitoring the execution status of these fuzzing jobs, as in lines 2-6 of algorithm \ref{sync_monitor}. It initializes the global coverage information to record the global fuzzing status of target applications by all the base fuzzer instances and then creates the global seed pool with the initial seeds, as in lines 7-9 of algorithm \ref{sync_monitor}. It then runs a continuous periodically synchronizing loop --- each base fuzzer will be synchronously dispatched with the interesting seeds from the global seed pool. Each base fuzzer will incorporate the seeds into its own local seed queue, once the seeds are deemed to be interesting seeds (seeds contribute to the coverage or crash and has not been generated by the local fuzzer), as in line 15-24 .
+To lower the overhead of seed synchronization, a thread \texttt{monitor} is designed to work periodically. Due to this globally asynchronous and locally synchronous based seed synchronization mechanism, base fuzzers cooperate effectively with each other as in the motivating example in Figure 1.
+
+
+%\subsubsection{Seed Synchronization Mechanism}
+%As mentioned in section \ref{Related Work}, in machine learning, researchers only ensemble base learners with their final results; but in fuzzing, we focus on the union of coverage throughout the fuzzing process. Consequently, to enhance cooperation among these base fuzzers during their fuzzing processes, the seed synchronization mechanism is designed. %, as presented in Figure \ref{fig:ensemble_architecture}.
+
+
+
+
+
+%Unlike ensemble learning which only wants averaging or voting of final results, ensemble fuzzing wants the union of base fuzzers' results. Accordingly, the global coverage map is designed to solve this problem, as presented in line 17-18 of Algorithm \ref{sync_monitor}. Any interesting seeds which contribute to cover new branches or paths, or trigger new crashes will be union into the global coverage map. This global map not only help decide which seeds to be synchronized, but also help de-duplicate and triage the results, output the final fuzzing report after the completion of all fuzzing jobs.
+%
+%
+%
+%The seed synchronization mechanism works with the global coverage map to make these base fuzzers cooperate with each other deeply and effectively. 
+%There are many other effective and advanced ensemble methods in ensemble learning, such as Boosting, which could also be applied and customized based on this architecture.
+

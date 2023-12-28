@@ -1,0 +1,175 @@
+\section{Bayesian inference at petascale}
+\label{sec:at-scale}
+
+Catalog inference is a ``big data'' problem that does not parallelize trivially.
+This section introduces high-performance computing (HPC) to a statistics audience by describing large-scale runs of our variational inference procedure.
+We construct a catalog from the entire 50-terabyte SDSS dataset. More importantly, we attain the computational efficiency needed to process the next generation of surveys, which will include $\mathcal O(100)$ petabytes of image data.
+
+\subsection{Hardware}
+
+Our test platform was the Cori supercomputer---currently ranked eighth in the global ``Top 500'' rankings~\citep{top500}.
+Cori comprises 9,688 compute nodes connected by a high-speed network~\citep{cori}.
+Each compute node has 112 GB of memory and one processor, an Intel Xeon Phi 7250, commonly referred to as ``Knights Landing.''
+Though Knights Landing runs at only 1.4 GHz, it more than makes up for this relatively slow clock by executing many instructions in parallel during each clock cycle.
+A single Knights Landing processor has 68 cores---physically distinct regions of the processor that execute instructions in parallel.
+Each core simultaneously runs two hardware threads that appear to the operating system as separate cores.
+A hardware thread executes batches of instructions twice per clock cycle: once on the ``up-tick'' and once on the ``down-tick.''
+During each tick, a hardware thread may execute the same instruction on eight different 64-byte floating point numbers. This is known as single-instruction multiple-data (SIMD) parallelism.
+
+
+\subsection{Efficient thread-level execution}
+\label{thread}
+
+Supercomputer programs are written almost exclusively in verbose languages like assembly, Fortran, C, and C\texttt{++}.
+Many statisticians, however, prefer very high-level (VHL) languages like R and Python.
+These languages often require $5\times$ to $10\times$ fewer lines of code to express the same algorithm.
+Unfortunately, they also often run $10\times$, $100\times$, or even $1000\times$ slower than equivalent C code~\citep{juliabenchmarks}.
+For high-performance computing, these languages are therefore limited to serving as ``glue'' code that connects libraries (e.g., BLAS, TensorFlow) that are implemented in more efficient languages.
+In turn, writing code in two languages prevents many optimizations~\citep{bezanson2017julia}.
+
+Our work uses the Julia programming language~\citep{bezanson2017julia} for the first time in an HPC setting.
+Julia matches both the succinctness of scripting languages and the speed of C.
+The ``hot spots'' in a Julia codebase, however, must be written carefully to attain C-like speed.
+
+The process of tuning Julia code to run in an HPC setting is iterative.
+It begins with profiling a typical execution of the code to find bottlenecks;
+intuition about which lines of code are hotspots is a poor substitute for measurement.
+Our first round of bottlenecks involved memory allocation, where the program requests that the operating system assign it more memory. We removed all these memory allocations from loops that contributed significantly to runtime by allocating the memory up front (i.e., ``pre-allocating'' memory).
+
+The next round of bottlenecks was due to memory access: processors cannot execute instructions until data has been transferred from main memory to the processor's registers. A hardware thread may remain idle for approximately 200 clock cycles while fetching one number from main memory.
+Memory-access bottlenecks need to be fixed on a case-by-case basis. The solution typically involves some reordering of the computation to enable better prefetching of data from main memory. In some cases, we save time by recomputing values rather than fetching them.
+
+
+\subsection{Multi-node scaling}
+In HPC, ``scalability'' refers to how a program's performance varies with the capacity of the hardware devoted to executing the program \citep{hager2010introduction}.
+We assess scaling empirically in two ways.
+First, we vary the number of compute nodes while keeping the amount of work constant per compute node (``weak scaling''); many compute nodes can solve a much larger problem.
+Here the problem size is the area of the sky that we are constructing a catalog for.
+Second, we vary the number of compute nodes while keeping the total job size constant (``strong scaling''); many compute nodes have to further subdivide the problem.
+The two scaling metrics give different perspectives to inform predictions about how a particular supercomputer program will perform on future datasets, which may be much larger than any of the datasets used for testing.
+
+Generally, it is harder to use more compute nodes efficiently. Ideal weak scaling is constant runtime as the number of compute nodes increases. Figure~\ref{fig:weak_scaling} shows instead that our runtime roughly doubles as the number of compute nodes increases from 1 to 8192. Ideal strong scaling is runtime that
+drops by a factor of $1/c$ when the number of compute nodes grows by a factor of $c$.
+Figure~\ref{fig:strong_scaling} shows instead that our runtime roughly halves as the number of compute nodes quadruples from 2048 to 8192.
+
+Additionally, the scaling graphs break out runtime by component.
+The \textit{image loading} component is the time taken to load images while worker threads
+are idle. After the first task, images are prefetched in the background, so the majority of image loading time accrues up front.
+Image loading time is constant in the weak scaling graph and proportional to the inverse of the number of nodes in the strong scaling graph---exactly what we want. We are not I/O bound even at high node counts.
+
+The \textit{load imbalance} component is time when processes are idle because no tasks remain, but the job has not ended because at least one process has not finished its current task.
+Both scaling graphs indicate that load imbalance is our primary scaling bottleneck.
+Fortunately, the load imbalance is due to having only 4 tasks per process.
+With at least $1000\times$ more data, the volume we expect from LSST, the load imbalance should become negligible.
+
+The \textit{task processing} component is the main work loop.
+It involves no network or disk I/O, only computation and shared memory access.
+Because of this, task processing serves as a sanity check for both graphs: it should, and does, stay roughly constant in the weak scaling graph and vary in inverse proportion to the number of nodes in the strong scaling graph.
+
+The \textit{other} component is everything else. It is always a small fraction of the total runtime.
+It includes scheduling overhead, network I/O (excluding image loading), and writing output to disk.
+
+\begin{figure}[ht]
+\begin{subfigure}{.48\textwidth}
+\begin{tikzpicture}[scale=.9]
+\begin{semilogxaxis}[
+const plot,
+smooth,
+width=2.5in,
+height=2.5in,
+stack plots=y,
+area style,
+xlabel=compute nodes (log scale),
+xtick={2,8,32,128,512,2048,8192},
+xticklabels={2,8,32,128,512,2048,8192}, % shouldn't really be necessary but it I think there is a bug in the Overleaf version of PGFPlots
+enlarge x limits=false,
+log basis x={2},
+log ticks with fixed point,
+ymin=0,
+ymax=1300,
+ylabel=seconds,
+legend pos=north west,
+legend columns=1,
+legend cell align={left},
+legend style={font=\scriptsize}]
+\addplot[fill=orange] table[x=nodes,y=opt_srcs] {figures/weak_scaling_GB.txt}
+\closedcycle;
+\addlegendentry{task processing}
+\addplot[fill=cyan] table[x=nodes,y=load_wait] {figures/weak_scaling_GB.txt}
+\closedcycle;
+\addlegendentry{image loading}
+\addplot[fill=magenta] table[x=nodes,y=wait_done] {figures/weak_scaling_GB.txt}
+\closedcycle;
+\addlegendentry{load imbalance}
+\addplot[fill=gray] table[x=nodes,y=other] {figures/weak_scaling_GB.txt}
+\closedcycle;
+\addlegendentry{other}
+\end{semilogxaxis}
+\end{tikzpicture}
+\caption{Weak scaling}
+\label{fig:weak_scaling}
+\end{subfigure}
+\hfill
+\begin{subfigure}{.48\textwidth}
+\begin{tikzpicture}[scale=.9]
+\begin{semilogxaxis}[
+const plot,
+smooth,
+width=2.5in,
+height=2.5in,
+stack plots=y,
+area style,
+xtick={2048,4096,8192},
+xticklabels={2048,4096,8192},
+xlabel=compute nodes (log scale),
+enlarge x limits=false,
+log basis x={2},
+log ticks with fixed point,
+ymin=0,
+ymax=2600,
+ylabel=seconds,
+legend pos=north east,
+legend columns=1,
+legend cell align={left},
+legend style={font=\scriptsize}]
+\addplot[fill=orange] table[x=nodes,y=opt_srcs]{figures/strong_scaling_GB.txt}
+\closedcycle;
+\addlegendentry{task processing}
+\addplot[fill=cyan] table[x=nodes,y=load_wait]{figures/strong_scaling_GB.txt}
+\closedcycle;
+\addlegendentry{image loading}
+\addplot[fill=magenta] table[x=nodes,y=wait_done]{figures/strong_scaling_GB.txt}
+\closedcycle;
+\addlegendentry{load imbalance}
+\addplot[fill=gray] table[x=nodes,y=other]{figures/strong_scaling_GB.txt}
+\closedcycle;
+\addlegendentry{other}
+\end{semilogxaxis}
+\end{tikzpicture}
+\caption{\textcolor{black}{Strong scaling}}
+\label{fig:strong_scaling}
+\vfill
+\end{subfigure}
+\caption{Scaling results. Load imbalance is due to the limited size of our study dataset---real datasets will be much larger. See text for additional discussion.}
+\label{fig:scaling}
+\end{figure}
+
+
+\subsection{Peak performance}
+To assess the peak performance that can be achieved for Bayesian inference at scale, we prepared a specialized configuration for performance measurement in which the processes synchronize after loading images, prior to task processing. We ran this configuration on 9568 Cori Intel Xeon Phi nodes, each running 17 processes of eight threads each, for a total of 1,303,832 threads. 57.8 TB of SDSS image data was loaded over a ten-minute interval. (Some regions were loaded multiple times, as prescribed by our algorithm.) The peak performance achieved was 1.54 PFLOP/s in double-precision. To the best of our knowledge, this experiment (conducted in May 2017) was the first time a supercomputer program in any language other than C, C\texttt{++}, Fortran, or assembly has exceeded one petaflop in double-precision.
+
+\subsection{Complete SDSS catalog}
+In a long-running job with 256 compute nodes, we constructed a preliminary astronomical catalog based on the entire SDSS. The catalog is 21 GB and contains 112 million light sources. Spot checking results gives us high confidence that distributed executions of our program give the same results as serial executions.
+
+Our catalog contains the parameters of the optimal variational distribution---a vector with 44 single-precision floating point numbers for each light source.
+We are considering both the FITS file format~\citep{wells1979fits} and the HDF5 file format~\citep{folk2011overview} for distributing future catalogs.
+FITS is the standard format for astronomical images and catalogs, whereas the HDF5 format has better I/O speed and compression~\citep{price2015hdfits}.
+
+\subsection{Future hardware}
+In July, 2018, it was reported that Intel will discontinue development of the Xeon Phi line of processors~\citep{phieol}.
+Future supercomputers will likely be based instead on the Xeon Scalable Family line of processors~\citep{intelroadmap} and the AMD Epyc~\citep{amdepyc}.
+Both are ``many core'' processors having tens of cores, like the Xeon Phi, but they are clocked at a higher rate. Running efficiently on these processors should not require significant changes to our algorithm or to our Julia implementation. The Julia compiler and LLVM, on the other hand, may require optimizations to fully exploit the capabilities of these processors.
+
+The next generation of supercomputers may also rely more on GPUs to attain exascale performance~\citep{summit}.
+The variable size of imaged light sources makes SIMD parallelization across light sources somewhat challenging.
+A different approach to parallelization may be advisable for astronomical cataloging on GPU-based clusters.
