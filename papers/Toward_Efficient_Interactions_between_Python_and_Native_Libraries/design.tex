@@ -1,0 +1,563 @@
+\section{Interaction Inefficiency Characterization}
+\label{characterization}
+
+% \textcolor{red}{A transition sentence: why perform this study?}
+This section provides a high-level preview of the key findings from applying \tool to an extensive collection of high-profile Python libraries at Github. We specifically categorize the interaction inefficiencies according to the root causes and summarize the common patterns, which serve three purposes: \emph{(i)} this is the first characterization of interaction inefficiencies based on large scale studies, thus rendering a more complete landscape of potential code quality issues that exist in Python codebase for ML and beyond, \emph{(ii)} we see a diverse set of inefficiencies hiding deep in Python-native library interaction, which justifies using heavy machineries/profiling tools to automatically identify them, and \emph{(iii)} these concrete examples explain the common patterns we use to drive the \tool’s design. 
+
+% {\color{red} knowledge gap mention?}
+
+%Interaction inefficiencies exist due to the knowledge gap between Python semantics and native libraries. We have extensively studied more than 100 Python applications, finding that interaction inefficiencies pervasively exist in production Python software packages. 
+
+
+
+%In this section, we categorize interaction inefficiencies according to their root causes and summarize two common patterns to serve as indicators to pinpoint these inefficiencies. This is the first work on thorough characterization of interaction inefficiencies.
+
+%This section describes the methodology of \tool. We focus on one important Python inefficiency --- the redundant \ffs, based on two reasons. First, to improve Python performance, a general method is to encapsulate performance critical components into native libraries, and embed these libraries into applications through \ffs. Then, native functions are responsible for intensive computations. The cost of a single \ff is not merely the computation itself, also includes invoking overheads. As a result, the redundant \ffs will waste much more computing/memory resources than traditional inefficiencies.
+
+%Through our investigations of more than one hundred real-world Python applications, we classify this inefficiency into six categories. We define two inefficiency patterns: {\it Mirror-nfc} and {\it Ghost-nfc}, which sufficiently cover six inefficiency categories, serve as distinguishing indicators to heuristically diagnose Python Applications.
+
+% First, we define two Python inefficiency patterns that \tool targets. Then, based on the behaviors of \ffs, we characterize the Python inefficiencies into five categories \yu{TODO}. Through the investigation to the real-worlds Python applications, we highlight the observation: {\it Mirror-bfc} and {\it Ghost-bfc} sufficiently cover the most scenarios of Python inefficiencies, they are distinguishing indicators to heuristically diagnose Python Applications. 
+
+
+
+%This section describes the methodology of \tool. We first introduce three Python inefficiency patterns that \tool targets. Our key observation is that all these inefficiency patterns will trigger wasting memory operations. Next, we propose a general framework to detect wasting memory operations between binary function calls by using PMUs and hardware debug registers. At last, we describe two types of wasting memory operations and discuss their inefficiency detecting abilities.
+
+
+
+\subsection{Interaction Inefficiency Categorization}
+\label{classification}
+
+%By analyzing real-world Python applications from various domains, we observe that the redundant \ffs are widely existed, and eliminating such inefficiency will lead to significant speedups.
+We categorize interaction inefficiencies into five groups. For each category, we give a real example, analyze the root causes, and provide a fix. 
+
+%We give each category a real example, analyze the root causes, and provide a solution for the fix.
+
+%based on root cases: slices underutilization, input-sensitive identical computation, inefficient algorithm, native function misuse, loop-invariant computation and redundant computation.
+
+
+\myparabb{\textbf{Slice underutilization.}}
+Listing~\ref{lst:iris1} is an example code from IrisData~\cite{irisdata}, a back-propagation algorithm implementation on Iris Dataset~\cite{fisher1936use}. A loop iterates two multidimensional arrays {\tt ihGrads} and {\tt ihWeights} with indices {\tt i} and {\tt j}  for computation. 
+Because Python arrays are supported by native libraries such as Numpy and PyTorch/TensorFlow, indexing operations (i.e., {\tt []}) in a loop trigger native function calls that repeat boundary and type checks~\cite{generalfunction}. 
+
+%both two-dimension Numpy arrays. This code snippet iterates vectors: the {\tt i}$^{th}$ rows of {\tt ihGrads} and {\tt ihWeights} with a loop. In {\tt j}$^{th}$ iteration, statements in line 4-5 read values of {\tt j}$^{th}$ elements in {\tt ihGrads[i]} and {\tt ihWeights[i]}, compute and save the results back to the  {\tt j}$^{th}$ element in {\tt ihWeights[i]}. The \ffs triggered by indexing operation repeatedly read the unchanged {\tt PyObject}, the vector {\tt ihGrads[i]}, resulting in redundant \ffs.
+
+
+The so-called vectorization/slicing eliminates repeated ``housework'' and (usually) enables the underlying BLAS~\cite{blackford2002updated} library to perform multi-core computation. Listing~\ref{lst:iris2} shows a simple fix in a 2$\times$ speedup for the entire program execution. 
+
+% \yu{(Ann:note that first sentence in 3.1 says you will give a real example, analyze the root causes, and then give a fix. not being an expert, i assume your readers will understand that you have analyzed the root cause here?)}
+
+
+
+%\yu{perform repeated work such as boundary and type verifications and, miss potential opportunity of vectorization, resulting in serious inefficiency~\cite{generalfunction}}. 
+
+%To fix this problem, we apply the slice notation, as shown in Listing~\ref{lst:iris2}, which removes the most repeated native function calls for array indexing, and leverages the accesses to consecutive memory elements, leading to more efficient interactions between Python code and native libraries. For this example, our optimization yields 
+
+
+\begin{comment}
+
+compared with slice notation. A indexing operation ({\tt []}) triggers one \ff, which is expensive because it involves a few additional operations to the array, such as data type verification and boundary safety check\footnote{General function for indexing Numpy array: \url{https://github.com/numpy/numpy/blob/master/numpy/core/src/multiarray/mapping.c\#L1506}}. Iterating arrays via loops invokes proportional times of indexing operations, causing massive number of \ffs. Compared with applying loops, slice notation only involves one indexing operation, which is much more efficient.
+
+What's more, slice notation gathers data from a consecutive memory range in raw data region, leading to a good data locality.
+
+%because the slice notation achieves scalable indexing. 
+
+
+
+
+To achieve scalable indexing, we replace the loop with slice notation, shown in Listing~\ref{lst:iris2}, yielding a 2.02$\times$ function speedup.
+\end{comment}
+
+
+\begin{figure}[t]
+\begin{lstlisting}[caption={Interaction inefficiencies in IrisData due to the iteration on Numpy arrays within a loop.},label=lst:iris1]
+def train(self, trainData, maxEpochs, learnRate):
+    ...
+    for j in range(self.nh):
+        delta = -1.0 * learnRate * ihGrads[i,j]
+        self.ihWeights[i, j] += delta
+    ...
+\end{lstlisting}
+\end{figure}
+
+
+
+\begin{figure}[t]
+\begin{lstlisting}[caption={Optimized IrisData code with slice notation.},label=lst:iris2]
+def train(self, trainData, maxEpochs, learnRate):
+    ...
+    self.ihWeights[i, 0:self.nh] += -1.0 * learnRate * ihGrads[i, 0:self.nh]
+    ...
+\end{lstlisting}
+\end{figure}
+
+
+
+\begin{figure}[t]
+\begin{lstlisting}[caption={Interaction inefficiencies in Matplotlib due to the same input {\tt theta}.},label=lst:matplot1]
+def rotate(self, theta):
+    a = np.cos(theta)
+    b = np.sin(theta)
+    rotate_mtx = np.array([[a, -b, 0.0], [b, a, 0.0], [0.0, 0.0, 1.0]], float)
+    self._mtx = np.dot(rotate_mtx, self._mtx)
+    ...
+\end{lstlisting}
+\end{figure}
+
+
+\myparabb{\textbf{Repeated native function calls with the same arguments.}}
+Functions from native libraries typically have no side effects, so applying the same arguments to a native function results in the same return value, which introduces redundant computations. 
+Listing~\ref{lst:matplot1} shows a code from Matplotlib~\cite{Hunter:2007}, a comprehensive library for visualization and image manipulation. This code rotates an image and is often invoked in training neural nets for images. 
+
+The argument {\tt theta} for the {\tt rotate} function (rotate angle) is usually the same across consecutive invocations from deep learning training algorithms because they rotate images in the same batch in the same way. Here, {\tt Pyobject}s returned from native functions {\tt np.cos()}, {\tt np.sin()} and {\tt np.array()} in lines 2-4 have the same values across images that share the same input {\tt theta}. 
+
+This can be fixed by either a simple caching trick~\cite{della2015performance, nguyen2013cachetor}, or refactoring the {\tt rotate} funcion so that it can take a batch of images. We gain a 2.8$\times$ speedup after the fix.
+
+%In the code, the argument {\tt theta} for the {\tt rotate} function (rotate angle) is usually the same across different invocations because many machine learning applications rotate images on batches and images in each batch share the same rotate angle. Thus, {\tt Pyobject}s returned from native functions {\tt np.cos()}, {\tt np.sin()} and {\tt np.array()} in lines 2-4 have the same values across images that share the same input {\tt theta}. {\color{red} ZLiu: Why Matplotlib and deep learning are used together?}
+
+
+%Our solution is to apply the memorization technique~\cite{della2015performance, nguyen2013cachetor}. Before calling the native functions, we check whether {\tt theta} is the same as in the last invocation. If the same, we reuse the return values from the last invocations of {\tt np.cos()}, {\tt np.sin()} and {\tt np.array()}. Our optimization saves redundant native function calls, and yields a 2.8$\times$ speedup to the {\tt rotate} function.
+
+%before calling the native functions and check whether the augments are the same as the ones in the last invocation. If the same, we reuse the return values from the last invocation.
+
+
+%catch the computation results of {\tt np.cos()}, {\tt np.sin()} and {\tt np.array()}. We add a conditional check to track the input {\tt theta}, and reuse the computation results if {\tt theta} keeps unchanged. This optimization yields a 2.83$\times$ function speedup.
+
+
+
+
+% \begin{figure}[t]
+% \begin{lstlisting}[caption={matplotlib opt identity computation},label=lst:matplot2]
+% def rotate(self, theta):
+%     if theta != theta_tmp:
+%         a = np.cos(theta)
+%         b = np.sin(theta)
+%         theta_tmp = theta
+%         rotate_tmp = np.array([[a, -b, 0.0], [b, a, 0.0], [0.0, 0.0, 1.0]], float)
+%     self._mtx = np.dot(rotate_tmp, self._mtx)
+%     ...   
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+
+
+
+\myparabb{\textbf{Inefficient algorithms.}}
+Listing~\ref{lst:scikit1} is an example of algorithmic inefficiencies from Scikit-learn, a widely used machine learning package. 
+The code works on {\tt X}, a two-dimensional Numpy array. It calls the native function {\tt swap} from the BLAS library to exchange two adjacent vectors. In each iteration, {\tt swap} returns two {\tt PyObject}s and Python runtime assigns these two {\tt PyObject}s to {\tt X.T[i]} and {\tt X.T[i+1]}, respectively. The loop uses {\tt swap} to move the first element in the range to the end position. Inefficiencies occur because it requires multiple iterations to move {\tt X.T[i]} to the final location.
+
+%The loop uses {\tt swap} to move {\tt X.T[i]} to the last position {\tt X.T[n\_active]}.
+
+Instead of using {\tt swap}, we directly move each element to the target location. We apply a similar optimization to the {\tt indices} array as well. Our improvement yields a  6.1$\times$ speedup to the {\tt lars\_path} function.
+
+%{\tt X} is a two-dimension Numpy array (matrix). This code piece performs left shifting to each column in {\tt X} between {\tt ii+1}$^{th}$ colunm and {\tt n\_active+1}$^{th}$ column. Line 4 achieves left shifting by swapping each two adjacent columns sequentially. {\tt swap} is a native function in BLAS~\cite{blackford2002updated}, which swaps two vectors. In each iteration, {\tt swap} returns two {\tt PyObject}s and Python runtime pushes them into data stack. Python runtime then assigns these two {\tt PyObject}s to {\tt X.T[i]} and {\tt X.T[i+1]} respectively. 
+
+%We observe that, in each iteration, the value of the second returned {\tt PyObject} always equals to the {\tt X.T[ii]}'s initial value. To conclude, {\tt swap} repeatedly returns {\tt PyObject}s with the same value to a same location in data stack among iterations. {\tt indices} is an one dimension Numpy array, it suffers the same inefficiency as {\tt X}. 
+
+%To improve the algorithm, we save the initial value of {\tt ii}th element in a local variable, {\tt tmp}. Then we assign all elements between {\tt ii+1} and {\tt n\_active+1} to their corresponding left positions. At last, we assign the {\tt tmp} to the {\tt n\_active}$^{th}$ position (shown in Listing~\ref{lst:scikit2}). Our optimization yields a 6.10$\times$ function speedup.
+
+
+\begin{figure}[t]
+\begin{lstlisting}[caption={Interaction inefficiencies in Scikit-learn due to the inefficient algorithm.},label=lst:scikit1]
+def lars_path(X, y, Xy=None, ...):
+    ...
+    for i in range(ii, n_active):
+        X.T[i], X.T[i + 1] = swap(X.T[i], X.T[i + 1])
+        indices[i], indices[i + 1] = indices[i + 1], indices[i]
+    ...
+\end{lstlisting}
+%\vspace{-1em}
+\end{figure}
+
+
+\begin{comment}
+
+\begin{figure}[t]
+\begin{lstlisting}[caption={Scikit-learn opt (inappropriate algorithm)},label=lst:scikit2]
+def lars_path(X, y, Xy=None, ...):
+    ...
+    tmp1 = X.T[ii].copy()
+    tmp2 = indices[ii].copy()
+    X.T[ii:n_active,:] = X.T[ii+1:n_active+1, :]
+    X.T[n_active] = tmp1
+    indices[ii:n_active] = indices[ii+1:n_active+1]
+    indices[n_active] = tmp2
+    ...
+\end{lstlisting}
+%\vspace{-1em}
+\end{figure}
+
+\end{comment}
+
+\begin{figure}[t]
+\begin{lstlisting}[caption={
+Interaction inefficiencies in Metaheuristic~\cite{nguyen2019building, nguyen2018resource} due to the API misuse in native Libraries.},label=lst:motivated1]
+def CEC_4(solution=None, problem_size=None, shift=0):
+    ...
+    for i in range(dim - 1):
+        res += 100 * np.square(x[i]**2-x[i+1]) + np.square(x[i]-1)
+    ...
+\end{lstlisting}
+\end{figure}
+
+
+
+
+\myparabb{\textbf{API misuse in native libraries.}}
+Listing~\ref{lst:motivated1} is an example of API misuse from Metaheuristic~\cite{nguyen2019building, nguyen2018resource}, which implements the-state-of-the-art meta-heuristic algorithms. The code accumulates the computation results to {\tt res}. Since the computation is based on Numpy arrays, the accumulation operation triggers one native function call in each iteration, resulting in many inefficiencies. 
+
+
+In Listing~\ref{lst:motivated2} shows our fix (i.e., use the efficient {\tt sum} API from Numpy) which avoids most of the native function invocations by directly operating on the Numpy arrays. This optimization removes most of interaction inefficiencies, and yields a 1.9$\times$ speedup to the entire program. 
+
+
+%, where the code performs cumulatively add operations ({\tt cumadd/+=}) among iterations. {\tt add} in each iteration triggers one \ffs, {\tt cumadd} will trigger a large amount of \ffs among iterations. Also, in each iteration, {\tt add} returns computing results to Python runtime and introduces interacting overhead.
+
+%As Listing~\ref{lst:motivated2} shows, {\tt np.sum()} is a better choice with a significantly greater performance. 
+%The performance comes from two main reasons.
+%Similar with the slice notation, {\tt np.sum()} dramatically reduce the amount of triggered native functions, it only triggers one \ff to complete the computation. Even more efficiently, {\tt np.sum()} directly operates {\tt PyObject}s in the scope of native library, avoiding Python runtime interaction overhead. 
+
+
+
+
+%Loop-invariant native function invocations always return the same {\tt PyObject}s. 
+
+%The loop-insensitive recomputations will call same native functions among iterations, and the native function always returns {\tt PyObject}s with same value.
+
+% Listing~\ref{lst:loop1} shows a loop-invariant computation example from Metaheuritics~\cite{meta}. 
+% The code calls the native function {\tt exp} in a nested loop to calculate the exponential of {\tt i}. Because {\tt i} is a loop-invariant variable, the {\tt exp} function always returns the {\tt PyObject}s pointing to the same value. For optimization, we hoist the loop-invariant computation out of the loop, which removes redundant native function calls, yielding a 1.4$\times$ speedup to the {\tt \_train\_\_} function in our example.
+
+%The statement in line 7 executes in a two-level nested loop. Since {\tt i} is a loop invariant, the code keeps calling the expensive native function {\tt np.exp()} to calculate the exponential of {\tt i}, which always return {\tt PyObject}s to the same location in data stack\footnote{Python runtime has three types of stacks: call stack, data stack (evaluation stack) and block stack.} with the same value. 
+
+%To optimize it, we define a local variable to save the computing result of {\tt np.exp(i)} outside the nested loop, yielding a 1.40$\times$ function speedup.
+
+
+% \begin{figure}[t]
+% \begin{lstlisting}[caption={metaheuritics org (loop invariant) {\color{red}check section.}},label=lst:loop1]
+% def _train__(self):
+%     ...
+%     for i in range(self.epoch):
+%         for j in range(self.pop_size):
+%             for k in range(self.problem_size):
+%                 f = np.random.uniform(2, 3)
+%                 l = np.random.uniform(1.5, 2)
+%                 S_A = f * np.exp(-i / l) - np.exp(i)
+%                 ...
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+
+
+
+
+
+
+
+\myparabb{\textbf{Loop-invariant computation.}}
+Listing~\ref{lst:loop2} is a code snippet from Deep Dictionary Learning~\cite{mahdizadehaghdam2019deep}, which seeks multiple dictionaries at different image scales to capture complementary coherent characteristics implemented with TensorFlow. Lines 1-3 indicate the computation inputs {\tt A}, {\tt D,} and {\tt X}. Lines 4-5 define the main computation. Lines 6-7 execute the computation with the actual parameters {\tt D\_} and {\tt X\_}. The following pseudo-code shows the implementation:
+
+\qquad \qquad \qquad {\bf for} \ {\it i $\leftarrow$ 1}  to  {\it Iter} \ {\bf do}\\
+\centerline{$A = D(X - D^T A)$ }
+where {\tt D} and {\tt X} are loop invariants. If we expand the computation, $DX$ and $DD^T$ can be computed outside the loop and reused among iterations, shown as pseudo-code:
+
+\qquad \qquad \qquad $t_1 = DX$
+
+\qquad \qquad \qquad $t_2 = DD^T$
+
+\qquad \qquad \qquad {\bf for} \ {\it i $\leftarrow$ 1}  to  {\it Iter} \ {\bf do}
+
+\centerline{$A = t_1 - t_2 A$ }
+
+This optimization yields a 3$\times$ speedup to the entire program~\cite{zhou2020harp}. 
+
+
+% \begin{figure}[ht]
+% \begin{lstlisting}[caption={metaheuritics org (loop invariant)},label=lst:]
+% def _train__(self):
+%     ...
+%     for i in range(self.epoch):
+%         tmp = np.exp(i)
+%         for j in range(self.pop_size):
+%             for k in range(self.problem_size):
+%                 f = np.random.uniform(2, 3)
+%                 l = np.random.uniform(1.5, 2)
+%                 S_A = f * np.exp(-i / l) - tmp
+%                 ...
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+
+
+
+
+
+
+
+
+% \begin{figure}[t]
+% \begin{lstlisting}[caption={network-slimming org},label=lst:network-slimming-org]
+% def normalize(tensor, mean, std):
+%     ...
+%     for t, m, s in zip(tensor, mean, std):
+%         t.sub_(m).div_(s)
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+
+% \begin{figure}[t]
+% \begin{lstlisting}[caption={network-slimming opt},label=lst:network-slimming-opt]
+% def normalize(tensor, mean, std):
+%     ...
+%     l = min(len(tensor), len(mean), len(std))
+%     tensor[0:l].sub_(mean[0:l,None]).div_(std[0:l,None])
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+
+\begin{comment}
+
+\myparabb{Redundant Computation}
+Listing~\ref{lst:linear1} shows an example from LinearRegression~\cite{linearregression}. In each iteration, the {\tt hypothesis} function is invoked twice with same arguments {\tt theta0}, {\tt theta1} and {\tt xi}, where {\tt xi} is a Numpy array. {\tt hypothesis} contains computations to {\tt xi} with some native functions, these native functions repeatedly read unchanged {\tt PyObject}s {\tt xi}, resulting redundant \ffs. 
+
+For the optimization, we save the result of redundant patter to a local variable and reuse it in the following statements in every iteration, yielding a 1.48$\times$ function speedup.
+
+\begin{figure}[t]
+\begin{lstlisting}[caption={Linear Regression org (Redundant Computations)},label=lst:linear1]
+def derivatives(theta0, theta1, X, y):
+    ...
+    for (xi, yi) in zip(X, y):
+        dtheta0 += hypothesis(theta0, theta1, xi) - yi
+        dtheta1 += (hypothesis(theta0, theta1, xi) - yi) * xi
+    ...
+\end{lstlisting}
+%\vspace{-1em}
+\end{figure}
+
+\end{comment}
+
+% \begin{figure}[t]
+% \begin{lstlisting}[caption={Linear Regression opt (Redundant Computations)},label=lst:linear2]
+% def derivatives(theta0, theta1, X, y):
+%     dtheta0 = 0
+%     dtheta1 = 0
+%     for (xi, yi) in zip(X, y):
+%         tmp = hypothesis(theta0, theta1, xi) - yi
+%         dtheta0 += tmp
+%         dtheta1 += tmp * xi
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+
+
+
+% \begin{figure}[t]
+% \begin{lstlisting}[caption={IrisData org API misusing},label=lst:]
+% def meanSquaredError():
+%     ...
+%     for j in range(self.no):
+%         err = t_values[j] - y_values[j]
+%         sumSquaredError += err * err
+%     ...
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+
+% \begin{figure}[t]
+% \begin{lstlisting}[caption={IrisData opt API misusing},label=lst:]
+% def meanSquaredError():
+%     ...
+%     sumSquaredError = np.sum(np.power(t_values - y_values, 2))
+%     ...
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+
+
+
+
+%Our key observation is that redundant function call pairs in all these inefficiency patterns will trigger wasting memory operations, which can be detected by monitoring consecutive accesses to the same memory location. 
+
+% \subsection{Wasting Memory Operations Detection Framework}
+% We define a wasting memory operation detector $D$ as:
+
+% $C = D(E, T, F)$
+
+% $F$ is a function with the parameters as $F(O, V_ 1, V_2)$
+
+% $C$ is a set of pairs  $<C_i, C_j>$ which presents the wasting memory operation calling context pairs.
+
+% \begin{figure}[t]
+% 	\centering
+% 	\includegraphics[width=\linewidth]{asplos21/paper/Figures/Detector.png}
+% 	\caption{The basic methodology of detector.\yu{Polish}}
+% 	\label{fig:detector}
+% \end{figure}
+
+% The basic procedure showing in Figure~\ref{fig:detector} define as following:
+
+% \begin{enumerate}
+% \item \tool subscribes to the precise PMU event $E$ for each thread before the thread's initialization.
+% \item When an overflow interrupt triggered by PMUs, \tool capture the signal, construct the calling context $C_1$ of the signal, extract the effective address $M$ and the value $V_1$ stored at $M$
+% \item \tool set a watchpoint with the trap type as $T$ and resumes the application's execution.
+% \item A trap is triggered by a subsequent memory operation $O$. The \tool handles the trap, construct the calling context $C_2$ of the trap and inspects the value $V_2$ stored at $M$.
+% \item Check the Python interpreter state. If the state is unchanged, resumes the execution and jump to step4.\footnote{A binary function call will block the Python interpreter. If the interpreter state is unchanged between two memory operations, it means these two operations are in a same binary function call. But we aim to detect wasting memory operations between different binary function calls. So we keep the watchpoint if the interpreter state is unchanged. }
+% \item \tool decides whether the context pair $<C_1, C_2>$ is wasting memory operation pairs or not depends on the $F(O, V_1, V_2)$, if $F$ doesn't give the result, resumes the execution and jump to step 4.
+% \item \tool disarms the debug register and resumes execution.
+% \end{enumerate}
+
+% \subsection{Detectors}
+% \subsubsection{Silent Store}
+
+% \begin{definition}{Silent Store.}
+% A memory store $S_2$ storing a value $V_2$ on location $M$, if the previous memory store on $M$, $S_1$, stored $V1$. $<S_1, S_2>$ is a silent store pair iff $V_1 == V_2$.
+% \end{definition}
+
+% \begin{definition}{Silent Store Detector}
+
+% $C_{SS} = D(E_{SS},T_{SS},F_{SS})$
+
+% $E_{SS}$: Memory store event
+
+% $T_{SS}$: $W\_TRAP$ (Trap on store)
+
+% $F_{SS}(O, V_1, V_2)$: if $V_1 == V_2$ return true; Else return false.
+% \end{definition}
+
+% \myparabb{Detecting Ability} \yu{PATTERN format} Silent store detector can detect Pattern 1 and Pattern 2. For Pattern 1, it is obvious that $C_1$ and $C_2$ will store values to a same memory address. For pattern 2, both of $C_1$ and $C_2$ will store values to same memory address because they modify a same {\tt PyObject}. Both of these two inefficiency patterns will trigger the wasting memory operations which match the definition of silent store.
+
+% \subsubsection{Silent Load}
+
+% \begin{definition}{Silent Load.}
+% A memory load $l_2$ loading a value $V_2$ on location $M$, if the previous memory load on $M$, $l_1$, loaded $V1$. $<l_1, l_2>$ is a silent load pair iff $V_1 == V_2$.
+% \end{definition}
+
+% \begin{definition}{Silent Store Detector}
+
+% $C_{SL} = D(E_{SL},T_{SL},F_{SL})$
+
+% $E_{SL}$: Memory load event
+
+% $T_{SL}$: $WR\_TRAP$ (trap on store and read)\footnote{Silent load detector uses $WR\_TRAP$ because x86 does not provide trap on read only facility.}
+
+% $F_{SL}(O, V_1, V_2)$: If O is load and $V_1 == V_2$, return true; If O is load and $V_1 != V_2$, return false; Else return nothing.
+% \end{definition}
+
+% \myparabb{Detecting Ability} \yu{PATTERN format} Silent load detector can detect Pattern 3. For pattern 3, $C_1$ and $C_2$ will load value from same memory address because they read same {\tt PyObject}. It will trigger the memory wasting operations which match the definition of silent load.
+
+
+
+% Table 1
+\begin{table}[b]
+    \centering
+    %\vspace{-1em}
+    %\tiny
+    %\small
+    \scriptsize
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{|c|c|}
+    \hline
+        Inefficiency Pattern & Inefficiency Category  \\
+    \hline
+    \hline
+        \multirow{3}{4em}{Redundant Loads}  & Slice underutilization  \\ 
+        \cline{2-2}
+        & Inefficient algorithms \\ 
+        \cline{2-2}
+        & API misuse in native libraries \\ 
+    \hline
+        \multirow{4}{4em}{Redundant Stores}  & Loop-invariant computation  \\ 
+        \cline{2-2}
+        %& \begin{tabular}{@{}c@{}}Repeated native function calls \\ with the same arguments \end{tabular}     \\ 
+        & Repeated native function calls with same arguments \\
+        \cline{2-2}
+        & Inefficient algorithms \\ 
+        \cline{2-2}
+        & API misuse in native libraries \\
+    \hline 
+    \end{tabular}
+    }
+    \caption{Redundant loads and stores detect different categories of interaction inefficiencies.}
+    \label{tab:patterns}
+\end{table}
+
+
+\subsection{Common Patterns in Interaction Inefficiencies}
+\label{commonpatterns}
+
+We are now ready to explain the common patterns in code that exhibits interaction efficiencies, which we use to drive the design of \tool. Specifically,  we find that almost all interaction inefficiencies involve \emph{(i)} repeatedly reading the same {\tt PyObject}s of the same values, and \emph{(ii)} repeatedly returning {\tt PyObject}s of the same values.
+
+Both observations require developing a tool to identify redundant {\tt PyObject}s, which is difficult and costly because it requires heavyweight Python instrumentation and modification to Python runtime. Further analysis, however, finds that {\tt PyObject} redundancies reveal the following two low-level patterns during the execution from the hardware perspective.
+\begin{itemize}[leftmargin=*]
+    \item {\em Redundant loads:} If two adjacent native function calls read the same value from the same memory location, the second native function call triggers a redundant (memory) load. Repeatedly reading {\tt PyObject} of the same value result in redundant loads.
+    \item {\em Redundant stores:} If two adjacent native function calls write the same value to the same memory location, the second native function call triggers a redundant (memory) store. Repeatedly returning {\tt PyObject} of the same value result in redundant stores.
+\end{itemize}
+We use the redundant loads and stores to serve as indicators of interaction inefficiencies. Table~\ref{tab:patterns} shows different categories of interaction inefficiencies, which show up as redundant loads or stores. Section 4 describes how we use the indicators. 
+
+% {\color{red} message.}
+
+
+% \yu{THIS SENTENCE IS WEIRD:Thus, we design \tool{} to monitor redundant load and store instructions and associate them with Python structures to pinpoint interaction inefficiencies.} {\color{red} massage.}
+
+
+
+
+
+\begin{comment}
+
+
+%According to our classifications in Section~\ref{classification}, we proposed following two {\tt PyObject}-centric inefficiency patterns to identify redundant \ffs:
+
+\begin{definition}{Mirror Native Function Calls (Mirror-nfc):}
+$C_1$ and $C_2$ are two \ffs that consecutively return to the same memory location.  $<C_1, C_2>$ is a {\it Mirror-nfc} pair iff the PyObject $O_2$ returned by $C_2$ is equal to the PyObject $O_1$ returned by $C_1$.  
+\end{definition}
+
+
+
+% \begin{definition}{}
+% $C_1$ and $C_2$ are two binary function calls which consecutively modify a same PyObject $O$. The $C_1$ modify $O$ to be $O_1$. The $<C_1, C_2>$ is a redundant pair iff the $C_2$ modify $O$ to be $O_2$ and, $O_1$ is equal to $O_2$.
+% \end{definition}
+
+\begin{definition}{Ghost Native Function Calls (Ghost-nfc):}
+$C_1$ and $C_2$ are two \ffs that consecutively read a same PyObject $O$. The $C_1$ reads the $O$ as $O_1$. The $<C_1, C_2>$ is a {\it Ghost-nfc} pair iff $C_2$ reads the $O$ as $O_2$, and $O_1$ is equal to $O_2$.
+\end{definition}
+
+{\color{red}XX XX category of interaction inefficiencies belong to Mirror-nfc, which involve writing the same value to the {\tt PyObject} instances. XX XX belong to Ghost-nfc, involving in reading the same {\tt PyObject} instances.} However, analyzing {\tt PyObject} instances require 
+\end{comment}
+
+\begin{comment}
+We name the first definition as the {\it Mirror-nfc}, if two \ffs consecutively return equal {\tt PyObject}s to a same memory location, it's highly possible that they have consistent behaviors. For the second definition, if two \ffs read an unchanged {\tt PyObject}, they may behave differently but still redundant, thus we name it as the {\it Ghost-nfc}. The inefficiencies of Listing~\ref{lst:motivated1} in Section~\ref{intro} match {\it Ghost-nfc}.
+
+{\tt PyObject}-centric analysis matches our inefficiency detecting scenario. Typically, native functions perform as stateless pipelines to Python runtime. They take arguments from Python "callers", process and return computing results back without saving any state\footnote{Some libraries have static data structures for cache or buffer, which is not in our research scope}. In other words, different \ffs are independent from each other. It is intuitive to inspect native function behaviors by monitoring function inputs and outputs. Also, {\tt PyObject}-based profiling effectively limits inefficiency detecting scope in applications, which eliminates the intervention of Python runtime.
+\end{comment}
+
+
+
+% Listing 6
+\begin{figure}[t]
+\begin{lstlisting}[caption={Optimized  Metaheuritics code for Listing~\ref{lst:motivated1}, with appropriate native library API.},label=lst:motivated2]
+def CEC_4(solution=None, problem_size=None, shift=0):
+    ...
+    res += np.sum(100 * np.square(x[0:dim-1]**2 -  x[1:dim]) + np.square(x[0:dim-1] - 1))
+    ...
+\end{lstlisting}
+\end{figure}
+
+
+\begin{figure}[t]
+\begin{lstlisting}[caption={Interaction inefficiencies in Deep Dictionary Learning~\cite{mahdizadehaghdam2019deep} due to loop-invariant computation.},label=lst:loop2]
+A = tf.Variable(tf.zeros(shape=[N, N]), dtype=tf.float32)
+D = tf.placeholder(shape=[N, N], dtype=tf.float32)
+X = tf.placeholder(shape=[N, N], dtype=tf.float32)
+R = tf.matmul(D, tf.subtract(X, tf.matmul(tf.transpose(D), A)))
+L = tf.assign (A, R)
+for i in range(Iter):
+    result = sess.run(L, feed_dict={D: D_, X: X_})
+\end{lstlisting}
+%\vspace{-1em}
+\end{figure}

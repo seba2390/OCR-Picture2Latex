@@ -1,0 +1,251 @@
+\section{Verifying compiled WebAssembly}
+\label{sec:wasm-verifier}
+
+Instead of trusting the Wasm compiler, we build a \emph{zero-cost verifier},
+\verifname{}, to check that the native, compiled output meets the zero-cost
+conditions and is thus safe to run without springboards and trampolines.
+%
+\verifname{} is a static x86 assembly analyzer that takes as input potentially
+untrusted native programs and verifies a series of local properties via abstract
+interpretation.
+%
+Together these local properties guarantee that the monitor checks defined in
+\olangname{} are met; we discuss the proof of soundness in
+\sectionref{sec:wasm-proof}.
+
+\verifname{} extends the VeriWasm SFI verifier~\cite{veriwasm}.
+%
+Both operate over WebAssembly modules compiled by the Lucet Wasm
+compiler~\cite{lucet}, first disassembling the native x86 code before computing
+a control-flow graph (CFG) for each function in the binary.
+%
+The disassembled code is then lifted to a subset of \langname{}, which serves as
+the first abstract domain in our analysis.
+%
+Unfortunately, the properties checked by VeriWasm, while sufficient to guarantee
+SFI security, are insufficient to guarantee zero-cost security.
+%
+Below we will describe how \verifname{} extends VeriWasm to guarantee the
+stronger zero-cost conditions are met.
+
+\begin{figure}[t]
+\begin{lstlisting}[style=asm, escapeinside=||, morekeywords={bad_func:, good_func:}]
+bad_func: [] >> rax                           good_func: [rdi] >> rax
+  push r12                                      mov rax <- rdi |\label{line:verifier:sample:store}|
+  ; TRACK: stack[0] = initial r12 value         ret
+  mov r12 <- 1                                                 |\label{line:verifier:sample:init}|
+  ; TRACK: r12 initialized
+  mov r11 <- r13 + r12                                         |\label{line:verifier:sample:uninit}|
+  ; TRACK: r11 uninitialized
+  mov rdi <- 2                                                 |\label{line:verifier:sample:arginit}|
+  ; TRACK: rdi initialized
+  ; ASSERT: good_func arguments initialized
+  call good_func                                               |\label{line:verifier:sample:call}|
+  ; TRACK: good_func return value initialized
+  pop r12                                                      |\label{line:verifier:sample:restore}|
+  ; TRACK: r12 = initial r12 value
+  ; ASSERT: callee-save registers restored
+  gateret                                                      |\label{line:verifier:sample:ret}|
+\end{lstlisting}
+\caption{Disassembled and lifted WebAssembly functions}
+\label{fig:verifier:sample}
+\end{figure}
+
+\para{The \verifname{} analyzers}
+%
+\verifname{} adds two new analyses to VeriWasm.
+%
+The first extends VeriWasm's CFI analysis, which only captures coarse
+grained control-flow (i.e., that all calls target valid sandboxed functions),
+to also extract type information.
+%
+Extracting type information from the binary code is possible without any complex
+type inference because Lucet leaves the type signatures in the compiled output
+(though we do not need to trust Lucet to get these type signatures correct 
+since \verifname{} would catch any deviations at the binary level).
+%
+For direct calls, \verifname{} simply extracts the WebAssembly type stored in the
+binary.
+%
+For indirect calls we extend the VeriWasm indirect call analysis to track the
+type of each indirect call table entry, enabling us to resolve each indirect call to a
+statically known type.
+%
+These types correspond to the input registers and stack slots, and the output registers
+(if any) used by a function.
+%
+For example, in \figref{fig:verifier:sample} \Asminline{bad_func} takes no input
+and outputs to \Asminline{rax} and \Asminline{good_func} takes \Asminline{rdi}
+as input and outputs to \Asminline{rax}.
+
+The second analysis tracks dataflow in local variables, i.e., in registers and stack slots.
+%
+Continuing with \Asminline{bad_func} as our example this analysis captures that:
+in \coderef{line:verifier:sample:store} stack slot 0 now holds the initial value
+of \Asminline{r12}, in \coderef{line:verifier:sample:init} \Asminline{r12}
+holds an initialized (and therefore public) value, in
+\coderef{line:verifier:sample:uninit} \Asminline{r13} has not been
+initialized and therefore potentially contains confidential data so
+\Asminline{r11} may also contain confidential data, etc.
+%
+This analysis is used to check confidentiality, callee-save register
+restoration, local state encapsulation, and is combined with the previous
+analysis to check type-directed CFI.
+
+\para{The dataflow abstract domain}
+%
+To track local variable dataflow, \verifname{} uses an abstract domain with
+three elements: $\vcuninit$ which represents an uninitialized, potentially
+confidential value; $\vcinit$ which represents an initialized, public value; and
+$\vccallee{r}$ which represents a potentially confidential value which
+corresponds to the original value of the callee-save register $r$.
+%
+The domain forms a meet-semilattice with $\vcuninit$ the least element and all
+other elements incomparable.
+
+From here, analysis is straightforward, with a function's argument registers and
+stack slots initialized to $\vcinit$, each callee-save register $r$ initialized
+to $\vccallee{r}$, and everything else $\vcuninit$.
+%
+Instructions are interpreted as expected, e.g., $\cinst{mov}$ simply copies the
+abstract value of its source into the target, operations return the meet of
+their operands, and all constants and reads from the heap are treated as
+initialized.
+%
+Across calls we assume that callee-save register conventions are followed (as we
+will be checking this), preserving the value of all callee-save registers and
+clearing all other registers' values.
+%
+We extract the type information from the extended CFI analysis to
+determine the return register that is initialized after a function call.
+
+\para{Checking the zero-cost conditions}
+%
+The above two analyses, along with additional information from VeriWasm's existing analyses enable us to check the zero-cost conditions.
+%
+\begin{CompactEnumerate}
+\item
+
+  \emph{Callee-save register restoration:}
+  %
+  The $\vccallee{r}$ value enables straightforward checking that callee-save
+  registers have been restored by checking that, at each $\cinst{ret}$
+  instruction, each callee-save register $r$ has the abstract value
+  $\vccallee{r}$.
+
+\item
+
+  \emph{Well-bracketed control-flow:}
+  %
+  VeriWasm already implements a stack checker that guarantees that all writes to
+  the stack are to local variables, ensuring that the saved return address on the stack
+  cannot be tampered with.
+  %
+  Further, it checks that the stack pointer is restored to its original
+  location at the end of every function, ensuring the saved return address is used.
+
+\item
+
+  \emph{Type-directed forward-edge CFI:}
+  %
+  The dataflow analysis gives us the registers that are initialized when we
+  reach a \cinst{call} instruction, enabling us to check that the input arguments
+  of the target have been initialized.
+  %
+  For example, when we reach \coderef{line:verifier:sample:call} we know that
+  \Asminline{rdi} has the value $\vcinit$.
+  %
+  The type-based CFI analysis tells us that \Asminline{good_func}
+  expects \Asminline{rdi} as an input, so this call is marked as safe.
+
+\item
+
+  \emph{Local state encapsulation:}
+  %
+  To ensure SFI security, VeriWasm checks that no writes are
+  below the current stack frame, ensuring that verified Wasm functions cannot
+  tamper with other frames.
+
+\item
+
+  \emph{Confidentiality:}
+  %
+  We check confidentiality using the information obtained in our dataflow
+  analysis, where the value $\vcinit$ ensures that a value is initialized with a
+  public, non-confidential value.
+  %
+  This enables us to check each of the confidentiality checks encoded in
+  \olangname{} are met: for instance the type-safe forward-edge CFI check
+  described above already ensures each argument is initialized.
+  %
+  In \figref{fig:verifier:sample}, the confidentiality checker will flag
+  \coderef{line:verifier:sample:uninit} as unsafe because \Asminline{r13} still has
+  the value $\vccallee{\mathtt{r13}}$, which potentially contains confidential information
+  leaked from the application.
+\end{CompactEnumerate}
+
+
+\subsection{Proving Wasm secure}
+\label{sec:wasm-proof}
+%
+We prove that compiled and verified Wasm libraries can safely elide springboards and
+trampolines while maintaining integrity and confidentiality, by showing that the
+verified code would not violate the safety monitor.
+%
+Formally, this amounts to showing that Wasm code verified by \verifname{} never
+reaches an $\oerror$ state.
+%
+This allows us to apply \thmref{thm:overlay-integrity-soundness} and
+\thmref{thm:overlay-confidentiality-soundness}.
+%
+It is relatively straightforward (with one exception) to prove that the abstract
+interpretation as described guarantees the necessary safety conditions.
+
+The crucial exception in the soundness proof is when a function calls to other Wasm
+functions.
+%
+We must inductively assume that the called function is safe, i.e.,
+doesn't change any variables in our stack frame, restores callee-save registers,
+etc.
+%
+Unfortunately, a naive attempt does not lead to an inductively well-founded
+argument.
+%
+Instead, we use the overlay monitor's notion of a well-behaved function to
+define a step-indexed logical relation (detailed in
+\iftechreport{\appref{appendix:lr}}{the technical
+appendix~\cite{kolosick2021isolation}}) that captures a semantic notion of
+well-behaved functions (as a relation $\Frel$), and then lift this to a relation
+over an entire Wasm library (as a relation $\Lrel$).
+%
+This gives a basis for an inductively well-founded argument where we can prove
+that, locally, the abstract interpretation gives that each Wasm function is
+semantically well-behaved (is in $\Frel$) and then use this to prove the
+standard fundamental theorem of a logical relation for a whole Wasm library:
+%
+\begin{theorem}[Fundamental Theorem for Wasm Libraries] \label{thm:wasm-in-lrel}
+  For any number of steps $n \in \nats$ and compiled Wasm library $L$,
+  $(n, L) \in \Lrel$.
+\end{theorem}
+%
+\noindent
+This theorem states that every function in a compiled Wasm library,
+when making calls to other Wasm functions or application callbacks, is
+well-behaved with respect to the zero-cost conditions.
+%
+The number of steps is a technical detail related to step-indexing.
+%
+Zero-cost security then follows by adequacy of the logical relation,
+\thmref{thm:overlay-integrity-soundness}, and
+\thmref{thm:overlay-confidentiality-soundness}:
+%
+\begin{theorem}[Adequacy of Wasm Logical Relation] \label{thm:lrel-adequacy}
+  For any number of steps $n \in \nats$, library $L$ such that $(n, L) \in
+  \Lrel$, program $\oc{\Phi_0} \in \programs$ using $L$, and $n' \leq n$, if
+  $\oc{\Phi_0} \ostepn{n'} \oc{\Phi'}$ then $\oc{\Phi'} \neq \oerror$.
+\end{theorem}
+%
+\noindent
+Details of the logical relation and proofs are in
+\iftechreport{\appref{appendix:webassembly}}{the technical
+appendix~\cite{kolosick2021isolation}}.

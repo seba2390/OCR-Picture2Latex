@@ -1,0 +1,490 @@
+\section{Feature Deep-Dives}
+\label{sec:features}
+
+\begin{figure*}[t!]
+    \centering
+    \includegraphics[width=0.75\linewidth]{figures/events}
+    \caption{Job submission event diagram.}
+    \label{fig:submission}
+\end{figure*}
+
+\subsection{Job Submission}
+\label{sec:jobsubmission}
+
+Users submit compiled application archives to create running jobs.  During job
+submission, the platform must:
+
+\begin{enumerate}
+    \item Create an internal logical model of the application by extracting the 
+        graph metadata from the application archive. This logical model is a 
+        graph where each node is an operator and all edges are streams. Some 
+        operators in the logical graph will not execute as literal operators, 
+        as they represent features of the application runtime.
+    \item Transform the logical model based on application features, such as 
+        parallelism or consistent regions.
+    \item Generate a topology model from the logical model. The topology model is 
+        a graph where all of the nodes are executable operators. This process
+        requires turning logical operators that represent application runtime features 
+        into metadata on executable operators.
+    \item Fuse the topology model into PEs. Each PE is an independent 
+        schedulable unit that contains at least one operator. Fusion also 
+        requires creating PE ports: streams between operators that cross PE 
+        boundaries require unique ports. At runtime, these ports will send and 
+        receive data across the network.
+    \item Generate graph metadata for each PE that tells it at runtime how 
+        to connect operators inside and outside of it.
+    \item Schedule and place the PEs across the cluster.
+    \item Track job submission progress.
+\end{enumerate}
+
+\paragraph{Legacy:} Users submitted jobs to the legacy platform through a
+bespoke command line tool or a development environment that communicated with
+the platform over JMX. This process was synchronous and monolithic. The entire
+process would not return until the job was either scheduled and placed, or some
+failure prevented that.
+
+During job submission, PEs were given IDs that were globally unique in the
+instance. A PE's ports were assigned IDs that were unique across that job.
+Upon creation, the topology model was immediately stored in ZooKeeper. The
+manner of its storage was fine-grained: each node and edge was individually
+stored in ZooKeeper. A job's topology model, backed by ZooKeeper, was kept
+around and actively maintained for the lifetime of the job.
+
+\paragraph{Cloud native:} Since jobs are represented as CRDs, users submit new
+jobs through the \code{kubectl apply} command, or programmatically through any
+Kubernetes client.
+
+Figure~\ref{fig:submission} is a job submission event diagram. Note that none of
+the controllers or conductors talk directly to each other: they exclusively
+interact with Kubernetes by creating, modifying or viewing resources. Kubernetes
+then delivers events based on these resources to all listening actors. When the
+job controller receives a new job notification, it executes steps 1--5. The code
+for executing these steps is reused from the legacy platform, with three major
+changes: PE IDs are not globally unique in the instance, but are local to the
+job; PE port IDs are not unique within the job but are local to the PE; and the
+job topology is not stored anywhere. In fact, the job topology is
+discarded once the job controller extracts the metadata and stores it in a local
+context.  Finally, the job controller assigns a job ID and marks it as
+\code{Submitting} by updating the job CRD.
+
+The job controller does not create any resources for the job until it has a
+guarantee that Kubernetes has successfully stored the new ID and job status.  It
+ensures this is true by waiting for the modification notification from
+Kubernetes.  It then uses the job metadata in the local context to start
+creating resources. Note that this local context truly is local and ephemeral.
+If the job controller fails before a job is fully submitted, upon restart, it
+will delete the partially created resources, create a copy of the job CRD,
+delete the original, and create a new job through Kubernetes.  It then goes
+through the submission process again. Rather than trying to save progress along
+the way, it is simpler to lose and delete transitory state and then restart the
+process over again.
+
+That all actors work asynchronously is evident Figure~\ref{fig:submission}'s
+timeline.  But some actions need to happen synchronously, such as pod creation:
+we can only create pods for PEs when we know that all of the other resources
+that pod depends on already exist.  The conductor pattern solves this problem.
+The pod conductor receives creation events for all of the resources that a PE's
+pod needs, and only when all of those resources exist does the pod conductor
+create the pod for that PE.
+
+The job conductor solves a similar problem for job status.  The job submission
+process must report its status to users.  But status is also important
+internally: because of the stateful nature of Streams applications, once a job
+has successfully submitted, simply deleting resources and starting over is no
+longer a viable method for dealing with updates or failures. The job conductor
+tracks the creation status of all resources that comprise a job, and when all
+exist, it commits the job to the \code{Submitted} state by updating the CRD with
+Kubernetes.
+
+\subsection{Scheduling}
+
+SPL allows users to control PE scheduling~\cite{spl_placement}: PEs can
+be colocated, exlocated, run in isolation or assigned to a \emph{hostpool},
+which is an SPL abstraction for a set of hosts. The platform is responsible for
+honoring these constraints while also scheduling the PEs across the cluster in a
+balanced manner.
+
+\paragraph{Legacy:} Since legacy Streams assumes that it owns the cluster, it
+was responsible for scheduling each PE on a host. The scheduler performs a
+finite number of attempts to find suitable hosts for each PE. Each round uses a
+different heuristic for how to favor PE placement. It tries to find a suitable
+host for each PE while honoring the constraints for that PE, and the constraints
+of the PEs already placed on hosts. The default behavior of the scheduler is to
+balance PEs proportional to the number of logical cores on a host while
+considering the PEs already placed from previous jobs.
+
+\paragraph{Cloud native:} As every PE is in its own pod, Kubernetes handles
+scheduling. Our responsibility is to communicate the PE constraints originally
+specified in the SPL application to the Kubernetes pod scheduler. The
+natural solution is through a pod's spec. We map the following existing SPL
+scheduling semantics onto the mechanisms exposed by pod specs:
+
+\emph{Host assignment:} We map the concept of a physical host in legacy Streams
+to a Kubernetes node in cloud native Streams. For PEs that request specific
+node names, we use the \code{nodeName} field in the pod spec.  This mapping is
+natural, but requires justification: in an ideal cloud native environment,
+users should not need to care about what nodes their code runs on. But a
+use-case for legacy Streams still applies in a cloud environment: specific
+nodes may have special capabilities such as hardware acceleration that PEs
+require.
+
+SPL also has the concept of a tagged hostpool: PEs do not request a specific
+host, but rather any from a set of hosts with a specific tag. The concept of
+tags maps directly to Kubernetes labels, which we can use with the
+\code{nodeAffinity} option in a pod's \code{affinity} spec.
+
+% SPACE_CUT_START
+%Assume that the tag for a hostpool is \code{source}, and that a Streams admin
+%has applied the label \code{streams.ibm.com/hostpool=source} to a node in the
+%cluster. Then we can ensure that PE in this hostpool will be scheduled correctly
+%by specifying a key of \code{streams.ibm.com/hostpool} and a value of
+%\code{source} in the match expressions for node selection in the
+%\code{nodeAffinity} spec.
+% SPACE_CUT_END
+
+\emph{Colocation:} PEs request colocation with other PEs through using a
+common token. They don't care about what host they run on, as long as they are
+scheduled with other PEs that specify that token. We can achieve the same
+scheduling semantics using pod labels and \code{podAffinity} in the pod spec:
+generate a unique Kubernetes label for each token in the application, and
+specify that label in \code{podAffinity} in the pod spec. Together, both halves
+implement the full semantics: \code{podAffinity} ensures that this PE
+is scheduled on the same node as PEs with the same label, and the label
+ensures that all other PEs with matching affinity are scheduled with this PE.
+
+
+% SPACE_CUT_START
+% NOTE: the paragraph above incorporated some of the below. Re-editing is 
+%       necessary to re-incorporate.
+%
+%Assume that PEs have requested colocation using the token \code{together}. In
+%the pod spec for the PE, we specify the label
+%\code{streams.ibm.com/hostcolocation.\$hash(together): together}. Note that
+%\code{\$hash(together)} refers to the hash of the token \code{together}. In our
+%implementation, we use SHA-1. This scheme is a compromise: in SPL, the token can
+%be any arbitrary string, including spaces and special characters. In Kubernetes,
+%labels have a stricter format~\cite{kubelabels}. PEs may have multiple
+%colocation labels, so we need to add something to \code{hostcolocation.} to
+%ensure this label is unique. Rather than using the literal token itself, we hash
+%it because 48 characters of the name budget are used by specifying that this
+%label is for a host colocation. We use the literal token provided at the SPL
+%level as the value, meaning that we have a minor incompatability with some
+%existing Streams applications. In practice, however, we have observed that
+%users' tokens already conform to that format.
+%
+%The other half of colocation is through \code{podAffinity} in the pod spec. We
+%specify a key of \code{streams.ibm.com/hostcolocation.\$hash(together)} and a
+%value of \code{together} as the match expression in the label selector for
+%\code{podAffinity}. Together, both halves implement the full semantics: the
+%\code{podAffinity} spec ensures that this PE is scheduled on the same node as
+%all PEs that have the same label, and the label ensures that all other PEs with
+%a matching affinity are scheduled with this PE.
+% SPACE_CUT_END
+
+\emph{Exlocation:} PEs request exlocation from other PEs through a common token.
+All PEs which exlocate using the same token will run on different hosts. We
+achieve these semantics in Kubernetes by using the same scheme as with
+colocation, except we use \code{podAntiAffinity} in the pod spec.
+
+\emph{Isolation:} PEs can request isolation from other PEs, but pod specs do not
+have a single equivalent mechanism. However, note that requesting isolation from
+all other PEs is semantically equivalent to requesting exlocation from each PE
+individually, using a unique token for each pairing. We further note that
+exlocation is symmetric and transitive. It is symmetric because if two PEs are
+exlocated from each other, they both must have requested exlocation with the
+same token. And it is transitive because if \emph{A} is exlocated from \emph{B},
+and \emph{B} is exlocated from \emph{C}, then \emph{A} must be exlocated from
+\emph{C}. However, the \code{podAntiAffinity} spec is not symmetric: if pod
+\emph{A} specifies anti-affinity to \emph{B}, that does not require \emph{B} to
+specify anti-affinity to \emph{A}. Because the pod relationship is not
+symmetric, we avoid transitivity. From this insight we can build PE isolation
+through pod labels and \code{podAntiAffinity}.  For each isolation request in a
+job, create a unique label. We apply this label to each PE's pod spec, except
+for the PE that requested isolation. For the requesting PE, we use
+\code{podAntiAffinity} against that label.
+
+% SPACE_CUT_START
+% NOTE: the below is a longer version of the last two sentences.
+%
+%For each isolation request in a job, we create a unique label with the format
+%\code{streams.ibm.com/hostisolation.\$hash(name)} where \code{\$hash(name)} is a
+%hash of the SPL operator name in the PE that requested isolation. The value of
+%the label is a sanitized version of \code{name} that obeys the Kubernetes label
+%restrictions. We apply this label to the pod for each PE in the job, except for
+%the pod for the PE that requested isolation. For the requesting PE, we use
+%\code{podAntiAffinity} against that label.
+% SPACE_CUT_END
+
+\subsection{Parallel Region Updates}
+\label{sec:parupdates}
+
+SPL allows developers to annotate portions of their stream graph as
+\emph{parallel regions}~\cite{spl_parallel}. Parallel expansion during job
+submission replicates all of the operators in such regions, and the
+runtime partitions tuples to different replicas to improve tuple processing
+throughput through data parallelism.
+
+Users can dynamically change the width of a parallel region, growing or
+shrinking the number of replicas. The platform will restart all PEs with
+operators in the parallel region, and all PEs with operators that communicate
+directly with them. (The PE runtime cannot dynamically its stream graph, so we
+must restart them to apply changes.) However, all other operators in the
+application should stay up. If we did not need to keep the operators outside of
+the parallel region running, we could trivially achieve a parallel region
+update by re-submitting the job with the new width and restarting everything.
+The process to find which operators to add, remove and modify is:
+
+\begin{enumerate}
+    \item Re-generate the logical and topology model of the application with the 
+        original parallel width.
+    \item Generate the logical and topology model of the application with the 
+        new parallel width.
+    \item Perform a diff of the selected parallel region across both topology models, 
+        figuring out which operators were added, removed or changed.
+    \item Graft the target parallel region from the topology model with the new width
+        into the original model.
+    \item Re-index all of the operators and streams in the parallel region as 
+        necessary to maintain consistency with the original topology model.
+\end{enumerate}
+
+After determining the affected operators, the platform is responsible for
+figuring out how to add, remove or restart the PEs with them.
+
+\paragraph{Legacy:} Users changed the parallel width for a region in a running
+job through either a command line tool or a development environment connected
+with the platform over JMX.
+
+The legacy Streams platform was not designed for dynamic job topology changes.
+But two key design details made it particularly difficult: PE IDs are unique
+within the instance, and PE port IDs are unique within the job. As a result,
+dynamic changes cannot go through the same code path as job submissions.  Trying
+to do so would result in assigning new IDs to unchanged PEs and ports, which
+would require restarting them. Instead, the legacy platform goes through a
+separate process for dynamic updates where only the changed operators are
+considered for fusion, scheduling and placement.
+
+\paragraph{Cloud native:} Kubernetes was designed for dynamic updates; updating
+a resource is a standard operation. We take advantage of this design because we
+represent parallel regions as CRDs. Users can edit the parallel region CRD's
+width through \code{kubectl} or a Kubernetes client. The parallel region
+controller will then receive the modification notification.
+
+In cloud native Streams, PE IDs are local to the job, and PE port IDs are local
+to the PE. For example, if a Streams job has two PEs, their IDs are always 0 and
+1. If a PE has a single input port, its ID is always 0. If a PE has $n$ output
+ports, an additional output port will always be output port $n$. This
+deterministic naming also means that it is necessarily hierarchical: in order to
+refer to a particular PE, we must also refer to its job, and in order to refer
+to a particular port, we must also refer to its PE.  We store this graph
+metadata in the \code{ConfigMap} for each PE's pod, and at runtime, PEs use this
+graph metadata to establish connections between each other.
+
+This seemingly minor design point allows us to greatly simplify parallel region
+updates: the parallel region controller simply feeds the topology model from
+step 5 into the normal job submission process through the job coordinator.  Our
+job submission process is generation-aware: each generation gets a
+monotonically increasing generation ID. We also do not blindly create
+resources, but instead use the create-or-replace model where if we try to
+create a resource that already exists, we instead modify it.  When the parallel
+region controller initiates a new generation for a job, the \code{ConfigMap}s
+for the PEs which should not be restarted will have identical graph metadata as
+before, due to our deterministic naming scheme.  The pod conductor remains
+active, even after a successful job submission. It will receive modification
+notifications for these \code{ConfigMap}s for each PE.  If the graph metadata
+is identical to the previous generation, it will update the generation ID for
+the pod, and take no further action. If the graph metadata is different, it
+will initiate a pod restart through a causal chain.
+
+\subsection{Import/Export}
+
+SPL provides a pub/sub mechanism between jobs in the same instance through the
+\code{Import} and \code{Export} operators~\cite{spl_import, spl_export}. These
+operators allow users to construct microservices out of their applications: they
+are loosely connected, can be updated independently and the platform is
+responsible for resolving subscriptions. A common pattern we have seen in
+production is users will deploy an ingest application for first-level parsing.
+It publishes tuples through an \code{Export} operator, and various analytic
+applications subscribe via their \code{Import} operators. The ingest application
+always runs, while the analytic applications can vary from always running
+to quick experiments.
+ 
+The three actors in this pub/sub system are:
+\begin{enumerate}
+    \item \code{Export} operator. Publishes its input stream through a name 
+        or a set of properties.
+    \item \code{Import} operator. Subscribes to a stream based on its name or 
+        a set of properties. Stream content can also be filtered on tuple 
+        attributes using a filter expression.
+    \item Subscription broker. Part of the platform, it's responsible for discovering 
+        matches between \code{Import} and \code{Export} operators during job 
+        submission and notifying PEs to establish new connections.
+\end{enumerate}
+
+\paragraph{Legacy:} Upon job submission, the platform creates states for all
+\code{Import} and \code{Export} operators found in the job's graph metadata and
+stores them in ZooKeeper. It then invokes the subscription broker to compute new
+available routes and send route update notifications to the relevant PEs.  Users
+can modify subscriptions at runtime either programmatically in an application
+through SPL and native language APIs, through a command line tool, or through
+dashboards.  Changes are relayed to the subscription broker through the platform
+using the JMX protocol. Upon reception of such modifications, the subscription
+broker reevaluates possible import and export matches and sends
+route updates to the relevant PEs.
+
+\paragraph{Cloud native:} We represent \code{Import} and \code{Export} operators
+as CRDs.  During job submission, each instance of such an operator in an
+application becomes a separate CRD. Users can update subscription properties by
+editing the CRD itself. The subscription broker is a conductor that
+observes events on both import and export CRDs. It maintains a local
+subscription board, and when it discovers a match, it notifies the relevant PE.
+Note that this subscription board is local state that can be lost: upon restart,
+the subscription broker will reconstruct it based on re-receiving all
+notifications from Kubernetes.  The PEs ignore any redundant subscription
+notifications.
+
+We replaced the JMX interface with a REST service endpoint (see
+\S~\ref{sec:coupling}), periodically polled by the PEs to watch for
+changes. We replace the synchronous JMX notification with a loosely coupled UDP
+notification from the subscription broker to the PEs.  Alterations to the
+import and export states from the application are also done
+through the REST service. This service and the import and export
+controllers are concurrent agents. To avoid race conditions, the REST service
+uses the import and export coordinators for state changes.
+
+\subsection{Consistent Regions}
+\label{sec:consistentregion}
+
+Streams provides application-level fault-tolerance through \emph{consistent
+regions}~\cite{consistent_regions}. A consistent region is a region of an
+application which guarantees at-least-once tuple processing.  The \emph{job
+control plane} (JCP) periodically coordinates a consistent checkpointing protocol
+where operators checkpoint their local state upon seeing special punctuations in their
+streams. The checkpoints are stored in highly available external storage, such
+as RocksDB or Redis. The JCP is composed of:
+
+\begin{enumerate}
+    \item A job-wide coordination system that orchestrates the consistency
+        protocol across the job's consistent regions using a finite-state machine.
+    \item A runtime interface embedded in each PE that interacts with the 
+        coordination system in the JCP.
+\end{enumerate}
+
+When a PE fails or a PE-to-PE connection drops, the JCP initiates
+rollback-and-recovery: failed PEs restart, all PEs instruct their operators to
+rollback state to the last known-good checkpoint, and sources resend all tuples
+whose resultant state was lost during the rollback.
+
+\paragraph{Legacy:} The JCP coordination system is implemented as an SPL
+operator~\cite{JCPOperator} with a Java backend and uses a JMX message bus.
+Once instantiated, this operator registers itself with the platform as a JMX
+service endpoint. Similarly, PEs that are part of a consistent region bootstrap
+their JCP runtime interface at startup.  This interface also registers itself as
+a JMX endpoint with the platform.  The platform is a message broker between the
+JCP coordination system and the runtime interfaces of the PEs.  Checkpointing is
+configured at the job level and the configurations are pushed to the PEs during
+instantiation. Each checkpointing option has a bespoke configuration system that
+must be determined manually by the Streams user or administrator. Life cycle
+events, such as PE failure, are handled by the platform and forwarded to the JCP
+coordination system.  Lastly, the coordination system implements its own fault
+tolerance by storing its internal state in ZooKeeper. The storage configuration
+must be determined by the user and manually set as an application parameter. For
+instance, when using Redis, users must manually specify the names of shards and
+replication servers~\cite{streamsredis}.
+
+\paragraph{Cloud native:} We did not change the consistent region protocols, as
+they are application-level. We also did not try to use Kubernetes CRDs to store
+operator checkpoints: they will be of an arbitrary number and size, and we
+wanted to maintain a clear separation between platform and application concerns.
+
+However, we did address architectural inefficiencies by applying the loose
+coupling principles (\S~\ref{sec:coupling}).  We moved the JCP coordination
+system into its own Kubernetes operator, which avoids making the instance
+operator the message broker between the JCP runtime and coordination system. At
+submission time, the instance operator creates a consistent region operator for
+each consistent region in a job. The consistent region operator monitors
+resource events through controllers and conductors. It also manages its own CRD,
+\code{ConsistentRegion}, used to persist internal states.
+
+We no longer rely on a JMX message bus because Kubernetes serves that purpose:
+controllers and conductors receive resource event notifications from Kubernetes.
+The consistent region operator subscribes to pod life cycle events, PE
+connectivity and consistent region state change events.  In the current version
+we use a REST service to propagate consistent region changes to PEs. PEs also
+use this service to notify both the instance operator and the consistent region
+operator of connectivity and consistent region state changes.
+
+As an example of our composability design goal (\S~\ref{sec:arch}), we
+automatically configure checkpoint storage. To use Redis with cloud native
+Streams, users specify a Redis cluster's service name.  The instance operator
+discovers all available servers in that cluster through the service's DNS record
+and automatically computes the appropriate configuration.
+
+\subsection{System Tests}
+
+Streams relies on over 2,400 application system tests for the development and
+release cycle. Accumulated from a decade of product development, each test uses
+at least one SPL application. The tests cover integration and regression testing
+for all core Streams application features. They are split into two major
+categories: those which require the distributed platform, and those that do not.
+The tests which do not require the distributed platform execute the application
+in a single PE, running in a normal Linux process. These tests primarily focus
+on the correctness of the compiler, application runtime semantics, and operators
+from the standard library. The tests which do require the distributed platform
+test many of the application features covered in this paper: PE-to-PE
+communication, metrics, consistent regions, parallel regions and any sort of
+application behavior which requires non-trivial interaction with its external
+environment. The test which require the distributed platform use multiple PEs (up 
+to hundreds) and some use multiple SPL applications.
+
+Tests are organized in scenarios containing a list of steps to perform,
+environment variables to use, and context tags to honor. Context tags are
+descriptors used by the test harness driver to determine the appropriate node
+the test must run on, attributes such as the operating system version or whether
+the node must be equipped with a network accelerator.
+
+A variety of test steps are available, ranging from moving files around to
+randomly killing critical processes. Test success or failures are determined
+using special steps called probes that wait for the system to reach a particular
+state to complete, such as waiting for a job to be in the \code{Submitted}
+state, or waiting for all the processing elements of a job to be in the
+\code{Connected} state.
+
+\paragraph{Legacy:} In order to operate with legacy Streams, our system test
+framework must be pre-installed on the target cluster. The target node names
+must be known and collected in the framework's configuration files. The cluster
+must also have a specific file system layout and sharing configuration in order
+for tests expecting shared files to operate. The version of IBM Streams
+being tested must be available at the same place in the file hierarchy to all
+nodes in the cluster. If the test application writes or reads files, those 
+files must be available over a Network File System.
+
+\paragraph{Cloud native:} Similar to our platform itself, we organize the system
+we use to test it around Kubernetes operators and CRDs. We define a
+\code{TestSuite} CRD which maintains five lists of tests: pending, running,
+passed, failed and aborted. It also maintains testing parameters such how to
+select tests to run, how many tests to run concurrently, how many failures to
+tolerate before stopping a run, and what to do with testing artifacts.  Users
+initiate a new test run by creating a \code{TestSuite} CRD which specifies which
+tests to run. The \code{TestSuite} controller will select $N$ tests to go on the
+running list, where $N$ is the concurrency number. The remaining tests that meet
+the selection criteria go on the pending list. The \code{TestSuite} controller
+then creates a pod for each test on the running list.  When a test pod finishes,
+the pod controller uses a \code{TestSuite} coordinator to indicate test success
+or failure. The coordinator computes how the test lists should be modified,
+creates a new pod for the next test on the pending list, and finally updates the
+CRD itself to match the computed test lists.  This process repeats until the
+pending list is empty, or the failed and aborted list exceed the failure
+threshold.
+
+The \code{TestSuite} controllers run in a test harness Kubernetes operator. This
+test harness architecture enjoys all the benefits of being cloud native. It can
+run on any Kubernetes cluster; it does not require any system-specific
+configuration except node labels to expose available hardware accelerators; it
+makes testing for a specific operating system version irrelevant as both cloud
+native Streams and the test framework are distributed as container images; it
+makes test run completely discoverable through the use of the \code{TestSuite}
+CRD; it is resilient to failures because all important state is stored in the
+CRD; and test runners and test executions can be monitored like any other pods
+in the cluster with standard tools like Prometheus and Grafana. Finally, the
+harness operator is blind to the kind of test runners it creates as from its
+perspective it only manipulate pods and their execution states.

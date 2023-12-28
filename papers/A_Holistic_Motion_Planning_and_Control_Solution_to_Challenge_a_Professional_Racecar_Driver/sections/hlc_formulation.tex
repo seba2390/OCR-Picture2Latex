@@ -1,0 +1,66 @@
+
+\subsection{Trajectory Optimization (TRO)}
+\label{sec:traj_opt}
+
+Given the vehicle model and the constraints, we now focus on the higher level controllers. First the offline track-level trajectory optimization is described. Following \cite{vazquez2020optimization}, we transform the continuous time dynamics \eqref{eq:dynamics} into the spatial domain, with progress $s$ as the running variable instead of time $t$. This transformation can be achieved as follows, 
+\begin{align}
+\label{eq:spatialdomain}
+\begin{split}
+&\mathbf{\dot{\tilde{x}}} = \frac{\partial \mathbf{\tilde{x}}}{\partial t} = \frac{\partial \mathbf{\tilde{x}}}{\partial s}\frac{\partial s}{\partial t}\,, \\
+& \Rightarrow \frac{\partial \mathbf{\tilde{x}}}{\partial s} = \frac{1}{\dot{s}}f^c_t(\mathbf{\tilde{x}}(s),\mathbf{u}(s))  = f^c_s(\mathbf{\tilde{x}}(s),\mathbf{u}(s)) \,,
+\end{split}
+\end{align}
+where $f^c_s(\mathbf{\tilde{x}}(s),\mathbf{u}(s))$ is the continuous space model. This transformation also makes the $s$ state redundant allowing us to reduce the state to $\mathbf{x} = [n,\mu,v_x,v_y,r,F_M,\delta]^T$.
+
+To formulate the track-level optimization problem, we use the center line reference path and discretize the continuous space model $f^c_s(\mathbf{{x}}(s),\mathbf{u}(s))$. An Euler forward integrator, with discretization $\Delta s$ is used, resulting in the discrete space system $\mathbf{{x}}_{k+1} = f_s^d(\mathbf{{x}}_k, \mathbf{u}_k) = \mathbf{{x}}_k + \Delta s f_s^c({{x}}_k,\mathbf{u}_k)$.
+For racing, it is necessary to optimize for a periodic trajectory. Thus, we add a periodicity constraint $f_s^d(\mathbf{{x}}_N, \mathbf{u}_N) = \mathbf{{x}}_{0} $, where $N$ is the number of discretization steps.
+
+The cost function seeks to maximize the progress rate $\dot{s}$, and also contains two regularization terms - a slip angle cost and a penalty on the input rates. The slip angle cost penalizes the difference between the kinematic and dynamic side slip angles as $B(\mathbf{{x}}_k) = q_\beta(\beta_{\rm{dyn},k} - \beta_{\rm{kin},k})^2$,
+where $q_\beta > 0$ is a weight, $\beta_{\rm{kin},k} = \arctan (\delta_k l_R /(l_F + l_R))$, and $\beta_{\rm{dyn},k} = \arctan (v_{y,k} / v_{x,k})$. The regularizer on the input rates is $\mathbf{u}^T R \mathbf{u}$, where $R$ is a diagonal weight matrix with positive weights. In summary, the overall cost function is, 
+\begin{equation}
+\label{eq:tro_cost}
+    J_{\rm{TRO}}(\mathbf{{x}}_k, \mathbf{u}_k) = -\dot{s}_k + \mathbf{u}^T R \mathbf{u} + B(\mathbf{{x}}_k) \,.
+\end{equation}
+Note that we introduced a new cost function compared to \cite{vazquez2020optimization}, which minimized the time. Our new cost function is nearly identical to the one used in the MPC-Curv motion planner (\cref{sec:mpc}), which makes tuning easier, and better aligns the solutions of the two levels.  
+
+Finally, we combine the cost, model and model related constraints from \cref{sec:constraints}, to formulate the trajectory optimization problem,
+\begin{equation}
+\begin{aligned}
+& \underset{\mathbf{{X}},\mathbf{U}}{\text{min}}
+    && \sum_{k=0}^{N} J_{\rm{TRO}}(\mathbf{{x}}_k, \mathbf{u}_k) \\
+& \; \text{s.t.}
+    && \mathbf{{x}}_{k+1} = f_s^d(\mathbf{{x}}_k, \mathbf{u}_k)\,,\\
+&&& f_s^d(\mathbf{{x}}_N, \mathbf{u}_N) = \mathbf{{x}}_{0} \,,\\
+&&& \mathbf{{x}}_k \in \mathcal{X}_{\text{Track}}, \quad \mathbf{{x}}_k \in \mathcal{X}_{\text{FE}} \,,\\
+&&& \mathbf{a}_k \in \mathcal{A}, \quad k = 0,...,N \,,
+\label{eq:TRO}
+\end{aligned}
+\end{equation}
+where $\mathbf{{X}} = [\mathbf{{x}}_0,...,\mathbf{{x}}_N]$ and $\mathbf{{U}} = [\mathbf{{u}}_0,...,\mathbf{{u}}_N]$. The problem is formulated using \emph{CppAD} \cite{CppAD} and solved using \emph{Ipopt} \cite{ipopt}.
+
+\subsection{MPC-Curv}
+\label{sec:mpc}
+We use MPC-Curv to follow the trajectory from TRO. Since the objectives of TRO and MPC-Curv are similar, we reuse large parts of the formulation, including the progress rate maximization. However, since the MPC-Curv problem is solved online, a few changes are necessary - first, we use the time-domain model since it is better suited for online control (see \cite{vazquez2020optimization} for a discussion). Second, since MPC-Curv has a limited prediction horizon, we use the TRO solution for long term guidance. This is done in two ways - first a regularization cost on the lateral deviation $n$ from the TRO path and more importantly a terminal velocity constraint to notify MPC-Curv about upcoming braking spots beyond the prediction horizon. 
+
+To formulate the MPC-Curv problem, we first reduce the state to $\mathbf{x} = [n,\mu,v_x,v_y,r,F_M,\delta]^T$. We use the initial guess of $s$ to evaluate all quantities depending on $s$ such as the curvature $\kappa(s)$ outside the MPC, and hence the $s$-state decouples. Second, we discretize the model using a second order Runge Kutta method, resulting in $f_t^d(\mathbf{x}_t, \mathbf{u}_t)$. In order to decouple the prediction horizon in terms of steps and time, we discretize the system with a sampling time different from the update frequency of the controller. We introduce this as a time scaling factor $\sigma$ which multiplies the sampling time of our controller. Note that this requires interpolating the previous optimal solution to get an initial guess, but at the same time allows to predict further in time with the same horizon in steps. This allows us to run MPC-Curv with higher update rates.
+
+The MPC-Curv cost function is identical to the TRO \eqref{eq:tro_cost}, with the addition of a path following cost on $n$, 
+\begin{equation}
+J_{\rm{MPC}}(\mathbf{{x}_t}, \mathbf{u}_t) = -\dot{s}_t + q_n n_t^2 + \mathbf{u}^T R \mathbf{u} + B(\mathbf{x}_t) \,,\\
+\end{equation}
+where $q_n$ is a positive regularization weight. Thus, we can now formulate the MPC-Curv problem, 
+
+\begin{equation}
+\label{eq:MPC}
+\begin{aligned}
+& \underset{\mathbf{X}, \mathbf{U}}{\text{min}}
+    && \sum_{t=0}^{T} J_{\rm{MPC}}(\mathbf{x}_t, \mathbf{u}_t) \\
+& \; \text{s.t.}
+    && \mathbf{x}_0 = \mathbf{\hat{x}}\,,\\
+    &&& \mathbf{x}_{t+1} = f_t^d(\mathbf{x}_t, \mathbf{u}_t) \,,\\
+&&& \mathbf{{x}}_t \in \mathcal{X}_{\text{Track}}, \quad \mathbf{{x}}_t \in \mathcal{X}_{\text{FE}} \,,\\
+&&& \mathbf{a}_t \in \mathcal{A}, \quad v_{x,T} \leq \bar{V}_{x}(s_T)\,, \\
+&&& t = 0,...,T\,,
+\end{aligned}
+\end{equation}
+where the subscript $t$ is used to highlight that the problem is formulated in the time domain, and $T$ is the prediction horizon. Further, $\mathbf{\hat{x}}$ is the current curvilinear state estimate and $v_{x,T} \leq \bar{V}_{x}(s_T)$ the terminal constraint from the TRO solution. The optimization problem is solved using ForcesPro \cite{FORCESPro,FORCESNLP}.

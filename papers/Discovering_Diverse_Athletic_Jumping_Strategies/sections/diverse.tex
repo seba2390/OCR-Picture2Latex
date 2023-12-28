@@ -1,0 +1,88 @@
+\section{LEARNING DIVERSE STRATEGIES}
+\label{sec:diverse}
+Given a virtual environment and a task objective, we would like to discover as many strategies as possible to complete the task at hand. Without human insights and demonstrations, this is a challenging task. To this end, we propose a two-stage framework to enable stochastic DRL to discover solution modes such as the Fosbury flop.
+
+The first stage focuses on strategy discovery by exploring the space of initial states. For example in high jump, the Fosbury flop technique and the straddle technique require completely different initial states at take-off, in terms of the approaching angle with respect to the bar, the take-off velocities, and the choice of inner or outer leg as the take-off leg. A fixed initial state may lead to success of one particular strategy, but can miss other drastically different ones. We systematically explore the initial state space through a novel sample-efficient Bayesian Diversity Search (BDS) algorithm to be described in Section~\ref{sec:methods-bayesian-diversity-search}.
+
+The output of Stage 1 is a set of diverse motion strategies and their corresponding initial states. Taken such a successful initial state as input, we then apply another pass of DRL learning to further explore more motion variations permitted by the same initial state. The intuition is to explore different local optima while maximizing the novelty of the current policy, compared to previously found ones. We describe our detailed settings for the Stage 2 novel policy seeking algorithm in Section~\ref{sec:methods-phase2}.
+
+\subsection{Stage 1: Initial States Exploration with Bayesian Diversity Search}\label{sec:methods-bayesian-diversity-search}
+
+In Stage 1, we perform diverse strategy discovery by exploring initial state variations, such as pose and velocity variations, at the take-off moment. We first extract a feature vector $f$ from a motion trajectory to characterize and differentiate between different strategies. A straightforward way is to compute the Euclidean distance between time-aligned motion trajectories, but we hand pick a low-dimensional visually-salient feature set as detailed in Section~\ref{sec:Experiments-Strategy-Features}. We also define a low-dimensional exploration space $\mathcal{X}$ for initial states, as exploring the full state space is computationally prohibitive. Our goal is to search for a set of representatives $X_n = \{x_1, x_2, ..., x_n | x_i \in \mathcal{X}\}$, such that the corresponding feature set $F_n= \{f_1, f_2, ..., f_n | f_i \in \mathcal{F}\}$ has a large diversity. Note that as DRL training and physics-based simulation are involved in producing the motion trajectories from an initial state, the computation of $f_i=g(x_i)$ is a stochastic and expensive black-box function. We therefore design a sample-efficient Bayesian Optimization (BO) algorithm to optimize for motion diversity in a guided fashion.
+
+Our BDS (Bayesian Diversity Search) algorithm iteratively selects the next sample to evaluate from $\mathcal{X}$, given the current set of observations $X_t = \{x_1, x_2, ..., x_t\}$ and $F_t = \{f_1, f_2, ..., f_t\}$. More specifically, the next point $x_{t+1}$ is selected based on an acquisition function $a(x_{t+1})$ to maximize the diversity in $F_{t+1}=F_t \cup \{f_{t+1}\}$. We choose to maximize the minimum distance between $f_{t+1}$ and all $f_i \in F_t$:
+\begin{equation}\label{eq:diversity-objective}
+    a(x_{t+1}) = \min_{f_i \in F_t}{||f_{t+1} - f_i||} .
+\end{equation}
+Since evaluating $f_{t+1}$ through $g(\cdot)$ is expensive, we employ a surrogate model to quickly estimate $f_{t+1}$, so that the most promising sample to evaluate next can be efficiently found through Equation~\ref{eq:diversity-objective}.
+
+We maintain the surrogate statistical model of $g(\cdot)$ using a Gaussian Process (GP) \cite{rasmussen2003gaussian-process}, similar to standard BO methods. A GP contains a prior mean $m(x)$ encoding the prior belief of the function value, and a kernel function $k(x,x')$ measuring the correlation between $g(x)$ and $g(x')$. More details of our specific $m(x)$ and $k(x,x')$ are given in Section~\ref{sec:Experiments-GP-Priors-Kernels}. Hereafter we assume a one-dimensional feature space $\mathcal{F}$. Generalization to a multi-dimensional feature space is straightforward as multi-output Gaussian Process implementations are readily available, such as \cite{GPflow2020multioutput-gp}. Given $m(\cdot)$, $k(\cdot, \cdot)$, and current observations $\{X_t, F_t\}$, posterior estimation of $g(x)$ for an arbitrary $x$ is given by a Gaussian distribution with mean $\mu_{t}$ and variance $\sigma^2_{t}$ computed in closed forms:
+\begin{equation}\label{eq:gp-mu-sigma}
+    \begin{gathered}
+        \mu_{t}(x) = k(X_t, x)^T (K + \eta^{2} I)^{-1} \left(F_t - m(x)\right) + m(x), \\
+        \sigma_{t}^{2}(x) = k(x, x) + \eta^{2} - k(X_t, x)^T(K + \eta^{2}I)^{-1} k(X_t,x) ,
+    \end{gathered}
+\end{equation}
+where $X_t \in \mathbb{R}^{t \times \text{dim}(\mathcal{X})}$, $F_t \in \mathbb{R}^{t}$, $K \in \mathbb{R}^{t \times t}, K_{i,j} = k(x_{i}, x_{j})$, and $k(X_t, x) = [k(x,x_{1}),k(x,x_{2}),...k(x,x_{t})]^T$. $I$ is the identity matrix, and $\eta$ is the standard deviation of the observation noise. Equation~\ref{eq:diversity-objective} can then be approximated by
+\begin{equation}\label{eq:diversity-approximation}
+    \hat{a}(x_{t+1}) = \mathbb{E}_{\hat{f}_{t+1} \sim \mathcal{N}(\mu_t(x_{t+1}), \sigma^2_t(x_{t+1}))}\left[\min_{f_i \in F_t}{||\hat{f}_{t+1} - f_i||}\right] .
+\end{equation}
+Equation~\ref{eq:diversity-approximation} can be computed analytically for one-dimensional features, but gets more and more complicated to compute analytically as the feature dimension grows, or when the feature space is non-Euclidean as in our case with rotational features. Therefore, we compute Equation~\ref{eq:diversity-approximation} numerically with Monte-Carlo integration for simplicity.
+
+The surrogate model is just an approximation to the true function, and has large uncertainty where observations are lacking. Rather than only maximizing the function value when picking the next sample, BO methods usually also take into consideration the estimated uncertainty to avoid being overly greedy. For example, GP-UCB (Gaussian Process Upper Confidence Bound), one of the most popular BO algorithms, adds a variance term into its acquisition function. Similarly, we could adopt a composite acquisition function as follows: 
+\begin{equation}\label{eq:diversity-ucb}
+    a'(x_{t+1}) = \hat{a}(x_{t+1}) + \beta\sigma_t(x_{t+1}),
+\end{equation}
+where $\sigma_t(x_{t+1})$ is the heuristic term favoring candidates with large uncertainty, and $\beta$ is a hyperparameter trading off exploration and exploitation (diversity optimization in our case). Theoretically well justified choice of $\beta$ exists for GP-UCB, which guarantees optimization convergence with high probability \cite{GP-bandit}. However in our context, no such guarantees hold as we are not optimizing $f$ but rather the diversity of $f$, the tuning of the hyperparameter $\beta$ is thus not trivial, especially when the strategy evaluation function $g(\cdot)$ is extremely costly. To mitigate this problem, we decouple the two terms and alternate between exploration and exploitation following a similar idea proposed in \cite{alternative-explore-exploit}. During exploration, our acquisition function becomes:
+\begin{equation}\label{eq:explore-acquisition}
+    a_\text{exp}(x_{t+1}) = \sigma_t(x_{t+1}).
+\end{equation}
+The sample with the largest posterior standard deviation is chosen as $x_{t+1}$ to be evaluated next:
+\begin{equation}\label{eq:explore-formula-2}
+    x_{t+1} = \mathop{\arg\max}\limits_{x}\sigma_t(x).
+\end{equation}
+Under the condition that $g(\cdot)$ is a sample from GP function distribution $\mathcal{GP}(m(\cdot), k(\cdot,\cdot))$, Equation~\ref{eq:explore-formula-2} can be shown to maximize the Information Gain $I$ on function $g(\cdot)$:
+\begin{equation}\label{eq:explore-formula-1}
+    x_{t+1} = \mathop{\arg\max}\limits_{x}I\left(X_t \cup \{x\}, F_t \cup \{g(x)\} ; g\right),
+\end{equation}
+where $I(A;B)=H(A)-H(A|B)$, and $H(\cdot)=\mathbb{E}\left[-\log p(\cdot)\right]$ is the Shannon entropy \cite{information-theory}. 
+
+We summarize our BDS algorithm in Algorithm~\ref{algorithm::BDS}. The alternation of exploration and diversity optimization involves two extra hyperparameters $N_\text{exp}$ and $N_\text{opt}$, corresponding to the number of samples allocated for exploration and diversity optimization in each round. Compared to $\beta$ in Equation~\ref{eq:diversity-ucb}, $N_\text{exp}$ and $N_\text{opt}$ are much more intuitive to tune. We also found that empirically the algorithm performance is insensitive to the specific values of $N_\text{exp}$ and $N_\text{opt}$. The exploitation stage directly maximizes the diversity of motion strategies. We optimize $\hat{a}(\cdot)$ with a sampling-based method DIRECT (Dividing Rectangle) \cite{Jones2001-DIRECT}, since derivative information may not be accurate in the presence of function noise due to the Monte-Carlo integration. This optimization does not have to be perfectly accurate, since the surrogate model is an approximation in the first place. The exploration stage facilitates the discovery of diverse strategies by avoiding repeated queries on well-sampled regions. We optimize $a_\text{exp}(\cdot)$ using a simple gradient-based method L-BFGS \cite{LBFGS}.
+
+\begin{algorithm}[t]
+\caption{Bayesian Diversity Search}\label{algorithm::BDS}
+\KwIn{Strategy evaluation function $g(\cdot)$, exploration count $N_\text{exp}$ and diversity optimization count $N_\text{opt}$, total sample count $n$.}
+\KwOut{Initial states $X_n = \{x_1, x_2, ..., x_n\}$ for diverse strategies.}
+$t=0$; $X_0 \leftarrow \varnothing$; $F_0 \leftarrow \varnothing$\;
+Initialize GP surrogate model with random samples\;
+\While{$t < n$}
+{
+\eIf{$t \% (N_\text{exp} + N_\text{opt}) < N_\text{exp}$}
+{
+$x_{t+1} \leftarrow \mathop{\arg\max}a_\text{exp}(\cdot)$ by L-BFGS; 
+\tcp*[f]{Equation~\ref{eq:explore-acquisition}}
+}
+{
+$x_{t+1} \leftarrow \mathop{\arg\max}\hat{a}(\cdot)$ by DIRECT; \tcp*[f]{Equation~\ref{eq:diversity-approximation}}
+}
+$f_{t+1} \leftarrow g(x_{t+1})$\; 
+$X_{t+1} \leftarrow X_t \cup \{x_{t+1}\}$; $F_{t+1} \leftarrow F_t \cup \{f_{t+1}\}$\;
+Update GP surrogate model with $X_{t+1}$, $F_{t+1}$;
+\hspace{8pt}\tcp{Equation~\ref{eq:gp-mu-sigma}}
+$t \leftarrow t+1$;
+}
+\Return $X_n$
+\end{algorithm}
+
+\subsection{Stage 2: Novel Policy Seeking}
+\label{sec:methods-phase2}
+
+In Stage 2 of our diverse strategy discovery framework, we explore potential strategy variations given a fixed initial state discovered in Stage 1. Formally, given an initial state $x$ and a set of discovered policies $\Pi = \{\pi_1, \pi_2, ..., \pi_n\}$, we aim to learn a new policy $\pi_{n+1}$ which is different from all existing $\pi_i \in \Pi$. This can be achieved with an additional policy novelty reward to be jointly optimized with the task reward during DRL training. We measure the novelty of policy $\pi_i$ with respect to $\pi_j$ by their corresponding motion feature distance $||f_i - f_j||$. The novelty reward function is then given by
+\begin{equation}
+    r_\text{novelty}(f) = \text{Clip}\left(\frac{\min_{\pi_i \in \Pi}{||f_i - f||}}{d_\text{threshold}}, 0.01, 1\right) ,
+\end{equation}
+which rewards simulation rollouts showing different strategies to the ones presented in the existing policy set. $d_\text{threshold}$ is a hyperparameter measuring the desired policy novelty to be learned next. Note that the feature representation $f$ here in Stage 2 can be the same as or different from the one used in Stage 1 for initial states exploration.
+
+Our novel policy search is in principle similar to the idea of \cite{zhang2019novel-policies,Sun2020novel-policies}. However, there are two key differences. First, in machine learning, policy novelty metrics have been designed and validated only on low-dimensional control tasks. For example in \cite{zhang2019novel-policies}, the policy novelty is measured by the reconstruction error between states from the current rollout and previous rollouts encapsulated as a deep autoencoder. In our case of high-dimensional 3D character control tasks, however, novel state sequences do not necessarily correspond to novel motion strategies. We therefore opt to design discriminative strategy features whose distances are incorporated into the DRL training reward.
+
+Second, we multiply the novelty reward with the task reward as the training reward, and adopt a standard gradient-based method PPO to train the policy. Additional optimization techniques are not required for learning novel strategies, such as the Task-Novelty Bisector method proposed in \cite{zhang2019novel-policies} that modifies the policy gradients to encourage novelty learning. Our novel policy seeking procedure always discovers novel policies since the character is forced to perform a different strategy. However, the novel policies may exhibit unnatural and awkward movements, when the given initial state is not capable of multiple natural strategies.

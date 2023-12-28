@@ -1,0 +1,219 @@
+\section{Autotuned Decision Transformer}
+
+
+In this section, we present \emph{Autotuned Decision Transformer (ADT)}, a new transformer-based decision model that is able to stitch sub-optimal trajectories from the offline dataset. 
+Our algorithm is derived based on a general hierarchical decision framework where DT naturally emerges as a special case. 
+Within this framework, we discuss how ADT overcomes several limitations of DT by automatically tune the prompt for decision making. 
+
+
+\subsection{Key Observations} 
+\label{sec:obs}
+
+Our algorithm is derived by considering a general framework that bridges transformer-based decision models with hierarchical reinforcement learning (HRL) \citep{nachum2018data}.  
+In particular, 
+we use the following hierarchical  representation of policy
+\begin{align}
+\pi(a | s) = \int_{\cP} \pi^{h}(p | s) \cdot  \pi^{l} (a | s, p) dp\, ,
+\end{align} 
+where $\cP$ is a set of {prompts}. 
+To make a decision, the high-level policy $\pi^h$ first generates a prompt $p\in\cP$, instructed by which the low-level policy $\pi^l$ returns an action conditioned on $p$.  
+%Consider the navigation problem as an example. For each state, the high-level policy learns to generate a sub-goal (landmark position). The low-level policy outputs an action to achieve this sub-goal 
+DT naturally fits into this hierarchical decision framework. 
+Consider the following value prompting mechanism. At state $s\in\cS$, the high-level policy generates a real-value prompt $R\in \RR$, representing \emph{"I want to obtain $R$ returns starting from $s$."}. 
+Informed by this prompt, the low-level policy responses an action $a\in\cA$, \emph{"Ok, if you want to obtain returns $R$, you should take action $a$ now."}.  
+This exactly what DT does. 
+It applies a dummy high-level policy which initially picks a target return-to-go prompt and subsequently decrement it along the trajectory.  
+The DT low-level policy, $\pi_{ \mathrm{DT}}(\cdot | s, {R}, \tau)$, learns to predict which action to take at state $s$ in order to achieve returns ${{R}}$ given the context $\tau$.  
+
+To better understand the failure of DT given sub-optimal data, we re-examine the illustrative example shown in Figure 2 of \citet{chen2021decision}.  
+The dataset comprises random walk trajectories and their associated per-state return-to-go.   
+Suppose that the DT policy $\pi_{\mathrm{DT}}$ perfectly memorizes  all trajectory information contained in the  dataset. The return-to-go prompt in fact acts as a \emph{switch} to guide the model to make decisions.  
+Let $\cT(s)$ be the set of trajectories starting from $s$ stored in the dataset, and $R(\tau)$ be the return of  a trajectory $\tau$.  
+Given $R'\in\{ R(\tau), \tau\in\cT(s) \}$, $\pi_{\mathrm{DT}}$ is able to output an action that leads towards $\tau$. 
+Thus, given an \emph{oracle return} $R^*(s)=\max_{\tau\in\cT(s)} R(\tau)$, it is expected that DT is able to follow the optimal trajectory contained in the dataset following the switch. 
+
+
+There are several issues. \emph{First}, the oracle return $R^*$ is not known. The initial return-to-go prompt of DT is picked by hand and might not be consistent with the one observed in the dataset. This requires the model to generalize well for unseen return-to-go and decisions. 
+\emph{Second}, even though $R^*$ is known for all states, memorizing trajectory information is still not enough for obtaining the stitching ability as $R^*$ only serves a lower bound on the maximum achievable return. 
+To understand this, 
+consider an example with two trajectories $a\rightarrow b\rightarrow c$, and $d\rightarrow b\rightarrow e$. Suppose that $e$ leads to a return of 10, while $c$ leads to a return of 0. 
+In this case, using 10 as the return-to-go prompt at state $b$, DT should be able to switch to the desired trajectory. 
+However, the information "leaning towards $c$ can achieve a return of 10" does not pass to $a$ during training, since the trajectory $a\rightarrow b\rightarrow e$ does not exist in the data. 
+If the offline data contains another trajectory that starts from $a$ and leads to a mediocre return (e.g. 1), DT might switch to that trajectory at $a$ using 10 as the  return-to-go prompt, missing a more promising path. 
+%In conclusion, trajectory returns only serve as lower bounds on the maximum achievable returns. 
+Thus,  making predictions conditioned on return-to-go alone is not enough for policy optimization. Some form of information backpropagation is still required. 
+
+
+\subsection{Algorithms}
+
+ADT jointly optimizes the hierarchical policies to overcomes the limitations of DT discussed above.  
+An illustration of ADT architecture is provided in \cref{fig:model_structure}.  
+Similar to DT, ADT applies a transformer model for the low-level policy. 
+Instead of \plaineqref{eq:dt-traj}, it considers the following trajectory representation, 
+ \begin{align}
+ \tau = \left( p_0, s_0, a_0, p_1, s_1, a_1, \dots, p_{T}, s_{T}, a_{T}\right)\, .
+ \label{eq:adt-traj}
+ \end{align}
+Here $p_i$ is the prompt generated by the high-level policy $p_i \sim \pi^h(\cdot | s_i)$, replacing the return-to-go prompt used by DT.   
+That is, for each trajectory in the offline dataset, we relabel it by adding a prompt generated by the high-level policies for each transition. 
+Armed with this general hierarchical decision framework, we propose two algorithms that apply different high-level prompting generation strategy while sharing a unified low-level policy optimization framework.  
+We learn a high-level policy $\pi_\omega\approx \pi^h$ with parameters $\phi$, and a low-level policy $\pi_\theta \approx \pi^l$ with parameters $\theta$. 
+
+
+\subsubsection{Value-prompted Autotuned Decision Transformer}
+
+Our first algorithm, \emph{Value-promped Autotuned Decision Transformer (V-ADT)}, uses scalar values as prompts. But unlike DT, it applies a more principled design of value prompts instead of return-to-go.  
+V-ADT aims to answer two questions: what is the maximum achievable value starting from a state $s$, and what action should be taken to achieve such a value?  
+To answer these, we view the offline dataset $\cD$ as an \emph{empirical MDP}, 
+$M_{\cD}=\{\cS_{\cD}, \cA, P_{\cD}, r, \gamma\}$, 
+where $\cS_{\cD}\subseteq \cS$ is the set of observed states in the data, 
+$P_{\cD}$ is the transition, which is an empirical estimation of the original transition $P$ \citep{fujimoto2019off}.  
+The optimal value of this empirical MDP is
+\begin{align}
+V^*_{\cD}(s) = \max_{a: \pi_{\cD}(a | s) > 0} r(s,a) + \gamma \EE_{s'\sim P_{\cD}(\cdot | s,a)} \left[ V^*_{\cD} (s') \right]\, .
+\label{eq:in-sample-v}
+\end{align}
+Let $Q^*_{\cD}(s,a)$ be the corresponding state-action value. 
+$V^*_{\cD}$ is known as the \emph{in-sample optimal value} in offline RL  \citep{fujimoto2018addressing,kostrikov2022offline,xiaosample}. 
+Computing this value requires to perform dynamic programming without querying out-of-distribution actions.  
+We apply Implicit Q-learning (IQL) to learn $V_{\phi}\approx V^*_{\cD}$ and $Q_{\psi}\approx Q^*_{\cD}$ with parameters $\phi, \psi$ \citep{kostrikov2022offline}. 
+Details of IQL are presented in the Appendix. 
+We now describe how V-ADT jointly optimizes high and low level policies to facilitate stitching. 
+
+
+\paragraph{{High-Level policy}} 
+V-ADT considers $\cP = \RR$ and adopts a deterministic policy $\pi_\omega: \cS\rightarrow \RR$, which predicts the in-sample optimal value $\pi_\omega\approx V^*_{\cD}$. Since we already have an approximated in-sample optimal value $V_\phi$, we let $\pi_\omega = V_\phi$. 
+This high-level policy offers two key advantages. 
+\emph{First}, this approach efficiently facilitates information backpropagation towards earlier states on a trajectory, 
+addressing a major limitation of DT. This is achieved by using $V^*_{\cD}$ as the value prompt, ensuring that we have precise knowledge of the maximum achievable return for any state.  
+Making  predictions conditioned on $R^*(s)$ is not enough for policy optimization, since $R^*(s)=\max_{\tau\in\cT(s)} R(\tau)$ only gives a lower bound on $V^*_{\cD}(s)$ and thus would be a weaker guidance (see  \cref{sec:obs} for detailed discussions). 
+\emph{Second}, the definition of $V^*_{\cD}$ exclusively focuses on the optimal value derived from observed data and thus avoids out-of-distribution returns. This prevents the low-level policy from making decisions conditioned on prompts that require extrapolation. 
+
+\paragraph{{Low-Level policy}} 
+
+%V-ADT learns the low-level policy from trajectories in the form of \plaineqref{eq:adt-traj}. 
+Directly training the model to predict the trajectory, as done in DT, is not suitable for our approach. This is because the action $a_t$ observed in the data may not necessarily correspond to the action at state $s_t$ that leads  to the return $V^*_{\cD}(s_t)$. 
+However, the probability of selecting $a_t$ should be proportional to the value of this action. 
+Thus,  we use \emph{advantage-weighted regression} to learn the low-level policy \citep{peng2019advantage,kostrikov2022offline,xiaosample}: given trajectory data \plaineqref{eq:adt-traj} the objective is defined as
+\begin{align}
+\cL(\theta) = -\sum_{t=0}^T \exp\left( \frac{Q_\psi(s_t,a_t) - V_{\phi}(s_t)}{\alpha}  \right) \log \pi_{\theta} (a_t | s_t, \pi_\omega(s_t))\, ,
+\label{eq:low-level-pi}
+\end{align}
+where $\alpha>0$ is a hyper-parameter.  
+The low-level policy takes the output of high-level policy as input. This guarantees no discrepancy between train and test value prompt used by the policies.  
+We note that the only difference of this compared to the standard maximum log-likelihood objective for sequence modeling is to apply a weighting for each transition.  
+One can easily implement this with trajectory data for a transformer. 
+In practice we also observe that the tokenization scheme when processing the trajectory data affects the performance of ADT.  
+Instead of treating the prompt $p_t$ as a single token as in DT, we find it is beneficial to concatenate $p_t$ and $s_t$ together and tokenize the concatenated vector. 
+We provide an ablation study on this in \cref{sec:exp-abl-tokenize}.  
+This completes the description of V-ADT. 
+
+\subsubsection{Goal-prompted Autotuned Decision Transformer}
+
+\iffalse
+In HRL, the high-level policy considers latent action space, typical choices of which includes \emph{sub-goal} \citep{andrychowicz2017hindsight,nachum2018data,park2023hiql}, \emph{skills} \citep{co2018self,ajay2020opal,lynch2020learning,jiang2022efficient,chebotar2021actionable}, 
+and options \citep{sutton1999between,bacon2017option,wulfmeier2021data}
+\fi
+
+In HRL, the high-level policy often considers a latent action space. Typical choices of latent actions includes \emph{sub-goal} \citep{nachum2018data,park2023hiql}, \emph{skills} \citep{ajay2020opal,jiang2022efficient}, 
+and \emph{options} \citep{sutton1999between,bacon2017option,klissarov2023deep}. 
+We consider goal-reaching problem as an example and use sub-goals as latent actions, which leads to our second algorithm, \emph{Goal-promped Autotuned Decision Transformer (G-ADT)}.   
+Let $\cG$ be the goal space\footnote{The goal space and state space could be the same \citep{nachum2018data,park2023hiql}}. 
+The goal-conditioned reward function $r(s,a, g)$ provides the reward of taking action $a$ at state $s$ for reaching the goal $g\in\cG$. Let $V(s,g)$ be the universal value function defined by the goal-conditioned rewards \citep{nachum2018data,schaul2015universal}. 
+Similarly, we define $V^*_{\cD}(s,g)$ and $Q^*_{\cD}(s,a,g)$ the in-sample optimal universal value function. 
+We also train $V_\phi \approx V^*_{\cD}$ and $Q_\psi \approx Q^*_{\cD}$ to approximate the universal value functions. 
+We now describe how G-ADT jointly optimizes the policies. 
+
+
+\paragraph{{High-Level policy}} 
+G-ADT considers $\cP = \cG$ and uses a high-level policy $\pi_\omega: \cS \rightarrow \cG$. 
+To find a shorter path, the high-level policy $\pi_\omega$ generates a sequence of sub-goals $g_t=\pi_{\omega}(s_t)$ that guides the learner step-by-step towards the final goal.  
+We use a sub-goal that lies in $k$-steps further from the current state, where $k$ is a hyper-parameter of the algorithm tuned for each domain \citep{badrinath2023waypoint,park2023hiql}.  
+%The "reward" of a sub-goal is measured by how far it can bring towards the final goal. 
+In particular, given trajectory data \plaineqref{eq:adt-traj}, the high-level policy learns the optimal \emph{k-steps jump}  using the recently proposed Hierarchical Implicit Q-learning (HIQL) algorithms \citep{park2023hiql}:
+\begin{align*}
+\cL(\phi) = -\sum_{t=0}^T \exp\left( \frac{ \sum_{t'=t}^{k-1} \gamma^{t'-t} r(s_{t'}, a_{t'}, g)  + \gamma^{k} V_{\phi}(s_{t+k}, g) - V_{\phi}(s_t, g)}{\alpha}  \right) \log \pi_\omega (s_{t+k} | s_t, g)\, . 
+\end{align*}
+
+
+
+
+\paragraph{{Low-Level policy}} 
+
+The low-level policy in G-ADT learns to reach the sub-goal generated by the high-level policy.  
+G-ADT shares the same low-level policy objective as V-ADT. 
+Given trajectory data \plaineqref{eq:adt-traj}, it considers the following 
+\begin{align*}
+\cL(\theta) = -\sum_{t=0}^T \exp\left( \frac{Q_{\psi}(s_t,a_t, \pi_\omega(s_t)) - V_{\phi}(s_t, \pi_\omega(s_t))}{\alpha}  \right) \log \pi_{\theta} (a_t | s_t, \pi_\omega(s_t))\, ,
+%\label{eq:low-level-pi}
+\end{align*}
+Note that this is exactly the same as \plaineqref{eq:low-level-pi} except that the advantages are computed by  universal value functions. 
+G-ADT also applies the same tokenization method as V-ADT by first concatenating $\pi_\omega(s_t)$ and $s_t$ together.  
+This concludes the description of the G-ADT algorithm. 
+
+\section{Discussions}
+
+\paragraph{Types of Prompts} 
+
+\citet{reed2022generalist} have delved into the potential scalability of transformer-based decision models through prompting. 
+They show that a causal transformer, trained on multi-task offline datasets, showcases remarkable adaptability to new tasks through fine-tuning. The adaptability is achieved by providing a sequence prompt as the input of the transformer model, typically represented as a trajectory of expert demonstrations. 
+Unlike such expert trajectory prompts, our prompt can be seen as a latent action generated by the high-level policy, serving as guidance for the low-level policy to inform its decision-making process.
+
+\paragraph{Comparison of other DT Enhancements}
+
+Several recent works have been proposed to overcome the limitations of DT. 
+\citet{yamagata2023q} relabelled trajectory data by replacing return-to-go with values learned by offline RL algorithms.  
+\citet{badrinath2023waypoint} proposed to use sub-goal as prompt, guiding the DT policy to find shorter path in navigation problems. 
+\citet{wu2023elastic} learned maximum achievable returns, $R^*(s)=\max_{\tau\in\cT(s)} R(\tau)$, to boost the stitching ability of DT at decision time. 
+\citet{liu2023emergent} structured trajectory data by relabelling the target return for each trajectory as the maximum total reward within a sequence of trajectories. 
+Their findings showed that this approach enabled a transformer-based decision model to improve itself during both training and testing time.
+Compared to these previous efforts, ADT introduces a principled framework of hierarchical policy optimization. Our practical studies show that the joint optimization of high and low level policies is the key to boost the performance of transformer-based decision models. 
+
+
+
+\iffalse
+
+
+
+\begin{algorithm*}[!htbp]
+\centering
+    \caption{Autotuned DT}
+    \label{alg:ISPI}
+    \begin{algorithmic}[1] %[1] enables line numbers
+        \REQUIRE  Training dataset $\mathcal{D}=\left\{\tau_1, \tau_2, \tau_3, \ldots, \tau_n\right\}$ of training trajectories. 
+        \STATE //High-level policy
+        \STATE Pre-train high-level policy following {\color{orange}{IQL for V-ADT}} or {\color{cyan}{HIQL for G-ADT}} 
+        \STATE //Low-level policy
+        \FOR{\text{each training epoch}}
+        \STATE Compute $\pi_\theta\left(a_t \mid s_{t-k .. t}, p_{t-k .. t}\right)$
+        \STATE  Calculate  {\color{orange}{$L_\theta(\tau)=xxxx$ for V-ADT}} or {\color{cyan}{$L_\theta(\tau)=xxxx$  for G-ADT}} \\
+        \STATE Backpropagate gradients w.r.t $L_\theta(\tau)$ to update low-level policy parameters \\
+        \ENDFOR
+       
+        % \FOR{$i=1,2$}
+        % \STATE  Sample a mini-batch of trajectories ${(s, a, r, s^\prime)}$ from offline dataset $\mathcal{D}$
+        % \STATE Update the parameters of critic $\theta^i$ using~\eqref{eq:critic-loss}
+        % \IF{$t \ \text{mod} \ 2$}  
+        %  \STATE // For CPI
+        %  \STATE {\color{orange}{Copy the historical snapshot of $\omega^1$ to $\omega^2$ and update $\omega^1$ using~\eqref{eq:seq-cpi1}}}
+        %  \STATE // For CPI-RE
+        %  \STATE {\color{cyan}{Choose the current best policy between  $\omega^1$ and $\omega^2$ as the reference policy} } 
+        %  \STATE {\color{cyan}{Update $\omega^1$ and $\omega^2$  using~\eqref{eq:seq-cpi1} with the cross-update scheme} } 
+  
+        % \STATE Update target networks
+        % \ENDIF
+        % \ENDFOR
+    \end{algorithmic}
+\end{algorithm*}
+
+
+
+
+\fi
+
+
+
+
+
+
+

@@ -1,0 +1,81 @@
+
+
+
+
+
+
+
+
+
+\section{Proposed Approach} \label{sec:method}
+
+Our goal is to create a unified model that maps task representations (e.g., obtained using task2vec~\cite{achille2019task2vec}) to simulation parameters, which are in turn used to render synthetic pre-training datasets for not only tasks that are seen during training, but also novel tasks.
+This is a challenging problem, as the number of possible simulation parameter configurations is combinatorially large, making a brute-force approach infeasible when the number of parameters grows. 
+
+\subsection{Overview} 
+
+\cref{fig:controller-approach} shows an overview of our approach. During training, a batch of ``seen'' tasks is provided as input. Their task2vec vector representations are fed as input to \ours, which is a parametric model (shared across all tasks) mapping these downstream task2vecs to simulation parameters, such as lighting direction, amount of blur, background variability, etc.  These parameters are then used by a data generator (in our implementation, built using the Three-D-World platform~\cite{gan2020threedworld}) to generate a dataset of synthetic images. A classifier model then gets pre-trained on these synthetic images, and the backbone is subsequently used for evaluation on specific downstream task. The classifier's accuracy on this task is used as a reward to update \ours's parameters. 
+Once trained, \ours can also be used to efficiently predict simulation parameters in {\em one-shot} for ``unseen'' tasks that it has not encountered during training. 
+
+
+\subsection{\ours Model} 
+
+
+Let us denote \ours's parameters with $\theta$. Given the task2vec representation of a downstream task $\bs{x} \in \mc{X}$ as input, \ours outputs simulation parameters $a \in \Omega$. The model consists of $M$ output heads, one for each simulation parameter. In the following discussion, just as in our experiments, each simulation parameter is discretized to a few levels to limit the space of possible outputs. Each head outputs a categorical distribution $\pi_i(\bs{x}, \theta) \in \Delta^{k_i}$, where $k_i$ is the number of discrete values for parameter $i \in [M]$, and $\Delta^{k_i}$, a standard $k_i$-simplex. The set of argmax outputs $\nu(\bs{x}, \theta) = \{\nu_i | \nu_i = \argmax_{j \in [k_i]} \pi_{i, j} ~\forall i \in [M]\}$ is the set of simulation parameter values used for synthetic data generation. Subsequently, we drop annotating the dependence of $\pi$ and $\nu$ on $\theta$ and $\bs{x}$ when clear.
+
+\subsection{\ours Training} 
+
+
+Since Task2Sim aims to maximize downstream accuracy after pre-training, we use this accuracy as the reward in our training optimization\footnote{Note that our rewards depend only on the task2vec input and the output action and do not involve any states, and thus our problem can be considered similar to a stateless-RL or contextual bandits problem \cite{langford2007epoch}.}.
+Note that this downstream accuracy is a non-differentiable function of the output simulation parameters (assuming any simulation engine can be used as a black box) and hence direct gradient-based optimization cannot be used to train \ours. Instead, we use REINFORCE~\cite{williams1992simple}, to approximate gradients of downstream task performance with respect to model parameters $\theta$. 
+
+\ours's outputs represent a distribution over ``actions'' corresponding to different values of the set of $M$ simulation parameters. $P(a) = \prod_{i \in [M]} \pi_i(a_i)$ is the probability of picking action $a = [a_i]_{i \in [M]}$, under policy $\pi = [\pi_i]_{i \in [M]}$. Remember that the output $\pi$ is a function of the parameters $\theta$ and the task representation $\bs{x}$. To train the model, we maximize the expected reward under its policy, defined as
+\begin{align}
+    R = \E_{a \in \Omega}[R(a)] = \sum_{a \in \Omega} P(a) R(a)
+\end{align}
+where $\Omega$ is the space of all outputs $a$ and $R(a)$ is the reward when parameter values corresponding to action $a$ are chosen. Since reward is the downstream accuracy, $R(a) \in [0, 100]$.  
+Using the REINFORCE rule, we have
+\begin{align}
+    \nabla_{\theta} R 
+    &= \E_{a \in \Omega} \left[ (\nabla_{\theta} \log P(a)) R(a) \right] \\
+    &= \E_{a \in \Omega} \left[ \left(\sum_{i \in [M]} \nabla_{\theta} \log \pi_i(a_i) \right) R(a) \right]
+\end{align}
+where the 2nd step comes from linearity of the derivative. In practice, we use a point estimate of the above expectation at a sample $a \sim (\pi + \epsilon)$ ($\epsilon$ being some exploration noise added to the Task2Sim output distribution) with a self-critical baseline following \cite{rennie2017self}:
+\begin{align} \label{eq:grad-pt-est}
+    \nabla_{\theta} R \approx \left(\sum_{i \in [M]} \nabla_{\theta} \log \pi_i(a_i) \right) \left( R(a) - R(\nu) \right) 
+\end{align}
+where, as a reminder $\nu$ is the set of the distribution argmax parameter values from the \name{} model heads.
+
+A pseudo-code of our approach is shown in \cref{alg:train}.  Specifically, we update the model parameters $\theta$ using minibatches of tasks sampled from a set of ``seen'' tasks. Similar to \cite{oh2018self}, we also employ self-imitation learning biased towards actions found to have better rewards. This is done by keeping track of the best action encountered in the learning process and using it for additional updates to the model, besides the ones in \cref{ln:update} of \cref{alg:train}. 
+Furthermore, we use the test accuracy of a 5-nearest neighbors classifier operating on features generated by the pretrained backbone as a proxy for downstream task performance since it is computationally much faster than other common evaluation criteria used in transfer learning, e.g., linear probing or full-network finetuning. Our experiments demonstrate that this proxy evaluation measure indeed correlates with, and thus, helps in final downstream performance with linear probing or full-network finetuning. 
+
+
+
+
+
+
+\begin{algorithm}
+\DontPrintSemicolon
+ \textbf{Input:} Set of $N$ ``seen'' downstream tasks represented by task2vecs $\mc{T} = \{\bs{x}_i | i \in [N]\}$. \\
+ Given initial Task2Sim parameters $\theta_0$ and initial noise level $\epsilon_0$\\
+ Initialize $a_{max}^{(i)} | i \in [N]$ the maximum reward action for each seen task \\
+ \For{$t \in [T]$}{
+ Set noise level $\epsilon = \frac{\epsilon_0}{t} $ \\
+ Sample minibatch $\tau$ of size $n$ from $\mc{T}$  \\
+ Get \ours output distributions $\pi^{(i)} | i \in [n]$ \\
+ Sample outputs $a^{(i)} \sim \pi^{(i)} + \epsilon$ \\
+ Get Rewards $R(a^{(i)})$ by generating a synthetic dataset with parameters $a^{(i)}$, pre-training a backbone on it, and getting the 5-NN downstream accuracy using this backbone \\
+ Update $a_{max}^{(i)}$ if $R(a^{(i)}) > R(a_{max}^{(i)})$ \\
+ Get point estimates of reward gradients $dr^{(i)}$ for each task in minibatch using \cref{eq:grad-pt-est} \\
+ $\theta_{t,0} \leftarrow \theta_{t-1} + \frac{\sum_{i \in [n]} dr^{(i)}}{n}$ \label{ln:update} \\
+ \For{$j \in [T_{si}]$}{ 
+    \tcp{Self Imitation}
+    Get reward gradient estimates $dr_{si}^{(i)}$ from \cref{eq:grad-pt-est} for $a \leftarrow a_{max}^{(i)}$ \\
+    $\theta_{t, j}  \leftarrow \theta_{t, j-1} + \frac{\sum_{i \in [n]} dr_{si}^{(i)}}{n}$
+ }
+ $\theta_{t} \leftarrow \theta_{t, T_{si}}$
+ }
+ \textbf{Output}: Trained model with parameters $\theta_T$. 
+ \caption{Training Task2Sim}
+ \label{alg:train}  
+\end{algorithm}

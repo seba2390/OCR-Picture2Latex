@@ -1,0 +1,360 @@
+\section{Method}
+\label{sec:method}
+We introduce the main model architecture in this section. Each subsection forms the foundation for the next one. Section~\ref{sec:din} describes an attention based network inspired by \cite{zhou2018deep} that exploits the correlation between the current ranking task and the entire historical sequence of items for which the user has expressed interest. Section~\ref{sec:rnn} details an elaborate Recurrent Neural Net backbone that can efficiently handle a batch of uneven sized sequences, and how it is used to capture more recent user interactions with the search engine. The output embedding of the attention network is simply fed as an input into every timestamp of the recurrence. Finally we discuss how to build an actor-critic style reinforcement learning model on top of the RNN structure in section~\ref{sec:ddpg}. 
+
+\subsection{Attention for Long-Term Session Sequence}
+\label{sec:din}
+As mentioned in section~\ref{subsec:rw:user}, the attention network in the Deep Interest Network (DIN) model is a natural way to incorporate user history into personalized recommendation. To adapt to the search ranking setting, we introduce Search Ranking Deep Interest Network (DIN-S), which makes the following adjustments on top of DIN:
+\begin{itemize}
+    \item Query side features are introduced alongside the focus item features, to participate in attention with historical item sequence.
+    \item To account for the possibility that the current query request is not correlated with any of the user's past actioins, a zero score is appended to the regular attention scores before getting the softmax weights. This is illustrated by the zero attention unit in Figure~\ref{fig:din}.
+\end{itemize}https://www.overleaf.com/project/5fed74e5fac2600586cb62da
+% The only difference in personalized search is to add query related features to the attend list. 
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{DIN.png}
+    \centering
+    \caption{DIN-S architecture.}
+    \label{fig:din}
+\vspace{-5pt}
+\end{figure}
+
+The overall architecture of DIN-S is outlined in Diagram~\ref{fig:din}. Due to the nature of algorithmic iterations within an industrial setting, DIN-S is not only one of our quality comparison baselines, but also one of the major components in our proposed final architecture.
+We have also tried DIEN \cite{zhou2019deep} and other follow up works. Despite the better results reported in papers, we found little incremental improvement in our own systems. However our design of the RNN backbone model shares some similarity with the approach in DIEN, and indeed both ours and the DIEN work use attention and RNN together. A key difference, however, is that our RNN training data and algorithmic design uses all features available in previous interactions by the user, including both item or query/user one-sided as well as two-sided features. By contrast, the RNN (GRU) in DIEN appears to be just an extension of the co-existing Attention network, taking mostly item-side only categorical features.
+
+\subsection{RNN for Near-Term Sequential Search}
+\label{sec:rnn}
+In order to compare with the baseline DIN-S (attention + MLP) model fairly and conveniently, we build a so-called RNN backbone that can wrap around any base model architecture. The logic is outline in the bottom half of Diagram~\ref{fig:rnn}. To summarize, for any base model $M$, the RNN backbone introduces a new feature vector $H_t$, the hidden state, concatenated to the output of $M$. The output of each time iteration of the RNN model is another vector $H_{t+1}$, which serves both as the input to downstream networks, as well as the hidden state input for the next time iteration. 
+
+\subsubsection{Contiguous Session-Based Data Format}
+\label{subsubsec:data_format}
+While DIN-S can be trained in a pointwise / pairwise fashion, our implementation of RNN tries to pool all relevant information together in the data by 
+\begin{itemize}
+    \item arranging all items within a query session in a single training example. In our case we used tsv (tab-separated values) format. Thus the number of columns in each row is variable, depending on the number of items under the session.
+    \item placing all query sessions belonging to the same user contiguously to ensure they are loaded altogether in a mini-match.
+\end{itemize}
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{DDPG-UserSessionTSV.png}
+    \centering
+    \caption{User Session Input Format. $B$ stands for batch size. Each row represents a single TSV row in the input data. The numbers of columns = number of query features + num of items $\times$ number of item features.}
+    \label{fig:user_session_tsv}
+\vspace{-5pt}
+\end{figure}
+As illustrated in Figure~\ref{fig:user_session_tsv}, each mini-batch thus contains a 4d tensor $B$ whose elements are indexed by $(u, t, i, f)$, which stand for users, sessions (time-ordered), items, and features respectively. We assume that features are all dense or have been converted to fixed width dense format, through either embedding sum-pooling or 
+attention-pooling from the DIN-S base model. We will use $B_{u, t}$ to denote the 2d slices of $B$ containing all $(i, f)$ values. 
+% \vspace{-20pt}
+
+\subsubsection{RNN Model Architecture}
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{RNN.png}
+    \centering
+    \caption{RNN architecture.}
+    \label{fig:rnn}
+\end{figure}
+Let $\omega_{u, t}, H_{u, t}$ stand for the regular output and hidden state output of the RNN network for user $u$ and session $t$. The RNN network can thus be described by a function $F$ with the following signature
+\begin{align} \label{eq:rnn_kernel}
+    (\omega_{u, t+1}, H_{u, t+1}) = F(B_{u, t + 1}, H_t).
+\end{align}
+This is the most general form of an RNN network. All RNN variants such as LSTM, GRU obey the above signature of $F$.
+
+Recall now $B_{u, t}$ is a 2d tensor, with dimension given by (the number of items, number of features). The same is true of the output tensor $\omega_{u,t}$. The hidden state $H_{u, t}$ however has \textbf{no item dimension}: it is a fixed width vector for a given user after a given session. For simplicity, our choice of $F$ simply computes $H_{u, t}$ as a weighted average of the output $\omega_{u, t}$. More precisely,
+\begin{align}
+    \omega_{u, t+1}, S_{u, t+1} &= \rm{GRU}(\omega_{u, t}, S_{u, t}) \\
+    H_{u, t+1, f} &= \frac{1}{|\cC_{u, t}|} \sum_{j \in \cC_{u, t}} \omega_{u, t+1, j, f}. 
+\end{align}
+Here $\cC_{u, t}$ stands for the set of items in user $u$'s session $t$ that were purchased. Those sessions without purchases are excluded from our training set, since under the above framework, 
+\begin{enumerate}
+    \item the user hidden state would not be updated;
+    \item the final pairwise training label contains no information.
+\end{enumerate} 
+The vast majority of the remaining sessions contain exactly 1 purchased item.
+
+This completes the description of the RNN evolution of the state vector under a listwise input format, where all items in a session are used. For training efficiency, however, we adopt a pairwise setup, where 2 items are sampled from each query session, and exactly one of them has been purchased. Thus we can think of each session as consisting of exactly 2 items. Since the hidden state is a weighted average over only the purchased items, pairwise sampling preserves all the information for the hidden state vector in a single RNN step, provided the session contains only a single purchased item, which is more than $90\%$ of the cases.
+
+Lastly, the RNN model outputs a single logit $\eta_{u, t, i}$ for each item $i$ chosen within the user session $(u, t)$, by passing the RNN output vector $\omega_{u, t, i} \in \R^d$ of dimension $d$ through a multi-layer perception $P$ of dimensions $[1024, 256, 64, 1]$:
+\begin{align} \label{eq:rnn_output}
+    \eta_{u, t, i} = P(O(u, t, i)),  \quad P: \R^d \to \R.
+\end{align}
+The corresponding label is a binary indicator $\lambda_{u, t, i} \in \{1, 0\}$, which denotes whether the item was purchased or not.
+
+\subsubsection{Pairwise Loss} \label{subsec:rnn:pairwise}
+Unlike clicks or mouse hover actions, each page session in e-commerce search typically receives at most one \textbf{purchase}. Thus we are confronted with severe positive and negative label imbalance. To address this problem, we choose pairwise loss in our modeling, which samples a purchased item from the current session at random, and matches it with a random item that is viewed or clicked but not purchased. 
+
+The exact sampling procedure is described in Algorithm~\ref{alg:pairwise_sampling}. Note that as long as the session is non-empty, the procedure will always output a pair. There are occasional edge cases when all items are purchased, in which case we output two purchased items. Alternatively, such perfect sessions can be filtered from the training set.
+
+\begin{algorithm}[t]
+\caption{Pairwise sampling from a query session.}
+\label{alg:pairwise_sampling}
+\begin{algorithmic}[1]
+\REQUIRE{a list of $N > 0$ labels: $\lambda_1, \ldots, \lambda_N \in \{0, 1\}$}
+\ENSURE{two indices $1 \leq a, b \leq N$, s.t. $\lambda_a = \max \lambda_i$ and $\lambda_b = \min \lambda_i$}
+\STATE Compute $\lambda_{\min} := \min_i \lambda_i$ and $\lambda_{\max} := \max_i \lambda_i$.
+\STATE Construct the list of admissible pairs $A := \{(a, b) \in [N]^2: \lambda_a = \lambda_{\max}, \lambda_b = \lambda_{\min}\}$ 
+\STATE Output a uniformly random element $(a, b)$ from $A$.
+\end{algorithmic}
+\end{algorithm}
+% Our choice of pairwise loss is motivated by the disparity between positive and negative examples within each session: typically users only make a single purchase out of a page of 10 results. 
+The final loss function on an input session $(u, t)$ is given by the following standard sigmoid cross entropy formula:
+
+\begin{align} \label{eq:logloss}
+    &\cL(B_{u, t}, \lambda_{u, t}) = -\lambda_{u, t} \log \sigma(\eta_{u, t}) - (1-\lambda_{u, t}) \log (1 - \sigma(\eta_{u, t}))
+\end{align}
+where 
+\begin{itemize}
+\item $B_{u, t}$ stands for all the features available to the model for a given user session $(u, t)$.
+\item $\lambda_{u, t} := \lambda_{u, t, a, b} = \frac{\lambda_{u, t, a}}{\lambda_{u, t, a} + \lambda_{u, t, b}} \in \{0, 1\}$, depending on whether a purchase was made on item $a$ or $b$ within the user session $(u, t)$. 
+\item $\eta_{u, t} := \eta_{u, t, a, b} = \eta_{u, t, a} - \eta_{u, t, b}$ is simply the difference between the model outputs for the two items $a$ and $b$, which can be interpreted as the log-odds that the purchase was made on the first item.
+\item $a, b$ are a pair of random item indices within the current session, chosen according to Algorithm~\ref{alg:pairwise_sampling}, where item $a$ is purchased while item $b$ is not.
+\item $\sigma(\eta_{u, t})$ transforms the pairwise logit $\eta_{u, t}$ through the sigmoid function $\sigma: x \mapsto (1 + e^{-x})^{-1}$, and can be interpreted as the model predicted probability that item $a$ is purchased, given exactly one of item $a$ and $b$ is purchased.
+\end{itemize}
+
+% \\
+%     &\frac{\ell_{u, t, i}}{\ell_{u, t, i} + \ell_{u, t, j}} \log \frac{e_{u, t, i}}{e_{u, t, i} + e_{u, t, j}} + \frac{\ell_{u, t, j}}{\ell_{u, t, i} + \ell_{u, t, j}} \log \frac{e_{u, t, j}}{e_{u, t, i} + e_{u, t, j}}
+\subsubsection{Knapsack Sequence Packing}
+Since the numbers of historical sessions vary widely across different users, the naive implementation of the above 4d representation can be computationally quite wasteful due to excessive zero padding. We thus adopt a knapsack strategy (Algorithm~\ref{alg:knapsack_rnn}) to fit multiple short user session sequences into the maximum length seen in the current mini-batch. 
+
+\begin{algorithm}[t]
+\caption{Parallel RNN via Knapsack Packing}
+\label{alg:knapsack_rnn}
+\begin{algorithmic}[1]
+\REQUIRE{a list of $N$ (user, session) indices: $\cI = \{(u_1, 1), \ldots, (u_1, T_1), \ldots, (u_n, T_n)\}$}
+\REQUIRE{input feature vectors associated with each (user, session) pair: $\{B_{u, t} \in \R^D: (u, t) \in \cI\}$}
+\REQUIRE{an expensive RNN kernel $\tilde{O}: \R^{2D} \to \R^{2D}$}
+\ENSURE{efficient computation of $\{\omega_{u, t} := O(B_{u, t}): (u, t) \in \cI\}$}
+\STATE Apply the greedy knapsack strategy (Algorithm~\ref{alg:greedy_knapsack}) to get a mapping $m: (u, t) \mapsto (u', t')$, as well as the 2d array $S := \{S_{u', t'}\}$ that encodes the starting positions of the subsequences.
+\STATE Construct a new input features $B'$ according to $B'_{u', t'} = B_{u, t}$.
+\STATE Zero pad the missing entries of $B'$, for vectorized processing.
+\STATE Compute $\omega' := O'(B', S)$ for all packed users in parallel.
+\STATE Rerrange $\omega'_{u', t'}$ into the original user sequences $\omega_{u, t}$ via the inverse map $m^{-1}: (u', t') \mapsto (u, t)$.
+\end{algorithmic}
+\end{algorithm}
+To break down Algorithm~\ref{alg:knapsack_rnn}, we introduce a few terminologies:
+\begin{definition}
+For a given RNN kernel $\tilde{O}: \R^D \times \R^D \to \R^D \times \R^D$, its associated \textbf{sequence map} $O: \R^{D \times T} \to \R^{D \times T}$, $(B_1, \ldots, B_T) \mapsto (\omega_1, \ldots, \omega_T)$ is given inductively by 
+\begin{align*}
+    (\omega_1, H_{u, 1}) &:= \tilde{O}(B_{u, 0}, H_{u, 0}) \\
+    (\omega_{t+1}, H_{u, t+1})  &:= \tilde{O}(\omega_t, H_{u, t}) \quad \text{for } t \leq T -1.
+\end{align*}
+The initial hidden state is typically chosen to be the all zero vector: $H_{u, 0} = \vec{0}$.
+\end{definition}
+
+Note that after applying the knapsack packing Algorithm~\ref{alg:greedy_knapsack}, the maximum length of all the sequences stays the same. The total number of sequences, however, is reduced, by an average factor of 20x. As a result, some new sequence now contains multiple old sequences, arranged contiguously from the left. In such cases, we do not want the hidden states to propagate across sequences. Thus we introduce the following extended RNN sequence map that takes into account the old sequence boundary information:
+\begin{definition}
+Given an RNN kernel $\tilde{O}$ as above, and a 2d indicator array $\{S_t \in \{0, 1\}: 1 \leq t \leq T\}$ denoting the starting positions of sub-sequences within each user sequence, the \textbf{boundary-aware sequence map} 
+\begin{align*}
+    O': \R^{D \times T} \times  \{0, 1\}^{D \times T} \to \R^{D \times T}, \quad (B_1, \ldots, B_T) \mapsto (\omega_1, \ldots, \omega_T)
+\end{align*} 
+is defined via the following inductive formula
+\begin{align*}
+    (\omega_1, H_{u, 1}) &:= \tilde{O}(B_{u, 0}, H_{u, 0}) \\
+    (\omega_{t + 1}, H_{u, t + 1}) &:= 
+    \begin{cases}
+      \tilde{O}(B_{u, t}, H_{u, 0}) & \text{if  $S_{t+1} = 1$ }\\
+      \tilde{O}(\omega_t, H_{u, t}) & \text{otherwise}
+    \end{cases}  
+\end{align*}
+\end{definition}
+ 
+% TODO(jyj): check table stats to ensure logical soundness here.
+% The numbers of items per session typically do not vary by much, and have a mean around 10; indeed we count users' next page request under the same query as a separate session. Thus there is little marginal benefit to apply knapsack packing along the item dimension. Furthermore, under the pairwise training strategy (Section~\ref{subsec:rnn:pairwise}, each session consists of exactly 2 items, making the item dimension already uniform across sessions. 
+
+Overall the session knapsack strategy saves about 20x compute and speed up CPU training time by about 3x. Note that during online serving, knapsack is not needed since we deal with one user at a time.
+\begin{algorithm}[t]
+\caption{Greedy Knapsack Sequence Packing.}
+\label{alg:greedy_knapsack}
+\begin{algorithmic}[1]
+\REQUIRE{A nonempty index set $\cI := \{(u_1, 1), \ldots, (u_1, T_1), \ldots, (u_n, T_n)\}$.}
+\ENSURE{an index map $m: \cI \to \cU' \times [T']$, where $|\cU'| \leq n$ is the packed user index set and $T' \leq \max_i T_i$.}
+\ENSURE{a 2d array $S_{u', t'}$ indicating the start positions of subsequences in each packed user sequence.}  
+\STATE Set $T' := \max_{i=1}^n T_i$.
+\STATE Initialize $U := [n] \setminus \{i\}$.
+\STATE Initialize the list of knapsacks $\cK \leftarrow []$.
+\STATE Initialize $S_{u', t'}$ to the all $0$ 2d array.
+\WHILE {$U \neq \emptyset$}
+    \STATE Pop a longest user sequence from $U$, say $u_j$.
+    \IF {$T_j + \sum_{k \in \cK_i} T_k < T'$ for some $i \leq |\cK|$}
+        \STATE Define $m(j, \ell) := (i, \ell + \sum_{k \in \cK_i} T_k)$ for $\ell < T_j$.
+        \STATE Set $S_{i, \sum_{k \in \cK_i} T_k} \leftarrow 1$.
+        \STATE Append $j$ to the end of $K_i$.
+    \ELSE
+        \STATE Append $[j]$ to the end of $\cK$.
+        \STATE Define $m(j, \ell) := (|\cK|, \ell)$
+        \STATE Set $S_{|\cK|, 1} \leftarrow 1$.
+    \ENDIF
+\ENDWHILE
+
+\end{algorithmic}
+\end{algorithm}
+\subsection{DDPG for Near-Term Future Sessions}
+\label{sec:ddpg}
+
+While attention and RNN are capable of leveraging past sequential data, they fall short of predicting or optimizing future user behavior several steps in advance. This is not surprising because the former are essentially trained in a supervised approach, where the target is simply the next session. To optimize trajectories of several future sessions, we naturally turn to the vast repertoire of reinforcement learning (RL) techniques. 
+
+As mentioned in Section~\ref{subsec:rw:rnn}, unlike the vast majority of RL literature in search and recommendation, our trajectory of agent (ranker) / environment (user) interaction is not confined within a single query session. Instead the user continues to type new queries, over a span of weeks or months. Thus the environment changes from one session to the next. However a key assumption here is that the different manifestations of the environment (user) share an underlying preference theme, as a single user's shopping tastes are strongly correlated across multiple shopping categories or intents.
+
+Another important difference between our sequential session setup and the single session setup in other works is that each step of S3DDPG needs to rank a list of tens or hundreds of items, rather than just picking the top K from the remaining candidate pool. Due to the combinatorial explosion associated with ranking tasks, it becomes infeasible to treat the set of permutations of the items as our action space. Instead we take the vector output of the RNN network, along with the actor network prediction, as the action, which lives in a continuous space.
+% Table~\ref{tab:modeling_differences} summarizes the key areas where S3DDPG departs from existing RL work in search and recommendation.
+
+% \begin{table}[htbp]
+% \centering
+% \caption{Modeling Difference}
+% \small
+% \begin{tabular}{c|c|c}
+% \hline
+% Key Areas & Our Work & Typical Other Work \\
+% \hline
+% Single Step Task & \begin{tabular}{@{}c@{}}Independent \\ Ranking\end{tabular} & \begin{tabular}{@{}c@{}} Masked Top-K \\ Retrieval \end{tabular} \\
+% \hline
+% Explicit Actions & 10! permutations & Candidate Items \\
+% \hline
+% Implicit Actions & RNN output vector & Candidate Items \\
+% \hline
+% \begin{tabular}{@{}c@{}} Environment \\
+% (User Intent) \end{tabular} & Dynamic & Static \\
+% \hline
+% \end{tabular}
+% \label{tab:modeling_differences}
+% \end{table}
+
+
+\subsubsection{S3DDPG Network}
+
+\begin{figure}
+    \centering
+    % \includegraphics[width=\linewidth]{DDPG.png}
+    \includegraphics[scale=0.5]{ddpg_new.png}
+    \centering
+    \caption{S3DDPG architecture.}
+    \label{fig:ddpg}
+\end{figure}
+
+Finally we come to our reinforcement-learning based ranking framework, which is depicted in Diagram~\ref{fig:ddpg}. The bottom half of the network consists of the RNN structure described in the previous subsection. The reinforcement learning part takes the regular RNN output (i.e., non-hidden state related) as the input, and is similar to the actor/critic framework. We closely follow the logic of DDPG network \cite{lillicrap2015continuous}.
+
+The actor network has the same structure as the final MLP layers in RNN that takes the intermediate embedding to per-item logit. The latter is thus used also as the final ranking score for each item within a single query session. 
+
+The critic network (also known as the Q-network) is a separate multi-layer perceptron, $Q: \R^d \to \R$, taking \textbf{a pair of RNN outputs} $\omega_{u, t, a}, \omega_{u, t, b} \in \R^d$ to a single scalar logit. 
+\begin{align*}
+    q_{u, t} := Q(\omega_{u, t, a}, \omega_{u, t, b}) \in \R.
+\end{align*}
+
+$Q$ is introduced here to approximate the following maximal cumulative discounted long term reward:
+\begin{align*}
+    q_{u, t} \sim \sup_{\eta_{u, t}, \ldots, \eta_{u, T}} \sum_{s = t}^T \gamma^{s - t} r(\eta_{u,  t}, \lambda_{u, t}).
+\end{align*}
+
+Here the supremum is taken over all trajectories starting at session $t$, and the reward $r(\eta_{u,t},\lambda_{u, t}) =: r_{u, t}$ is simply given by the opposite of the sigmoid cross entropy loss $\cL(B_{u, t}, \lambda)$ (See \eqref{eq:logloss}):
+% reproduced here for convenience:
+\begin{align} \label{eq:reward_definition}
+    r(\eta_{u, t}, \lambda_{u, t}) = \lambda_{u, t} \log \sigma(\eta_{u, t}) + (1 - \lambda_{u, t}) \log \sigma(1 - \eta_{u, t}).
+\end{align}
+The time horizon $T$ itself is also random in general.
+
+To summarize, we have introduced three networks and their associated output layers so far
+\begin{itemize}
+    \item $\omega_{u, t, a}, \omega_{u, t, b} \in \R^d$ are the output vectors of the RNN network for the chosen item pair.
+    \item $\eta_{u, t} = P(\omega_{u, t, a}) - P(\omega_{u, t, b})$ is the scalar output of the actor network, which has the interpretation of log-odds of the first item being purchased.
+    \item $q_{u, t} = Q(\omega_{u, t, a}, \omega_{u, t, b})$ is the scalar output of the critic (Q) network for the pair.
+\end{itemize}
+
+
+The critic (Q) network differs significantly from the actor network $P$ in that the input consists of pairs of items. Thus unlike $\eta_{u, t}$, it is not anti-symmetric under swapping of the item pair.
+
+
+It is interesting to note that the original supervised loss function $\cL(\eta, \lambda)$ has been re-purposed as the reward in the Q-network. The actual loss functions are defined next.
+% At this stage, we have not defined the loss function of our S3DDPG model yet, which we proceed to do next.
+
+\subsubsection{Loss Functions}
+There are two loss functions in the S3DDPG framework. The first of these two, the temporal difference (TD) loss, is well-known since the first DQN paper \cite{mnih2013playing}. It aims to enforce the Bellman's equation on the Q-values:
+\begin{align} \label{eq:bellman}
+    q_{u, t} = \sup_{\eta_{u, t}} r(\eta_{u, t}, \lambda_{u, t}) + \gamma q_{u, t + 1}.
+\end{align}
+Here $\gamma$ is a discount factor, which is set to $0.8$ throughout our experiments. The associated TD loss would then be
+\begin{align} \label{eq:dqn_td_loss}
+    \cL^{\text{DQN}}_{\text{TD}} (B_{u, t}, \lambda_{u, t}) := \sum_{u \in \cU} \sum_{t=1}^{T - 1} (q_{u, t} - \sup_\eta \left\{r_t(\eta, \lambda) - \gamma q_{u, t+1}\right\})^2.
+\end{align}
+Here $\cU$ stands for all the users in the training data, and $T$ implicitly depends on the choice of $u$. 
+
+% As mentioned in Table~\ref{tab:modeling_differences}, however,
+As mentioned in Section~\ref{sec:ddpg}, however, our action space is either combinatorially explosive ($10!$), or continuous $\R^d$. Thus it is unclear how to compute the supremum on the right hand side. Instead we simply drop the supremum operator and consider the following weakened Bellman equation
+\begin{align} \label{eq:weak_bellman}
+    q_{u, t} = r(\eta_{u, t}, \lambda_{u, t}) + \gamma q_{u, t + 1}, \quad q_{u, T} = 0.
+\end{align}
+The TD loss thus aims to minimize the sum-of-square error between the two sides of the equation above:
+\begin{align} \label{eq:td_loss}
+    \cL_{\text{TD}}(B_{u, t}, \lambda_{u, t}) := \sum_{u \in \cU} \sum_{t=1}^{T - 1} (q_{u, t} - r_{u, t} - \gamma q_{u, t + 1})^2.
+\end{align}
+The problem with the above weakened TD loss \eqref{eq:td_loss} is that by itself, it is under-specified. Indeed, $r_{u, t} = r(\eta_{u, t}, \lambda_{u, t})$ can take on any (negative) value without affecting $\cL_{\text{TD}}$, since the extra degrees of freedom in $q_{u, t}$ can easily compensate for its wild moves. By contrast, the original TD Loss (for DQN) \eqref{eq:dqn_td_loss} eliminates this extra degree of freedom by taking the supremum over all actions $\eta_{u, t}$. 
+
+To make the training loss fully specified, we thus introduce a second loss term, the policy gradient (PG) loss, which seeks to maximize the cumulative Q-value over the RNN and critic network model parameters. 
+\begin{align}
+    \cL_{\text{PG}}(B_{u, t}, \lambda_{u, t}) := \sum_{u \in \cU} \sum_{t=1}^T q_{u, t}, \quad q_{u, t} = Q(O(B_{u, t})).
+\end{align}
+where recall $q_{u, t} = Q(O(B_{u, t, a}), O(B_{u, t, b}))$ for the chosen positive / negative item pair. Note that since the actor network also depends on the RNN network parameters, the PG loss also indirectly optimizes over the action space. Furthermore, since $q_{u, t}$ are very closely tied with the supervised reward function $r_t$, by maximizing $q_{u, t}$, we are implicitly also maximizing the original supervised reward.
+
+
+% This prediction is then fed into a policy gradient loss, which takes into account the logged user feedback label, which in our case is the binary signal of whether the current item has been purchased. The exact policy gradient loss is given by the formula below
+% \begin{align}
+%     \rm{PGLoss} = \sum_{t=1}^T \gamma^t \mathbb{E} Q_t, \quad Q_t := Q(\omega_{u, t}, P_{u, t}) 
+% \end{align}
+
+% The critic network takes the RNN output and actor output (the scalar logit value) as its input, and tries to simulate the Q value associated with the Bellman equation, which is a vector, $\{Q_t: 1 \leq t \leq T\}$, indexed by the session ids. The resulting Q value output is then used to compute a temporal difference loss which measures the deviation from the exact Bellman equation.
+% \begin{align}
+%     \rm{TDLoss} = \sum_{t=1}^{T-1} (Q_t - \gamma Q_{t+1} - r_t)^2.
+% \end{align}
+
+As is standard in DQN and DDPG, we also add the so-called target Q-network \cite{mnih2015human}, denoted by $\tilde{Q}$, that differs from the original Q-network only by one time-step, which is useful for stabilizing its learning. In other words, the exact weight updates are given by,
+\begin{align}
+    Q &\leftarrow Q + \alpha \nabla_Q (\sum_{t = 1}^{T - 1} Q(\omega_t) - \gamma \tilde{Q}(\omega_{t+1}) - r_t) \\
+    \tilde{Q} &\leftarrow Q ,
+\end{align}
+where $\alpha$ is the effective learning rate that depends on the actual 1st order optimizer used.
+
+
+% TODOs:
+% 1. Put a formula about target Q-network here.
+% 2. Put a formula about GRU here.
+% 3. Put a formula about 
+
+
+% One distinguishing feature of DDPG from DQN is that besides Q-learning, there is also policy learning, expressed through the policy gradient loss. The latter tries to maximizes the expected discounted cumulative reward over available actions given the current state. This is naturally done through gradient descent in our ranking problem since the parameter space is continuous, where exact discrete maximization is highly infeasible.
+% Due to the instability of optimizing both the target and the source in Q loss, we use two copies of the Q network, and periodically copy the source version (at $t$) to the target (at $t + 1$).
+
+We have also tried two versions of the actor networks, but the difference in evaluation metrics is small (about 0.04\% in session AUC), thus was discarded for simplicity and training efficiency.
+
+Another important way S3DDPG differs from traditional DDPG implmementation is the relation between the two losses and weight updates. In the original proposal \cite{lillicrap2015continuous}, the actor and critic network weights are updated separately by the PG and TD losses:
+\begin{align*}
+    P \leftarrow P + \alpha \nabla_P \cL_{\text{PG}}, \qquad Q \leftarrow Q + \alpha \nabla_Q \cL_{\text{TD}}.
+\end{align*}
+However we cannot get the model to converge under this gradient update schedule. Instead we simply take the sum of the two losses $\cL_{\text{PG}} + \cL_{\text{TD}}$, and update all the network weights according to
+\begin{align*}
+    O, P, Q \leftarrow \alpha \nabla_{O, P, Q} (\cL_{\text{PG}} + \cL_{\text{TD}}).
+\end{align*}
+
+
+\section{Online Incremental Update}
+To capitalize on the underlying RNN modeling framework, we perform incremental update when the model is served online, so that the most recent user interactions can be captured by the model to update the user states. The overall architecture and its relation to offline training is summarized in Figure~\ref{fig:incremental_update}. The offline trained model can be divided into two sets of network parameters: 
+\begin{itemize}
+    \item The user state aggregation network takes the hidden states associated with all the items in the session, along with their corresponding labels, and perform average pooling to obtain a fixed size updated user state. If the session contains no purchase action, we do not update the user state.
+    \item The remaining network take in the usual input features, along with the user state, to output predictions for each item.
+\end{itemize}
+The first of these is sent to an online incremental update component. While the latter goes directly to the neural network scorer.
+
+The online serving component is roughly divided into three modules. At the center is the search engine itself, which is in charge of distributing and receiving features. 
+
+When a user types in a query, the associated user context features, including query text, user's basic profile information, as well as user's historical actions, are all sent to the search engine. The search engine then relays this information to the neural network predictor, which in turn computes the predicted scores as well as the hidden state for each item, all of which are sent back to the search engine. Finally if the user makes any purchase in the current session, the new user state is updated to be the average of hidden states from the purchase items. 
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{DDPG-IncrementalUpdate.png}
+    \caption{Real-Time Incremental Update Pipeline.}
+    \label{fig:incremental_update}
+\vspace{10pt}
+\end{figure}
+
+% TODOs:
+% 1. add some diversity time series plot.
+% 2. add UV value time series plot.
+% 3. show some arena side by side to show diversity.
+% 4. 

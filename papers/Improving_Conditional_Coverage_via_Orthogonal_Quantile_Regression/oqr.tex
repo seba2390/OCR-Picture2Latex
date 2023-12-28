@@ -1,0 +1,1228 @@
+\documentclass{article}
+
+\PassOptionsToPackage{square,numbers,sort&compress}{natbib}
+\usepackage[preprint]{neurips_2021}
+
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage[hidelinks]{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{comment}
+\usepackage{amsthm}
+\usepackage{mathtools}
+\usepackage{amsmath}
+\usepackage{physics}
+\usepackage{array,makecell}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{bbm}
+\usepackage[toc,page]{appendix}
+\usepackage{caption}
+\usepackage{setspace}
+\usepackage{xcolor}         % colors
+\usepackage{listings}
+\usepackage{wrapfig}
+
+
+\newcommand{\indep}{\perp \!\!\! \perp}
+
+\makeatletter
+\newtheorem*{rep@theorem}{\rep@title}
+\newcommand{\newreptheorem}[2]{%
+\newenvironment{rep#1}[1]{%
+ \def\rep@title{#2 \ref{##1}}%
+ \begin{rep@theorem}}%
+ {\end{rep@theorem}}}
+\makeatother
+
+\renewcommand{\ttdefault}{pcr}
+
+
+\newtheorem{theorem}{Theorem}
+\newreptheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newreptheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}%[theorem]
+\newtheorem{proposition}{Proposition}
+
+
+\usepackage{xr}
+\makeatletter
+\newcommand*{\addFileDependency}[1]{
+  \typeout{(#1)}
+  \@addtofilelist{#1}
+  \IfFileExists{#1}{}{\typeout{No file #1.}}
+}
+\makeatother
+
+
+\title{Improving Conditional Coverage via Orthogonal Quantile Regression}
+
+
+\author{%
+
+   Shai Feldman \\
+   Department of Computer Science \\
+   Technion, Israel \\
+   \texttt{shai.feldman@cs.technion.ac.il}
+   \And
+   Stephen Bates \\
+   Departments of Statistics and of EECS \\
+   UC Berkeley \\
+   \texttt{stephenbates@cs.berkeley.edu}
+   \And
+   Yaniv Romano \\
+   Departments of Electrical Engineering\\and of Computer Science \\
+   Technion, Israel \\
+   \texttt{yromano@cs.technion.ac.il} \\
+
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We develop a method to generate prediction intervals that have a user-specified coverage level across all regions of feature-space, a property called \emph{conditional coverage}. A typical approach to this task is to estimate the conditional quantiles with quantile regression---it is well-known that this leads to correct coverage in the large-sample limit, although it may not be accurate in finite samples. We find in experiments that traditional quantile regression can have poor conditional coverage. To remedy this, we modify the loss function to promote independence between the size of the intervals and the indicator of a miscoverage event. For the true conditional quantiles, these two quantities are independent (orthogonal), so the modified loss function continues to be valid. Moreover, we empirically show that the modified loss function leads to improved conditional coverage, as evaluated by several metrics. We also introduce two new metrics that check conditional coverage by looking at the strength of the dependence between the interval size and the indicator of miscoverage. 
+
+
+\end{abstract}
+
+\section{Introduction}
+Learning algorithms are increasingly prevalent within consequential real-world systems, where reliability is an essential consideration: confidently deploying learning algorithms requires more than high prediction accuracy in controlled testbeds \cite{intro_to_unc_quant, uncertainty_quant}.
+Consider, for example, estimating the effects of a drug for a specific person given their demographic information and medical measurements. In such a high-stakes setting, giving a point prediction for the drug's effect is insufficient; the decision-maker must know what the plausible range of effects \emph{for this specific individual}. Instance-wise uncertainty quantification in such settings is critical \cite{drug_unc_quant, MRI_unc_quant, osti_1561669}. One approach to this problem comes from the quantile regression and prediction interval literature \cite{QR, flexible_pred_bands, quantile_regression_forests}; instead of a point prediction, we can return a range of outcomes that represent the plausible response for a given input. We would like these prediction intervals to achieve a pre-specified coverage level (e.g., 90\%) for all inputs---that is, across all regions of feature space. Training models to satisfy this validity guarantee is challenging, however, particularly with complex models like neural networks \cite{quantile_regression, deep_qr_right_censoring}. In this work, we show how to generate prediction intervals that achieve coverage closer to the desired level evenly across all sub-populations. Technically, we achieve this by augmenting the quantile regression loss function with an additional term that promotes appropriately balanced coverage across the feature space.
+
+Formally, consider a regression problem where we are given $n$ training samples $\{(X_i,Y_i)\}_{i=1}^n$, where $X\in\mathbb{R}^p$ is a feature vector
+, and $Y\in\mathbb{R}$ is a response variable.
+At test time, we observe a feature vector $X_{n+1}$ and our goal is to predict the unknown value of $Y_{n+1}$ and---importantly---to report on its uncertainty. In this work, we represent this uncertainty by
+constructing a \emph{prediction interval} $\hat{C}(X_{n+1}) \subseteq \mathbb{R}$ that is likely to contain the response $Y_{n+1}$. In particular, we seek to produce intervals that contain the response with a user-specified probability $1-\alpha$ that are valid across all regions of feature space:
+\begin{equation}\label{eq:cond_statement}
+\mathbb{P}[Y_{n+1}\in \hat{C}(X_{n+1}) \mid X_{n+1}=x]\geq 1-\alpha,
+\end{equation}
+a property known as \emph{conditional coverage}. Notice that such prediction intervals are both correct in that they satisfy a coverage guarantee and also are adaptive, in that the size of the prediction intervals can change with the difficulty of the inputs: easy inputs give small intervals and hard inputs give large intervals.
+Returning to our medical example, consider predicting the outcome of a drug from age, gender, blood pressure, and so on. The conditional coverage requirement in~\eqref{eq:cond_statement} asks that intervals are correct for any age, gender, and health status combination. That is, no matter what an individual's value of the features $x$, the uncertainty quantification must be valid.
+
+The conditional quantiles of $Y \mid X = x$ are the natural way to produce intervals satisfying \eqref{eq:cond_statement}. Let $\alpha_{\textrm{lo}} = \alpha/2$ and $\alpha_{\textrm{hi}} = 1-\alpha/2$.
+
+Given the true conditional quantiles, $q_{\alpha_{\textrm{lo}}}(x), q_{\alpha_{\textrm{hi}}}(x)$, we can build an \emph{oracle prediction interval} satisfying \eqref{eq:cond_statement} in the following way:
+\begin{equation}\label{eq:oracle_intervals}
+C(x)= [q_{\alpha_{\textrm{lo}}}(x), q_{\alpha_{\textrm{hi}}}(x)].
+\end{equation}
+In practice, the conditional quantiles are unknown but can be estimated with quantile regression, yielding the interval $\hat{C}(x) = [\hat{q}_{\alpha_{\textrm{lo}}}(x), \hat{q}_{\alpha_{\textrm{hi}}}(x)]$. This approach is attractive because quantile regression yields intervals that are adaptive to heteroscedasticity without requiring parametric assumptions \cite{non_parametric_qr, qr_conf_sets, hetero_qr}, but these intervals \emph{might not satisfy the conditional coverage statement \eqref{eq:cond_statement}}, since $\hat{q}_{\alpha_{\textrm{lo}}}(x), \hat{q}_{\alpha_{\textrm{hi}}}(x)$ are merely estimations of the true quantiles \cite{barber2019limits}. Indeed, we observe in experiments \ref{sec:experiments} that traditional quantile regression often gives intervals with poor conditional coverage, prompting the present investigation.
+
+
+
+In this work, we propose a novel regularization scheme to push quantile regression algorithms towards solutions that better satisfies the conditional coverage requirement \eqref{eq:cond_statement}. The core idea is to force the coverage and interval length to be approximately independent, since this independence must hold for the optimal oracle intervals in \eqref{eq:oracle_intervals}. A method that constructs intervals whose coverage and length are dependent is either sometimes too conservative (generating too wide intervals), sometimes too liberal (yeilding too short intervals), or both. 
+
+In addition to improved training schemes, we propose two new tools to check the validity of the resulting predictions in a meaningful way. Specifically, in Section \ref{metrics_section}, we present two new interpretable metrics to asses the violation of conditional coverage, taking advantage of the orthogonality property identified above.
+We use these (and other) metrics in Section~\ref{sec:experiments} to study our proposal on simulated data and nine real benchmark data sets. We find that our training scheme yields improvements when used together with both a classic \cite{QR} and a more recent \cite{beyond_pinball_loss}
+ quantile regression method.
+
+
+
+\subsection*{A synthetic two-group example}\label{syn_example}
+
+We begin with a small synthetic experiment that demonstrates the challenges of constructing prediction intervals with accurate conditional coverage. We generate a dataset with two unbalanced sub-populations: 80\% of the samples belong to a majority group and the remaining 20\% to a minority group, where the conditional distribution $Y \mid X$ of the minority group is more dispersed than the majority group. In our experiments, group membership is included as one of the features. See Section \ref{syn_dataset_details} of the Supplementary Material for a full description of the distribution.
+\begin{figure}
+\centering
+\begin{tabular}{cc}
+\centering
+\includegraphics[width=0.43\linewidth]{Experimental Figures/During training/QR with and without decorrelation penalty/lambda=3/seed=42/Majority_Group_vanilla_QR.png} &
+  
+\includegraphics[width=0.43\linewidth]{Experimental Figures/During training/QR with and without decorrelation penalty/lambda=3/seed=42/Majority_Group_orthogonal_QR.png} \\
+
+\includegraphics[width=0.43\linewidth]{Experimental Figures/During training/QR with and without decorrelation penalty/lambda=3/seed=42/Minority_Group_vanilla_QR.png} &   
+\includegraphics[width=0.43\linewidth]{Experimental Figures/During training/QR with and without decorrelation penalty/lambda=3/seed=42/Minority_Group_orthogonal_QR.png} \\
+
+\end{tabular}
+\caption{Coverage as a function of the training epochs obtained by quantile natural network model; target coverage rate is 90\%. The \texttt{vanilla QR} model (left) is trained by optimizing the pinball loss whereas the \texttt{orthogonal QR} model (right) is fitted by combining the pinball loss with the proposed independence penalty. The purple vertical line marks the epoch that achieves the smallest empirical risk on a validation set.}
+\label{fig:syn_during_training}
+\end{figure}
+
+As a baseline method, we first fit a quantile neural network model (\texttt{vanilla QR}) by optimizing the pinball loss (see Section~\ref{sec:related_work}), attempting to estimate the low $\alpha_{\textrm{lo}} = 0.05$ and high $\alpha_{\textrm{hi}} = 0.95$ conditional quantiles. The left panel of Figure \ref{fig:syn_during_training} shows the coverage obtained by the \texttt{vanilla QR} model across training epochs. The coverage on the test data is far lower than suggested by the training data, failing to reach the desired 90\% level and increasing as the training progresses. In particular, this gap remains large at the epoch in which the model achieves the minimal loss evaluated on an independent validation set. Here, the empirical test coverage measured over the majority and minority groups is equal to 80\% and 68\%, and the empirical average lengths evaluated over them are 1.55, 6.45, respectively. 
+
+Next, we fit our proposed \texttt{orthogonal QR} model (which we will formally introduce in Section~\ref{sec:method}) on the same data. The coverage rate across epochs is illustrated in the right panel of Figure \ref{fig:syn_during_training}. In contrast to \texttt{vanilla QR}, the training and testing curves of the majority group overlap for the entire training epochs and both approximately reach the desired 90\% level. The minority group coverage has similar behavior, with a significantly smaller gap between the two curves compared to \texttt{vanilla QR}. Here, the model that corresponds to the best epoch achieves 86\% coverage rate with 1.62 average length on the majority group, and 83\% coverage rate with 9.33 average length on the minority group. Importantly, here we are able to train for more epochs before overfitting, which leads to a better final model.
+To conclude, in this example \texttt{orthogonal QR} prevents overfitting and leads to better conditional coverage.
+
+
+\section{Preliminaries and related work}
+\label{sec:related_work}
+
+\subsection{Quantile regression}\label{quantile_regression_section}
+
+
+
+The task of estimating the low and high conditional quantiles, $\hat{q}_{\alpha_{\textrm{lo}}}(x)$, $ \hat{q}_{\alpha_{\textrm{hi}}}(x)$, can be expressed as a minimization problem taking the following form:
+\begin{equation}\label{quantile_regression_optimization}
+\begin{gathered}
+(\hat{q}_{\alpha_{\textrm{lo}}}, \hat{q}_{\alpha_{\textrm{hi}}}) = \operatorname*{argmin}_{f_{\alpha_{\textrm{lo}}}, f_{\alpha_{\textrm{hi}}} \in \mathcal{F}} \ \ \ {\frac{1}{n}{\sum_{i=1}^{n} {\ell_{\alpha}(Y_i,f_{\alpha_{\textrm{lo}}}(X_i), f_{\alpha_{\textrm{hi}}}(X_i))}}}.
+\end{gathered}
+\end{equation}
+Above, $\ell_\alpha$ is a loss function designed to fit quantiles; we  discuss two examples next.
+
+
+The most common loss function for estimating a conditional quantile $\hat{q}_\alpha$ is called the \emph{pinball loss} or check function \cite{QR, quantile_regression, estimating_cond_quantiles_pinball}, expressed as
+\begin{equation}
+\rho_\alpha(y,\hat{y}) = 
+\begin{cases} 
+      \alpha(y-\hat{y}) & y-\hat{y} > 0, \\
+      (1-\alpha)(\hat{y}-y) & \textrm{otherwise}.
+   \end{cases}
+\end{equation}
+Observe that for the choice $\alpha=1/2$ the above becomes the $L_1$ norm that is known to estimate the conditional median. By setting $\alpha \neq 1/2$ we get a tilted version of the latter, with a degree controlled by the value of $\alpha$. In the context of \eqref{quantile_regression_optimization}, we can set $\ell^\textrm{pb}_{\alpha}(y,f_{\alpha_{\textrm{lo}}}(x), f_{\alpha_{\textrm{hi}}}(x)) = \rho_{\alpha_{\textrm{lo}}}(y,f_{\alpha_{\textrm{lo}}}(x)) + \rho_{\alpha_{\textrm{hi}}}(y,f_{\alpha_{\textrm{hi}}}(x))$ to simultaneously estimate the low and high quantiles. Throughout this paper, we will refer to this procedure as \texttt{vanilla QR}. 
+
+A recently-developed alternative to the pinball loss is the \emph{interval score loss} \cite{interval_score_loss}, defined as:
+\begin{align}
+& \ell^\textrm{int}_{\alpha}(y,f_{\alpha_{\textrm{lo}}}(x), f_{\alpha_{\textrm{hi}}}(x)) = \nonumber \\ 
+&  \ \ \ \ \ (f_{\alpha_{\textrm{hi}}}(x) - f_{\alpha_{\textrm{lo}}}(x)) + \frac{2}{\alpha}(f_{\alpha_{\textrm{lo}}}(x) - y) \mathbbm{1}[y < f_{\alpha_{\textrm{lo}}}(x)]
++ \frac{2}{\alpha}(y - f_{\alpha_{\textrm{hi}}}(x)) \mathbbm{1}[ y > f_{\alpha_{\textrm{hi}}}(x)].
+\end{align}
+Note that the left-most term encourages short intervals and the two remaining components promote intervals with the right coverage. To improve statistical efficiency, it is recommended by \cite{beyond_pinball_loss} to simultaneously estimate all conditional quantiles by minimizing the following empirical risk function: $\mathbb{E}_{\alpha \sim U[0,1]}[\ell^\textrm{int}_{\alpha}(\cdot)]$.\footnote{The code is hosted at \url{https://github.com/YoungseogChung/calibrated-quantile-uq}} This is the approach we take in our experiments. Note that \cite{beyond_pinball_loss} proposed additional learning schemes for improving efficiency, such as group batching and ensemble learning; see also \cite{ENS_QR}. These ideas are complementary to our proposal and may further improve the performance of our proposed \texttt{orthogonal QR}.
+
+
+
+Quantile regression is a large, active area of research, and we finish by pointing out a few representative strands of work in the literature. Estimates of conditional quantile functions using the pinball loss with specific models are proven to be asymptotically consistent under regularity conditions \cite{estimating_cond_quantiles_pinball}. The work reported in \cite{non_parametric_qr, qr_conf_sets, hetero_qr} offer a non-parametric version of quantile regression. This line of research was further developed by \cite{additive_qr} that presented a generalization to additive models that are non-parametric. 
+The pinball loss and interval score loss can be also used to estimate conditional probability distribution \cite{qr_conditional_density,interval_score_loss}. 
+Nevertheless, quantiles can be estimated in other ways rather than minimizing these two loss functions. These include quantile random forest \cite{quantile_regression_forests} and the method proposed in \cite{qr_mm} that iteratively estimates the conditional quantile through the Majorize-Minimize algorithm. Besides the regularization term we propose, there are other suggested penalties that are useful in different situations, such as using sparse modeling in high dimensional response \cite{high_dimensional_sparse, high_dimensional_qr, high_dimensional_sparse2}.
+
+
+\subsection{Conformal inference}
+
+Conformal inference \cite{vovk2005algorithmic} is a framework for building a prediction intervals that provably attain a weaker \emph{marginal} coverage property:
+\begin{equation}\label{eq:marginal_statement}
+\mathbb{P}[Y_{n+1}\in \hat{C}(X_{n+1})]\geq 1-\alpha.
+\end{equation}
+Importantly, one can guarantee that this holds for any joint distribution $P_{XY}$, sample size $n$, and predictive algorithm. In contrast to \eqref{eq:cond_statement}, the probability statement in~\eqref{eq:marginal_statement} is marginal and taken over all the training and test samples $\{(X_i, Y_i)\}^{n+1}_{i=1}$. For example, in the context of the data from Figure~\ref{fig:syn_during_training}, intervals that satisfy \eqref{eq:marginal_statement} would be allowed to undercover the minority group and overcover the majority group. Therefore, the statement in \eqref{eq:marginal_statement}  is much weaker than that in \eqref{eq:cond_statement}. Yet, the former can be achieved for any distribution whereas the latter can not be achieved for badly-behaved distributions; see \cite{barber2019limits, MedianInference}. While variants of the guarantee in \eqref{eq:marginal_statement} are possible~\cite{vovk_conditional_validity, equalized_cov, bates2021distributionfree}, achieving coverage exactly balanced across a continuous feature cannot be done without further assumptions.
+Much recent work in conformal inference with quantile regression attempts to generate intervals that are adaptive to such heteroscedasticity so that they approximately achieve conditional coverage in \eqref{eq:cond_statement}, while ensuring that $1-\alpha$ marginal coverage in \eqref{eq:marginal_statement} is exactly achieved \cite{CQR,flexible_pred_bands,comparison_conformal,adaptive_intervals,dist_conformal_pred,nested_conformal,conformal_regions}. The experiments we conduct show that our proposed \texttt{Orthogonal QR} method can be used in combination with conformal prediction to improve the conditional coverage property while attaining valid marginal coverage.
+
+\section{Proposed method: orthogonal quantile regression}
+\label{sec:method}
+
+\subsection{Formulating the learning scheme}
+This section presents a modification of the pinball loss or interval score loss in order to fit models with improved conditional coverage. 
+Denote by $V=\mathbbm{1}[Y \in  \hat{C}(X)]$ the coverage identifier, and by $L=|\hat{C}(X)|$ the interval's length.
+
+Our proposal is motivated by the following observation.
+
+
+\begin{proposition}[Independence of width and coverage]\label{prop:independence_theorem}
+Let $(X,Y)$ be a sample drawn from $P_{XY}$, and let $\mathcal{X}$ be the support of $X$. If the distribution of $Y \mid X = x$ is continuous for all $x \in \mathcal{X}$, and its interval $\hat{C}(X)$ satisfies $\mathbb{P}[Y\in \hat{C}(X)|X=x]=1-\alpha$ for all $x \in \mathcal{X}$ and some $\alpha \in (0,1)$, then the interval satisfies $V \indep L$.
+\end{proposition}
+In particular, the above implies that the length of an interval $L = q_{\alpha_{\textrm{hi}}}(X) - q_{\alpha_{\textrm{lo}}}(X)$ constructed by the true low and high quantiles is independent of the coverage identifier $V$, as stated next.
+
+
+\begin{corollary}\label{cor:quantile_indp}
+Under the assumptions of Proposition~\ref{prop:independence_theorem}, an interval constructed by the true conditional quantiles satisfies $V \indep L$.
+\end{corollary}
+We note that an earlier, limited version of this observation appears in~\cite{angelopoulos2020uncertainty} in the context conditional coverage for classification problems.
+All proofs are presented in Section \ref{proofs} of the Supplementary Material. Since intervals constructed by the true conditional quantiles obey the independence property, forcing the fitted model to approximately satisfy this property during training can result in better conditional coverage for future test points.
+
+
+This leads us to our proposed \texttt{orthogonal QR} objective:
+\begin{equation}\label{eq:quantile_regression_optimization_reg}
+\begin{gathered}
+(\hat{q}_{\alpha_{\textrm{lo}}}, \hat{q}_{\alpha_{\textrm{hi}}}) = \operatorname*{argmin}_{f_{\alpha_{\textrm{lo}}}, f_{\alpha_{\textrm{hi}}} \in \mathcal{F}} \ \ \ {\frac{1}{n}{\sum_{i=1}^{n} {\ell_{\alpha}(Y_i,f_{\alpha_{\textrm{lo}}}(X_i), f_{\alpha_{\textrm{hi}}}(X_i))}}} + \gamma \mathcal{R}({\mathbf{L}}, {\mathbf{V}}).
+\end{gathered}
+\end{equation}
+where $\ell_{\alpha}$ is either $\ell^\textrm{pb}_{\alpha}$ or $\ell^\textrm{int}_{\alpha}$, $\mathbf{L} \in \mathbb{R}^n$ is a vector that contains $L_i = f_{\alpha_{\textrm{hi}}}(X_i) - f_{\alpha_{\textrm{lo}}}(X_i) = |\hat{C}(X_i)|$ as its elements, and $\mathbf{V} \in \mathbb{R}^n$ is a vector with entries $V_i  = \mathbbm{1}[Y_i \in  \hat{C}(X_i)]$. (To facilitate training with gradient methods, in practice we use a smooth approximation to the indicator function; see Section \ref{V_estimation} of the Supplementary Material.) The function $\mathcal{R}({\mathbf{L}}, {\mathbf{V}})\in \mathbb{R}^+$ returns a real-valued score that quantifies the strength of the dependence between ${L}$ and ${V}$, where a large value indicates that the two are more dependent; we discuss specific choices in Section \ref{penalty_formulation}. The regularization strength is controlled by the hyperparameter $\gamma$. 
+
+
+
+Lastly, we point out that our proposal falls into the broader theme of fitting models while enforcing conditional independence properties, a goal that is important for algorithmic fairness~\citep[e.g.,][]{fairness_constraints, ERM_fairness, romano2020achieving}. This work aims to achieve uncertainty estimates that are equally good across all feature space, a prediction interval analog to the goal of \cite{hsic_implementation}.
+
+\subsection{The orthogonality loss}
+\label{penalty_formulation}
+We now turn to the question of choosing the specific dependence loss penalty, $\mathcal{R}$ in \eqref{eq:quantile_regression_optimization_reg}.
+In principle, we could use any dependence measure from the many in the literature: chi-squared tests \cite{chi2_test}, Pearson's correlation, distance correlation \cite{distance_corr}, Kolmogorov-Smirnov statistic \cite{KS_test}, Randomized Dependence Coefficient \cite{RDC}, Hilbert-Schmidt independence criterion (HSIC) \cite{hsic}, and so on. In this work we focus on Pearson's correlation and HSIC which are described hereafter.
+
+The Pearson's correlation measures the linear dependency between two random variables. Here, the loss is defined as:
+\begin{equation}
+\label{eq:corr}
+\mathcal{R}_{\textrm{corr}}(L, V)= \left| \frac{\textrm{Cov}(L, V)}{\sqrt{\textrm{Var}(L)} \sqrt{\textrm{Var}(V)}} \right|.
+\end{equation} 
+The advantages of this choice are its simplicity and the minimal computational burden.
+
+Next, HSIC is a more sophisticated, nonlinear complement to the Pearson's correlation measure, which can detect arbitrary complex relationships between the coverage identifier and the interval length. It is an analog of the well-known Maximum Mean Discrepancy (MMD) distance~\cite{MMD}, but is a measure of dependence.  The idea is that while $\mathcal{R}_{\textrm{corr}}(L,V)=0$ does not necessarily imply that $L $ and $V$ are independent, having $\mathcal{R}_{\textrm{corr}}(g(L),h(V))=0$ for every continuous bounded functions $g, h$ guarantees the independence property \cite{corr_indp_property}. While it is impossible to sweep over all possible continuous bounded functions, $\textrm{HSIC}$ offers a tractable solution, guaranteeing that $\textrm{HSIC}(L, V)=0$ if and only if $L \indep V$ \cite{hsic}. In our work, we utilize this measure, and define the orthogonality loss as $\mathcal{R}_{\textrm{HSIC}}(L,V) = \sqrt{\textrm{HSIC}(L, V)}$ (taking the square root to magnify small values). This choice is similar to the one advocated in \cite{mmd_sqrt}. 
+
+With these choices of $\mathcal{R}$, we now show that the true conditional quantiles are a solution for the \texttt{orthogonal QR} problem.
+
+\begin{theorem}[Validity of orthogonal quantile regression]\label{thm:oqr_validity}
+Suppose $Y \mid X = x$ follows a continuous distribution for each $x \in \mathcal{X}$, and suppose that 
+$q_{\alpha_{\textrm{lo}}}(X), q_{\alpha_{\textrm{hi}}}(X) \in \mathcal{F}$.
+
+Consider the infinite-data version of the \textnormal{\texttt{orthogonal QR}} optimization in \eqref{eq:quantile_regression_optimization_reg}:
+\begin{equation*}
+    \begin{gathered} \operatorname*{argmin}_{f_{\alpha_{\textrm{lo}}}, f_{\alpha_{\textrm{hi}}} \in \mathcal{F}} \ \ \ { \mathbb{E} \big[{\ell_{\alpha}(Y,f_{\alpha_{\textrm{lo}}}(X), f_{\alpha_{\textrm{hi}}}(X))} + \gamma \mathcal{R}\big(|\hat{C}(X)|,  \mathbb{I}[Y \in \hat{C}(X)]\big)\big]},
+\end{gathered}
+\end{equation*}
+where $\hat{C}(X) = [f_{\alpha_{\textrm{lo}}}(X), f_{\alpha_{\textrm{hi}}}(X)]$, $\ell_\alpha$ is either $\ell^\textrm{pb}_\alpha$ or $\ell^\textrm{int}_\alpha$, and $\mathcal{R}$ is $\mathcal{R}_\textrm{corr}$ or $\mathcal{R}_\textrm{HSIC}$. Then, true conditional quantiles are solutions to the above optimization problem. Moreover, if the solution is unique for $\gamma = 0$ then the solution is unique for all $\gamma > 0$.
+\end{theorem}
+The uniqueness part of the theorem means that whenever \texttt{vanilla QR} is guaranteed to give the correct quantiles in the large-sample limit, then \texttt{orthogonal QR} will give the same (correct) solution. The result continues to hold for any dependence measure $\mathcal{R}$ that achieves its minimum value for any two independent variables, a basic property that all dependence measures that we are aware of satisfy. See the proof in Section~\ref{proofs} of the Supplementary Material for further details.
+
+
+\section{Metrics for assessing conditional coverage}\label{metrics_section}
+We next discuss several quantitative measures of conditional coverage. We will introduce two new metrics for conditional coverage, and then review one existing proposal from the literature. Lastly, we will discuss two ad-hoc metrics to help us compare \texttt{orthogonal QR} with \texttt{vanilla QR} in our upcoming simulation experiments.
+
+\subsection{Two new metrics for conditional coverage}
+\textbf{\texttt{Pearson's correlation}:} 
+As previewed in the previous section, the Pearson correlation between the interval size and the indicator of coverage (i.e., $\mathcal{R}_{\textrm{corr}}$ from \eqref{eq:corr}) is a simple, effective way to measure conditional coverage. However, to the best of our knowledge, we are the first to leverage it for this purpose.
+
+\textbf{\texttt{HSIC}:} Similarly, we consider the HSIC measure of dependence between the interval size and the indicator of coverage (i.e., $\mathcal{R}_{\textrm{HSIC}}$ above). We estimate this metric as described in \cite{hsic_implementation}.\footnote{The code is available at \url{https://github.com/danielgreenfeld3/XIC}} As before, to our knowledge this has never been leveraged as a metric to asses conditional coverage.
+
+\subsection{Other metrics for our empirical evaluations}
+\textbf{$\Delta$\texttt{WSC}:} As an additional measure of conditional coverage, we  evaluate the coverage over the worst-slab as proposed in \cite{wsc}.\footnote{We used the implementation from  \url{https://github.com/msesia/arc/}} To avoid a case where an improvement in this quantity is obtained by naively enlarging all prediction intervals, we suggest a variant that we call $\Delta$\texttt{WSC}. This metric is defined as the absolute difference between the worst-slab coverage and the marginal coverage, both evaluated on test data $\mathcal{I}$:
+\begin{equation*}
+\Delta \texttt{WSC}= \left| \textrm{WSC}\left(\left\{\left(X_i, Y_i\right)\right\}_{i \in \mathcal{I}}; \hat{C}\right) - \textrm{Coverage}\left(\left\{(X_i,Y_i)\right\}_{i \in \mathcal{I}}; \hat{C}\right) \right|.
+\end{equation*}
+Above, $\textrm{Coverage}\left(\{(X_i,Y_i)\}_{i \in \mathcal{I}}; \hat{C}\right) = \frac{1}{|\mathcal{I}|}\sum_{i \in \mathcal{I}}{\mathbbm{1}[Y_i \in  \hat{C}(X_i)]}$ where $\hat{C}(x)$ is a prediction interval method. Importantly, a uniform increase of the length of all intervals will not deceive the $\Delta$\texttt{WSC} measure as it will remain fixed.
+
+
+\textbf{\texttt{$\Delta$ILS-Coverage}:} We next consider a measure that checks whether the intervals made larger by \texttt{orthogonal QR} compared to \texttt{vanilla QR} are necessary for improving the conditional coverage. In general, suppose we are given two algorithms $\mathcal{A}_1$ and $\mathcal{A}_2$ for constructing prediction intervals. Let
+$\Delta L_i = |\hat{C}_{\mathcal{A}_1}(X_i)| - |\hat{C}_{\mathcal{A}_2}(X_i)|$
+be the difference between the interval length $|\hat{C}_{\mathcal{A}}(X_i)|$ obtained by $\mathcal{A}_1$ and $\mathcal{A}_2$, evaluated on the same test point $X_i$. Next, let $q_{0.9}(\{\Delta L_i\}_{i\in\mathcal{I}})$ be the 90\% empirical quantile of $\{\Delta L_i\}_{i\in \mathcal{I}}$. Then, let ILS be the 10\% of samples whose length increased the most:
+\begin{equation*}
+\text{ILS} = \{i: \Delta L_i \geq q_{0.9}(\{\Delta L_i\}_{i \in \mathcal{I}}) , i \in \mathcal{I} \}.
+\end{equation*}
+With this notation in place, we propose the \texttt{$\Delta$ILS-Coverage} metric:
+\begin{equation*}
+\texttt{$\Delta$ILS-Coverage}=
+\abs{\textrm{Coverage}\left(\left\{(X_i,Y_i)\right\}_{i \in \mathrm{ILS}}; \hat{C}_{\mathcal{A}_k}\right) - \textrm{Coverage}\left(\left\{(X_i,Y_i)\right\}_{i \in \mathcal{I}}; \hat{C}_{\mathcal{A}_k}\right)}.
+\end{equation*}
+In words, the above is the absolute difference between the coverage over the ILS samples and the marginal coverage, evaluated for each algorithm $\mathcal{A}_k, k=1,2$. A smaller value for $k=1$ indicates that the points with very different size under $\mathcal{A}_1$ and $\mathcal{A}_2$ are handled better by $\mathcal{A}_1$.
+
+
+\texttt{\textbf{$\Delta$Node-Coverage}}: As a variant of $\texttt{$\Delta$ILS-Coverage}$, we identify a sub-population characterized by a small set of features such that the two algorithms $\mathcal{A}_1$ and $\mathcal{A}_2$ produce very different intervals, and check the coverage on this region.
+To this end, we label the ILS samples as the positive class and fit a binary classifier formulated as a decision tree, aiming to predict whether a sample $X$ belongs to the ILS set. Denote the set of tree nodes in depth at most three that contain at least 5\% of the samples by $\{\textrm{Node}_j\}_j$, where $\textrm{Node}_j \subseteq  \mathcal{I}$. Next, let $\textrm{ND}$ be the set of indices of the samples that belong to the node that maximizes the following ratio: ${\left|{ \textrm{Node}_j \cap \text{ILS} } \right| / \left|\textrm{Node}_j \setminus \text{ILS} \right|}$.
+
+Finally, given a method for constructing prediction intervals $\hat{C}(\cdot)$, compute the distance between the coverage over the ND samples and the marginal coverage, formulated as $$ \Delta\texttt{Node-Coverage}= \left| \textrm{Coverage}\left(\left\{(X_i,Y_i)\right\}_{i \in \textrm{ND}}; \hat{C}\right) - \textrm{Coverage}\left(\left\{(X_i,Y_i)\right\}
+_{i \in \mathcal{I}}; \hat{C}\right) \right|.$$ 
+
+
+
+\section{Experiments}\label{sec:experiments}
+Armed with the performance metrics described in Section~\ref{metrics_section}, we now systematically quantify the effectiveness of the proposed independence penalty when combined with baseline quantile regression methods. In all experiments, we apply a deep neural network as a base model for constructing prediction intervals with $1-\alpha = 0.9$ coverage level. Section~\ref{exp_settings} of the Supplementary Material gives the details about the network architecture, training strategy, and details about this experimental setup. Software implementing the proposed method and reproducing our experiments can be found at \url{https://github.com/Shai128/oqr}
+
+
+\subsection{A synthetic two-group setting}\label{syn_data_section}
+We return to the synthetic two-group setting previewed in Section~\ref{syn_example}, but first provide more details about the data. In this data set, the difference in distribution between the majority and minority groups is controlled by modifying the noise level of the conditional distribution $Y \mid X$ of the minority group. Furthermore, $X$ has 50 coordinates, the first of which indicates the group membership. Section \ref{syn_dataset_details} of the Supplementary Material contains more details about the generation of this synthetic data. To analyze the performance of our method, we generate 7000 i.i.d. samples and repeat the following experiment for 30 random train/validation/test splits of the data. We fit a quantile regression model with pinball loss on 5040 training samples, where we tune the number of epochs on an independent validation set that contains 560 samples. The remaining 1400 samples are used to test the model's performance. We pre-processed the feature vector using z-score standardization, and normalized the features and response variables to have a zero mean and a unit variance.
+
+
+In Table~\ref{tab:syn_pinball_table} we report the average coverage, length, and conditional coverage metrics for \texttt{vanilla QR} and \texttt{orthogonal QR} for two minority-group noise levels. (The $\Delta$\texttt{ILS-Coverage}, $\Delta$\texttt{Node-Coverage} metrics are not reported in this case, since they both essentially correspond to the minority group's coverage level, which is given in the table.) The intervals constructed by the baseline \texttt{vanilla QR} undercover both the majority and minority group but; this tendency is more severe for the latter. By contrast, the regularized model achieves similar coverage rates for the two groups, with levels that are closer to the nominal 90\%. This is also reflected by the improvement in the \texttt{Pearson's correlation}, \texttt{HSIC}, and $\Delta$\texttt{WSC} metrics of conditional coverage. Overall, \texttt{orthogonal QR} gives wider intervals for the minority group, which is anticipated since the coverage of the baseline model is far below the nominal rate. As for the majority group, our proposed training gives intervals of about the same length compared to the baseline model, while achieving a considerably higher coverage rate. In fact, the regularized model constructs even shorter intervals in the high noise level case. Lastly, we note that this performance continues to hold even when using interval score loss in place of the pinball loss; see Section \ref{syn_int_results} of the Supplementary Material.
+
+
+
+\begin{table}[tbp]
+\setstretch{1.1}
+  \centering
+    \caption{Simulated data experiments. Performance of neural network quantile regression, using either \texttt{vanilla QR} (baseline) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$. The average coverage, length, and percent of improvement in the conditional coverage metrics described in Section~\ref{metrics_section} are evaluated over 30 independent trials. The standard errors for coverage and length are about 0.25, 0.06, respectively. The standard errors for the conditional coverage metrics are presented in Supplementary Table~\ref{tab:syn_pb_std_errs}.}
+    
+    \scalebox{0.67}{
+
+    \begin{tabular}{cccccccccccc}
+
+
+    \toprule[1.1pt]
+    
+          \multicolumn{1}{c}{{\parbox{1.8cm}{\centering\textbf{Minority Noise Level}}}} 
+          & \multicolumn{1}{c}{\textbf{Majority Coverage (\%)}} &
+          \multicolumn{1}{c}{\textbf{Minority Coverage (\%)}} & 
+          \multicolumn{1}{c}{\textbf{Majority Lengths}} & 
+          \multicolumn{1}{c}{\textbf{Minority Lengths}} & 
+          \multicolumn{3}{c}{\textbf{Improvement (\%)}} \\
+    \midrule
+          & 
+          
+          \multicolumn{1}{c}{\parbox{2.6cm}{\centering baseline / \texttt{OQR}}} & 
+          \multicolumn{1}{c}{\parbox{2.6cm}{\centering baseline / \texttt{OQR}}} & 
+          \multicolumn{1}{c}{\parbox{2.6cm}{\centering baseline / \texttt{OQR}}} & 
+          \multicolumn{1}{c}{\parbox{2.6cm}{\centering baseline / \texttt{OQR}}} & 
+          
+          \multicolumn{1}{c}{\parbox{1.5cm}{\centering{\texttt{corr}}}} & \multicolumn{1}{c}{\parbox{1cm}{\centering{\texttt{HSIC}}}} &
+          \multicolumn{1}{c}{\parbox{1cm}{\centering{$\Delta$\texttt{WSC}}}}
+          \\
+    \midrule
+    {Low} & 79.64  / 87.24  & 66.34  / 82.55  & 1.59  / 1.62  & 6.45  / 9.18  & \textcolor[rgb]{ 0,  .502,  0}{+64.07} & \textcolor[rgb]{ 0,  .502,  0}{+53.76} & \textcolor[rgb]{ 1,  0,  0}{-13.88} \\
+    % \midrule
+    {High} & 81.07  / 86.97  & 68.74  / 83.74  & 1.88  / 1.71  & 22.05 / 30.11 & \textcolor[rgb]{ 0,  .502,  0}{+72.21} & \textcolor[rgb]{ 0,  .502,  0}{+27.99} & \textcolor[rgb]{ 0,  .502,  0}{+17.96} \\
+
+    \bottomrule[1.1pt]
+    
+    \end{tabular}%
+    
+    
+    }
+
+\label{tab:syn_pinball_table}%
+\end{table}%
+
+
+\subsection{Real data}
+
+Next, we compare the performance of the proposed \texttt{orthogonal QR} to \texttt{vanilla QR} on nine benchmarks data sets as in \cite{CQR,beyond_pinball_loss}: Facebook comment volume variants one and two (facebook\_1, facebook\_2), blog feedback (blog\_data), physicochemical properties of protein tertiary structure (bio), forward kinematics of an 8 link robot arm (kin8nm), condition based maintenance of naval propulsion plants (naval), and medical expenditure panel survey number 19-21 (meps\_19, meps\_20, and meps\_21). See Section \ref{real_dataset_details} of the Supplementary Material for details about these data sets. We follow the experimental protocol and training strategy described in Section \ref{syn_data_section}. We randomly split each data set into disjoint training (54\%), validation (6\%), and testing sets (40\%). We normalized the features and response variables to have a zero mean and a unit variance each, except for facebook\_1, facebook\_2, blog\_data, and bio datasets in which we log transform $Y$ before the standardization.
+
+\begin{wrapfigure}[16]{r}{0.5\textwidth}
+  \vspace{-0.4cm}
+  \centering
+    \includegraphics[width=0.9\linewidth, height=0.6\linewidth]{Experimental Figures/Final results/Real data/Coverage vs Length/qr+corr0.5_mep21.png}
+    \caption{Length versus coverage for \texttt{vanilla QR} and \texttt{orthogonal QR} over the meps\_21 data. In Section~\ref{real_exp_description} of the Supplementary Material we explain how the figure was constructed.}
+    \label{fig:meps_cov_vs_len}
+\end{wrapfigure}
+Table \ref{tab:real_pinball_results} summarizes the performance of \texttt{vanilla QR} and \texttt{orthogonal QR}. Our proposed method consistently improves the conditional coverage, as measured by the \texttt{Pearson's correlation}, \texttt{HSIC}, and $\Delta$\texttt{WSC} metrics for conditional coverage, even though the latter two are not optimized directly by \texttt{orthogonal QR}. In Figure \ref{fig:meps_cov_vs_len}, we show the coverage as a function of the interval's length evaluated on the meps\_21 data set, and find that \texttt{orthogonal QR} (in orange) is closer to the nominal 90\% level when compared to the baseline method. Our penalty also improves the \texttt{$\Delta$Node-Coverage} in most data sets (see Table \ref{tab:real_pinball_results}), indicating that the baseline model tends to undercover the response of at least one sub-population. Turning to the statistical efficiency, observe that the intervals produced by the regularized models tend to be wider than the ones of the baseline method, which is needed to better achieve conditional coverage. We further probe this phenomenon by checking the $\Delta$\texttt{ILS-Coverage} which shows that the regions with wider intervals now have better coverage. 
+
+
+In Section~\ref{real_int_results} of the Supplementary Material we provide additional experiments by replacing the pinball loss with the recently-introduced interval score loss. The effect of the decorrelation penalty is similar to the one described above. Moreover, in Section \ref{HSIC_results} we also compare between the decorrelation and HSIC penalties for independence, and show that in most data sets the decorrelation penalty achieves better performance over all metrics of conditional independence at the cost of producing wider intervals.
+
+
+\begin{table}[tbp]
+\setstretch{1.1}
+  \centering
+  \caption{Conditional coverage on real data. Performance of a neural network model for quantile regression, using either \texttt{vanilla QR} (baseline) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$. The average coverage, length, and percent of improvement in the conditional coverage metrics described in Section~\ref{metrics_section} are evaluated over 30 independent trials. The standard errors for coverage and width are about 0.45 and 0.03, respectively. The standard errors for the conditional coverage metrics are presented in Supplementary Table~\ref{tab:real_pb_std_errs}.}
+    \scalebox{0.75}{
+    \begin{tabular}{cccccccccc}
+    \toprule[1.1pt]
+          \multicolumn{1}{c}{\centering\textbf{Dataset Name}} & 
+          \multicolumn{2}{c}{\textbf{Coverage (\%)}} &
+          \multicolumn{2}{c}{\textbf{Length}} & 
+          \multicolumn{5}{c}{\textbf{Improvement (\%)}} \\
+    \midrule
+    &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering baseline}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{OQR}}} &     
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering baseline}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{OQR}}} & \multicolumn{1}{c}{\parbox{1.5cm}{\centering{\texttt{corr}}}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{WSC}}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{ILS}}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{Node}}}}
+    
+    \\
+
+    \midrule
+    \textbf{facebook\_1} & 88.10  & 90.48  & 1.09  & 1.44  & \textcolor[rgb]{ 0,  .502,  0}{+81.08} & \textcolor[rgb]{ 0,  .502,  0}{+76.75} & \textcolor[rgb]{ 0,  .502,  0}{+33.42} & \textcolor[rgb]{ 0,  .502,  0}{+65.81} & \textcolor[rgb]{ 0,  .502,  0}{+47.30} \\
+    \textbf{facebook\_2} & 87.38  & 91.13  & 1.07  & 1.41  & \textcolor[rgb]{ 0,  .502,  0}{+91.27} & \textcolor[rgb]{ 0,  .502,  0}{+96.36} & \textcolor[rgb]{ 0,  .502,  0}{+33.86} & \textcolor[rgb]{ 0,  .502,  0}{+65.71} & \textcolor[rgb]{ 0,  .502,  0}{+55.63} \\
+    \textbf{blog\_data} & 82.89  & 88.92  & 1.36  & 1.64  & \textcolor[rgb]{ 0,  .502,  0}{+77.49} & \textcolor[rgb]{ 0,  .502,  0}{+2.27} & \textcolor[rgb]{ 0,  .502,  0}{+21.44} & \textcolor[rgb]{ 0,  .502,  0}{+89.94} & \textcolor[rgb]{ 0,  .502,  0}{+34.41} \\
+    \textbf{bio} & 88.42  & 89.08  & 1.88  & 2.03  & \textcolor[rgb]{ 0,  .502,  0}{+53.49} & \textcolor[rgb]{ 0,  .502,  0}{+75.55} & \textcolor[rgb]{ 1,  0,  0}{-44.73} & \textcolor[rgb]{ 0,  .502,  0}{+43.20} & \textcolor[rgb]{ 0,  .502,  0}{+7.25} \\
+    \textbf{kin8nm} & 84.63  & 88.62  & 0.98  & 1.28  & \textcolor[rgb]{ 0,  .502,  0}{+27.54} & \textcolor[rgb]{ 0,  .502,  0}{+48.47} & \textcolor[rgb]{ 0,  .502,  0}{+14.97} & \textcolor[rgb]{ 0,  .502,  0}{+57.38} & \textcolor[rgb]{ 1,  0,  0}{-16.44} \\
+    \textbf{naval} & 89.89  & 89.50  & 0.56  & 1.49  & \textcolor[rgb]{ 0,  .502,  0}{+75.19} & \textcolor[rgb]{ 0,  .502,  0}{+33.98} & \textcolor[rgb]{ 1,  0,  0}{-57.52} & \textcolor[rgb]{ 0,  .502,  0}{+72.36} & \textcolor[rgb]{ 1,  0,  0}{-14.34} \\
+    \textbf{meps\_19} & 82.44  & 85.16  & 0.84  & 1.00  & \textcolor[rgb]{ 0,  .502,  0}{+54.16} & \textcolor[rgb]{ 0,  .502,  0}{+22.25} & \textcolor[rgb]{ 0,  .502,  0}{+43.28} & \textcolor[rgb]{ 0,  .502,  0}{+88.05} & \textcolor[rgb]{ 0,  .502,  0}{+45.43} \\
+    \textbf{meps\_20} & 82.81  & 84.27  & 0.86  & 1.03  & \textcolor[rgb]{ 0,  .502,  0}{+43.51} & \textcolor[rgb]{ 0,  .502,  0}{+1.99} & \textcolor[rgb]{ 0,  .502,  0}{+24.06} & \textcolor[rgb]{ 0,  .502,  0}{+84.71} & \textcolor[rgb]{ 0,  .502,  0}{+46.88} \\
+    \textbf{meps\_21} & 82.50  & 84.07  & 0.86  & 0.99  & \textcolor[rgb]{ 0,  .502,  0}{+57.46} & \textcolor[rgb]{ 0,  .502,  0}{+13.62} & \textcolor[rgb]{ 0,  .502,  0}{+20.78} & \textcolor[rgb]{ 0,  .502,  0}{+85.02} & \textcolor[rgb]{ 0,  .502,  0}{+38.28} \\
+    
+    
+    
+    \bottomrule[1.1pt]
+
+    \end{tabular}%
+    }
+  \label{tab:real_pinball_results}%
+\end{table}%
+
+
+
+
+
+\subsection*{Conformalized quantile regression results}
+
+In previous experiments the quantile regression methods tend to (marginally) undercover the response variables. This limitation is easily remedied by combining \texttt{vanilla QR} or \texttt{orthogonal QR} with conformalized quantile regression \cite{CQR} that adjusts the estimated intervals to exactly achieve the marginal coverage property in~\eqref{eq:marginal_statement}. Table~\ref{tab:real_cqr_results} summarizes the results, demonstrating that by conformalizing the intervals our proposed method precisely achieves the desired marginal coverage while improving the conditional coverage of the baseline model, as measured by the \texttt{Pearson's correlation}, \texttt{HSIC}, and $\Delta$\texttt{WSC}, \texttt{$\Delta$Node-Coverage} metrics.
+The two independence metrics indicate that even after after adjusting the intervals to achieve marginal coverage, our method still results in improved independence between the coverage event and length. We note that the $\Delta$\texttt{WSC}, and \texttt{$\Delta$Node-Coverage} metrics have a more muted improvement compared to the setting without conformalization, since the conformalization step smooths out the coverage to some extent. 
+Further details regarding this conformalizing setting is given in Section \ref{cqr_exp} of the Supplementary Material.
+
+
+\begin{table}[tbp]
+\setstretch{1.1}
+  \centering
+  \caption{Conditional coverage on real data, with conformalization. Performance of a neural network model for conformalized quantile regression, using either \texttt{vanilla CQR} (\texttt{CQR}) or \texttt{orthogonal CQR} (\texttt{COQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$. Refer to the caption of Table~\ref{tab:real_pinball_results} for further details. The standard errors for coverage and length are about 0.2 and 0.03, respectively. The standard errors for the conditional coverage metrics are presented in Supplementary Table~\ref{tab:real_cqr_std_errs}.}
+    \scalebox{0.75}{
+    \begin{tabular}{cccccccccc}
+    \toprule[1.1pt]
+          \multicolumn{1}{c}{\textbf{Dataset Name}} & 
+          \multicolumn{2}{c}{\textbf{Coverage (\%)}} & 
+          \multicolumn{2}{c}{\textbf{Length}} & 
+          \multicolumn{5}{c}{\textbf{Improvement (\%)}} \\
+    \midrule
+     &
+     
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{CQR}}} & 
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{COQR}}} &     \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{CQR}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{COQR}}} & 
+    \multicolumn{1}{c}{\parbox{1.5cm}{\centering{\texttt{corr}}}} & 
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{WSC}}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{ILS}}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{Node}}}}
+    \\
+
+
+    \midrule
+
+    \textbf{facebook\_1} & 90.08  & 90.11  & 1.09  & 1.43  & \textcolor[rgb]{ 0,  .502,  0}{+58.28} & \textcolor[rgb]{ 0,  .502,  0}{+37.61} & \textcolor[rgb]{ 0,  .502,  0}{+34.86} & \textcolor[rgb]{ 0,  .502,  0}{+67.79} & \textcolor[rgb]{ 0,  .502,  0}{+29.46} \\
+    \textbf{facebook\_2} & 90.40  & 89.94  & 1.07  & 1.39  & \textcolor[rgb]{ 0,  .502,  0}{+76.25} & \textcolor[rgb]{ 0,  .502,  0}{+52.16} & \textcolor[rgb]{ 0,  .502,  0}{+29.51} & \textcolor[rgb]{ 0,  .502,  0}{+53.33} & \textcolor[rgb]{ 0,  .502,  0}{+52.46} \\
+    \textbf{blog\_data} & 89.93  & 90.15  & 1.41  & 1.64  & \textcolor[rgb]{ 0,  .502,  0}{+13.77} & \textcolor[rgb]{ 1,  0,  0}{-79.60} & \textcolor[rgb]{ 0,  .502,  0}{+24.38} & \textcolor[rgb]{ 0,  .502,  0}{+90.57} & \textcolor[rgb]{ 0,  .502,  0}{+39.38} \\
+    \textbf{bio} & 90.02  & 89.98  & 1.93  & 2.05  & \textcolor[rgb]{ 0,  .502,  0}{+51.19} & \textcolor[rgb]{ 0,  .502,  0}{+71.55} & \textcolor[rgb]{ 1,  0,  0}{-30.80} & \textcolor[rgb]{ 0,  .502,  0}{+39.18} & \textcolor[rgb]{ 1,  0,  0}{-40.48} \\
+    \textbf{kin8nm} & 90.11  & 90.11  & 1.12  & 1.33  & \textcolor[rgb]{ 0,  .502,  0}{+18.16} & \textcolor[rgb]{ 0,  .502,  0}{+13.06} & \textcolor[rgb]{ 1,  0,  0}{-69.52} & \textcolor[rgb]{ 0,  .502,  0}{+58.14} & \textcolor[rgb]{ 1,  0,  0}{-1.44} \\
+    \textbf{naval} & 89.84  & 90.06  & 0.55  & 1.51  & \textcolor[rgb]{ 0,  .502,  0}{+77.28} & \textcolor[rgb]{ 0,  .502,  0}{+36.78} & \textcolor[rgb]{ 1,  0,  0}{-77.14} & \textcolor[rgb]{ 0,  .502,  0}{+68.24} & \textcolor[rgb]{ 1,  0,  0}{-10.18} \\
+    \textbf{meps\_19} & 89.96  & 89.84  & 0.92  & 1.05  & \textcolor[rgb]{ 0,  .502,  0}{+50.59} & \textcolor[rgb]{ 0,  .502,  0}{+39.94} & \textcolor[rgb]{ 0,  .502,  0}{+58.85} & \textcolor[rgb]{ 0,  .502,  0}{+83.77} & \textcolor[rgb]{ 0,  .502,  0}{+36.84} \\
+    \textbf{meps\_20} & 90.08  & 90.19  & 0.95  & 1.09  & \textcolor[rgb]{ 0,  .502,  0}{+43.22} & \textcolor[rgb]{ 0,  .502,  0}{+39.66} & \textcolor[rgb]{ 0,  .502,  0}{+47.50} & \textcolor[rgb]{ 0,  .502,  0}{+84.13} & \textcolor[rgb]{ 0,  .502,  0}{+43.89} \\
+    \textbf{meps\_21} & 89.93  & 89.89  & 0.94  & 1.05  & \textcolor[rgb]{ 0,  .502,  0}{+41.88} & \textcolor[rgb]{ 0,  .502,  0}{+29.69} & \textcolor[rgb]{ 0,  .502,  0}{+33.46} & \textcolor[rgb]{ 0,  .502,  0}{+79.47} & \textcolor[rgb]{ 0,  .502,  0}{+37.33} \\
+    
+    
+    \bottomrule[1.1pt]
+
+
+    \end{tabular}%
+    }
+  \label{tab:real_cqr_results}%
+\end{table}%
+
+\section{Conclusion}\label{sec:conclusion}
+
+In this work we presented the \texttt{orthogonal QR} approach to achieve coverage closer to the desired level evenly across all sup-populations in the setting of quantile regression algorithms.
+A technical limitation of our method is the use of large batches during training, required to effectively detect the dependencies between the intervals length and coverage events. In our experiments we focus on i.i.d data, but we believe that the orthogonal loss can be beneficial beyond this, such as in time-series data, which we hope to investigate in future work. A related future direction is to encourage independence between a coverage event and a function of the feature vector, other than that of interval length---similar logic to that of our proposal means that this independence would hold for the true quanties. A clever choice may better capture the relationships between $X$ and the coverage obtained by the model, and further improve conditional coverage.
+
+
+As a concluding remark, while empirical evidence shows that our \texttt{orthogonal QR} approach produces intervals that represent the uncertainty in subgroups more reliably than standard methods, it does not guarantee a valid coverage across all feature space with access to only a finite sample. This guarantee may be necessary for ensuring that predictions are unbiased against a minority group of interest, indexed by an individual's gender or race, for example. To alleviate this, one can combine our methods with the \emph{equalized coverage} framework \cite{equalized_cov} that builds upon conformal inference to achieve the desired coverage for pre-defined sub-populations, which is a weaker but achievable demand compared to conditional coverage.
+
+
+\begin{ack}
+This research was supported by the ISRAEL SCIENCE FOUNDATION (grant No. 729/21). Y.R. thanks the Career Advancement Fellowship, Technion.
+
+\end{ack}
+
+\bibliographystyle{unsrt}
+\bibliography{bibliography}
+\clearpage
+\begin{appendices}
+
+
+
+\section{Emperical estimations}
+
+\subsection{A differentiable coverage identifier}\label{V_estimation}
+
+Given a prediction interval $\hat{C}(X_i)=[\hat{q}_{\alpha_{\textrm{lo}}}(X_i), \hat{q}_{\alpha_{\textrm{lo}}}(X_i)]$ for a point $X_i$, we approximate its coverage indicator $\mathbbm{1}[Y \in \hat{C}(X_i)]$ in the following way:
+\begin{equation}
+\begin{split}
+& \Tilde{V_i} = \tanh\left(c \min\{Y_i -  \hat{q}_{\alpha_{\textrm{lo}}}(X_i), \hat{q}_{\alpha_{\textrm{hi}}}(X_i) - Y_i\}\right) \\
+& \hat{V_i} = \frac{1}{2} \left( \Tilde{V_i} + 1 \right)
+\end{split}
+\end{equation}
+where $c \in \mathbb{R}^+$ controls the slope of the step function. In the experiments, we set $c$ to be equal to~$5\cdot {10}^3$. This approximation is differentiable and used in practice.
+
+
+\section{Theoretical results}\label{proofs}
+
+
+\subsection{Proof of proposition 1}\label{th1_proof}
+
+\begin{proof}
+Consider an $l \in \mathbb{R}$, and $v\in \{0,1\}$. To prove the theorem, it suffices to show that $\mathbb{P}(V=v \mid L=l) = \mathbb{P}(V=v)$. 
+Denote $g_X, g_{X|L}$ the density functions of $X$ and  $X|L$ respectively, and denote $\beta = \mathbb{P}(V=v \mid X=x)$. It is given that the interval constructed satisfies $\mathbb{P}(V=1 \mid X=x)=1-\alpha$ for all $x \in \mathcal{X}$, and therefore $\beta$ is a constant and equals $1-\alpha$ if $v=1$, or $\alpha$ if $v=0$.
+
+First, we show that $\mathbb{P}(V=v)=\beta$:
+\begin{equation*}
+\mathbb{P}(V=v) = \int_{x \in \mathcal{X}} \mathbb{P}(V=v \mid X=x) g_{X}(x)  \,dx = \beta \int_{x \in \mathcal{X}} g_{X}(x)  \,dx = \beta
+\end{equation*}
+ To conclude our proof, we show that $\mathbb{P}(V=v \mid L=l) = \beta$ as well.
+\begin{equation*}
+\begin{split}
+\mathbb{P}(V=v \mid L=l) & = \int_{\{x \in \mathcal{X} \mid L=l \}} \mathbb{P}(V=v \mid L=l, X=x) g_{X \mid L}(x \mid l)  \,dx \\
+& = \int_{\{x \in \mathcal{X} \mid L=l \}} \mathbb{P}(V=v \mid X=x) g_{X \mid L}(x \mid l)  \,dx \\
+& = \int_{\{x \in \mathcal{X} \mid L=l \}} \beta g_{X \mid L}(x \mid l)  \,dx \\ & = \beta = \mathbb{P}(V=v)
+\end{split}
+\end{equation*}
+\end{proof}
+
+\subsection{Proof of corollary}\label{cor1_proof}
+
+\begin{proof}
+The interval constructed by true conditional quantiles $C(X) = [q_{\alpha_{\textrm{lo}}}(X), q_{\alpha_{\textrm{hi}}}(X)]$ satisfies $\mathbbm{P}(Y\in C(X)|X=x)=1-\alpha$ for all $x\in \mathcal{X} $, and hence, from Proposition \ref{prop:independence_theorem} we conclude that $L \indep V$.
+
+\end{proof}
+
+
+\subsection{Proof of theorem 1}\label{th2_proof}
+
+\begin{proof}
+The true quantiles minimize the first term in the sum, by the properties of pinball loss or interval score loss. Moving to the next term.
+
+Assuming $Y \mid X$ is continuous, from Corollary~\ref{cor:quantile_indp} the true conditional quantiles satisfy: $V \indep L$, and this implies that their correlation, denoted as $\textrm{CORR}(L,V)$, and HSIC are fixed and equal zero, and therefore:
+\begin{equation*}
+\begin{split}
+& \textrm{CORR}(L,V)=0 \Rightarrow \mathcal{R}_{\textrm{corr}}(L,V)= \left| \textrm{CORR}(L,V) \right|= \left| 0 \right|=0,\\ 
+& \textrm{HSIC}(L,V)=0 \Rightarrow \mathcal{R}_{\textrm{HSIC}}(L,V)= \sqrt{\textrm{HSIC}(L,V)}= \sqrt{0}=0.\\ 
+\end{split}
+\end{equation*}
+This means that for either choice loss function, $\mathcal{R}(L,V)=0$ which is the minimal value of the second term, as it is non-negative.
+Therefore, the true quantiles are a solution to the minimization problem, since they minimize both terms separately.
+
+Turning to the uniqueness, assume there is a unique solution for $\gamma=0$. Then, since the true quantiles minimize the the pinball loss or interval score loss, it follows that the true conditional quantiles are the unique solution. We proved that they attain $\mathcal{R}(L,V)=0$, the minimum value this term could achieve. Thus, we conclude that there is only one solution for all $\gamma>0$.
+\end{proof}
+
+
+
+\section{Datasets details}
+
+\subsection{Synthetic datasets details}\label{syn_dataset_details}
+
+The synthetic dataset is determined by the parameter $\lambda$ which controls the variance of the response value of the minority group. The generation of the feature vector and the response variable is done in the following way:
+
+\begin{align*}
+& \hat{\beta} \sim \textrm{Uniform} (0,1)^{50}, \hat{\gamma} \sim \textrm{Uniform}(0,1)^{50}, & \\
+& \beta = \frac{\hat{\beta}}{\Vert\hat{\beta}\Vert_2}, \gamma = \frac{\hat{\gamma}}{\Vert\hat{\gamma}\Vert_2}, & \\
+& \varepsilon_{1,i} \sim \mathcal{N}(0,1), \varepsilon_{2,i} \sim  \mathcal{N}(0,1), & 1 \leq i \leq n,\\
+& X_{i, 1-49} \sim \textrm{Uniform}(0,5)^{49}, & 1\leq i \leq n,\\
+& X_{i, 0} = \begin{cases} 
+      0, & \textrm{w.p.}\text{ } 0.8 \\
+      1, & \textrm{otherwise} \\
+   \end{cases} & 1 \leq i \leq n, \\
+& Y_i = \begin{cases} 
+      0.03\beta^TX_i\varepsilon_{1,i}, & X_{i,0}=0 \\
+      0.03\gamma^TX_i\varepsilon_{1,i} + \lambda \varepsilon_{2,i}, & X_{i,0}=1 \\
+   \end{cases} & 1 \leq i \leq n, \\
+\end{align*}
+
+where Uniform$(a,b)$ is a uniform distribution on the interval $(a,b)$, and $\mathcal{N}(0,1)$ is the standard Gaussian distribution. The dataset with minority noise level set to low was created with $\lambda=3$, and the one with the High noise level with $\lambda=10$. Both datasets contain 7000 samples, and were generated with a seed value equals to 1.
+
+\subsection{Real dataset details}\label{real_dataset_details}
+Table \ref{tab:real_datasets_info} shows the size of each data set and the feature dimension.
+
+\begin{table}[htbp]
+
+\caption{Real datasets information. Number of samples and feature dimension of each real dataset we used in the experiments}
+    \label{tab:real_datasets_info}
+\setstretch{1.4}
+  \centering
+\scalebox{0.8}{
+\centering
+\begin{tabular}{ccc}
+    \toprule[1.1pt]
+    \textbf{Dataset Name} & \textbf{Number of Samples} & \textbf{Feature Dimension} \\
+    \midrule
+    
+    \textbf{facebook\_1} \cite{facebook_data} & 40948 & 53 \\
+
+    \textbf{facebook\_2} \cite{facebook_data} & 81311 & 53 \\
+
+    \textbf{blog\_data} \cite{blog_data} & 52397 & 280 \\
+
+    \textbf{bio} \cite{bio_data} & 45730 & 9 \\
+
+    \textbf{kin8nm} \cite{kin8nm_data} & 8192 & 8 \\
+
+    \textbf{naval} \cite{naval_data} & 11934 & 17 \\
+
+    \textbf{meps\_19} \cite{meps19_data} & 15785 & 139 \\
+
+    \textbf{meps\_20} \cite{meps20_data}& 17541 & 139 \\
+
+    \textbf{meps\_21} \cite{meps21_data} & 15656 & 139 \\
+    
+    \bottomrule[1.1pt]
+    \end{tabular}%
+}
+\end{table}
+
+\section{Experimental setup}\label{exp_settings}
+\subsection{Setup}
+
+The network we used receives as an input a vector of size $p+1$ (where the feature dimension is $p$). The first $p$ variables in the input vector correspond to the elements of the feature vector, and the last variable is the quantile level of the desired quantile. We trained quantile regression with pinball loss over two quantile levels: 95\% and 5\% level quantiles, and trained quantile regression with interval score over all quantile levels.
+For each model, we built prediction intervals using the 95\%-th and 5\%-th quantiles it outputted, as explained in \ref{quantile_regression_section}.
+The code we used is based on the implementation of \cite{beyond_pinball_loss}.
+The penalty multipliers for each dataset were chosen by an independent train-validation-test split (with seed=42), so the coefficient that achieved the best performance was taken. The multipliers tested for the real data are: 0.1, 0.5, for pinball loss, and 0.1, 0.5, 1, 3, for interval score loss. For the synthetic data we checked: 0.1, 0.5 for both losses.
+When combining our penalty with pinball loss, the coefficient given to the model is multiplied by 0.1.
+
+
+\subsection{Synthetic data experiments}\label{syn_exp_description}
+We split the synthetic datasets into a training set (64\%), a validation set (16\%) for early stopping, and a test set (20\%) to evaluate performance.
+After that, the feature vectors and the labels were preprocessed using z-score normalization.
+The neural network is made of 2 layers of 64 hidden units, and a ReLU activation function. The network does not contain a dropout layer. The learning rate used is $1e^{-3}$, the model's optimizer is Adam \cite{adam}, and the batch size is 1024 for all methods.
+The maximum number of epochs is 10000, but the training is stopped early if the validation loss does not increase for 200 epochs, and in this case the model with the lowest loss is taken as the final model. 
+The results were averaged over all seeds in the range between 0 and 29 (inclusive).
+
+The decorrelation coefficients used in the experiments are: for pinball loss, 0.5 for both $\lambda=3$, and $\lambda=10$, and for interval score loss 3 for both $\lambda=3, 10$.
+
+\subsection{Real data experiments}\label{real_exp_description}
+First, the datasets: facebook\_1, facebook\_2, blog\_data, and bio, were log scaled: $y = \log(y-\min(y)+1)$.
+We split each dataset it into a training set (54\%), a validation set (6\%) for early stopping, and a test set (40\%) to evaluate performance.
+After that, the feature vectors and the labels were preprocessed using z-score normalization.
+The neural network is made of 3 layers of 64 hidden units, and ReLU activation function. The network contains a dropout layer with parameter $0.1$. The learning rate, training strategy and batch size are the same as described in \ref{syn_exp_description}.
+The maximum number of epochs is 10000, and we used the same early stopping technique described in \ref{syn_exp_description}.
+The results were averaged over all seeds in the range between 0 and 29 (inclusive).
+
+Figure \ref{fig:meps_cov_vs_len} was produced by splitting all test's coverages and lengths over all seeds to hundred bins, and averaging each bin separately. Both \texttt{vanilla QR} and \texttt{orthogonal QR} used pinball loss as an objective function, and the penalty used by our method is $\mathcal{R}_{\textrm{corr}}$.
+
+Table \ref{coefficients_used} displays the multiplier used for each data set and method.
+
+\begin{table}[!htb]
+    \centering
+    \caption{Penalty multipliers used for each dataset}
+    \setstretch{1.4}
+    \label{coefficients_used}
+    \begin{minipage}{.5\linewidth}
+        \caption*{Pinball Loss}
+        \centering
+  \scalebox{0.8}{
+      \centering
+
+    \begin{tabular}{ccc}
+    \toprule[1.1pt]
+    \textbf{Dataset Name} & \textbf{Decorr multiplier} & \textbf{HSIC multiplier} \\
+    \midrule
+    \textbf{facebook\_1} & 0.5 & 0.5 \\
+
+    \textbf{facebook\_2} & 0.5 & 0.5 \\
+
+    \textbf{blog\_data} & 0.5 & 0.5 \\
+
+    \textbf{bio} & 0.1 & 0.1 \\
+
+    \textbf{kin8nm} & 0.1 & 0.1 \\
+
+    \textbf{naval} & 0.1 & 0.1 \\
+
+    \textbf{meps\_19} & 0.5 & 0.1 \\
+
+    \textbf{meps\_20} & 0.5 & 0.1 \\
+
+    \textbf{meps\_21} & 0.5 & 0.5 \\
+    \bottomrule
+    \end{tabular}%
+    }
+    \end{minipage}%
+    \begin{minipage}{.65\linewidth}
+      \centering
+        \caption*{Interval Score Loss}
+  \scalebox{0.8}{
+      \centering
+
+    \begin{tabular}{cc}
+    \toprule[1.1pt]
+    \textbf{Dataset Name} & \textbf{Decorr multiplier} \\
+    \midrule
+    \textbf{facebook\_1} & 0.5 \\
+
+    \textbf{facebook\_2} & 0.5 \\
+
+    \textbf{blog\_data} & 1 \\
+
+    \textbf{bio} & 0.1 \\
+
+    \textbf{kin8nm} & 0.5 \\
+
+    \textbf{naval} & 0.1 \\
+
+    \textbf{meps\_19} & 3 \\
+
+    \textbf{meps\_20} & 3 \\
+
+    \textbf{meps\_21} & 3 \\
+    \bottomrule[1.1pt]
+    \end{tabular}%
+    }
+    \end{minipage} 
+    
+\end{table}
+
+
+\subsection{Conformalized quantile regression experiments}\label{cqr_exp}
+We used the same setting as in \ref{real_exp_description}, except for the following changes.
+The dataset was split into a training set (54\%), a validation set (6\%) for early stopping, a calibration set (20\%) to achieve valid marginal coverage, and a test set (20\%) to evaluate performance. 
+The calibration method used is Conformalized Quantile Regression \cite{CQR}.
+
+\subsection{Machine's spec}\label{sec:exp_spec}
+
+The resources used for the experiments are:
+
+\begin{itemize}
+    \item \textbf{CPU}: Intel(R) Core(TM) i5-10600K CPU 4.10GHz.
+    \item \textbf{GPU}: NVIDIA GeForce RTX 2060 SUPER.
+    \item \textbf{OS}: Windows 10.
+
+\end{itemize}
+
+
+\section{Additional results}
+
+\subsection{Synthetic data}\label{syn_int_results}
+
+As shown in Table \ref{tab:syn_int_table}, when combined with interval score loss, the suggested penalty consistently improves all metrics, and balances the coverage rates over the majority and minority subgroups.
+
+\begin{table}[htbp]
+\setstretch{1.4}
+  \centering
+  \caption{Simulated data experiments - using interval score loss with either \texttt{QR} (baseline) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$. Refer to the caption of Table~\ref{tab:syn_pinball_table} for further details. The standard errors for coverage and width are about 0.45, 0.1, respectively. See Table~\ref{tab:syn_int_std_errs} for a full reporting of all standard errors. }
+    \scalebox{0.67}{
+
+    \begin{tabular}{cccccccccccc}
+    \toprule[1.1pt]
+          \multicolumn{1}{c}{{\parbox{1.8cm}{\centering \textbf{Minority Group Uncertainty }}}} 
+          & \multicolumn{1}{c}{{\textbf{Majority Coverage (\%)}}}
+          & \multicolumn{1}{c}{\textbf{Minority Coverage (\%)}}
+          & \multicolumn{1}{c}{\textbf{Majority Lengths}} 
+          & \multicolumn{1}{c}{\textbf{Minority Lengths}}
+          & \multicolumn{3}{c}{\textbf{Improvement (\%)}} \\
+    \midrule
+          & 
+          
+                    \multicolumn{1}{c}{\parbox{2.6cm}{\centering baseline / \texttt{OQR}}} & 
+          \multicolumn{1}{c}{\parbox{2.6cm}{\centering baseline / \texttt{OQR}}} & 
+          \multicolumn{1}{c}{\parbox{2.6cm}{\centering baseline / \texttt{OQR}}} & 
+          \multicolumn{1}{c}{\parbox{2.6cm}{\centering baseline / \texttt{OQR}}} & 
+          
+          \multicolumn{1}{c}{\parbox{1.5cm}{\centering{\texttt{corr}}}} & \multicolumn{1}{c}{\parbox{1cm}{\centering{\texttt{HSIC}}}} &
+          \multicolumn{1}{c}{\parbox{1cm}{\centering{$\Delta$\texttt{WSC}}}} \\
+    \midrule
+
+    Low & 84.38  / 88.56  & 72.77  / 78.41  & 1.73  / 1.89  & 7.46  / 8.70  & \textcolor[rgb]{ 0,  .502,  0}{+35.03} & \textcolor[rgb]{ 0,  .502,  0}{+46.48} & \textcolor[rgb]{ 0,  .502,  0}{+49.80} \\
+    
+    High & 85.99  / 89.89  & 74.08  / 80.05  & 2.22  / 2.53  & 24.99 / 29.07 & \textcolor[rgb]{ 0,  .502,  0}{+27.91} & \textcolor[rgb]{ 0,  .502,  0}{+7.00} & \textcolor[rgb]{ 0,  .502,  0}{+17.62} \\
+    
+    \bottomrule[1.1pt]
+
+    \end{tabular}%
+    }
+  \label{tab:syn_int_table}%
+\end{table}%
+
+
+
+\subsection{Real data}\label{real_int_results}
+
+The advantages of adding the suggested orthogonal loss to the interval score loss are summarized in Table \ref{tab:real_int_results}. Similarly to pinball loss, our regularizer improves the baseline method over all metrics in most datasets.
+
+Also, the improvement over $\Delta$\texttt{WSC} and $\Delta$\texttt{Node-Coverage} metrics suggest that our loss does help to better approximate conditional validity with interval score as well as pinball loss. Overall, we can conclude that our proposal is useful for various scoring rules.
+
+
+
+
+\begin{table}[htbp]
+\setstretch{1.4}
+  \centering
+  \caption{Real data experiments - using interval score loss with either \texttt{QR} (baseline) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$. Refer to the caption of Table~\ref{tab:real_pinball_results} for further details. The standard errors for coverage and width are about 0.6, 0.1, respectively. See Table~\ref{tab:real_int_std_errs} for a full reporting of all standard errors.}
+    \scalebox{0.75}{
+    \begin{tabular}{cccccccccc}
+    \toprule[1.1pt]
+          \multicolumn{1}{c}{\textbf{Dataset Name}} & \multicolumn{2}{c}{\textbf{Coverage (\%)}} & \multicolumn{2}{c}{\textbf{Length}} & \multicolumn{5}{c}{\textbf{Improvement (\%)}} \\
+    \midrule
+     &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering baseline}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{OQR}}} &     \multicolumn{1}{c}{\parbox{1.3cm}{\centering baseline}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{OQR}}} & \multicolumn{1}{c}{\parbox{1.5cm}{\centering{\texttt{corr}}}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{WSC}}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{ILS}}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{Node}}}}
+    \\
+
+    \midrule
+
+
+\textbf{facebook\_1} & 89.03  & 91.97  & 1.43  & 1.45  & \textcolor[rgb]{ 0,  .502,  0}{+79.02} & \textcolor[rgb]{ 0,  .502,  0}{+96.90} & \textcolor[rgb]{ 0,  .502,  0}{+15.91} & \textcolor[rgb]{ 0,  .502,  0}{+68.69} & \textcolor[rgb]{ 0,  .502,  0}{+1.15} \\
+    \textbf{facebook\_2} & 88.82  & 93.35  & 1.35  & 1.38  & \textcolor[rgb]{ 0,  .502,  0}{+90.96} & \textcolor[rgb]{ 0,  .502,  0}{+98.71} & \textcolor[rgb]{ 0,  .502,  0}{+30.53} & \textcolor[rgb]{ 0,  .502,  0}{+69.23} & \textcolor[rgb]{ 0,  .502,  0}{+5.81} \\
+    \textbf{blog\_data} & 82.94  & 87.25  & 1.58  & 1.65  & \textcolor[rgb]{ 0,  .502,  0}{+86.13} & \textcolor[rgb]{ 0,  .502,  0}{+94.47} & \textcolor[rgb]{ 0,  .502,  0}{+2.79} & \textcolor[rgb]{ 0,  .502,  0}{+89.66} & \textcolor[rgb]{ 0,  .502,  0}{+18.64} \\
+    \textbf{bio} & 89.93  & 89.76  & 2.19  & 2.19  & \textcolor[rgb]{ 0,  .502,  0}{+22.89} & \textcolor[rgb]{ 0,  .502,  0}{+37.16} & \textcolor[rgb]{ 1,  0,  0}{-8.85} & \textcolor[rgb]{ 0,  .502,  0}{+48.56} & \textcolor[rgb]{ 1,  0,  0}{-15.18} \\
+    \textbf{kin8nm} & 90.51  & 91.81  & 1.49  & 1.59  & \textcolor[rgb]{ 0,  .502,  0}{+28.63} & \textcolor[rgb]{ 0,  .502,  0}{+49.19} & \textcolor[rgb]{ 0,  .502,  0}{+13.67} & \textcolor[rgb]{ 0,  .502,  0}{+73.32} & \textcolor[rgb]{ 0,  .502,  0}{+22.77} \\
+    \textbf{naval} & 91.95  & 92.36  & 1.95  & 1.98  & \textcolor[rgb]{ 0,  .502,  0}{+14.18} & \textcolor[rgb]{ 0,  .502,  0}{+30.95} & \textcolor[rgb]{ 0,  .502,  0}{+20.33} & \textcolor[rgb]{ 0,  .502,  0}{+59.16} & \textcolor[rgb]{ 0,  .502,  0}{+26.28} \\
+    \textbf{meps\_19} & 83.68  & 86.16  & 0.95  & 1.13  & \textcolor[rgb]{ 0,  .502,  0}{+17.15} & \textcolor[rgb]{ 0,  .502,  0}{+17.49} & \textcolor[rgb]{ 0,  .502,  0}{+24.28} & \textcolor[rgb]{ 0,  .502,  0}{+82.29} & \textcolor[rgb]{ 0,  .502,  0}{+27.97} \\
+    \textbf{meps\_20} & 84.86  & 86.81  & 1.04  & 1.21  & \textcolor[rgb]{ 1,  0,  0}{-10.31} & \textcolor[rgb]{ 1,  0,  0}{-9.51} & \textcolor[rgb]{ 0,  .502,  0}{+1.36} & \textcolor[rgb]{ 0,  .502,  0}{+77.66} & \textcolor[rgb]{ 0,  .502,  0}{+24.69} \\
+    \textbf{meps\_21} & 85.27  & 86.63  & 0.98  & 1.14  & \textcolor[rgb]{ 0,  .502,  0}{+20.88} & \textcolor[rgb]{ 1,  0,  0}{-49.49} & \textcolor[rgb]{ 0,  .502,  0}{+17.14} & \textcolor[rgb]{ 0,  .502,  0}{+77.89} & \textcolor[rgb]{ 0,  .502,  0}{+10.89} \\
+    
+    
+    \bottomrule[1.1pt]
+
+
+    \end{tabular}%
+    }
+  \label{tab:real_int_results}%
+\end{table}%
+
+\subsubsection*{HSIC results}\label{HSIC_results}
+
+Table \ref{tab:real_pinball_hsic_results} presents the results of \texttt{vanilla QR} and \texttt{orthogonal QR} using HSIC penalty. Similarly to the decorrelation penalty, the HSIC approach also improves the conditional coverage metrics in most data sets. 
+
+\begin{table}[htbp]
+\setstretch{1.4}
+  \centering
+  \caption{Real data experiments - using pinball loss with either \texttt{vanilla QR} (baseline) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{HSIC}}$. Refer to the caption of Table~\ref{tab:real_pinball_results} for further details. The standard errors for coverage and width are about 0.5, 0.06, respectively. See Table~\ref{tab:real_pb_hsic_std_errs} for a full reporting of all standard errors.}
+    \scalebox{0.75}{
+    \begin{tabular}{cccccccccc}
+    \toprule[1.1pt]
+          \multicolumn{1}{c}{\textbf{Dataset Name}} & 
+          \multicolumn{2}{c}{\textbf{Coverage (\%)}} & 
+          \multicolumn{2}{c}{\textbf{Length}} & 
+          \multicolumn{5}{c}{\textbf{Improvement (\%)}} \\
+    \midrule
+     &
+     
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering baseline}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{OQR}}} &     \multicolumn{1}{c}{\parbox{1.3cm}{\centering baseline}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering \texttt{OQR}}} & 
+    \multicolumn{1}{c}{\parbox{1.5cm}{\centering{\texttt{corr}}}} & 
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{WSC}}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{ILS}}}} &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{Node}}}}
+    \\
+
+
+    \midrule
+
+    \textbf{facebook\_1} & 88.10  & 93.86  & 1.09  & 1.43  & \textcolor[rgb]{ 0,  .502,  0}{+73.51} & \textcolor[rgb]{ 0,  .502,  0}{+88.41} & \textcolor[rgb]{ 0,  .502,  0}{+32.76} & \textcolor[rgb]{ 0,  .502,  0}{+76.86} & \textcolor[rgb]{ 0,  .502,  0}{+38.15} \\
+    \textbf{facebook\_2} & 87.38  & 94.77  & 1.07  & 1.37  & \textcolor[rgb]{ 0,  .502,  0}{+88.49} & \textcolor[rgb]{ 0,  .502,  0}{+98.77} & \textcolor[rgb]{ 0,  .502,  0}{+42.68} & \textcolor[rgb]{ 0,  .502,  0}{+82.77} & \textcolor[rgb]{ 0,  .502,  0}{+57.24} \\
+    \textbf{blog\_data} & 82.89  & 92.88  & 1.36  & 1.64  & \textcolor[rgb]{ 0,  .502,  0}{+63.79} & \textcolor[rgb]{ 0,  .502,  0}{+35.79} & \textcolor[rgb]{ 0,  .502,  0}{+32.58} & \textcolor[rgb]{ 0,  .502,  0}{+89.66} & \textcolor[rgb]{ 0,  .502,  0}{+41.74} \\
+    \textbf{bio} & 88.42  & 89.47  & 1.88  & 2.03  & \textcolor[rgb]{ 0,  .502,  0}{+11.26} & \textcolor[rgb]{ 0,  .502,  0}{+16.18} & \textcolor[rgb]{ 1,  0,  0}{-42.33} & \textcolor[rgb]{ 0,  .502,  0}{+43.76} & \textcolor[rgb]{ 1,  0,  0}{-25.75} \\
+    \textbf{kin8nm} & 84.63  & 88.22  & 0.98  & 1.20  & \textcolor[rgb]{ 0,  .502,  0}{+9.00} & \textcolor[rgb]{ 0,  .502,  0}{+25.34} & \textcolor[rgb]{ 1,  0,  0}{-42.92} & \textcolor[rgb]{ 0,  .502,  0}{+52.75} & \textcolor[rgb]{ 0,  .502,  0}{+27.39} \\
+    \textbf{naval} & 89.89  & 89.72  & 0.56  & 1.21  & \textcolor[rgb]{ 0,  .502,  0}{+49.73} & \textcolor[rgb]{ 0,  .502,  0}{+5.52} & \textcolor[rgb]{ 1,  0,  0}{-51.05} & \textcolor[rgb]{ 0,  .502,  0}{+61.98} & \textcolor[rgb]{ 0,  .502,  0}{+8.52} \\
+    \textbf{meps\_19} & 82.44  & 85.47  & 0.84  & 0.94  & \textcolor[rgb]{ 0,  .502,  0}{+9.21} & \textcolor[rgb]{ 1,  0,  0}{-8.17} & \textcolor[rgb]{ 0,  .502,  0}{+12.26} & \textcolor[rgb]{ 0,  .502,  0}{+78.54} & \textcolor[rgb]{ 0,  .502,  0}{+19.16} \\
+    \textbf{meps\_20} & 82.81  & 86.02  & 0.86  & 0.96  & \textcolor[rgb]{ 1,  0,  0}{-20.63} & \textcolor[rgb]{ 1,  0,  0}{-34.17} & \textcolor[rgb]{ 0,  .502,  0}{+2.57} & \textcolor[rgb]{ 0,  .502,  0}{+81.03} & \textcolor[rgb]{ 0,  .502,  0}{+14.74} \\
+    \textbf{meps\_21} & 82.50  & 82.51  & 0.86  & 0.94  & \textcolor[rgb]{ 1,  0,  0}{-19.50} & \textcolor[rgb]{ 0,  .502,  0}{+10.39} & \textcolor[rgb]{ 0,  .502,  0}{+8.00} & \textcolor[rgb]{ 0,  .502,  0}{+84.43} & \textcolor[rgb]{ 0,  .502,  0}{+24.41} \\
+    
+    
+    \bottomrule[1.1pt]
+
+
+    \end{tabular}%
+    }
+  \label{tab:real_pinball_hsic_results}%
+\end{table}%
+
+
+Table \ref{tab:real_pinball_hsic_vs_corr} compares the two proposed loss functions, and displays the improvement obtained by regularizing with decorrelation instead of HSIC. As expected, the method optimizing \texttt{Pearson's corr} consistently achieves better results over this metric compared to pinball loss combined with HSIC regularizer. Surprisingly, in most datasets the model that uses decorrelation penalty attains a better \texttt{HSIC} value than the one optimizing directly this metric. These empirical drawbacks of HSIC regularization compared to our suggested penalty might have been caused by the fact that the latter receives twice as many samples in each gradient step, or its coefficients were more tuned. Nevertheless, the method using HSIC is able to achieve better statistical efficiency, which is probably due to its strength.
+Overall, we can conclude that thanks to the low computational burden, it is easier to fine tune the coefficients of the decorrelation loss and use more samples, but it might not be as strong as HSIC.
+
+\begin{table}[htbp]
+\setstretch{1.4}
+  \centering
+  \caption{
+  Real data experiments. Performance of a neural network model for quantile regression, \texttt{orthogonal QR} using either ($\mathcal{R}_{\textrm{HSIC}}$) penalty or ($\mathcal{R}_{\textrm{corr}}$) penalty. Refer to the caption of Table~\ref{tab:real_pinball_results} for further details. The standard errors for coverage and width are about 0.5, 0.06, respectively. See Tables~\ref{tab:real_pb_std_errs},\ref{tab:real_pb_hsic_std_errs} for a full reporting of all standard errors.}
+    \scalebox{0.75}{
+   \begin{tabular}{cccccccc}
+    \toprule[1.1pt]
+    
+          \multicolumn{1}{c}{\textbf{Dataset Name}} & 
+          \multicolumn{2}{c}{\textbf{Coverage (\%)}} &
+          \multicolumn{2}{c}{\textbf{Length}} & 
+          \multicolumn{3}{c}{\textbf{Improvement (\%)}} \\
+    \midrule
+     &
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\mathcal{R}_{\textrm{HSIC}}$}}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\mathcal{R}_{\textrm{corr}}$}}} &     \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\mathcal{R}_{\textrm{HSIC}}$}}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\mathcal{R}_{\textrm{corr}}$}}} & \multicolumn{1}{c}{\parbox{1.5cm}{\centering{\texttt{corr}}}} & \multicolumn{1}{c}{\parbox{1.3cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{1}{c}{\parbox{1.3cm}{\centering{$\Delta$\texttt{WSC}}}} \\
+
+    \midrule
+    
+    \textbf{facebook\_1} & 93.86  & 90.48  & 1.43  & 1.44  & \textcolor[rgb]{ 0,  .502,  0}{+28.59} & \textcolor[rgb]{ 1,  0,  0}{-100.51} & \textcolor[rgb]{ 0,  .502,  0}{+0.98} \\
+    \textbf{facebook\_2} & 94.77  & 91.13  & 1.37  & 1.41  & \textcolor[rgb]{ 0,  .502,  0}{+24.18} & \textcolor[rgb]{ 1,  0,  0}{-195.60} & \textcolor[rgb]{ 1,  0,  0}{-15.38} \\
+    \textbf{blog\_data} & 92.88  & 88.92  & 1.64  & 1.64  & \textcolor[rgb]{ 0,  .502,  0}{+37.84} & \textcolor[rgb]{ 1,  0,  0}{-52.21} & \textcolor[rgb]{ 1,  0,  0}{-16.51} \\
+    \textbf{bio} & 89.47  & 89.08  & 2.03  & 2.03  & \textcolor[rgb]{ 0,  .502,  0}{+47.59} & \textcolor[rgb]{ 0,  .502,  0}{+70.83} & \textcolor[rgb]{ 1,  0,  0}{-1.69} \\
+    \textbf{kin8nm} & 88.22  & 88.62  & 1.20  & 1.28  & \textcolor[rgb]{ 0,  .502,  0}{+20.38} & \textcolor[rgb]{ 0,  .502,  0}{+30.98} & \textcolor[rgb]{ 0,  .502,  0}{+40.50} \\
+    \textbf{naval} & 89.72  & 89.50  & 1.21  & 1.49  & \textcolor[rgb]{ 0,  .502,  0}{+50.64} & \textcolor[rgb]{ 0,  .502,  0}{+30.12} & \textcolor[rgb]{ 1,  0,  0}{-4.28} \\
+    \textbf{meps\_19} & 85.47  & 85.16  & 0.94  & 1.00  & \textcolor[rgb]{ 0,  .502,  0}{+49.51} & \textcolor[rgb]{ 0,  .502,  0}{+28.12} & \textcolor[rgb]{ 0,  .502,  0}{+35.35} \\
+    \textbf{meps\_20} & 86.02  & 84.27  & 0.96  & 1.03  & \textcolor[rgb]{ 0,  .502,  0}{+53.17} & \textcolor[rgb]{ 0,  .502,  0}{+26.95} & \textcolor[rgb]{ 0,  .502,  0}{+22.05} \\
+    \textbf{meps\_21} & 82.51  & 84.07  & 0.94  & 0.99  & \textcolor[rgb]{ 0,  .502,  0}{+64.40} & \textcolor[rgb]{ 0,  .502,  0}{+3.60} & \textcolor[rgb]{ 0,  .502,  0}{+13.89} 
+    \\
+
+    
+    
+    \bottomrule[1.1pt]
+    
+    \end{tabular}%
+    }
+  \label{tab:real_pinball_hsic_vs_corr}%
+\end{table}%
+
+
+\section{Standard error results}\label{sec:std_err_results}
+
+\subsection{Synthetic data}
+In the following tables we present the mean value and standard errors received for each metric in the synthetic data experiments.
+
+\begin{table}[htbp]
+\setstretch{1.6}
+  \centering
+  \caption{
+  Simulated data: Average metric value (standard error) - using pinball loss with either \texttt{vanilla QR} (\texttt{QR}) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$.}
+    \scalebox{0.75}{
+   \begin{tabular}{ccccccc}
+   \toprule[1.1pt]
+   
+    \multicolumn{1}{c}{\parbox{1.8cm}{\centering\textbf{Minority Group Uncertainty}}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{corr}}}} & \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{WSC}}}}  \\
+    \midrule
+
+    & 
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}}
+    \\
+
+    \midrule
+    Low  &    .105 (.005) &  \textbf{.038 (.008)} &  .001 (1e-4) &  \textbf{1e-3 (1e-4)} &  \textbf{2.195 (.337)} &           2.500 (.373) \\
+    High &    .115 (.006) &  \textbf{.032 (.006)} &  1e-3 (1e-4) &  \textbf{1e-3 (1e-3)} &           3.240 (.384) &  \textbf{2.658 (.335)} \\
+    
+    \bottomrule[1.1pt]
+    
+    \end{tabular}%
+    }
+  \label{tab:syn_pb_std_errs}%
+\end{table}%
+
+
+\begin{table}[htbp]
+\setstretch{1.6}
+  \centering
+  \caption{
+    Simulated data: Average metric value (standard error) - using interval score loss with either quantile regression (\texttt{QR}) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$.}
+    \scalebox{0.75}{
+   \begin{tabular}{ccccccc}
+   \toprule[1.1pt]
+   
+    \multicolumn{1}{c}{\parbox{1.8cm}{\centering\textbf{Minority Group Uncertainty}}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{corr}}}} & \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{WSC}}}}  \\
+    \midrule
+
+    & 
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}}
+    \\
+
+    \midrule
+    Low  &    .094 (.008) &  \textbf{.061 (.008)} &  1e-3 (1e-3) &  \textbf{1e-3 (1e-4)} &  3.062 (.322) &  \textbf{1.537 (.339)} \\
+    High &    .124 (.009) &  \textbf{.089 (.014)} &  1e-3 (1e-4) &  \textbf{1e-3 (1e-3)} &  3.196 (.369) &  \textbf{2.633 (.359)} \\
+    
+    \bottomrule[1.1pt]
+    
+    \end{tabular}%
+    }
+  \label{tab:syn_int_std_errs}%
+\end{table}%
+
+
+\subsection{Real data}
+In the following tables we present the mean value and standard errors received for each metric in the real data experiments.
+
+
+\begin{table}[htbp]
+\setstretch{1.6}
+  \centering
+  \caption{
+    Real data: Average metric value (standard error) - using pinball loss with either \texttt{vanilla QR} (\texttt{QR}) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$.}
+    \scalebox{0.65}{
+   \begin{tabular}{ccccccccccc}
+   \toprule[1.1pt]
+   
+    \multicolumn{1}{c}{\textbf{Dataset Name}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{corr}}}} & \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{WSC}}}} &
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{ILS}}}} &
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{Node}}}} \\
+    \midrule
+
+    & 
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.1cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.1cm}{\centering{\texttt{OQR}}}}
+    \\
+
+    \midrule
+\textbf{facebook\_1} &    .057 (.013) &  \textbf{.011 (.002)} &  1e-3 (1e-3) &  \textbf{1e-4 (1e-5)} &           6.371 (.731) &  \textbf{4.242 (.399)} &       9.345 (.520) &  \textbf{3.195 (.185)} &           3.555 (.491) &  \textbf{1.874 (.238)} \\
+\textbf{facebook\_2} &    .099 (.028) &  \textbf{.009 (.002)} &  .002 (.001) &  \textbf{1e-4 (1e-5)} &          6.810 (1.239) &  \textbf{4.504 (.314)} &      10.104 (.986) &  \textbf{3.465 (.117)} &          4.654 (1.433) &  \textbf{2.065 (.284)} \\
+\textbf{blog\_data}  &    .043 (.002) &  \textbf{.010 (.002)} &  1e-4 (1e-4) &  \textbf{1e-4 (1e-4)} &          10.037 (.330) &  \textbf{7.885 (.306)} &      12.773 (.261) &  \textbf{1.285 (.178)} &           4.823 (.386) &  \textbf{3.163 (.322)} \\
+\textbf{bio}        &    .084 (.002) &  \textbf{.039 (.002)} &  1e-3 (1e-4) &  \textbf{1e-4 (1e-5)} &  \textbf{1.218 (.192)} &           1.762 (.248) &       8.461 (.263) &  \textbf{4.806 (.167)} &            .912 (.153) &   \textbf{.846 (.116)} \\
+\textbf{kin8nm}     &    .283 (.003) &  \textbf{.205 (.006)} &  .002 (1e-4) &  \textbf{.001 (1e-4)} &           1.638 (.216) &  \textbf{1.393 (.205)} &      16.770 (.452) &  \textbf{7.148 (.283)} &  \textbf{1.471 (.256)} &           1.713 (.347) \\
+\textbf{naval}      &    .269 (.006) &  \textbf{.067 (.006)} &  .001 (1e-4) &  \textbf{1e-3 (1e-4)} &  \textbf{2.824 (.394)} &           4.449 (.563) &       8.674 (.633) &  \textbf{2.398 (.278)} &  \textbf{2.410 (.312)} &           2.756 (.427) \\
+\textbf{meps\_19}    &    .056 (.006) &  \textbf{.026 (.004)} &  1e-3 (1e-5) &  \textbf{1e-4 (1e-4)} &           8.580 (.644) &  \textbf{4.866 (.496)} &      12.976 (.551) &  \textbf{1.550 (.204)} &          7.204 (1.066) &  \textbf{3.931 (.584)} \\
+\textbf{meps\_20}    &    .048 (.005) &  \textbf{.027 (.005)} &  1e-4 (1e-5) &  \textbf{1e-4 (1e-4)} &           7.269 (.697) &  \textbf{5.520 (.590)} &      11.351 (.459) &  \textbf{1.735 (.270)} &           5.328 (.850) &  \textbf{2.830 (.494)} \\
+\textbf{meps\_21}    &    .064 (.006) &  \textbf{.027 (.004)} &  1e-3 (1e-4) &  \textbf{1e-3 (1e-4)} &           8.745 (.687) &  \textbf{6.927 (.738)} &      12.940 (.507) &  \textbf{1.938 (.236)} &           6.043 (.911) &  \textbf{3.730 (.569)} \\
+    
+    
+    \bottomrule[1.1pt]
+    
+    \end{tabular}%
+    }
+  \label{tab:real_pb_std_errs}%
+\end{table}%
+
+
+
+
+\begin{table}[htbp]
+\setstretch{1.6}
+  \centering
+  \caption{
+    Real data: Average metric value (standard error) - using interval score loss with either quantile regression (\texttt{QR}) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$.}
+    \scalebox{0.65}{
+   \begin{tabular}{ccccccccccc}
+   \toprule[1.1pt]
+   
+    \multicolumn{1}{c}{\textbf{Dataset Name}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{corr}}}} & \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{WSC}}}} &
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{ILS}}}} &
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{Node}}}} \\
+    \midrule
+
+    & 
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.1cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.1cm}{\centering{\texttt{OQR}}}}
+    \\
+
+    \midrule
+\textbf{facebook\_1} &           .075 (.020) &  \textbf{.016 (.003)} &           .001 (.001) &  \textbf{1e-4 (1e-5)} &          3.392 (1.079) &   \textbf{2.853 (.405)} &       7.230 (.661) &  \textbf{2.264 (.190)} &          1.189 (.190) &  \textbf{1.175 (.168)} \\
+\textbf{facebook\_2} &           .083 (.028) &  \textbf{.007 (.002)} &           .002 (.002) &  \textbf{1e-4 (1e-5)} &          4.161 (1.483) &   \textbf{2.891 (.227)} &       6.707 (.660) &  \textbf{2.063 (.131)} &          2.065 (.708) &  \textbf{1.945 (.330)} \\
+\textbf{blog\_data}  &           .081 (.026) &  \textbf{.011 (.002)} &           .001 (1e-3) &  \textbf{1e-4 (1e-5)} &          10.468 (.450) &  \textbf{10.176 (.656)} &      10.610 (.338) &  \textbf{1.097 (.180)} &          4.875 (.657) &  \textbf{3.966 (.670)} \\
+\textbf{bio}        &           .089 (.004) &  \textbf{.069 (.004)} &           1e-3 (1e-4) &  \textbf{1e-3 (1e-4)} &  \textbf{1.761 (.167)} &            1.917 (.204) &       7.853 (.684) &  \textbf{4.040 (.290)} &  \textbf{.796 (.154)} &            .917 (.137) \\
+\textbf{kin8nm}     &           .250 (.004) &  \textbf{.178 (.006)} &           .001 (1e-4) &  \textbf{1e-3 (1e-4)} &           1.740 (.234) &   \textbf{1.502 (.231)} &      14.186 (.823) &  \textbf{3.785 (.276)} &          1.775 (.286) &  \textbf{1.371 (.212)} \\
+\textbf{naval}      &           .157 (.003) &  \textbf{.135 (.005)} &           1e-3 (1e-4) &  \textbf{1e-3 (1e-4)} &           4.189 (.601) &   \textbf{3.337 (.560)} &       9.506 (.937) &  \textbf{3.883 (.378)} &          1.450 (.233) &  \textbf{1.069 (.166)} \\
+\textbf{meps\_19}    &           .040 (.010) &  \textbf{.033 (.005)} &           1e-3 (1e-4) &  \textbf{1e-3 (1e-4)} &         10.867 (1.001) &  \textbf{8.228 (1.018)} &     11.066 (1.220) &  \textbf{1.960 (.288)} &          6.720 (.917) &  \textbf{4.841 (.659)} \\
+\textbf{meps\_20}    &  \textbf{.028 (.005)} &           .031 (.005) &  \textbf{1e-3 (1e-4)} &           1e-3 (1e-4) &           7.898 (.430) &   \textbf{7.790 (.634)} &       8.513 (.476) &  \textbf{1.902 (.222)} &          4.234 (.763) &  \textbf{3.189 (.565)} \\
+\textbf{meps\_21}    &           .047 (.004) &  \textbf{.037 (.004)} &  \textbf{1e-3 (1e-4)} &           1e-3 (1e-4) &           9.295 (.668) &   \textbf{7.702 (.789)} &       9.743 (.459) &  \textbf{2.154 (.258)} &         5.771 (1.112) &  \textbf{5.143 (.820)} \\
+    
+    \bottomrule[1.1pt]
+    
+    \end{tabular}%
+    }
+  \label{tab:real_int_std_errs}%
+\end{table}%
+
+\begin{table}[htbp]
+\setstretch{1.6}
+  \centering
+  \caption{
+    Real data: Average metric value (standard error) - using pinball loss with either \texttt{vanilla QR} (\texttt{QR}) or \texttt{orthogonal QR} (\texttt{OQR}) with penalty term $\mathcal{R}_{\textrm{HSIC}}$.}
+    \scalebox{0.65}{
+   \begin{tabular}{ccccccccccc}
+   \toprule[1.1pt]
+   
+    \multicolumn{1}{c}{\textbf{Dataset Name}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{corr}}}} & \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{WSC}}}} &
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{ILS}}}} &
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{Node}}}} \\
+    \midrule
+
+    & 
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{OQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.1cm}{\centering{\texttt{QR}}}} &
+    \multicolumn{1}{c}{\parbox{0.1cm}{\centering{\texttt{OQR}}}}
+    \\
+
+    \midrule
+    \textbf{facebook\_1} &           .057 (.013) &  \textbf{.015 (.003)} &           1e-3 (1e-3) &  \textbf{1e-4 (1e-5)} &           6.371 (.731) &  \textbf{4.284 (.357)} &       9.620 (.521) &  \textbf{2.226 (.141)} &          3.300 (.552) &  \textbf{2.041 (.346)} \\
+    \textbf{facebook\_2} &           .099 (.028) &  \textbf{.011 (.002)} &           .002 (.001) &  \textbf{1e-4 (1e-5)} &          6.810 (1.239) &  \textbf{3.904 (.247)} &     11.088 (1.170) &  \textbf{1.910 (.103)} &         5.849 (1.887) &  \textbf{2.501 (.355)} \\
+    \textbf{blog\_data}  &           .043 (.002) &  \textbf{.016 (.004)} &           1e-4 (1e-4) &  \textbf{1e-4 (1e-5)} &          10.037 (.330) &  \textbf{6.768 (.270)} &      13.524 (.286) &  \textbf{1.399 (.102)} &          4.851 (.467) &  \textbf{2.826 (.403)} \\
+    \textbf{bio}        &           .084 (.002) &  \textbf{.075 (.002)} &           1e-3 (1e-4) &  \textbf{1e-3 (1e-4)} &  \textbf{1.218 (.192)} &           1.733 (.239) &       8.530 (.210) &  \textbf{4.797 (.107)} &  \textbf{.772 (.130)} &            .971 (.162) \\
+    \textbf{kin8nm}     &           .283 (.003) &  \textbf{.257 (.004)} &           .002 (1e-4) &  \textbf{.001 (1e-4)} &  \textbf{1.638 (.216)} &           2.341 (.326) &      17.769 (.500) &  \textbf{8.396 (.189)} &          1.813 (.327) &  \textbf{1.317 (.212)} \\
+    \textbf{naval}      &           .269 (.006) &  \textbf{.135 (.006)} &           .001 (1e-4) &  \textbf{.001 (1e-4)} &  \textbf{2.824 (.394)} &           4.266 (.513) &       6.480 (.640) &  \textbf{2.464 (.273)} &          2.374 (.380) &  \textbf{2.172 (.327)} \\
+    \textbf{meps\_19}    &           .056 (.006) &  \textbf{.051 (.006)} &  \textbf{1e-3 (1e-5)} &           1e-3 (1e-4) &           8.580 (.644) &  \textbf{7.528 (.632)} &      11.940 (.299) &  \textbf{2.563 (.273)} &         6.736 (1.050) &  \textbf{5.446 (.854)} \\
+    \textbf{meps\_20}    &  \textbf{.048 (.005)} &           .057 (.008) &  \textbf{1e-4 (1e-5)} &           1e-3 (1e-4) &           7.269 (.697) &  \textbf{7.082 (.655)} &      11.128 (.468) &  \textbf{2.111 (.274)} &          4.979 (.916) &  \textbf{4.245 (.800)} \\
+    \textbf{meps\_21}    &  \textbf{.064 (.006)} &           .077 (.014) &           1e-3 (1e-4) &  \textbf{1e-3 (1e-4)} &           8.745 (.687) &  \textbf{8.045 (.754)} &      12.333 (.507) &  \textbf{1.920 (.283)} &          3.899 (.673) &  \textbf{2.947 (.528)} \\
+    
+    \bottomrule[1.1pt]
+    
+    \end{tabular}%
+    }
+  \label{tab:real_pb_hsic_std_errs}%
+\end{table}%
+
+
+\begin{table}[htbp]
+\setstretch{1.6}
+  \centering
+  \caption{
+    Real data: Average metric value (standard error) - using pinball loss with conformalization and either \texttt{vanilla CQR} (\texttt{CQR}) or \texttt{orthogonal CQR} (\texttt{COQR}) with penalty term $\mathcal{R}_{\textrm{corr}}$.}
+    \scalebox{0.65}{
+   \begin{tabular}{ccccccccccc}
+   \toprule[1.1pt]
+   
+    \multicolumn{1}{c}{\textbf{Dataset Name}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{corr}}}} & \multicolumn{2}{c}{\parbox{0.01cm}{\centering{\texttt{HSIC}}}} & 
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{WSC}}}} &
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{ILS}}}} &
+    \multicolumn{2}{c}{\parbox{0.01cm}{\centering{$\Delta$\texttt{Node}}}} \\
+    \midrule
+
+    & 
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{CQR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{COQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{CQR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{COQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{CQR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{COQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{CQR}}}} &
+    \multicolumn{1}{c}{\parbox{0.01cm}{\centering{\texttt{COQR}}}} &
+
+    \multicolumn{1}{c}{\parbox{0.1cm}{\centering{\texttt{CQR}}}} &
+    \multicolumn{1}{c}{\parbox{0.1cm}{\centering{\texttt{COQR}}}}
+    \\
+
+    \midrule
+    
+    \textbf{facebook\_1} &    .039 (.009) &  \textbf{.016 (.003)} &           1e-3 (1e-4) &  \textbf{1e-4 (1e-5)} &           5.187 (.408) &  \textbf{3.379 (.410)} &      10.395 (.376) &  \textbf{3.348 (.168)} &           2.945 (.534) &  \textbf{2.078 (.334)} \\
+    \textbf{facebook\_2} &    .068 (.011) &  \textbf{.016 (.003)} &           1e-3 (1e-4) &  \textbf{1e-4 (1e-4)} &           5.175 (.342) &  \textbf{3.648 (.317)} &       8.625 (.278) &  \textbf{4.026 (.153)} &           3.538 (.427) &  \textbf{1.682 (.238)} \\
+    \textbf{blog\_data}  &    .018 (.003) &  \textbf{.016 (.003)} &  \textbf{1e-4 (1e-5)} &           1e-4 (1e-4) &           9.658 (.318) &  \textbf{7.303 (.402)} &      14.131 (.348) &  \textbf{1.332 (.175)} &           6.216 (.677) &  \textbf{3.768 (.344)} \\
+    \textbf{bio}        &    .080 (.002) &  \textbf{.039 (.003)} &           1e-3 (1e-5) &  \textbf{1e-4 (1e-5)} &  \textbf{1.222 (.142)} &           1.598 (.206) &       7.565 (.286) &  \textbf{4.601 (.114)} &   \textbf{.757 (.120)} &           1.064 (.179) \\
+    \textbf{kin8nm}     &    .231 (.003) &  \textbf{.189 (.007)} &           1e-3 (1e-4) &  \textbf{1e-3 (1e-4)} &  \textbf{1.708 (.265)} &           2.896 (.375) &      14.443 (.509) &  \textbf{6.046 (.327)} &  \textbf{1.833 (.322)} &           1.859 (.218) \\
+    \textbf{naval}      &    .270 (.005) &  \textbf{.061 (.007)} &           .001 (1e-4) &  \textbf{1e-3 (1e-4)} &  \textbf{2.338 (.406)} &           4.142 (.632) &       8.718 (.557) &  \textbf{2.769 (.332)} &  \textbf{2.280 (.322)} &           2.512 (.469) \\
+    \textbf{meps\_19}    &    .122 (.007) &  \textbf{.060 (.007)} &           1e-3 (1e-4) &  \textbf{1e-4 (1e-4)} &          11.942 (.708) &  \textbf{4.915 (.565)} &      14.824 (.563) &  \textbf{2.406 (.302)} &          8.570 (1.345) &  \textbf{5.413 (.969)} \\
+    \textbf{meps\_20}    &    .104 (.006) &  \textbf{.059 (.007)} &           1e-3 (1e-4) &  \textbf{1e-4 (1e-4)} &           9.638 (.802) &  \textbf{5.060 (.606)} &      13.447 (.544) &  \textbf{2.134 (.297)} &          7.278 (1.430) &  \textbf{4.084 (.754)} \\
+    \textbf{meps\_21}    &    .118 (.008) &  \textbf{.069 (.006)} &           1e-3 (1e-4) &  \textbf{1e-3 (1e-4)} &          10.310 (.926) &  \textbf{6.860 (.639)} &      14.119 (.578) &  \textbf{2.899 (.364)} &          7.204 (1.294) &  \textbf{4.515 (.858)} \\
+    
+    \bottomrule[1.1pt]
+    
+    \end{tabular}%
+    }
+  \label{tab:real_cqr_std_errs}%
+\end{table}%
+
+\end{appendices}
+
+\end{document}

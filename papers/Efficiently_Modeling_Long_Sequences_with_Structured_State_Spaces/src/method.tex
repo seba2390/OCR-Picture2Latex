@@ -1,0 +1,222 @@
+
+\section{Method: Structured State Spaces (\methodabbrv)}
+\label{sec:s4}
+
+Our technical results focus on developing the \methodabbrv{} parameterization and showing how to efficiently compute all views of the SSM (\cref{sec:background}):
+the continuous representation \( (\bm{A}, \bm{B}, \bm{C}) \) \eqref{eq:1},
+the recurrent representation \( (\bm{\overline{A}}, \bm{\overline{B}}, \bm{\overline{C}}) \) \eqref{eq:2},
+and the convolutional representation \( \bm{\overline{K}} \) \eqref{eq:convolution}.
+
+
+\cref{sec:s4-motivation} motivates our approach, which is based on the linear algebraic concepts of conjugation and diagonalization, and discusses why the naive application of this approach does not work.
+\cref{sec:s4-overview} gives an overview of the key technical components of our approach and formally defines the \methodabbrv{} parameterization.
+\cref{sec:s4-efficiency} sketches the main results, showing that \methodabbrv{} is asymptotically efficient (up to log factors) for sequence models.
+Proofs are in \cref{sec:lssl-instability,sec:s4-details}.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Motivation: Diagonalization}
+\label{sec:s4-motivation}
+
+The fundamental bottleneck in computing the discrete-time SSM \eqref{eq:2} is that it involves repeated matrix multiplication by \( \bm{\overline{A}} \).
+For example, computing \eqref{eq:krylov} naively as in the LSSL involves \( L \) successive multiplications by \( \bm{\overline{A}} \), requiring \( O(N^2 L) \) operations and \( O(NL) \) space.
+
+To overcome this bottleneck, we use a structural result that allows us to simplify SSMs.
+\begin{lemma}%
+  \label{lmm:conjugation}
+  Conjugation is an equivalence relation on SSMs \small \( (\bm{A}, \bm{B}, \bm{C}) \sim (\bm{V}^{-1} \bm{A} \bm{V}, \bm{V}^{-1}\bm{B}, \bm{C}\bm{V}) \).
+\end{lemma}
+\begin{proof}%
+  Write out the two SSMs with state denoted by \( x \) and \( \tilde{x} \) respectively:
+  \begin{align*}
+    x' &= \bm{A}x + \bm{B}u & \tilde{x}' &= \bm{V}^{-1}\bm{A}\bm{V}\tilde{x} + \bm{V}^{-1}\bm{B}u \\
+    y &= \bm{C}x & y &= \bm{C}\bm{V}\tilde{x}
+  \end{align*}
+  After multiplying the right side SSM by \( \bm{V} \), the two SSMs become identical with \( x = \bm{V}\tilde{x} \).
+  Therefore these compute the exact same operator \( u \mapsto y \), but with a change of basis by \( \bm{V} \) in the state \( x \).
+\end{proof}
+
+\cref{lmm:conjugation} motivates putting \( \bm{A} \) into a canonical form by conjugation\footnote{Note that although we ultimately require \( \bm{\overline{A}} \), conjugation commutes with discretization so we refer to \( \bm{A} \).}, which is ideally more structured and allows faster computation.
+For example, if \( \bm{A} \) were diagonal, the resulting computations become much more tractable.
+In particular, the desired \( \bm{\overline{K}} \) (equation \eqref{eq:convolution}) would be a \textbf{Vandermonde product} which theoretically only needs \( O((N+L)\log^2(N+L)) \) arithmetic operations \citep{pan2001structured}.
+
+Unfortunately, the naive application of diagonalization does not work due to numerical issues.
+Werive the explicit diagonalization for the HiPPO matrix \eqref{eq:hippo} and show it has entries exponentially large in the state size \( N \), rendering the diagonalization numerically infeasible (e.g. \( \bm{C}\bm{V} \) in \cref{lmm:conjugation} would not be computable).
+We note that \citet{gu2021lssl} proposed a different (unimplemented) algorithm to compute \( \bm{\overline{K}} \) faster than the naive algorithm.
+In \cref{sec:lssl-instability}, we prove that it is also numerically unstable for related reasons.
+\begin{lemma}%
+  \label{lmm:hippo-diagonalization}
+  The HiPPO matrix \( \bm{A} \) in equation \eqref{eq:hippo} is diagonalized by the matrix \( \bm{V}_{ij} = \binom{i+j}{i-j} \).
+  In particular, \( \bm{V}_{3i,i} = \binom{4i}{2i} \approx 2^{4i} \).
+  Therefore \( \bm{V} \) has entries of magnitude up to \( 2^{4N / 3} \).
+\end{lemma}
+
+\subsection{The \methodabbrv{} Parameterization: Normal Plus Low-Rank}
+\label{sec:s4-overview}
+
+The previous discussion implies that we should only conjugate by well-conditioned matrices \( \bm{V} \).
+The ideal scenario is when the matrix \( \bm{A} \) is diagonalizable by a perfectly conditioned (i.e., unitary) matrix.
+By the Spectral Theorem of linear algebra, this is exactly the class of \textbf{normal matrices}.
+However, this class of matrices is restrictive; in particular, it does not contain the HiPPO matrix \eqref{eq:hippo}.
+
+
+\begin{algorithm}[t]
+  \caption{\textsc{\methodabbrv{} Convolution Kernel (Sketch)}}%
+  \label{alg:s4-convolution}
+  \begin{algorithmic}[1]
+    \renewcommand{\algorithmicrequire}{\textbf{Input:}}
+    \Require{\methodabbrv{} parameters \( \bm{\Lambda}, \bm{P}, \bm{Q}, \bm{B}, \bm{C} \in \mathbbm{C}^N \) and step size \( \dt \)}
+    \renewcommand{\algorithmicensure}{\textbf{Output:}}
+    \Ensure{SSM convolution kernel \( \bm{\overline{K}} = \mathcal{K}_L(\bm{\overline{A}}, \bm{\overline{B}}, \bm{\overline{C}}) \) for \( \bm{A} = \bm{\Lambda} - \bm{P}\bm{Q}^* \)} (equation \eqref{eq:krylov})
+    \State $\bm{\widetilde{C}} \gets \left(\bm{I} - \bm{\overline{A}}^L\right)^* \bm{\overline{C}}$
+    \Comment{Truncate SSM generating function (SSMGF) to length \( L \)}
+    \State
+    \( \begin{bmatrix} k_{00}(\omega) & k_{01}(\omega) \\ k_{10}(\omega) & k_{11}(\omega) \end{bmatrix} \gets \left[ \bm{\widetilde{C}} \; \bm{Q} \right]^* \left(\frac{2}{\Delta} \frac{1-\omega}{1+\omega} - \bm{\Lambda} \right)^{-1} \left[ \bm{B} \; \bm{P} \right] \)
+    \label{step:cauchy}
+    \Comment{Black-box Cauchy kernel}
+    \State
+    \( \bm{\hat{K}}(\omega) \gets \frac{2}{1+\omega} \left[ k_{00}(\omega) - k_{01}(\omega) (1 + k_{11}(\omega))^{-1} k_{10}(\omega) \right]  \)
+    \Comment{Woodbury Identity} %
+    \State \( \bm{\hat{K}} = \{\bm{\hat{K}}(\omega) : \omega = \exp(2\pi i \frac{k}{L})\} \)
+    \Comment{Evaluate SSMGF at all roots of unity \( \omega \in \Omega_L \)}
+    \State \( \bm{\overline{K}} \gets \mathsf{iFFT} (\bm{\hat{K}}) \)
+    \Comment{Inverse Fourier Transform}
+  \end{algorithmic}
+\end{algorithm}
+
+
+We make the observation that although the HiPPO matrix is not normal, it can be decomposed as the \emph{sum of a normal and low-rank matrix}.
+However, this is still not useful by itself:
+unlike a diagonal matrix, powering up this sum (in \eqref{eq:krylov}) is still slow and not easily optimized.
+We overcome this bottleneck by simultaneously applying three new techniques.
+\begin{itemize}[leftmargin=*]%
+  \item Instead of computing \( \bm{\overline{K}} \) directly,
+    we compute its spectrum by evaluating its \textbf{truncated generating function} \( \sum_{j=0}^{L-1} \bm{\overline{K}}_j \zeta^j \) at the roots of unity \( \zeta \).
+    \( \bm{\overline{K}} \) can then be found by applying an inverse FFT.
+  \item This generating function is closely related to the matrix resolvent, and now involves a matrix \emph{inverse} instead of \emph{power}.
+    The low-rank term can now be corrected by applying the \textbf{Woodbury identity} which reduces \( (\bm{A} + \bm{P}\bm{Q}^*)^{-1} \) in terms of \( \bm{A}^{-1} \), truly reducing to the diagonal case.
+  \item Finally, we show that the diagonal matrix case is equivalent to the computation of a \textbf{Cauchy kernel} \( \frac{1}{\omega_j - \zeta_k} \), a well-studied problem with stable near-linear algorithms \citep{pan2015transformations,pan2017fast}.
+\end{itemize}
+
+
+Our techniques apply to any matrix that can be decomposed as \emph{\textbf{Normal Plus Low-Rank (NPLR)}}.
+\begin{theorem}%
+  \label{thm:hippo-nplr}
+  All HiPPO matrices from \citep{gu2020hippo} have a NPLR representation
+  \begin{equation}
+    \label{eq:nplr}
+    \bm{A} = \bm{V} \bm{\Lambda} \bm{V}^* - \bm{P} \bm{Q}^\top = \bm{V} \left( \bm{\Lambda} - \left(\bm{V}^* \bm{P}\right) (\bm{V}^*\bm{Q})^* \right) \bm{V}^*
+  \end{equation}
+  for unitary \( \bm{V} \in \mathbbm{C}^{N \times N} \), diagonal \( \bm{\Lambda} \), and low-rank factorization \( \bm{P}, \bm{Q} \in \mathbbm{R}^{N \times r} \).
+  These matrices HiPPO- LegS, LegT, LagT all satisfy \( r=1 \) or \( r=2 \).
+  In particular, equation \eqref{eq:hippo} is NPLR with \( r=1 \).
+\end{theorem}
+
+\subsection{\methodabbrv{} Algorithms and Computational Complexity}
+\label{sec:s4-efficiency}
+
+By equation \eqref{eq:nplr}, note that NPLR matrices can be conjugated into \emph{diagonal plus low-rank} (DPLR) form
+(now over \( \mathbbm{C} \) instead of \( \mathbbm{R} \)).
+\cref{thm:s4-recurrence,thm:s4-convolution} describe the complexities of SSMs where \( \bm{A} \) is in DPLR form.
+\methodabbrv{} is optimal or near-optimal for both recurrent and convolutional representations.
+
+
+\begin{theorem}[\methodabbrv{} Recurrence]%
+  \label{thm:s4-recurrence}
+  Given any step size \( \dt \), computing one step of the recurrence \eqref{eq:2} can be done in \( O(N) \) operations where \( N \) is the state size.
+\end{theorem}
+
+\cref{thm:s4-recurrence} follows from the fact that the inverse of a DPLR matrix is also DPLR (e.g. also by the Woodbury identity).
+This implies that the discretized matrix \( \bm{\overline{A}} \) is the product of two DPLR matrices and thus has \( O(N) \) matrix-vector multiplication.
+\cref{sec:s4-recurrence-proof} computes \( \bm{\overline{A}} \) in closed DPLR form.
+\begin{theorem}[\methodabbrv{} Convolution]%
+  \label{thm:s4-convolution}
+  Given any step size \( \dt \), computing the SSM convolution filter \( \bm{\overline{K}} \) can be reduced to 4 Cauchy multiplies,
+  requiring only
+  \( \widetilde{O}(N+L) \) operations and \( O(N+L) \) space.
+\end{theorem}
+
+
+\cref{sec:s4-details}, \cref{def:cauchy} formally defines Cauchy matrices, which are related to rational interpolation problems.
+Computing with Cauchy matrices is an extremely well-studied problem in numerical analysis,
+with both fast arithmetic and numerical algorithms based on the famous Fast Multipole Method (FMM)
+\citep{pan2001structured,pan2015transformations,pan2017fast}.
+The computational complexities of these algorithms under various settings are described in \cref{sec:s4-details}, \cref{prop:cauchy}.
+
+We reiterate that \cref{thm:s4-convolution} is our core technical contribution,
+and its algorithm is the very motivation of the NPLR \methodabbrv{} parameterization.
+This algorithm is formally sketched in \cref{alg:s4-convolution}.
+
+
+\subsection{Architecture Details of the Deep \methodabbrv{} Layer}
+\label{sec:s4-architecture}
+
+Concretely, an \methodabbrv{} layer is parameterized as follows.
+First initialize a SSM with \( \bm{A} \) set to the HiPPO matrix \eqref{eq:hippo}.
+By \cref{lmm:conjugation} and \cref{thm:hippo-nplr},
+this SSM is unitarily equivalent to some \( (\bm{\Lambda} - \bm{P}\bm{Q}^*, \bm{B}, \bm{C}) \) for some diagonal \( \bm{\Lambda} \) and vectors \( \bm{P}, \bm{Q}, \bm{B}, \bm{C} \in \mathbbm{C}^{N \times 1} \).
+These comprise \methodabbrv's \( 5N \) trainable parameters.
+
+
+The overall deep neural network (DNN) architecture of \methodabbrv{} is similar to prior work.
+As defined above,
+\methodabbrv{} defines a map from \( \mathbbm{R}^L \to \mathbbm{R}^L \), i.e. a 1-D sequence map.
+Typically, DNNs operate on feature maps of size \( H \) instead of \( 1 \).
+\methodabbrv{} handles multiple features by simply defining \( H \) independent copies of itself, and then mixing the \( H \) features with a position-wise linear layer for a total of \( O(H^2) + O(HN) \) parameters per layer.
+Nonlinear activation functions are also inserted between these layers.
+Overall, \methodabbrv{} defines a sequence-to-sequence map of shape (batch size, sequence length, hidden dimension), exactly the same as related sequence models such as Transformers, RNNs, and CNNs.
+
+
+\begin{table}
+  \caption{
+    Complexity of various sequence models in terms of sequence length ($\bm{L}$), batch size ($\bm{B}$), and hidden dimension ($\bm{H}$);
+    tildes denote log factors.
+    Metrics are parameter count, training computation, training space requirement, training parallelizability, and inference computation (for 1 sample and time-step).
+    For simplicity, the state size \( N \) of \methodabbrv{} is tied to \( H \).
+    Bold denotes model is theoretically best for that metric.
+    Convolutions are efficient for training while recurrence is efficient for inference, while SSMs combine the strengths of both.
+  }
+  \small
+  \centering
+  \begin{tabular}{@{}lllll@{}}
+    \toprule
+               & Convolution\tablefootnote{Refers to global (in the sequence length) and depthwise-separable convolutions, similar to the convolution version of S4.} & Recurrence     & Attention            & \methodabbrv                                     \\
+    \midrule
+    Parameters & \( LH \)                                                                                                                                             & \( \bm{H^2} \) & \( \bm{H^2} \)       & \( \bm{H^2} \)                                   \\
+    Training   & \( \bm{\tilde{L}H(B + H)} \)                                                                                                                         & \( BLH^2 \)    & \( B(L^2H + LH^2) \) & \( \bm{BH(\tilde{H}+\tilde{L}) + B\tilde{L}H} \) \\
+    Space      & \( \bm{BLH} \)                                                                                                                                       & \( \bm{BLH} \) & \( B(L^2 + HL) \)    & \( \bm{BLH} \)                                   \\
+    Parallel   & \textbf{Yes}                                                                                                                                         & No             & \textbf{Yes}         & \textbf{Yes}                                     \\
+    Inference  & \( LH^2 \)                                                                                                                                           & \( \bm{H^2} \) & \( L^2H + H^2L \)    & \( \bm{H^2} \)                                   \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:complexity}
+\end{table}
+
+Note that the core S4 module is a linear transformation, but the addition of non-linear transformations through the depth of the network makes the overall deep SSM non-linear.
+This is analogous to a vanilla CNN, since convolutional layers are also linear.
+The broadcasting across \( H \) hidden features described in this section is also analogous to depthwise-separable convolutions.
+Thus, the overall deep S4 model is closely related to a depthwise-separable CNN but with \emph{global} convolution kernels.
+
+Finally, we note that follow-up work found that this version of S4 can sometimes suffer from numerical instabilities when the \( \bm{A} \) matrix has eigenvalues on the right half-plane \citep{goel2022sashimi}.
+It introduced a slight change to the NPLR parameterization for S4 from \( \bm{\Lambda} - \bm{P}\bm{Q}^* \) to \( \bm{\Lambda} - \bm{P}\bm{P}^* \) that corrects this potential problem.
+
+\cref{tab:complexity} compares the complexities of the most common deep sequence modeling mechanisms.

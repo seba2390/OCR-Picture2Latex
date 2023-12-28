@@ -1,0 +1,166 @@
+\section{Durable Functions}\label{sec:durablefunctions}
+
+DF is a programming model that offers a novel combination of abstractions for reliable workflows. It supports both simple scenarios, such as workflows of tasks that perform sequential or parallel composition and iteration, as well as advanced concepts, such as durable entities and critical sections. Its implementation is open-source \cite{df-extension-repo,df-js-repo,df-python-repo, df-powershell-repo}, and is built on top of the Azure Functions framework \cite{azure-functions-repo}. The currently supported languages are JavaScript, Python, C\#, and PowerShell.  
+
+\vspace{.07in}\noindent\textbf{Orchestrations} 
+are reliable workflows written in a task-parallel style. An example illustrating a simple orchestration, a sequential composition of two functions, is shown in Fig.~\ref{fig:simplesequence}. Lines 1--3 declare that this is an orchestration function named \texttt{SimpleSequence}. When invoked, this orchestration reads its input (line 7) and then calls an activity with name \texttt{F1}. The term "activity" is DF terminology for a stateless serverless function, that can take an input and return an output. We have omitted the code for the activities in our examples. The \texttt{await} on line 8 indicates that the orchestration should resume execution only after \texttt{F1} is complete. The returned result is then passed to the next function \texttt{F2} (line 9). When the latter finishes, the orchestration returns the final result (line 10). If anything goes wrong, the exception handler (line 13) can take appropriate action.
+
+A slightly more interesting example containing parallel iteration is shown in Fig.~\ref{fig:orchestration}. It shows a JavaScript example of an orchestration that creates thumbnails for all pictures in a directory. It receives a directory name as input (line 4), and then calls an activity "GetImageList" (line 6) to obtain the list of files. The \texttt{yield} on line 6 serves as a JavaScript equivalent of \texttt{await}. Next, to create the thumbnails in parallel, the orchestration starts an activity for each of them, without \text{yield}, thus not waiting for the result, but storing the tasks in an array (line 12). Next it calls \texttt{yield} to indicate that the orchestration should resume after all the parallel tasks are complete (line 16). Finally, it aggregates (sums) all the returned numbers (sizes) and returns the result (line 18).
+    
+\begin{figure}
+\begin{minted}[fontsize=\footnotesize,linenos]{csharp}
+[FunctionName("SimpleSequence")]
+public static async Task<int> Run(
+    [OrchestrationTrigger] IDurableOrchestrationContext c)
+{
+    try
+    {
+        var x = c.GetInput<int>();
+        var y = await c.CallActivityAsync<int>("F1", x);
+        var z = await c.CallActivityAsync<int>("F2", y);
+        return z;
+    }
+    catch (Exception) {
+        // Error handling or compensation can go here.
+    }
+}
+\end{minted}
+    \caption{Sequencing two functions F1 and F2 using a durable functions orchestration in C\#.}
+    \label{fig:simplesequence}
+\end{figure}
+    
+\begin{figure}
+\begin{minted}[fontsize=\footnotesize,linenos]{javascript}
+const df = require("durable-functions");
+module.exports = df.orchestrator(function*(context) {
+  // Get the directory input argument
+  const directory = context.df.getInput();
+  // Call an activity and wait for the result
+  const files = yield context.df.callActivity(
+    "GetImageList", directory);
+  // For each image, call activity without waiting
+  // and store the task in a list
+  const tasks = [];
+  for (const file of files) {
+    tasks.push(context.df.callActivity(
+      "CreateThumbnail", file));
+  }
+  // wait for all the tasks to complete
+  const results = yield context.df.Task.all(tasks);
+  // return sum of all sizes
+  return results.reduce((prev, curr) => prev + curr, 0);
+});
+\end{minted}
+\caption{Example orchestration using the Durable Functions JavaScript API. It calls
+an activity \texttt{GetImageList}, and then, in parallel, \texttt{CreateThumbnail} for each image. It then waits for all to complete and returns the aggregated size.}
+\label{fig:orchestration}
+\end{figure}
+
+
+\begin{figure}
+\begin{minted}[fontsize=\footnotesize,linenos]{csharp}
+public class Account
+{
+    public int Balance { get; set; }
+    public int Get() => Balance;
+    public void Modify(int Amount) { Balance += Amount; }
+
+    // boilerplate for Azure Functions (feel free to ignore)
+    [FunctionName(nameof(Account))]
+    public static Task Run([EntityTrigger] 
+      IDurableEntityContext ctx)
+        => ctx.DispatchAsync<Account>();
+}
+\end{minted}
+\caption{Example entity using the Durable Functions C\# API. Its state 
+is an integer \texttt{Balance}, and
+it has operations \texttt{Get} and \texttt{Modify} to read or update it.}
+\label{fig:entity}
+\end{figure}
+
+\vspace{.07in}\noindent\textbf{Entities} 
+are addressable units that can receive operation requests and execute them sequentially and reliably.
+% , and that can automatically persist state. 
+\hide{
+\kk{I am not sure whether persisting state should be mentioned here. Reliability (which is a guarantee that DF provides) should be mentioned though.}
+}
+Fig.~\ref{fig:entity} shows a C\# example of an entity representing a bank account. The state of the entity is an integer (line 3) that is read by an operation \texttt{Get} (line 4) and updated by an operation \texttt{Modify} (line 5). An entity ID consists of two strings, the entity name and the entity key. For example, an account entity may be identified by ("Account", "0123-44918"). All entity operations are serialized, that is, their execution does not overlap, which provides a simple solution to basic synchronization challenges. The concept of entities is similar to virtual actors, or \emph{grains}, as introduced by Orleans~\cite{bykov2011orleans}.  
+
+%While orchestrations and entities are each useful on their own, their combination is especially powerful. For example, when orchestrations issue entity operations, the runtime automatically enforces in-order delivery and filters duplicates. This helps to avoid a proliferation of tedious idempotence mechanisms in the application. 
+
+%Moreover, we provide \emph{critical sections}, a synchronization primitive that provides mutual exclusion not just for operations on individual entities, but for designated sections of orchestrations. 
+
+\vspace{.07in}\noindent\textbf{Critical sections} help to address synchronization challenges involving durable state stored in more than one place, such as in multiple entities and/or in external services. For example, consider an orchestration that intends to transfer money between accounts. Fig.~\ref{fig:transfer} shows such an orchestration, using the C\# API. First, we obtain the input parameters (source, destination, and amount) on line 5. Then, we construct entity IDs for the two accounts (line 7, 8). The \texttt{LockAsync} call on line 10 locks both account entities for the duration of the critical section (lines 11 through 23), enforcing exclusive access. On line 12, we read the current balance of the source account by calling the \texttt{Get} operation.\footnote{Our .NET interface also offers an interface-and-proxy-based syntax for calling  entities that provides type checking for operations and arguments. It takes a bit more space so we chose the untyped syntax for this small demonstration example.} If the balance does not cover the amount (line 13) we return false (line 15), otherwise we modify both accounts by calling the two account entities in parallel (lines 20, 21). After both entities finish the operation, the \texttt{await} (line 19) completes and we return true, exiting the critial section, and releasing both locks.
+
+\begin{figure}
+\vspace{.1in}
+\begin{minted}[fontsize=\footnotesize,linenos]{csharp}
+[FunctionName("Transfer")]
+public static async Task<bool> Transfer(
+    [OrchestrationTrigger] IDurableOrchestrationContext ctx)
+{
+  (string source, string dest, int amount) = 
+    ctx.GetInput<string,string,int>();
+  EntityId sourceId = new EntityId("Account", source);
+  EntityId destId = new EntityId("Account", dest);
+  
+  using (await ctx.LockAsync(sourceId, destId))
+  {
+    int bal = await ctx.CallEntityAsync<int>(sourceId, "Get");
+    if (bal < amount)
+    {
+      return false;
+    }
+    else
+    {
+      await Task.WhenAll(
+        ctx.CallEntityAsync(sourceId, "Modify", -amount),
+        ctx.CallEntityAsync(destId, "Modify", +amount));
+      return true;
+} } }
+\end{minted}
+\vspace{-.17in}\caption{Example of an orchestration with a critical section that reliably transfers money between account entities.}
+\label{fig:transfer}
+\end{figure}
+
+\begin{figure}
+\begin{center}
+\begin{math}\small
+\noindent\begin{array}{|c|c|c|@{\quad}l}
+    \rotatebox[origin=c]{90}{\text{\ step 1}} 
+  & \rotatebox[origin=c]{90}{\text{\ step 2}} 
+  & \rotatebox[origin=c]{90}{\text{\ step 3}}  \\\hline
+x & x & x &\eestarted(\mi{"SimpleSequence"}, \mi{x})\\
+x & x & x &\etscheduled(\mi{"F1"}, \mi{x})\\
+  & x & x &\etcompleted(\mi{y})\\
+  & x & x &\etscheduled(\mi{"F2"}, \mi{y})\\
+  &   & x &\etcompleted(\mi{z})\\
+  &   & x &\eecompleted(\mi{z})\\
+\end{array}
+\end{math}
+\end{center}
+\caption{The history recorded for the orchestration in Fig.~\ref{fig:simplesequence}.}\label{fig:history}
+\end{figure}
+
+\subsection{Orchestration Persistence}
+%
+In contrast to stateless functions, orchestrations do not have to remain in memory, accumulating billing charges, while they wait for a step to complete. Instead their progress can be stored in durable storage and retrieved when the step has completed. This is particularly important for long-running workflows.
+
+Rather than persisting the program location, variables, and heap, DF records a \emph{history} of events. For example, the orchestration from Fig.~\ref{fig:simplesequence} executes in three steps, with partial histories as shown in Fig.~\ref{fig:history}. It is possible to re-hydrate the intermediate state of an orchestration from storage by replaying the persisted partial history. Completed tasks are not re-executed during replay; rather, the recorded results are reused.
+
+Replay can cause problems if the orchestration contains nondeterminism or if histories are excessively long. Developers are expected to avoid these issues by (1) encapsulating  nondeterminism in activities, and (2) using sub-orchestrations, or restarting orchestrations, to limit history size. DF also includes a static analysis tool that can detect common mistakes of this kind for its C\# front end.
+
+\subsection{Comparing DF to Triggers}
+
+Perhaps the simplest way to construct a workflow is to specify \emph{triggers}, also called \emph{bindings}, which launch functions in response to storage events. For example, to implement a simple sequence, we can instruct each step to write its result to storage (typically, a queue or a file) which then triggers the next step. Because of their conceptual simplicity and wide availability, triggers are commonly used by FaaS developers. 
+
+Authoring complex workflows using just triggers is possible, but the developer experience is not ideal. One has to create bindings and queues/directories for each intermediate step of the workflow, which is tedious and error-prone. Also, triggers do not support specifying that a step should wait for the completion of multiple previous steps, which is a common requirement (e.g. on line 16 in Fig.~\ref{fig:orchestration}). Finally, triggers do not offer a convenient way to specify error handling (e.g. as in line 13 in Fig.~\ref{fig:simplesequence}).
+
+\subsection{Comparing DF to Step Functions}
+%
+% \hide{\dajusto{Wrote a little blurb, let me know what you think}\seb{liked it, but shortened it a little.}}
+%
+Another alternative for specifying workflows declaratively is to define a state machine that invokes and guides the composition of functions. For example, with AWS Step Functions \cite{aws-step-functions}, a computation graph is expressed using a JSON-based declarative DSL. Nodes in this graph either invoke a serverless function (or some other cloud service), forwarding its output to a specified target node, or they inspect their input to make a conditional state transition. Special nodes exist to handle exceptions or invoke other AWS services.
+
+Conceptually, an AWS Step Function is comparable to a DF orchestrator. But the programming model is different: DF expresses orchestrations in a mainstream language, while Step Functions use a JSON-based schema with limited options for abstraction and control flow. For example, sequential loops with dependent iterations cannot be expressed (\S\ref{ssec:eval-programmability}).
+

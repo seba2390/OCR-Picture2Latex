@@ -1,0 +1,225 @@
+
+\section{WiFi Battery Drain Attack} \label{sec:wifi-battery-drain}
+When IoT devices require high bandwidth, WiFi is the most lucrative option.
+It provides a nice balance between throughput, range, and power consumption for applications that require more than 1~Mbps of bandwidth.
+This is why most wireless cameras use WiFi to connect to the Internet. 
+
+As explained in Section~\ref{sec:background}, WiFi devices consume hundreds of milliwatts even in the idle mode. Therefore, they utilize power saving mechanisms to significantly reduce the power consumption. In the following section, we show how an attacker can drain the battery of an IoT device by disabling WiFi power saving on the device which significantly increases its power consumption.
+
+
+
+\subsection{Attack Overview}
+The WiFi battery draining attack we study in this paper employs two main ideas: 1) disabling power saving on the target device and 2) forcing the target device to continuously transmit WiFi packets. In the following we describe each in more details.
+
+\textbf{1) Disabling power saving:} As described in Section~\ref{sec:background}, WiFi devices that are in the power saving mode periodically wake up to receive beacon frames to see if the access point has buffered any incoming packets for them. 
+If there are incoming packets for them, they stay awake to receive said packets. Our attack exploits this behavior by actively preventing a WiFi device from going back to sleep.
+To do this, the attacker injects fake beacon frames that indicate the target device has some buffered packets on the access point\footnote{Packet injection is the process of transmitting a raw WiFi packet without being connected to any WiFi network. This feature is supported by many WiFi chipsets~\cite{beacon-stuffing-1, beacon-stuffing-2}.}. 
+Upon receiving this fake beacon frame, the target device does not sleep and instead tries to contact the access point. 
+Soon after, the target device will find out there are no packets buffered for it and will return to sleep. 
+However, we found that if the attacker's device keeps sending these fake beacon frames, it can prevent the victim's device from going back to sleep, keeping it in an awake state.
+
+\textbf{2) Forcing the target device to continuously transmit:} Although preventing a device from going to the sleep mode significantly impacts battery life, an attacker can further increase the power consumption of the target device by forcing it to transmit WiFi packets.
+Transmission is typically the most power-hungry operation on WiFi chipsets because it involves amplifying the signal before transmission.
+But how can an attacker, that is not part of the target device's network, force the target device to transmit packets?
+
+%lets put Abedi et al for camera ready.
+
+A recent study has shown all existing WiFi devices respond with acknowledgement to fake packets transmitted to them, even when the packet is sent from outside of their network~\cite{polite-wifi}. This is because upon receiving a packet, the device must send back an acknowledgment within a short amount of time which is between 10 to 16 microseconds (i.e., SIFS defined in IEEE 802.11). This short turnaround time does not allow for deep inspection of received packets. During this short time, WiFi devices can only calculate the cyclic redundancy check (CRC) of the frame to detect possible errors. As a result, WiFi devices will even acknowledge fake packets received from an attacker. Therefore, the attacker can keep sending fake packets to the target device, forcing it to continuously transmit acknowledgements back, resulting in a significant increase in its power consumption. 
+
+To summarize, an attacker can combine the two above techniques to keep the radio of a WiFi device on and force it to continuously send packets, further increasing the power consumption of a target device. We next explain this attack in detail and provide an analysis of its performance in different scenarios.
+
+% \begin{figure*}[ht]
+%     \centering
+%     \includegraphics[width=0.75\textwidth]{figures/battery-draining/wireshark.png}
+%     \vspace{-10pt}
+%     \caption{Injected WiFi traffic and responses from the target device.}
+%     \vspace{-15pt}
+%     \label{fig:wifi_traffic}
+% \end{figure*}
+
+\subsection{Attack Details}
+We now present the technical details of the battery draining attack.
+As we have previously described, for this attack the attacker transmits a combination of beacon frames and some other fake packets:
+
+\textbf{Fake beacons: } To keep the radio of the target device on, the attacker keeps sending fake beacon frames that tell the target device that it must stay on to receive its buffered frames.
+When a client device associates with a WiFi access point, it receives an association ID. In every beacon frame, there is a Traffic Indication Map (TIM) which is a bitmap that indicates which clients have buffered packets on the access point. If the association ID is $x$, then the $(x+1)^{th}$ bit of TIM is assigned to that station.
+
+Therefore, the attacker needs to find the association ID of the device so that they can then set the correct bit in TIM. This requires the attacker to monitor the ongoing traffic for a long time or potentially be present when the target device associates with the access point to figure out the association ID. 
+To solve this problem, we set all bits in the TIM to 1. 
+The side effect is that all devices in the target network will think they need to stay awake. To eliminate this side effect, we send the fake beacon frame as a unicast packet, instead of the usual broadcast beacons. This way only the target device receives the packet and we don't interfere with the operation of other devices. Interestingly, our experiments show that target devices do not care if they receive beacons as broadcast or unicast frames.
+
+\textbf{Fake queries: }
+We refer to any fake WiFi packet that forces a target device to respond as a \textit{query packet}. The attacker tries to force the target device to transmit WiFi packets by continuously sending it fake queries. To maximize the amount of time the target device spends transmitting, we study a few different types of fake query packets that the attacker can send. 
+Note, the power consumption of transmission is typically higher than that of reception. For example, ESP8266~\cite{esp8266} and ESP32~\cite{esp32} WiFi modules draw 50 and 100 mA when receiving while they draw 170 and 240 mA when transmitting. 
+These low-power WiFi modules are very popular for IoT devices.
+
+\begin{table}[h]
+    \centering
+    \begin{tabular}{|l|l|l|l|}
+        \hline
+         Query & Query size & Response & Response size \\
+         \hline
+         Data (null)    &   28 bytes & ACK   &   14 bytes\\
+         RTS            &  20 bytes & CTS   &  14 bytes\\
+         B-ACK Req.     &  24 bytes & B-ACK &  32 bytes \\
+         \hline
+    \end{tabular}
+    \caption{Different types of fake queries and their  responses.}
+    \vspace{-10pt}
+    \label{tbl:queries}
+\end{table}
+
+
+
+Ideally, we want to send a short query packet and receive a long response. However, the target device's responses are limited to some control packets.
+Table~\ref{tbl:queries} lists some query packets and their corresponding responses.
+As you can see, the best choice of for a query packet is Block ACK requests because the target will respond with a Block ACK that is bigger than the query packet. We will empirically evaluate this analysis in Section~\ref{sec:wifi-results}.
+
+
+
+
+Another aspect of the query packets is the transmission rate. 
+When the bitrate of the query packet increases, the bitrate of the response will also increase as specified in the IEEE 802.11 standard. When the query packet is a control packet such as RTS or a block ACK request, the bitrate of the response will be the same. The control packets are supposed to be transmitted using a basic rate (i.e., legacy 802.11b/g rates up to 24 Mbps). A similar rule is valid for data packets and ACKs. ACKs must be transmitted at the highest basic rate that is lower than the bitrate of the data packet.
+
+
+
+At first glance, it may seem that the attacker must use the fastest 
+bitrate possible to transmit query packets. This way it forces the target device to transmit as many responses as possible. However, it turns out that this is not the case. The power consumption depends mostly on the amount of time the target device spends on transmitting packets. When a higher rate is used for the query and response packets the total time the target spends on transmission does not increase. The number of responses increases but the duration of each response decreases too.
+In fact, the total time spent transmitting decreases mainly due to overheads such as channel sensing and backoffs. For example, if we increase the bitrate by 6 times (i.e., from 1 Mbps to 6 Mbps), the number of packets will increase by only 3.3 times.
+As a result, to maximize the transmission time of the target device, the attacker should use the lowest rate (i.e., 1 Mbps) for the query packet.
+In contrast, when a high bitrate is used, the target device needs to process more packets. We believe that the power consumption of packet processing is much less than that of active transmission. Therefore, regardless of packet processing, it seems that 1 Mbps is the best choice for query packets. We verify this analysis in Section~\ref{sec:wifi-results}.
+
+% Figure~\ref{fig:wifi_traffic} demonstrates sample beacons, query and response packets.
+% The attacker transmits a fake beacon frame to a target device by spoofing the MAC address of the access point that the target device is actually connected to. Since there is no response for the beacon, the attacker does not need to use the slowest rate. In this example, we used 24 Mbps.
+% The attacker then sends 5 block ACK requests which are replied to by 5 block ACKs. 
+% The attacker continues this process to drain the battery of the target device.
+% Our experiments show that sending a beacon between every 5 query packets keeps our target device awake. However, note the optimal number of block ACKs to send for each beacon may depend upon the target device. 
+
+
+
+% WiFi modules are typically power-hungry. (\textbf{it might be good to include some figure here for a typical power consumption for a wifi module}). Consequently, the battery-powered WiFi-enabled IoT devices need some mechanisms to save power from the WiFi module, otherwise, they can easily run out of battery and stop functioning. A common mechanism used by many manufacturers is to reduce activity of WiFi module when the device is not used, and hence, entering a power-saving mode. In power-saving mode, the device may not transmit as many packets in the WiFi network, but it still listens to the Access Point (AP) to enable its IoT features. The device may still sense the environment based on their functionality. When the users try to communicate with the device through the access point or the device sense something that needs to report to the users, the device will return to normal mode and activates its WiFi module. There are other mechanisms for power saving such as introducing a fixed time interval sleep in the low level design. However, these mechanisms are not useful in a home security setting that will be discussed in this paper. 
+
+
+
+\subsection{Experiment Setup}
+Our testbed includes a wireless security camera as the target device and an attacking device. 
+
+\textbf{Target device: }
+The most common IoT devices that utilize WiFi are security cameras.
+We choose Amazon Ring Spotlight Cam Battery HD Security Camera~\cite{ring-camera} for our battery drain experiments. However, our attack also works on other wireless security cameras since they all use WiFi for communication. The Ring Spotlight Cam is a battery-powered outdoor security camera that comes with various security features. It captures a short video clip when it senses motion. Users can use the application on their phones to view the captured video. It also supports live streaming and two-way audio communication to enhance its security features. To realize all these features with limited battery, the WiFi card of this camera is in the power saving mode most of the time when there is no motion detected and no interactions from the user.
+The camera is powered by a custom 6040 mAh lithium-ion battery. The device also has a second battery slot as a backup. However, the box comes with only one battery which is enough to run the camera. The battery life of this camera is estimated to be between 6 and 12 months under normal usage~\cite{ring-camera-battery1, ring-camera-battery2}.
+
+We leave the camera settings to their defaults which means most power consuming options are turned off. This assures that our measurements will be an upper bound on the battery life and hence the attack might drain the battery much faster in the real world.
+
+\textbf{Attacking device: }
+Any WiFi card capable of packet injection can be used as the attacking device.
+We use a USB WiFi card connected to a laptop running Ubuntu 20.04. The WiFi card has an RTL8812AU chipset~\cite{rtl8812au} that supports IEEE 802.11 a/b/g/n/ac standards.
+We have installed the aircrack-ng/rtl8812au driver~\cite{aircrack-ng} for this card which enables robust packet injection.
+We utilize the Scapy~\cite{scapy} library to inject fake WiFi packets to the target device. Scapy is a Python library that enables convenient packet sniffing and injection functionalities. It allows defining customized packets and multiple options for packet injection. 
+Since we need to inject many packets in this attack, we use the \textit{sendpfast} function to inject packets at high rates. \textit{sendpfast} relies on \textit{tcpreplay}~\cite{tcpreplay} for high performance packet injection. 
+
+% The fake WiFi frames for packets injection are created by Python's Scapy library and are sent through WT-AC9006 WiFi adapter. 
+% % I forgot its name... Is it called WiFi adapter? Or WiFi Card? It is the thing we plugged to the laptop
+% For the physical setup, the camera is faced towards the wall and the WiFi adapter's antenna is placed 1 meter away from the camera.
+% % We may need to convince the audience that it is kind of a worst-case setup because the camera is never activated by the motion. So it increases battery life and makes it harder for us to drain the battery
+% WAITING FOR ALI's SETUP FOR A MORE REALISTIC ATTACK.
+
+
+
+\subsection{Results\\} \label{sec:wifi-results}
+\vspace{-20pt}
+\subsubsection{Finding the optimal configuration:}
+We first evaluate our analysis for the best type of query packet and bitrate.
+We found that sending block ACK requests at the lowest bitrate (i.e., 1 Mbps) should maximize the power consumption of the target device.
+To verify this analysis, we have conducted a series of experiments with different types of query packets and transmission bitrates.
+In each experiment, we continuously transmit query packets to the Ring security camera for 6 hours.
+We start with a fully charged battery and we record the battery level at the end of each 6-hour experiment.
+In all experiments, the attacker injects query packets as fast as possible.
+
+Figure~\ref{fig:inject-time} shows the number of packets the attacker transmits to the target device and the number of responses it receives during 100 seconds of our 6-hour experiment.
+In this experiment, the query packet is a null packet and the transmission rate is 1 Mbps.
+The number of transmitted packets include beacon frames. There is a beacon frame after every five null packets. Since the target only responds to null packets, the number of target's packets (i.e., ACKs) is about 17\% lower than attacker's packets. 
+
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.9\columnwidth]{figures/battery-draining/null-1-mbps.pdf}
+    \vspace{-10pt}
+    \caption{Packets sent to and received from the target device.}
+    \vspace{-15pt}
+    \label{fig:inject-time}
+\end{figure}
+
+Our first assumption was that transmitting packets consumes more power than receiving WiFi packets. 
+To verify this assumption, we increase the payload of the attacker's queries. Therefore, the target spends more time on receiving than responding. Figure~\ref{fig:inject-bar} shows that when we add a 100 byte payload to the null packets the number of attackers packets and responses drop by about 40\% (denoted by Null+Payload).
+Figure~\ref{fig:battery-bar} reveals that after 6 hours of sending regular null packets the battery is drained by 10\%. However, when the same attack is performed with null packets that have a 100 byte payload the battery of the camera drains only 8\%. This small change will make the battery drain attack 20\% longer.
+Adding a bigger payload will further reduce the effectiveness of the battery drain attack.
+This observation confirms that to speed up battery drain the attacker needs to force the target device to spend more time in the transmitting mode.
+Note that after 6-hours of normal use without any attack, the battery of the camera stays at 100\%.
+
+As we showed before, a block ACK is larger than a block ACK request. This should improve the speed of the battery drain. 
+Figure~\ref{fig:inject-bar} shows that the number of block ACKs we can receive from the target is slightly less than the number of ACK because of larger frame sizes. We show this experiment by BAR/1 in the figure to represent Block ACK Request.
+Figure~\ref{fig:battery-bar} also shows that the battery can be drain 30\% faster using block ACK requests compared to null packets.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.9\columnwidth]{figures/battery-draining/packets-bar.pdf}
+    \vspace{-10pt}
+    \caption{Average number of packets sent to and received from the target device under different settings.}
+    \vspace{-15pt}
+    \label{fig:inject-bar}
+\end{figure}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.9\columnwidth]{figures/battery-draining/battery-bar.pdf}
+    \vspace{-10pt}
+    \caption{Battery drain during the 6-hour test.}
+    \vspace{-15pt}
+    \label{fig:battery-bar}
+\end{figure}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.9\textwidth]{figures/battery-draining/wifi-range.pdf}
+    \vspace{-15pt}
+    \caption{Percentage of attacker's query packets responded by the target device for different attacker's locations.}
+    \label{fig:wifi-range}
+\end{figure*}
+
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=0.7\columnwidth]{figures/battery-draining/wifi-range-setup.pdf}
+%     \caption{The setup of the WiFi battery draining experiment.}
+%     \vspace{-10pt}
+%     \label{fig:wifi-range-setup}
+% \end{figure}
+
+Finally, we investigate the impact of transmission bitrate.
+Our previous analysis suggested that increasing the bitrate should hurt the speed of draining a battery. 
+To validate this analysis, we repeat the block ACK request experiment but instead of using 1~Mbps to transmit the requests, we use 6~Mbps. Due to a higher physical layer, many more query packets (i.e., around 3000 per second) can be transmitted. Note that the responses are also transmitted back to us at 6~Mbps as specified by the IEEE 802.11 standard.
+The attacker sends close to 2500 block ACKs per second as shown in Figure~\ref{fig:inject-bar} marked by BAR/6.
+Despite the 3x increase in the number of responses, the battery is only drained 5\% which is considerably less than the 13\% when 1 Mbps is used.
+Interestingly, although the attacker imposes 3x more packet processing overhead to the target device, the energy consumption is still less than half of when 1 Mbps is used. This result shows that the power consumption of transmitting WiFi packets is at least an order of magnitude more than that of packet processing.
+
+\subsubsection{Battery drain with optimal configurations}
+We use the best setting which is a block ACK request query transmitted at 1~Mbps to fully drain the battery of the Ring security camera.
+We keep blasting beacon and block ACK requests at the camera and measure how long it takes to kill the battery. We are able to drain a fully charged battery in 36 hours. Considering the fact that the typical battery life of this camera is 6 to 12 months, our attack reduces the battery life by 120 to 240 times! Finally, it is worth mentioning that it takes our attack 36 hours to kill a \textit{fully charged} battery (i.e. at 100\%). However, since a typical user charges the battery every 6-12 months, in most cases the batteries are at 20-60\%, and therefore it would take much less for our attack to kill the battery. 
+
+
+
+\subsubsection{Range of WiFi battery draining attack}
+A key factor in the effectiveness of the battery draining attack is how far the 
+attacker can be from the victim device and still be able to carry on the attack. 
+If the attack can be done from far away, it becomes more threatening. 
+To evaluate the range of this attack, we design an experiment in which the attacker transmits packets to the target from different distances and we measure what percentage of the attacker's packets are responded by the target device.
+We use a realistic testbed. The Ring security camera is installed in front of a house, and the attacker is placed in a car, parked at different locations on the street. We test the attack at 10 different locations up to 150 meters away from the target device. Figure~\ref{fig:wifi-range} 
+%and Figure~\ref{fig:wifi-range-setup} 
+shows these locations and our setup. Each yellow circle represents each of the locations tested at. The numbers inside the circles show the percentage of the attacker's packets responded to by the camera.
+Each number is an average over 60 one-second measurements.
+The closest distance is about 5 meters when we park the car in front of the target house. 
+In this location 97\% of the attacker's packets are responded.
+We conducted other experiments within 10 meters of the target (no shown here) and we obtained similar results.
+
+One interesting finding in this experiment is that, even within a distance of 100 meters, almost all attacker's packets are responded by the victim device. In some locations such as the rightmost circle (at 150 meters away), we could still achieve a reply rate as high as 73\%, confirming our attack works even at that distance. The reason for achieving such a long range is that the attacker transmits at 1 Mbps bitrate which uses extremely robust modulation and coding rate (i.e. BPSK modulation and a 1/11 coding rate). 
+

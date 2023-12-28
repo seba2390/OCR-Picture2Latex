@@ -1,0 +1,71 @@
+\section{Method}
+
+\subsection{ViTs with mixed-resolution tokenization}
+
+We define a \textbf{mixed-resolution patch mosaic} to be a division of an image into a set of non-overlapping patches of different sizes, such that the entire area of the image is covered (see examples in Figure \ref{figure:quadformer}, Figure \ref{figure:more_quadtree_examples}, Figure \ref{figure:quadtree_comparison}). With small adaptions to the way ViT models represent image patches, we convert mixed-resolution patch mosaics into token sequences that can be processed by a standard Transformer model. These adaptations deal with 2 aspects of the tokens: patch embedding and position embedding.
+
+\noindent \textbf{Patch embedding:} each patch in the mosaic is resized to a fixed representation size (e.g. $16^2$ pixels), then flattened and passed through a shared fully connected layer. Notice that all patches are represented by tokens of equal dimension, regardless of the area they cover in the image.
+
+\noindent \textbf{Position embedding:} the learned 1-dimensional position embeddings common in vanilla ViTs lose meaning when the patches are not part of a regular grid. Instead, we use 2-dimensional position embeddings. We embed the $x$ and $y$ positions separately, then concatenate them to create the final position embedding, as suggested by Dosovitskiy \etal~\cite{Dosovitskiy2020AnII} We use the $(x,y)$ position of the center of the patch inside a grid determined by the smallest patch size. 
+
+
+\input{tex_parts/algorithm_quadtree}
+
+\subsection{Saliency-based Quadtrees}
+
+\paragraph{Quadtrees for RGB images.} Quadtrees are data structures that recursively split a two-dimensional space into a tree of quadrants, where each internal node has exactly four children. Each node in the tree represents a specific spatial area defined by an axis-aligned rectangle or square. In Quadtrees that represent RGB images, each leaf contains a compressed representation of an image patch, often a copy of that patch downsampled to some predetermined size.
+
+Typically, Quadtrees for RGB images are constructed by a top-down algorithm (Algorithm \ref{algorithm:quadtree}), which iteratively chooses the ``most important'' image patch as ranked by a scoring function and splits it into 4 patches, effectively using 4 times more pixels to represent the selected image region. We call this scoring function a ``patch scorer''.
+
+We use the Quadtree algorithm as a tokenizer, splitting images into mixed-resolution patch mosaics which we then feed into a standard Transformer model. We experiment with several patch scorers (Figure \ref{figure:quadtree_comparison}): the pixel-blur scorer commonly used for Quadtree image compression, a novel feature-based scorer that estimates saliency using neural representations, and a Grad-CAM oracle scorer which utilizes a label-aware saliency method and gives a loose upper bound on the scoring quality we can hope to achieve.
+
+
+\begin{figure}[t!]
+  \centering
+  \vspace*{-12pt}
+  \includegraphics[width=0.52\linewidth]{figures/importance_map_comparison.png}
+  \caption{Patch saliency maps created by different scorers for an image labeled ``African Elephant''.}
+  \label{figure:importance_map_comparison}
+\end{figure}
+
+
+\paragraph{Pixel-blur scorer.} In image compression applications, Quadtree patch scoring often relies on the MSE between an image patch and a compressed representation of that patch~\cite{Markas1992QuadTS}, such as a blurry version of the patch obtained by downsampling it to the Quadtree representation size and upsampling back to the original size. This score estimates the pixel-level information loss caused by decreasing the resolution of the patch. Let $p$ be an image patch:
+\begin{align}
+\begin{aligned}
+&p_{blur} = upsample \bigl( downsample(p) \bigr) \\
+&score_{PixelBlur}(p) = MSE \bigl( p,\ p_{blur} \bigr)
+\end{aligned}
+\label{equation:pixel_blur_scorer}
+\end{align}
+
+The pixel blur scorer assigns high importance to areas of the image with a lot of high-frequency content, since calculating the difference between a patch and its blurry counterpart is equivalent to running a high-pass filter. While high-frequency content may be a good importance measure for image compression, it is a poor measure of object saliency, as natural images often have detailed backgrounds or textures that are insignificant when trying to identify the objects in the image. To address this misalignment between the patch scorer objective and the model objective, we propose a different scorer based on semantic representations.
+
+
+
+\begin{figure}[t!]
+  \centering
+  \vspace*{-10pt}
+  \includegraphics[width=0.8\linewidth]{figures/feature_based_scorer.png}
+  \caption{Feature-based patch scorer. The MSE between a patch representation and its blurry counterpart estimates the semantic information loss from decreasing the resolution of the patch.}
+  \label{figure:feature_based_scorer}
+\end{figure}
+
+
+\paragraph{Feature-based scorer.}\label{paragraph:feature_based_scorer}
+Computer vision neural networks are often used to extract semantically meaningful feature vectors. Both Vision Transformers and CNNs create contextualized embeddings of image regions: ViTs have an explicit mapping between feature vectors to image patches, and CNNs create a spatially-aware convolutional activation volume for the entire image wherein each feature vector can be mapped implicitly to a corresponding image region.
+
+Using these neural representations, we introduce $score_{Feat}$, a patch scorer that estimates the semantic information loss from decreasing the resolution of an image patch by comparing its original representation to its representation in a blurred image (Figure \ref{figure:feature_based_scorer}). Intuitively, this score estimates how much semantic information is lost when we downsample the patch from its original size to the Quadtree representation size. For example, if the Quadtree representation size is $16^2$ pixels, the features of a $64^2$ patch in full resolution are compared to the features of this patch when the image is blurred by a factor of $\frac{64}{16}=4$.
+
+Formally,  let $im\in\mathbb{R}^{h_{im} \times w_{im} \times 3}$ and $blur(im, x)$ be an RGB image and its corresponding blurred image obtained by downsampling the image by a factor of $x$ and upsampling it back to the original size. We extract a feature map $feat(im)\in\mathbb{R}^{H \times W \times d}$ by running a feature extractor NN on the image $im$. Given an image patch $p$ of size $s_p \times s_p$, we slice the region in $feat(im)$ which corresponds to $p$'s location in the image: $feat(im)[p]\in\mathbb{R}^{\frac{s_p}{h_{im}}H \times \frac{s_p}{w_{im}}W \times d}$. We use $feat(im)[p]$ as a semantic representation of $p$, a technique very similar to RoI pooling~\cite{Girshick2015FastR}. Given the Quadtree representation size $s_{rep} \in \mathbb{N}$, we use these notations to \linebreak define $score_{Feat}$:
+\begin{align}
+\begin{aligned}
+&im_{blur} = blur \bigl( im,\frac{s_p}{s_{rep}} \bigr)  \\
+&score_{Feat}(p) = MSE \bigl( feat(im_{blur})[p],~feat(im)[p] \bigr)
+\end{aligned}
+\label{equation:feature_base_scorer}
+\end{align}
+
+
+
+\paragraph{Grad-CAM oracle scorer.}\label{paragraph:oracle_scorer}
+Grad-CAM~\cite{Selvaraju2016GradCAMVE} is a method for creating visual explanations of predictions made by a variety of computer vision models. For classification nets, given an image and a target class, Grad-CAM produces a pixel-level saliency map where the weight attributed to each pixel represents its importance in classifying the image to the given target class. Using average pooling, we turn this saliency map into patch scores suitable for the saliency-based Quadtree algorithm (Figure \ref{figure:importance_map_comparison}). To estimate a loose upper bound on the accuracy we can hope to achieve with Quadformer models, we use specific oracle Quadformers, which we train and evaluate with the high-quality saliency scores produced by a Grad-CAM patch scorer that is aware of the actual ground-truth label of the input images.

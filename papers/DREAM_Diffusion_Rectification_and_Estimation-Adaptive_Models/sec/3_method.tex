@@ -1,0 +1,489 @@
+% \newpage
+
+\section{Method}
+\label{sec:method}
+
+
+\begin{figure*}
+    \centering
+\includegraphics[width=.98\textwidth]{figures/overview.pdf}
+    \caption{\textbf{Overview of the DREAM framework}. Starting with ground-truth HR images,  a standard diffusion process with a frozen denoiser network generates denoised HR estimates. The \textcolor{pipgreen}{Adaptive Estimation} merges these estimated HR images with the original HR images, guided by the pattern of estimation errors.  The \textcolor{pipblue}{Diffusion Rectification} constructs the noisy images from this merged HR images,  which are then fed into the denoiser network (now unfrozen). Similar to DDPM~\cite{ho2020denoising}, the denoiser network is trained to eliminate both the introduced Gaussian noise and errors arising from the training-sampling discrepancy, as detailed in~\cref{eq:dream-objective}.
+   % \zz{The figure is very clear, except for the input to the noisy image. Maybe add a switch to distinguish the two states?} 
+   }
+    \label{fig:overview}
+    \vspace{-.1in}
+\end{figure*}
+
+
+
+% \td{We first provide the preliminaries (\Cref{subsec:3.1}), following which we discuss the challenges associated with the training-sampling discrepancy observed in existing diffusion processes (\Cref{subsec:3.2}). Then, we present DreamSR, a novel diffusion model augmented with dynamic rectification (\Cref{subsec:3.3}) and adaptive estimation (\Cref{subsec:3.4}) tailored for the super-resolution (SR) task, as illustrated in~\Cref{fig:overview}. The training objective is given in~\Cref{subsec:3.5}.}
+
+
+\subsection{Preliminaries}\label{subsec:3.1}
+% \subsection{Background}
+
+The goal of SR is to recover a high-resolution (HR) image from its low-resolution (LR) counterpart. This task is recognized as ill-posed due to its one-to-many nature~\cite{saharia2022image,yue2023resshift}, and is further complicated by various degradation models in real-world scenarios. Notably, diffusion models~\cite{sohl2015deep, ho2020denoising} have emerged as powerful generative models, showcasing strong capabilities in image generation tasks. Following~\cite{saharia2022image}, we address the SR challenge by adapting a \emph{conditional} denoising diffusion probabilistic
+(DDPM) model. This adaptation, conditioned on the LR image, sets it apart from traditional, unconditional models which are primarily designed for unconstrained image generation.
+
+We denote the LR and HR image pair as $(\vx_0, \vy_0)$. A conditional DDPM model involves a Markov chain, encompassing a \emph{forward process} that traverses the chain, adding noise to $\vy_0$, and a \emph{reverse process}, which conducts reverse sampling from the chain for denosing from pure Gaussain noise to the HR image $\vy_0$, conditioned on the LR image $\vx_0$.
+
+\begin{algorithm}[t]
+\small
+\caption{Conditional DDPM Training}
+\begin{algorithmic}[1]
+    \REPEAT
+    \STATE $(\vx_0, \vy_0)\sim p(\vx_0, \vy_0), t\sim\sU(1,T), \bm\rvepsilon_t\sim\gN(\vzero, \mI)$
+    \STATE Compute $\vy_t = \sqrt{\bar{\alpha}_t}\vy_0 + \sqrt{1-\bar{\alpha}_t}\bm\rvepsilon_t$ \label{line:update-yt-training}
+    \STATE
+    % Take gradient descent step on
+    Update $\theta$ with gradient $\nabla_\rvtheta||\bm\rvepsilon_t-\bm\rvepsilon_\rvtheta(\vx_0,\vy_t, t)||_1$
+    \UNTIL{converged}
+\end{algorithmic}
+% \vspace{-.1in}
+\label{sr3-training}
+\end{algorithm}
+
+
+\textbf{Forward process.} The forward process, also referred to as the diffusion process, takes a sample $\vy_0$ and simulates the non-equilibrium thermodynamic diffusion process~\cite{sohl2015deep}. It gradually adds Gaussian noise to $\vy_0$ via a fixed Markov chain of length $T$:
+
+\vspace{-.25in}
+\begin{align}
+\small
+q(\vy_t|\vy_{t-1}) &= \gN(\vy_t; \sqrt{1-\beta_t}\vy_{t-1}, \beta_t \mI),\\
+q(\vy_{1:T}| \vy_0) &=\prod_{t=1}^Tq(\vy_t|\vy_{t-1}),
+\end{align}
+\vspace{-.15in}
+
+\noindent
+where $\{\beta_t\in (0,1)\}_{t=1}^T$ is the variance scheduler. As the step $t$ increases, the signal $\vy_0$ gradually loses its distinguishable features. Ultimately, as $t\to\infty$, $\vy_t$ converges to an isotropic Gaussian distribution. Moreover, we can derive the distribution for sampling at arbitrary step $t$ from $\vy_0$:
+
+\vspace{-.2in}
+\begin{align}
+\small
+    q\left(\vy_t | \vy_0\right)=\mathcal{N}\left(\vy_t ; \sqrt{\bar{\alpha}_t} \vy_0,\left(1-\bar{\alpha}_t\right) \boldsymbol{I}\right) .
+    \label{eq:forward-yt}
+\end{align}
+where $\bar{\alpha}_t=\prod_{i=1}^t\alpha_i$ and $\alpha_t=1-\beta_t$.
+
+
+\begin{algorithm}[t]
+\small
+\caption{Conditional DDPM Sampling}
+\begin{algorithmic}[1]
+    \STATE ${\vy}_T\sim\gN(\vzero, \mI)$
+\FOR{$t=T \cdots 1$}
+\STATE $\vz\sim\gN(\vzero,\mI)$ if $t>1$ else $\vz=\vzero$
+\STATE ${\vy}_{t-1}=\frac{1}{\sqrt{\alpha_t}}({\vy}_t-\frac{1-\alpha_t}{\sqrt{1-\bar{\alpha}_t}}\bm\rvepsilon_\rvtheta(\vx_0, {\vy}_t, t))+\sigma_t\vz$\label{line:update-yt-sampling}
+\ENDFOR
+\STATE return ${\vy}_0$
+\end{algorithmic}
+\label{sr3-sampling}
+\end{algorithm}
+
+
+\textbf{Reverse process.} The reverse process, also referred to as the denosing process,  learns the conditional distributions $ p_\theta(\vy_{t-1} | \vy_t, \vx_0) $ for denoising from Gaussian noise to  $\vy_0$ conditioned on $\vx_0$, through a reverse Markovian process:
+
+\vspace{-.2in}
+\begin{align}
+\small
+    p_\rvtheta(\vy_{t-1}|\vy_{t}, \vx_0) &= \gN(\vy_{t-1}; \vmu_\rvtheta(\vx_0,\vy_t,t), \sigma_t^2\mI),\label{eq:reverse-yt}\\
+p_\rvtheta(\vy_{0:T}| \vx_0)&=p(\vy_T)\prod_{t=1}^Tp_\rvtheta(\vy_{t-1}|\vy_{t},\vx_0),
+\end{align}
+\vspace{-.2in}
+
+\noindent
+where $\sigma_t$ is a predetermined term related to $\beta_t$~\cite{ho2020denoising}.
+
+
+\textbf{Training.} We train a denoising network $\bm\epsilon_\theta(\bm x_0,\vy_t, t)$ to predict the noise vector $\bm\epsilon_t$ added at step $t$. Following~\cite{ho2020denoising, saharia2022image}, the training objective can be expressed as:
+
+\vspace{-.2in}
+\begin{align}
+\small
+    \gL(\rvtheta) = \E_{(\vx_0,\vy_0), \bm\rvepsilon_t, t}\left\|\bm\rvepsilon_t - \bm\rvepsilon_\rvtheta(\vx_0,\vy_t, t)\right\|_1.
+    \label{eq:dm-objective}
+\end{align}
+\vspace{-.2in}
+
+\noindent
+With~\cref{eq:forward-yt}, we parameterize $\vy_t=\sqrt{\bar{\alpha}_t}\vy_0 + \sqrt{1-\bar{\alpha}_t}\bm\rvepsilon_t$, and summarize the training process in~\cref{sr3-training}.
+
+\textbf{Sampling.} In essence, the training minimizes the divergence between the forward posterior $q\left(\vy_{t-1} | \vy_t, \vy_0\right)$ and $p_\theta\left(\vy_{t-1} | \vy_t,\vx_0\right)$, and the mean $\vmu_\rvtheta(\vx_0, \vy_t, t)$ in~\cref{eq:reverse-yt} is parameterized~\cite{saharia2022image} to match the mean of $q\left(\vy_{t-1} | \vy_t, \vy_0\right)$:
+
+\vspace{-.2in}
+\begin{align}\label{eq:sampling-mean}
+\small
+    \vmu_\rvtheta(\vx_0,\vy_t, t) = \frac{1}{\sqrt{\alpha_t}}(\vy_t-\frac{1-\alpha_t}{\sqrt{1-\bar{\alpha}_t}}\bm\rvepsilon_\rvtheta(\vx_0,\vy_t, t)).
+\end{align}
+\vspace{-.15in}
+
+\noindent
+To sample $\vy_0\sim p_\theta(\vy_0| \vx_0)$, starting from $\vy_T\sim\mathcal{N}(\bm0, \bm I)$, we reverse the Markovian process by iteratively sampling $\vy_{t-1}\sim p(\vy_{t-1}| \vy_{t}, \vx_0)$ based on~\cref{eq:reverse-yt,,eq:sampling-mean}, which completes the sampling process, as shown in~\cref{sr3-sampling}.
+
+
+% Diffusion models~\cite{sohl2015deep, ho2020denoising} are a type of latent-variable generative models, which intimates the non-equilibrium thermodynamic diffusion process to approximate a given data distribution $q(\vy_0)$. Specifically, given a sample $\vy_0$ from the data distribution $q(\vy_0)$, the \emph{forward process} $q(\vy_{1:T}|\vy_0)$ follows a Markov process which gradually adds Gaussian noise to the data sample $q(\vy_0)$ through $T$ steps:
+% \begin{align}
+%     q(\vy_t|\vy_{t-1}) &= \gN(\vy_t; \sqrt{1-\beta_t}\vy_{t-1}, \beta_t \mI),\\
+%     q(\vy_{1:T}|\vy_0) &=\prod_{t=1}^Tq(\vy_t|\vy_{t-1})),
+% \end{align}
+% where $\beta_t\in (0,1), t=1\cdots T$ is a predefined scheduler that controls the amount of noise added at each step $t$. At the end of process, the data sample loses all information and degrades to a complete Gaussian noise $\vy_T\sim\gN(\vzero,\mI)$. With the reparameterization of the sampled noise $\rvepsilon_t\sim\gN(\vzero,\mI)$, the noisy sample $\vy_t$ at arbitrary intermediate step $t$ can be expressed in a close form:
+% \begin{align}
+%     \vy_t = \sqrt{\bar{\alpha}_t}\vy_0 + \sqrt{1-\bar{\alpha}_t}\rvepsilon_t, 
+%     \label{eq:forward-yt}
+% \end{align}
+% where $\bar{\alpha}_t=\prod_{i=1}^t\alpha_i$ and $\alpha_t=1-\beta_t$. 
+% Conversely, the \emph{reverse process} $p_\rvtheta(\vy_{0:T})$ with learnable parameters $\rvtheta$ can be formulated as:
+% \begin{align}
+%     p_\rvtheta(\vy_{t-1}|\vy_{t}) &= \gN(\vy_{t-1}; \vmu_\rvtheta(\vx_t,t), \sigma_t\mI),\label{eq:reverse-yt}\\
+%     p_\rvtheta(\vy_{0:T})&=p(\vy_T)\prod_{t=1}^Tp_\rvtheta(\vy_{t-1}|\vy_{t}).
+% \end{align}
+% To iteratively recover the underlying data distribution and generate high-quality image from a random noise $\vy_T$, the reverse process is trained to minimizing the KL divergence against the forward process. Empirically, Ho et al. \cite{ho2020denoising} observes the superiority of training a step-aware neural network $\rvepsilon_\rvtheta(\vy_t, t)$ to predict $\rvepsilon_t$, and then the $\vmu_\rvtheta(\vy_t, t)$ can be parameterized as:  
+% \begin{align}
+%     \vmu_\rvtheta(\vy_t, t) = \frac{1}{\sqrt{\alpha_t}}(\vy_t-\frac{1-\alpha_t}{\sqrt{1-\bar{\alpha}_t}}\rvepsilon_\rvtheta(\vy_t, t)).
+% \end{align}
+% Moreover, Ho et al. \cite{ho2020denoising} finds that it is beneficial to simplify the objective function as below by ignoring the scaling effect at different diffusion steps:
+% \begin{align}
+%     \gL(\rvtheta) = \E_{\vy_0, t, \rvepsilon_t}||\rvepsilon_\rvtheta(\vy_t, t)-\rvepsilon_t||_p^p.
+% \end{align}
+% Instead of randomly generation, the conditional diffusion models use additional conditions $\vy$ as prior to learn a conditional distribution $p_\rvtheta(\vy|\vx)$. In the context of super-resolution (SR), the conditional diffusion model is trained to learn the conditional distribution of the HR images $\vy$ under the conditions of LR counterpart $\vx$. The training and sampling algorithms of the conditional DDPM models on SR task \cite{saharia2022image} are presented in the \cref{sr3-training} and \cref{sr3-sampling}, respectively. 
+
+
+
+
+
+% \vspace{-.2in}
+
+
+
+% \subsection{Motivation}
+\subsection{Challenge: training-sampling discrepancy}
+\label{subsec:3.2}
+
+
+Training diffusion models for SR presents a critical challenge, stemming from a discrepancy between the training and inference phases, which we term as \emph{training-sampling discrepancy}. During the training phase, the model operates on actual data, wherein the noisy image $\vy_t$ at diffusion step $t$ is derived from the \emph{ground-truth} HR image $\vy_0$ as per line~\ref{line:update-yt-training} in~\cref{sr3-training}. However, during the inference phase, the ground truth $\vy_0$ is unavailable. As outlined in line~\ref{line:update-yt-sampling} in~\cref{sr3-sampling}, the model now operates on predicted data, where $\vy_t$ is obtained from the preceding sampling step $t+1$. Due to the estimation error, the noisy image ${\vy}_t$ constructed in these two processes usually differs, giving rise to the training-sampling discrepancy.
+
+% A notable parallel to this challenge is the exposure bias found in autoregressive text generation models. Similar to our scenario, these models train on actual ground-truth sentences but transition to operating on previously generated words during inference, as highlighted in [1, 3, 4, 6]. This analogy underscores the broader concern of managing training-inference discrepancies, an imperative for improving the efficacy and robustness of diffusion models in super-resolution tasks.
+
+% This phenomenon resembles the exposure bias found in autoregressive  text generation models, where during training, the model conditions on an actual ground-truth sentence, but during testing, it conditions on words that have been previously generated, as highlighted in \citep{bengio2015scheduled, RanzatoCAZ16Sequence, rennie2017self, Schmidt19closer}. 
+
+% Given the inherent approximation and optimization errors, the \textbf{prediction error} (e.g.  $\rvepsilon_\rvtheta(\vx, \vy_t, t) \neq \rvepsilon_t$) during training is practically unavoidable. Consequently, the prediction network's inputs ${\rvepsilon}_{\rvtheta}(\cdot)$, differ between the training and inference phases, resulting in a \textbf{training-sampling  discrepancy} (e.g. $\rvepsilon_\rvtheta(\rx, \vy_t, t)\neq\rvepsilon_\rvtheta({\vx, \hat{\vy}_t, t})$). Specifically, by examining line 4 of \Cref{sr3-training} and juxtaposing it with line 4 of \Cref{sr3-sampling}, we can observe that the conditional DDPMs employ $\rvepsilon_\rvtheta (\vx, \vy_t, t)$ during training, wherein the noisy images $\vy_t$ at diffusion step $t$ are obtained from the \textbf{ground truth} sample $\vy_0$ according to \Cref{eq:forward-yt}. However, because the ground truth $\vy_0$ is unavailble during inference, they utilize $\rvepsilon_\rvtheta (\vx,\hat{\vy}_t, t)$, with $\hat{\vy}_t$ being derived from the outcome of $\rvepsilon_{\rvtheta}(\cdot)$ from the \textbf{preceding sampling step} $t+1$. Due to the existence of prediction error, the noisy image $\hat{\vy}_t$ in the sampling process differs from $\vy_t$ used in the training process. This phenomenon resembles the exposure bias found in autoregressive  text generation models, where during training, the model conditions on an actual ground-truth sentence, but during testing, it conditions on words that have been previously generated, as highlighted in \citep{bengio2015scheduled, RanzatoCAZ16Sequence, rennie2017self, Schmidt19closer}. 
+
+% the noisy image $\hat{\vy}_t$ in the sampling process differs from $\vy_t$ used in the training process, resulting in a discrepancy between training and sampling. When we examine line 4 of \Cref{sr3-training} and juxtapose it with line 4 of \Cref{sr3-sampling}, it becomes apparent that the prediction network's inputs, represented as ${\rvepsilon}_{\rvtheta}(\cdot)$, differ between the training and inference phases. To be more specific, during training, conditional DDPMs employ $\rvepsilon_\rvtheta (\vx, \vy_t, t)$, wherein the noisy images $\vy_t$ at diffusion step $t$ are obtained from the \textbf{ground truth} sample $\vy_0$ according to \Cref{eq:forward-yt}. However, during inference, they utilize $\rvepsilon_\rvtheta (\vx,\hat{\vy}_t, t)$, with $\hat{\vy}_t$ being derived from the outcome of $\rvepsilon_{\rvtheta}(\cdot)$ from the \textbf{preceding sampling step} $t+1$.
+% \jz{I want to dicuss two things: 1. \textbf{prediction error} $\rvepsilon_\rvtheta(\vy_t,t)\neq \rvepsilon_t$ and 2. \textbf{training and sampling discrepancy} $\rvepsilon_\rvtheta(\vy_t,t)\neq \rvepsilon_\rvtheta(\hat{\vy}_t,t)$. The prediction error leads to the discrepancy. 
+% From the figures, we can clarify 3 points. First, larger $t$, larger prediction error(the red line). Second, because of the prediction error, with the inference time accumulation, the discrepancy between training and sampling gradually enlarged if we look at lpips. Finally, since the prediction error increases with diffusion step, our method dynamic rectifies the error, leading to the yellow and green line overlapped together. Because of the distortion-quality trade-off, there still exist prediction error when t is small, but our method outperform the standard training. }
+
+To better illustrate the discrepancy, we conduct an experiment utilizing a pre-trained SR3 model~\cite{saharia2022image}, denoted by $\bm\epsilon_\theta$, adhering to the standard diffusion training framework. The goal is to understand the implications for HR signal $\vy_0$ reconstruction under two distinct scenarios:
+\begin{itemize}%[leftmargin=.1in]
+    \item ``Training". Simulating the training process, we \emph{assume access} to the ground-truth $\vy_0$, and construct the noisy image at time step $t$ as per line~\ref{line:update-yt-training} in~\cref{sr3-training}, denoting the image as $\vy_t^{\text{train}}$.
+    \item ``Sampling". Simulating the sampling process, we \emph{assume no access} to $\vy_0$ and iteratively construct the noisy image at each time step $t$ by sampling from the previous step, as per line~\ref{line:update-yt-sampling} in~\cref{sr3-sampling}. The noisy image thus obtained is denoted by $\vy_t^{\text{sample}}$.
+\end{itemize}
+
+To retrieve the HR image $\vy_0$ from the noisy image in both scenarios, we utilize~\cref{eq:forward-yt} and the pre-trained network $\bm\epsilon_\theta$ to compute the predicted HR signal as follows:
+
+\vspace{-.2in}
+\begin{equation}
+\small
+\widetilde{\boldsymbol{y}}_0=\frac{1}{\sqrt{\bar{\alpha}_t}}\left(\boldsymbol{y}_t-\sqrt{1-\bar{\alpha}_t} \bm\epsilon_\theta\left(\boldsymbol{x}_0, \boldsymbol{y}_t, t\right)\right)=:h_\theta(\vy_t).
+\label{eq:estimate_y0}
+\end{equation}
+\vspace{-.15in}
+
+\noindent
+Following this, we compute $\widetilde{\vy}_0^{\text{train}}=h_\theta(\vy_t^{\text{train}})$ and $\widetilde{\vy}_0^{\text{sample}}=h_\theta(\vy_t^{\text{sample}})$ as the predicted HR images in the ``training" and ``sampling" scenarios, respectively. For performance evaluation, we take 100 samples from FFHQ~\cite{karras2019style} and calculate the averaged MSE and LPIPS~\cite{zhang2018unreasonable} metrics between the predicted HR images and the ground-truth $\vy_0$ across various time step $t$ under the defined settings.
+
+\begin{figure} [t]
+     \centering
+     \begin{subfigure}[b]{0.23\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/vanilla_training_vs_sampling.pdf}
+         \caption{Standard diffusion}
+         \label{fig:pixel-error-dynamic}
+     \end{subfigure}
+     % \qquad\qquad
+    % \hfill
+     \begin{subfigure}[b]{0.23\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/training_vs_sampling_with_dream.pdf}
+         \caption{DREAM}
+         \label{fig:latent-error-dynamic}
+     \end{subfigure}\
+     \vspace{-.1in}
+         \caption{Evaluation of training-sampling discrepancy and its alleviation through our DREAM framework. The mean curve over 100 samples at each time step $t$ is plotted, with the shaded area representing the standard deviation of each metric.  Here, $T=2000$.}
+        \label{fig:error-dynamic}
+        \vspace{-.1in}
+\end{figure}
+
+We present the findings in~\Cref{fig:pixel-error-dynamic}, where both MSE and LPIPS exhibit a decline with a smaller $t$, as expected, since the network can reconstruct more accurate HR signal from less noisy input. Importantly, discernible disparities are observed between the curves representing the ``training" and ``sampling" settings---the ``training" curves consistently exhibit lower error compared to the ``sampling" ones, suggesting the advantage of having access to the ground-truth $\vy_0$ for improved prediction accuracy. In contrast, \Cref{fig:latent-error-dynamic} illuminates a remarkable alleviation in this discrepancy when employing our DREAM framework to train the identical SR3 architecture: \emph{the ``sampling" curve closely aligns with the ``training" curve, despite the lack of access to the ground-truth $\vy_0$, across both MSE and LPIPS metrics.} This underscores the efficacy of our approach in bridging the training-sampling discrepancy and thereby facilitating more accurate predictions.
+% Additionally, a notable consistency is observed in the standard deviations of the two curves, further corroborating the merit of our approach in harmonizing the training and inference phases.
+
+% To assess the prediction error across varying diffusion steps during training, we perform an experiment with a pretrained model. We first obtain the noisy image, $\vy_t$, from the clean image, $\vy_0$, as per \Cref{eq:forward-yt}. Subsequently, the predicted clean image, $\tilde{\vy}_0$, is computed by substituting $\rvepsilon_t$ with $\rvepsilon_\rvtheta(\vx, \vy_t, t)$ in the \Cref{eq:forward-yt}. We define the prediction error as the absolute difference between $\vy_0$ and $\tilde{\vy}_0$. This difference is depicted as a red line in both the pixel space (\Cref{fig:pixel-error-dynamic}) and the latent space (\Cref{fig:latent-error-dynamic}). As illustrated by the red line in \Cref{fig:error-dynamic}, the prediction error escalates with an increase in diffusion steps. This aligns with the intuition that networks are able to reconstruct ground-truth images more precisely from clearer inputs. For further comparison, we employ a similar computation for the sampling process. Given a certain $t$ and the noisy image $\hat{\vy}_t$ from previous step, the predicted images, $\tilde{\vy}_0$, are obtained accroding to \Cref{eq:forward-yt} by replacing $\rvepsilon_t$ and $\vy_t$ with $\rvepsilon_\rvtheta(\vx, \hat{\vy}_t, t)$ and $\hat{\vy}_t$, respectively. The disparity between $\vy_0$ and $\tilde{\vy}_0$ during the sampling process is represented by a blue line in \Cref{fig:error-dynamic}. By comparing it with red line, it is apparent that as the reverse process extends, the gap between the training and sampling processes widens, particularly in the latent space as depicted in \Cref{fig:latent-error-dynamic}. This indicates a growing error accumulation that intensifies with each denoising step, starting from random noise at $t=T$. It's noteworthy that estimating the error  using $\tilde{\vy}_0$ and $\vy_0$ to estimate the error instead of comparing $\rvepsilon_\rvtheta(\cdot)$ and $\rvepsilon_t $, offers benefits.  Specifically, the former provides a more meaningful interpretation in the latent space, and, during sampling, the ground-truth noise $\rvepsilon_t$ for each step is not available. 
+
+
+% training/sampling
+
+% 1. inspired by depthgen, distribution shift between training/sampling with holes in depth map: we "could" use similar alignment strategy, as defined by: ...
+
+% 2. However, we observe it has some issues, psnr vs blurring, .. figures (discard p = 1) 
+
+% 3. Balance adapative estimation to resolve the above issue
+
+% \subsection{Vallina SA}
+
+% $y_0\rightarrow y_{t-1}\rightarrow \hat{y}_0$ and $\tilde{y_{0}}\rightarrow y_{t-1}\rightarrow \bar{y}_0$
+% $|y_0-\hat{y}_0|$
+% \subsection{DREAM framework}
+\subsection{The DREAM framework} \label{subsec:3.3}
+
+
+
+We now present our DREAM framework (see~\Cref{fig:overview}), an end-to-end training strategy designed to bridge the gap between training and sampling in diffusion models. It consists of two core components: \emph{diffusion rectification} and \emph{estimation adaptation}, which we elaborate as follows.
+% In this part, we introduce a two-phase end-to-end training strategy, composed of two crucial components: \emph{dyna rectification} and \emph{estimation adaptation}, which can effectively align the training process with the sampling process.  
+% \label{subsec:3.3}
+% \jz{not sure where to introduce the SA in the depth estimation.}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.99\columnwidth]{figures/dr_visuals/sr3_visual.pdf}
+    \vspace{-.1in}
+    \caption{
+    % Qualitative comparison on 8$\times$ SR on CelebA-HQ \cite{karras2017progressive} between standard and DRM methods. 
+    $8\times$ SR on the CelebA-HQ dataset~\cite{karras2017progressive}.} 
+        \label{fig:drm-visual}
+    \vspace{-.1in}
+\end{figure}
+
+
+\textbf{Diffusion rectification.} The goal of diffusion rectification is to modify the behavior of the diffusion training to account for the training-sampling discrepancy, which arises from the manner in which we construct the intermediate signals---either from the ground-truth or from the model's own estimation.  Hence, we extend the diffusion training framework to align more closely with the sampling process, enabling the model to utilize its own output for prediction.
+
+Specifically, during training, upon acquiring $\vy_t^{\text{train}}$ as per line~\ref{line:update-yt-training} in~\cref{sr3-training}, we refrain from directly  minimizing $\mathcal{L}(\theta)$. Instead,  we construct our own prediction of the HR image as $\widetilde{\vy}_0^{\text{train}}$ according to~\cref{eq:estimate_y0}, formulated as:
+
+\vspace{-.2in}
+\begin{align}\label{eq:y0-train-drm}
+\small
+    \begin{split}
+    \widetilde{\boldsymbol{y}}_0^{\text{train}}&=\frac{1}{\sqrt{\bar{\alpha}_t}}\big(\boldsymbol{y}_t^{\text{train}}-\sqrt{1-\bar{\alpha}_t} \bm\epsilon_\theta(\boldsymbol{x}_0, \boldsymbol{y}_t^{\text{train}}, t)\big)\\
+        &=\frac{1}{\sqrt{\bar{\alpha}_t}}\big( \sqrt{\bar{\alpha}_t}\vy_0 + \sqrt{1-\bar{\alpha}_t}\bm\rvepsilon_t    \hspace{.48in}\triangleright\text{line~\ref{line:update-yt-training}}   \\
+        &\hspace{1.1in}-\sqrt{1-\bar{\alpha}_t} \bm\epsilon_\theta(\boldsymbol{x}_0, \boldsymbol{y}_t^{\text{train}}, t)\big)\\
+        &=\vy_0 + \sqrt{(1-\bar{\alpha}_t)/{\bar{\alpha}_t}} \Delta\bm{\rvepsilon}_{t,\theta}
+    \end{split}
+\end{align}
+\vspace{-.15in}
+
+\noindent
+where $\Delta\bm{\rvepsilon}_{t,\theta} = \bm{\rvepsilon}_t-\bm{\rvepsilon}_\rvtheta(\vx_0,\vy_t^{\text{train}},t)$. Utilizing this self-estimated HR image $\widetilde{\vy}_0^{\text{train}}$,  we generate the noisy image $\widetilde{\vy}_t^{\text{train}}$ to serve as input\footnote{To match the actual sampling process, there might be a desire to reconstruct $ \widetilde{\vy}_{t-1}^{\text{train}}$, yet this could notably complicate the entire procedure. Nonetheless, we have observed similar performance by simply using $ \widetilde{\vy}_t^{\text{train}}$.} to the network $\bm\epsilon_\theta$ once more:
+
+\vspace{-.2in}
+\begin{align}\label{eq:self-supervise}
+\small
+\begin{split}
+    \widetilde{\vy}_t^{\text{train}} &= \sqrt{\bar{\alpha}_t}\widetilde{\vy}_0^{\text{train}}+\sqrt{1-\bar{\alpha}_t}\bm\epsilon'_t\\
+    &= \sqrt{\bar{\alpha}_t}\vy_0+ \sqrt{1-\bar{\alpha}_t}(\bm \epsilon'_t+\Delta\bm{\rvepsilon}_{t,\theta}),
+\end{split}
+\end{align}
+\vspace{-.15in}
+
+\noindent
+where $\bm\epsilon'_t\sim\mathcal{N}(\bm0, \bm I)$. Then, the training objective for this diffusion rectification model (DRM) can be expressed as:
+
+\vspace{-.25in}
+\begin{align}\label{eq:drm-objective}
+\small
+    \gL^{\text{DRM}}(\rvtheta) = \E_{(\vx_0,\vy_0), \bm\rvepsilon_t,\bm\rvepsilon'_t, t} \left\|\big(\bm\rvepsilon'_t +\Delta\bm{\rvepsilon}_{t,\theta}\big) -\bm\rvepsilon_\rvtheta(\vx_0,\widetilde{\vy}_t^{\text{train}}, t) \right\|_1.
+\end{align}
+\vspace{-.2in}
+
+% \textbf{Diffusion rectification.} As discussed in \Cref{subsec:3.2}, the training and sampling discrepancy stems from the different noisy images $\vy_t^{train}$ and $\vy_t^{sample}$ used in two processes. To bridge such gap, the error rectification modifies the training process to align more closely with the sampling process. Specifically, it uses noisy images $\tilde{\vy}_t^{\text{train}}$, which are derived from the estimated SR image $\tilde{\vy}_0^{\text{train}}$, rather than the ground-truth HR images $\vy_0$, as inputs to the denoiser network. To achieve this, our strategy consists of two phases, as illustrated in Figure \ref{fig:overview}. During the first phase, it follows the standard diffusion model pipeline to generate an estimated SR images $\tilde{\vy}_0^{\text{train}}$, which can be expressed as following according to \Cref{eq:forward-yt} and \Cref{eq:estimate_y0}:
+% \begin{align}
+%     \tilde{\vy}_0^{\text{train}}&=\vy_0 + \sqrt{\frac{1-\bar{\alpha}_t}{\bar{\alpha}_t}} \Delta\bm{\rvepsilon}_t,\\
+%     \Delta\bm{\rvepsilon}_t &= \bm{\rvepsilon}_t^{(1)}-\bm{\rvepsilon}_\rvtheta(\vx,\vy_t^{\text{train}},t),
+% \end{align}
+% where $\rvepsilon_t^{(1)}$ reprsents the sampled noise at the first phase. 
+% At the second stage, the noisy image $\tilde{\vy}_t^{\text{train}}$ is constructed by adding noise $\rvepsilon_t^{(2)}$ to the previous imperfect estimation $\tilde{\vy}_0^{\text{train}}$:
+% \begin{align}
+%     \tilde{\vy}_t^{\text{train}} &= \sqrt{\bar{\alpha}_t}\tilde{\vy}_0^{\text{train}}+\sqrt{1-\bar{\alpha}_t}\rvepsilon_t^{(2)}\nonumber\\
+%     &= \sqrt{\bar{\alpha}_t}\vy_0+ \sqrt{1-\bar{\alpha}_t}(\rvepsilon_t^{(2)}+\Delta\bm{\rvepsilon}_t) ,
+% \end{align}
+% Similar as \Cref{eq:dm-objective}, the training objective can be expressed as:
+% \begin{align}
+%     \gL(\rvtheta) = \E_{(\vx_0,\vy_0), \bm\rvepsilon_t^{(1)},\bm\rvepsilon_t^{(2)}, t} \left\|\bm\rvepsilon_t^{(2)} +\Delta\bm{\rvepsilon}_t -
+%     \bm\rvepsilon_\rvtheta(\vx_0,\tilde{\vy}_t^{\text{train}}, t) \right\|_1.
+% \end{align}
+
+
+
+Essentially,~\cref{eq:drm-objective} suggests that this DRM approach strives not only to eliminate the sampled noise $\bm\rvepsilon'_t$  but also to address the error term $\Delta\bm{\rvepsilon}_{t,\theta}$ arising from the discrepancy between the imperfect estimation $\widetilde{\vy}_0^{\text{train}}$ and the ground-truth $\vy_0$, as seen in~\cref{eq:y0-train-drm}; hence the term ``rectification". Notably, leveraging the model's own prediction during training as in~\cref{eq:self-supervise} mirrors the sampling process of DDIM~\cite{song2021denoising} with a particular choice of $\sigma_t$, thereby imposing enhanced supervision. We remark that DRM is closely related to the approaches in~\cite{saxena2023monocular,savinov2022stepunrolled,ji2023ddp} where they perform similar step-unrolling techniques for perceptual vision tasks or text generation tasks. However, we are the first to tailor it to low-level vision tasks and provide a clear analysis.
+
+% However, we empirically observe that there is a distortion-perception tradeoff \cite{blau2018perception} when applying dynamic rectification solely. Typically, the produced SR images exhibit reduced distortion but poorer quality compared to the standard diffusion method. As visual results presented in \Cref{fig:drm-visual}, compared with standard training, the only error-rectification approach results in images that appear blurred and lack fine details. 
+% In other words, the denoiser networks are trained not only to remove the sampled noise $\rvepsilon_t^{(2)}$ at the second phase but also to predict the error $\Delta\bm{\rvepsilon}_t$ arising from the discrepancy between the imperfect estimation $\tilde{\vy}_0^{\text{train}}$ and the ground-truth $\vy_0$. This enables the sampling process to dynamically rectify the accumulated error from the imperfect estimation. However, we empirically observe that there is a distortion-perception tradeoff \cite{blau2018perception} when applying dynamic rectification solely. Typically, the produced SR images exhibit reduced distortion but poorer quality compared to the standard diffusion method. As visual results presented in \Cref{fig:drm-visual}, compared with standard training, the only error-rectification approach results in images that appear blurred and lack fine details. 
+
+
+% A plausible explanation is that during the initial stages of training, the prediction of denoiser network $\bm{\rvepsilon}_\rvtheta(\cdot)$ significantly diverges from the target $\bm{\rvepsilon}_t$  
+
+
+
+% \begin{figure} [t]
+%      \centering
+%      \begin{subfigure}[b]{0.1\textwidth}
+%          \centering
+%          \includegraphics[width=\textwidth]{figures/dr_visuals/lr_1.png}
+%      \end{subfigure}
+%      \begin{subfigure}[b]{0.1\textwidth}
+%          \centering
+%          \includegraphics[width=\textwidth]{figures/dr_visuals/dm_1.png}
+%      \end{subfigure}
+%      \begin{subfigure}[b]{0.1\textwidth}
+%          \centering
+%          \includegraphics[width=\textwidth]{figures/dr_visuals/drm_1.png}
+%      \end{subfigure}
+%      \begin{subfigure}[b]{0.1\textwidth}
+%          \centering
+%          \includegraphics[width=\textwidth]{figures/dr_visuals/hr_1.png}
+%      \end{subfigure}\\
+%      \begin{subfigure}[b]{0.1\textwidth}
+%          \centering
+%          \includegraphics[width=\textwidth]{figures/dr_visuals/lr_2.png}
+%          \caption{LR}
+%          \label{fig:drm-visual-lr}
+%      \end{subfigure}
+%      \begin{subfigure}[b]{0.1\textwidth}
+%          \centering
+%          \includegraphics[width=\textwidth]{figures/dr_visuals/dm_2.png}
+%          \caption{Standard}
+%          \label{fig:drm-visual-dm}
+%      \end{subfigure}
+%      \begin{subfigure}[b]{0.1\textwidth}
+%          \centering
+%          \includegraphics[width=\textwidth]{figures/dr_visuals/drm_2.png}
+%          \caption{DRM}
+%          \label{fig:drm-visual-drm}
+%      \end{subfigure}
+%      \begin{subfigure}[b]{0.1\textwidth}
+%          \centering
+%          \includegraphics[width=\textwidth]{figures/dr_visuals/hr_2.png}
+%          \caption{HR}
+%          \label{fig:drm-visual-hr}
+%      \end{subfigure}
+%      % \qquad\qquad
+%     % \hfill
+%         \caption{Qualitative comparison on 8$\times$ SR on CelebA-HQ \cite{karras2017progressive} between standard and DRM methods. } 
+%         \label{fig:drm-visual}
+% \end{figure}
+
+\begin{algorithm}[t]
+\small
+\caption{Conditional DREAM Training}
+\begin{algorithmic}[1]\label{alg:dr-training}
+    \REPEAT
+    \STATE $(\vx_0, \vy_0)\sim p(\vx_0, \vy_0), t\sim\sU(1,T), \bm\rvepsilon_t\sim\gN(\vzero, \mI)$
+    \STATE Compute $\vy_t = \sqrt{\bar{\alpha}_t}\vy_0 + \sqrt{1-\bar{\alpha}_t}\bm\rvepsilon_t$
+    \STATE Compute $\Delta\bm{\rvepsilon}_{t,\theta}=\bm{\rvepsilon}_t-\texttt{StopGradient}(\bm{\rvepsilon}_\rvtheta(\vx_0, \vy_t, t))$ \label{line:start}
+    \STATE
+    Compute $\widehat{\vy}_t=\vy_t+ \sqrt{1-\bar{\alpha}_t}\lambda_t\Delta\bm{\rvepsilon}_{t,\theta}$
+    \STATE Update $\theta$ with gradient  $\nabla_\rvtheta||\bm\rvepsilon_t +\lambda_t\Delta\bm{\rvepsilon}_{t,\theta}-\bm\rvepsilon_\rvtheta(\vx_0,\widehat{\vy}_t, t)||_1$\label{line:end}
+    \UNTIL{converged}
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Estimation adaptation.} While DRM incorporates additional rectification supervision to account for the sampling process, its naive application to the SR task might not deliver satisfactory results. As shown in~\Cref{fig:drm-visual}, a distortion-perception tradeoff~\cite{blau2018perception} is observed in the generated SR images.  Despite achieving a state-of-the-art PSNR (less distortion), the images produced by DRM tend to be smoother and lack fine details, reflecting a high FID score (poor perception). This is particularly evident when compared to the standard conditional diffusion model, namely SR3~\cite{saharia2022image}.  This limitation could be traced back to DRM's static self-alignment mechanism, which may inappropriately guide the generated images to regress towards the mean.
+
+To address the issue, and inspired by the powerful generative capability of the standard diffusion model, we propose an estimation adaptation strategy. This aims to harness both the superior quality of standard diffusion and the reduced distortion offered by diffusion rectification. Specifically, rather than naively using our own prediction $\widetilde{\vy}_0^\text{train}$ computed in~\cref{eq:y0-train-drm}, we adaptively inject ground-truth information $\vy_0$ by blending it with $\widetilde{\vy}_0^\text{train}$ as follows: 
+
+\vspace{-.23in}
+\begin{align}\label{eq:blend-hat-y0}
+\small
+    \widehat{\vy}_0 = \lambda_t \widetilde{\vy}_0^{\text{train}} + (1-\lambda_t) \vy_0,
+\end{align}
+\vspace{-.22in}
+
+\noindent
+where $\lambda_t\in(0,1)$ is an increasing function such that $\widehat{\vy}_0$ emphasizes more on $\vy_0$ at smaller $t$, aligning with the network's tendency to achieve more accurate predictions, as observed in~\Cref{fig:error-dynamic}. Intuitively, as $t$ decreases, $\widehat{\vy}_0$ closely approximates the ground-truth, making it more beneficial to resemble the standard diffusion, yielding images with realistic details. Conversely, as $t$ increases and the prediction leans towards random noise, it is advantageous to focus more on the estimation itself, effectively aligning the training and sampling processes through the rectification.
+
+\begin{table*}[t]
+\centering
+\caption{Comparison  on face and general scene datasets against three baselines for various $p$ values, with  \colorbox{red!20}{best} and \colorbox{orange!20}{second-best} colorized.}
+\vspace{-.1in}
+% \setlength{\tabcolsep}{0.6mm}{
+\label{tab:face-sr3-peffect}
+\footnotesize
+\tabcolsep=0.30em
+\begin{tabular}{ccccccccc|cccccccc}
+\toprule
+\multirow{3}{*}{$p$} & \multicolumn{8}{c|}{CelebA-HQ~\cite{karras2017progressive}} & \multicolumn{8}{c}{DIV2K~\cite{agustsson2017ntire}} \\ \cmidrule(lr){2-17} 
+ & \multicolumn{4}{c|}{SR3~\cite{saharia2022image}} & \multicolumn{4}{c|}{IDM~\cite{gao2023implicit}} & \multicolumn{4}{c|}{SR3~\cite{saharia2022image}} & \multicolumn{4}{c}{ResShift~\cite{yue2023resshift}} \\ %\cline{2-17} 
+ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & \multicolumn{1}{c|}{FID$\downarrow$} & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & \multicolumn{1}{c|}{FID$\downarrow$} & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & \multicolumn{1}{c|}{FID$\downarrow$} & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & FID$\downarrow$ \\ \midrule
+\multicolumn{1}{l}{$0$ (DRM)} & \cellcolor{red!20}{$25.04$} & \cellcolor{red!20}$0.76$ & $0.204$ & \multicolumn{1}{c|}{$77.51$} & \cellcolor{red!20}$25.06$ & \cellcolor{red!20}$0.76$ & $0.188$ & $67.46$ & \cellcolor{red!20}$28.67$ & \cellcolor{red!20}$0.81$ & $0.189$ & \multicolumn{1}{c|}{$16.72$} & \cellcolor{red!20}$29.98$ & \cellcolor{red!20}$0.83$ & $0.233$ & $17.76$ \\\midrule
+\multicolumn{1}{l}{$1$ (DREAM)} & \cellcolor{orange!20}$24.63$ & \cellcolor{orange!20}$0.74$ & \cellcolor{red!20}$0.177$ & \multicolumn{1}{c|}{ \cellcolor{red!20}$56.01$} & \cellcolor{orange!20}$24.50$ & \cellcolor{orange!20}$0.73$ & \cellcolor{red!20}$0.167$ & \cellcolor{red!20}$53.22$ & \cellcolor{orange!20}$28.10$ & \cellcolor{orange!20}$0.79$ & \cellcolor{red!20}$0.121$ & \multicolumn{1}{c|}{\cellcolor{red!20}$14.32$} & \cellcolor{orange!20}$29.24$ & \cellcolor{orange!20}$0.80$ & $0.158$ & $16.23$ \\
+\multicolumn{1}{l}{$2$ (DREAM)} & $24.62$ & \cellcolor{orange!20}$0.74$ & \cellcolor{orange!20}$0.180$ & \multicolumn{1}{c|}{$61.72$} & $24.32$ & $0.72$ & \cellcolor{orange!20}$0.169$ & $55.38$ & $28.06$ & \cellcolor{orange!20}$0.79$ & $0.140$ & \multicolumn{1}{c|}{$15.54$} & $28.77$ & $0.79$ & \cellcolor{orange!20}$0.134$ & \cellcolor{orange!20}$15.72$ \\
+\multicolumn{1}{l}{$3$ (DREAM)} & $24.15$ & $0.71$ & $0.182$ & \multicolumn{1}{c|}{ \cellcolor{orange!20}$58.89$} & $24.09$ & $0.72$ & $0.172$ & \cellcolor{orange!20}$54.04$ & $27.88$ & \cellcolor{orange!20}$0.79$ & \cellcolor{orange!20}$0.123$ & \multicolumn{1}{c|}{\cellcolor{orange!20}$14.83$} & $28.44$ & $0.79$ & \cellcolor{red!20}$0.124$ & \cellcolor{red!20}$15.67$ \\\midrule
+\multicolumn{1}{l}{$\infty$ (standard)} & $23.85$ & $0.71$ & $0.184$ & \multicolumn{1}{c|}{$61.98$} & $24.01$ & $0.71$ & $0.172$ & $56.01$ & $27.02$ & $0.76$ & \cellcolor{red!20}$0.121$ & \multicolumn{1}{c|}{$16.72$} & $25.30$ & $0.68$ & $0.211$ & $25.91$ \\ \bottomrule
+\end{tabular}
+\vspace{-.1in}
+\end{table*}
+
+
+Following the adaptive estimation $\widehat{\vy}_0$ in~\cref{eq:blend-hat-y0}, we construct the new noisy image $\widehat{\vy}_t$ similarly as before:
+
+\vspace{-.2in}
+\begin{align}\label{eq:hat-yt}
+\begin{split}
+\small
+    \widehat{\vy}_t & = \sqrt{\bar{\alpha}_t}\widehat{\vy}_0+\sqrt{1-\bar{\alpha}_t}\bm \epsilon'_t \\
+    &= \sqrt{\bar{\alpha}_t}\vy_0+ \sqrt{1-\bar{\alpha}_t}(\bm\epsilon'_t+\lambda_t\Delta\bm{\rvepsilon}_{t,\theta}).
+\end{split}
+\end{align}
+\vspace{-.1in}
+
+\noindent
+Finally, the training objective for our full \emph{Diffusion Rectification and Estimation-Adaptive Model (DREAM)} can be expressed as:
+
+\vspace{-.2in}
+\begin{align}\label{eq:dream-objective}
+\small
+    \gL^{\text{DREAM}}(\rvtheta) = \E_{(\vx_0,\vy_0), \bm\rvepsilon_t,\bm\rvepsilon'_t, t} \left\|\big(\bm\rvepsilon'_t +\lambda_t\Delta\bm{\rvepsilon}_{t,\theta}\big) -\bm\rvepsilon_\rvtheta(\vx_0,\widehat{\vy}_t, t) \right\|_1.
+\end{align}
+\vspace{-.2in}
+
+% To alleviate the above problem, we propose a simple but effective strategy, which adaptively adjusts the ratio of estimation in the diffusion process. 
+% To leverage both the superior quality of standard diffusion and the reduced distortion of dynamic rectification, instead of  exclusively relying on the training estimation $\tilde{\vy}_0^{\text{train}}$ throughout the diffusion process, we propose an adaptive approach that combines this estimation with the ground-truth images $\vy_0$. 
+% \begin{align}
+%     \hat{\vy}_0^{\text{train}} = \lambda_t \tilde{\vy}_0^{\text{train}} + (1-\lambda_t) \vy_0
+%     % =\tilde{\vy}_0^{\text{train}} + \sqrt{\frac{1-\bar{\alpha}_t}{\bar{\alpha}_t}} \lambda_t\Delta\bm{\rvepsilon}_t
+% \end{align}
+% Intuitively, when the estimation closely approximates the ground-truth, it is more beneficial to emphasize the standard diffusion model, generating images with realistic details. Conversely, when the estimation deviates from the ground-truth, more attention should be paid to the estimation itself, aligning the training and sampling processes effectively. As indicated in \Cref{fig:error-dynamic}, the network achieves more accurate estimations with smaller values of $t$, suggesting that $\lambda_t$ should be an increasing function with respect to $t$. 
+% Following the  \Cref{eq:forward-yt}, the construction of noisy images $\hat{\vy}_t$ can be adapted from the estimation as follows:
+% \begin{align}
+%     \hat{\vy}_t & = \sqrt{\bar{\alpha}_t}\hat{\vy}_0^{\text{train}}+\sqrt{1-\bar{\alpha}_t}\rvepsilon_t^{(2)}\nonumber\\
+%     &= \sqrt{\bar{\alpha}_t}\vy_0+ \sqrt{1-\bar{\alpha}_t}(\rvepsilon_t^{(2)}+\lambda_t\Delta\bm{\rvepsilon}_t)
+% \end{align}
+% Similar as \Cref{eq:dm-objective}, the updated training objective can be expressed as follows:
+% \begin{align}
+%     \gL(\rvtheta) = \E_{(\vx_0,\vy_0), \bm\rvepsilon_t^{(1)},\bm\rvepsilon_t^{(2)}, t} \left\|\bm\rvepsilon_t^{(2)} +\lambda_t\Delta\bm{\rvepsilon}_t -\bm\rvepsilon_\rvtheta(\vx_0,\hat{\vy}_t^{\text{train}}, t) \right\|_1.
+% \end{align}  
+
+\textbf{Choice of $\lambda_t$.} Comparing~\cref{eq:dream-objective} with~\cref{eq:drm-objective}, the key difference lies in the introduction of $\lambda_t$ for adaptively modulating the intensity of the rectification term $\Delta\bm\epsilon_{t,\theta}$. Note that we only need $\lambda_t\in(0,1)$ to be increasing to leverage the benefits of both standard diffusion and rectification. In practice, we set $\lambda_t=(\sqrt{1-\bar{\alpha}_t})^{p}$, where $p$ adds an extra layer of flexibility: at $p=0$, $\lambda_t$ remains at 1, reverting the method to DRM with consistent static rectification; as $p\to\infty$, $\lambda_t\to0$, transitioning our approach towards the standard diffusion model. As shown in~\Cref{fig:drm-visual}, the images produced by DERAM with $p=1$ achieve a superior balance between perception and distortion, significantly outperforming the standard SR3~\cite{saharia2022image} across both metrics.
+
+
+\textbf{Training details.}  It's important to highlight that while the same network $\bm\epsilon_\theta$ is utilized for calculating both the rectification term $\Delta\bm\epsilon_{t,\theta}$ and the predicted noise $\bm\rvepsilon_\rvtheta(\vx_0,\widehat{\vy}_t, t)$ in~\cref{eq:dream-objective}, a key distinction exists:  we refrain from propagating the gradient when computing $\Delta\bm\epsilon_{t,\theta}$, and thus, it is derived from the frozen network. The actual supervision is imposed following its adaptive adjustment. Moreover, we empirically observe that using the same Gaussian noise (\ie, $\bm{\rvepsilon}_t\equiv\bm{\rvepsilon}'_t$) in DREAM yields superior performance, further simplifying~\cref{eq:hat-yt} to:
+\begin{align}
+    \widehat{\vy}_t & = \vy_t^{\text{train}}+ \sqrt{1-\bar{\alpha}_t}\lambda_t\Delta\bm{\rvepsilon}_{t,\theta}.
+\end{align}
+We summarize our DREAM framework in~\Cref{alg:dr-training}, tailored for enhanced diffusion training, while~\cref{sr3-sampling} remains applicable for sampling purposes.
+% Note that both phases utilize the same network, but with a key distinction: the parameters remain frozen during the first phase. The reasons behind the frozen first stage comes from two considerations. On one hand, as discussed in \Cref{subsec:3.2}, the optimization of first phase inevitable leads to the training-sampling discrepancy. On the other hand, the optimization  in the first phase necessitates an additional backward pass, hampering training efficiency. Furthermore, we empirically observe that utilization of same sampled noise (e.g. $\bm{\rvepsilon}_t^{(1)}=\bm{\rvepsilon}_t^{(2)}=\bm{\rvepsilon}_t$) during two phases yields superior performance. The reason could be that employing two distinct noise samples introduces excessive randomness, complicating the training convergence. For simplicity, we set $\lambda_t=(1-\bar{\alpha})^\frac{p}{2}$. As a result, when $p=0$, $\lambda_t=1$ for any $t$, and the method consistently utilizes the estimation throughout the diffusion process. However, as $p$ approaches infinity, $\lambda_t$ converges to 0, leading to our approach degrading into the standard diffusion model.
+% The training of our DREAM method is summarized in \Cref{alg:dr-training} 
+
+
+
+
+% \subsection{Additional training details}
+
+
+% \label{subsec:3.5}
+% \paragraph{Consistency Model}
+% \paragraph{Data augmentation}
+% \paragraph{Boost}
+% \paragraph{Central}
+% You must include your signed IEEE copyright release form when you submit your finished paper.
+% We MUST have this form before your paper can be published in the proceedings.
+
+% Please direct any questions to the production editor in charge of these proceedings at the IEEE Computer Society Press:
+% \url{https://www.computer.org/about/contact}.

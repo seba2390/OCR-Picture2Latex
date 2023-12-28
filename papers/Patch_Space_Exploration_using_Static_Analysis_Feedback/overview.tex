@@ -1,0 +1,228 @@
+\section{Motivation and Overview}
+We next highlight some of the key aspects of our approach to APR and support these choices by means of examples. 
+
+\noindent \emph{\bf The case for static analysis.}
+Consider the null pointer dereference bug (NPE) in \autoref{fig:exnull-manifest}, which is reported in OpenSSL.
+Under low memory, \mcode{OPENSSL\_malloc} returns \mcode{NULL}, thus leading to a null pointer dereference during the call to \mcode{memset} which takes \mcode{param} as an argument. The issue here is that explicitly checking \mcode{param} to be a non-null value---as per the fix high-lighted in green---is not a standard practice  within this project since,
+  unlike  \mcode{OPENSSL\_malloc}, most \mcode{malloc} wrappers in OpenSSL abort if the result is \mcode{NULL}. The reservations developers have in acknowledging and fixing such bugs is highlighted in the conversations the authors of a static analyser used at Meta had with the OpenSSL maintainers \cite{Le2022}. 
+
+
+\begin{figure}[t]\hspace{1.4em}
+{\footnotesize
+\begin{subfigure}{0.41\textwidth}
+\begin{lstlisting}[language=C,mathescape=true,firstnumber=90,numbers=left,escapeinside={(*@}{@*)}]
+VERIFY_PARAM $*$VERIFY_PARAM_new(void){
+ VERIFY_PARAM  $*$param; 
+ param=OPENSSL_malloc(sizeof(VERIFY_PARAM));
+\end{lstlisting}
+\vspace{-\baselineskip}
+\begin{lstlisting}[language=C,mathescape=true,firstnumber=93,numbers=left,backgroundcolor=\color{green!20}] 
+ (+) if (!param)
+ (+)        return NULL;
+\end{lstlisting}  
+\vspace{-\baselineskip}
+\begin{lstlisting}[language=C,mathescape=true,firstnumber=95,numbers=left] 
+ memset(param, 0, sizeof(VERIFY_PARAM));
+ verify_param_zero(param);
+ return param; }
+  \end{lstlisting}
+  \end{subfigure}
+  \vspace{-0.5em}
+\caption{An NPE bug
+  \vspace{-1.5em}
+ and its fix in OpenSSL}
+\label{fig:exnull-manifest}
+}
+\end{figure}
+
+To uncover and fix difficult to detect pointer manipulating bugs such as the NPE in  \autoref{fig:exnull-manifest}, the bug detector should understand the semantic 
+effect a statement may have on the heap even in exceptional cases. 
+This is hardly possible by means of dynamic testing because of the non-deterministic nature of dynamically allocated data structures and the difficulty of tracking alias information, which explains why so many memory related errors in production remain uncovered or unfixed for many years. The shortfalls of testing demonstrates the case for static analysis as a driving engine for automated program repair since static analyses generally quantify over all possible states a program may be in. We leverage the advances in ISL, a logic tailored for proving the presence of memory bugs, to describe the semantic effects programs have on the heap, and to guide the repair process towards the correct patch, i.e. a patch removing the unwanted semantic effects. 
+
+For our running example, an ISL bug detector is able to infer that a call to \mcode{OPENSSL\_malloc} may result in two different valid program states, one corresponding to an empty memory footprint where the allocation fails, and another one where the allocation succeeds with a footprint comprising a single memory cell abstracted by a symbolic variable $X$:
+
+{\small
+\noindent$\isltriple{\emp }{\mcode{OPENSSL\_malloc}}{\cok: \pointsto{\text{param}}{\nil}}$ \\
+$\isltriple{\emp }{\mcode{OPENSSL\_malloc}}{\cok: \pointsto{\text{param}}{X} * \pointsto{X}{\_}}$ 
+}
+
+Informally, the above abstract states (simplified for brevity) read as follows: starting from an ${\color{ACMBlue}\emp}$ty heap, the program may result in a valid state (indicated by the label $\cok$) where the resulting pointer points to $\nil$, or in a valid state where the \mcode{param} points to a symbolic heap location $\text{X}$ which stores an unspecified value $\_$.
+The first state causes issues at the call to \mcode{memset} at line 95 (ignoring the fix) which requires \mcode{param} to point to a valid memory location. After the call to  \mcode{memset}, the abstract states change to:
+
+{\small
+\noindent$\isltriple{\ok: \pointsto{\text{param}}{\nil}}{\mcode{\qquad ~~\,\,memset}}{\cerr: \pointsto{\text{param}}{\nil}}$ \\
+$\isltriple{\ok: \pointsto{\text{param}}{X} * \pointsto{X}{\_}}{\mcode{memset}}{\cok: \pointsto{\text{param}}{\!X} * \pointsto{X}{0}}$ 
+}
+
+Since there is no modification in the $\cerr$oneous symbolic state other than the label which changed from $\cok$ to $\cerr$, it seems difficult to automatically derive a fix by simply looking at the program's abstract state. That is why, instead of adopting the abstract-state driven template-based patch search \cite{TonderG18} which would restrict the kind of patches we can derive, we opt for a generic synthesis  based on context free grammars (CFG),
+and only use the abstract state for validation. We seek to derive patches that lead to valid abstract states, i.e. no memory safety bugs, while keeping the code's functionality unchanged.
+
+\noindent \emph{\bf The case for equivalence classes.} 
+The advantages of a CFG driven synthesis are clear, i.e. genericity and simple machinery, and so are its disadvantages, i.e. poor efficiency due to a large search space which makes validation expensive. 
+We aim to keep the advantages of our approach, while striving for efficiency. 
+To this purpose, as we gradually derive more patches, we refine the search space into equivalent classes of patches, i.e. patches with \emph{indistinguishable} effects on the symbolic heap, and, by doing so, we need not validate every generated patch but only one representative patch per equivalence class. 
+
+Consider the patches in \autoref{fig:equivpatch}---patches that could be generated for the example in \autoref{fig:exnull-manifest}. Although there are small syntactic differences between them, semantically they are equivalent. This equivalence is made obvious by the representation of the semantic effects these patches have on the symbolic heap depicted below each patch. We simplified the view of the heap, from formulae in ISL to sets of disjoint symbolic memory locations; in particular we use the empty set $\{\}$ to denote an empty memory footprint, the singleton $\{X\}$ to denote a memory footprint comprising a single memory cell, and the implication $\mathsf{param} = \nil \implies  \cok: \{\} \wedge \ret=\nil$ to denote the pair of path condition $\mathsf{param} = \nil$ and corresponding heap abstraction. It becomes evident that all these patches have the same effects on the symbolic heap, and we need only validate one of them to conclude the validity of all the others. The size of one such class may exponentially grow  with the size of the symbolic  heap and the number of existing aliases. 
+
+\begin{figure*}[t]
+\centering
+{\footnotesize
+% \hspace{2em}
+\begin{subfigure}{0.31\textwidth}
+\begin{lstlisting}[language=C,mathescape=true,firstnumber=3,numbers=left]
+param = OPENSSL_malloc($\ldots$);
+(+) if (!param) 
+(+)   return NULL;  
+memset(param, 0, $\ldots$);
+\end{lstlisting}
+\end{subfigure}
+% \hfill
+\begin{subfigure}{0.31\textwidth}\begin{lstlisting}[language=C,mathescape=true,firstnumber=3,numbers=left]
+param = OPENSSL_malloc($\ldots$);
+(+) if (!param) 
+(+)   return param;  
+memset(param, 0, $\ldots$);
+\end{lstlisting}
+\end{subfigure}
+% \hfill
+\begin{subfigure}{0.31\textwidth}\begin{lstlisting}[language=C,mathescape=true,firstnumber=3,numbers=left]
+param = OPENSSL_malloc($\ldots$);
+(+) if (param == NULL) 
+(+)   return param;  
+memset(param, 0, $\ldots$);
+\end{lstlisting}
+\end{subfigure}
+%%
+\begin{subfigure}{0.31\textwidth}
+\vspace{1em}
+$\mathsf{param} = \nil \implies  \cok: \{\} \wedge \ret=\nil$\\
+$\mathsf{param} \neq \nil \implies \cok: \{X\}  \wedge \ret=\mathsf{param}$
+\end{subfigure}
+% \hfill
+\begin{subfigure}{0.31\textwidth}
+\vspace{1em}
+$\mathsf{param} = \nil \implies \cok: \{\}  \wedge \ret=\mathsf{param}$\\
+$\mathsf{param} \neq \nil \implies  \cok: \{X\}  \wedge \ret=\mathsf{param}$
+\end{subfigure}
+% \hfill
+\begin{subfigure}{0.31\textwidth}
+\vspace{1em}
+$\mathsf{param} = \nil \implies \cok: \{\} \wedge \ret=\mathsf{param}$\\
+$\mathsf{param} \neq \nil \implies  \cok: \{X\} \wedge \ret=\mathsf{param}$
+\end{subfigure}
+}
+\vspace{-0.5em}
+\caption{Equivalent patches and their effects for the bug in \autoref{fig:exnull-manifest}}\label{fig:equivpatch}
+\end{figure*}
+%%
+
+
+\begin{figure*}[t]
+\centering
+{\footnotesize
+% \hspace{2em}
+\begin{subfigure}{0.31\textwidth}
+\begin{lstlisting}[language=C,mathescape=true,firstnumber=3,numbers=left]
+param = OPENSSL_malloc($\ldots$);
+(+) if (false) 
+(+)   return NULL; 
+memset(param, 0, $\ldots$);
+\end{lstlisting}
+\vspace{-1em}
+\caption{}\label{fig:nonsol1}
+\end{subfigure}
+% \hfill
+\begin{subfigure}{0.31\textwidth}
+\begin{lstlisting}[language=C,mathescape=true,firstnumber=3,numbers=left]
+param = OPENSSL_malloc($\ldots$);
+(+) if (param!=NULL) 
+(+)   return NULL; 
+memset(param, 0, $\ldots$);
+\end{lstlisting}
+\vspace{-1em}
+\caption{}\label{fig:nonsol2}
+\end{subfigure}
+% \hfill
+\begin{subfigure}{0.31\textwidth}\begin{lstlisting}[language=C,mathescape=true,firstnumber=3,numbers=left]
+param = OPENSSL_malloc($\ldots$);
+(+)  param = app_malloc($\ldots$);
+memset(param, 0, $\ldots$);
+\end{lstlisting}
+\vspace{-1em}
+\caption{}\label{fig:nonsol4}
+\end{subfigure}
+}
+\vspace{-1em}
+\caption{Non-solutions for the bug in \autoref{fig:exnull-manifest}}\label{fig:nonsol}
+\vspace{-1em}
+\end{figure*}
+
+\noindent \emph{\bf The case for probabilistic context free grammars} (PCFG). 
+A large pool of patches generally means that significant time is spent
+in generating incorrect patches. Ideally, we would like to spend less time in exploring patches belonging to an equivalence class of incorrect patches, and instead focus on search spaces (in the form of CFG productions) more likely to produce correct patches. 
+To do that we equip the CFG with probabilities which indicate the likelihood of a certain 
+production rule to be fired in a correct patch. 
+
+Understanding what is a correct patch without a specification is tricky. We break the correctness criterion into four requirements. The first and most obvious requirement is for the patch to actually fix the bug. For example, all patches in figure 
+\autoref{fig:equivpatch} fixes the bug, however, the patches in \autoref{fig:nonsol1} and \autoref{fig:nonsol2} are non-solutions since \mcode{NULL} can still flow into \mcode{memset}. We reward the production rules used in generating  the patches in 
+\autoref{fig:equivpatch} with a maximum reward, while offering no rewards for those in the incorrect patches since they have no effect on the buggy path. Although an \mcode{if-then} construct is used in both kind of patches, by choosing not to reward it in the incorrect patches, instead of, say, penalizing it, allows us to still explore the space of plausible patches containing \mcode{if-then} but with different condition expressions. 
+
+
+
+The second requirement is that the patch should introduce no new bugs, and, third, it should only affect the path on which the considered bug manifests, i.e. when  \mcode{param} is \mcode{NULL}.
+For example, the patch in  \autoref{fig:nonsol4} is a non-solution:  
+although this patch fixes the NPE (\mcode{app\_malloc} is a wrapper which aborts if the allocation is unsuccessful), it also changes the intended functionality of the program since it affects the case where \mcode{param} is not \mcode{NULL} and introduces a potential memory leak. Although a non-solution, we still choose to reward this patch, albeit a very small reward, since it offers an 
+insight into how to remove the bug, hence a search space worth exploring further. 
+
+So far we have learnt that \mcode{if-then} is highly likely to be part of a correct patch, and that, although with a lesser probability, \mcode{app\_malloc} can also fix the bug. This setup leads to a correct patch that wraps the \mcode{app\_malloc} in a conditional affecting only the buggy path, which in turn brings us to the fourth concern regarding patch correctness: what should the error handling routine be? Existing solutions for learning the error handling routine \cite{Junhee2022} are bug specific and would restrict the applicability of our approach. 
+Instead, we choose to discover as many plausible solutions as allowed by a given time constraint, and give the developer the autonomy of choosing the \emph{preferred class} of correct patches. 
+
+In general, the probabilities ascribed to the CFG are gradually learnt from measuring how close the patch is to fixing a bug and how much the memory footprint changes. For example, the memory footprints of the buggy method in \autoref{fig:exnull-manifest}, the one fixed with a patch from \autoref{fig:equivpatch}, and the one incorrectly fixed with the patch in  \autoref{fig:nonsol4} are, respectively, as follows:
+
+\vspace{0.5em}
+{\small
+\begin{tabular}{rl}
+\autoref{fig:exnull-manifest} & $\mathsf{param} = \nil \implies  \cerr: \{\} \wedge \ret=\nil$\\
+
+{} & $\mathsf{param} \neq \nil \implies \cok: \{X\}  \wedge \ret=\mathsf{param}$
+~\\[5pt]
+
+\autoref{fig:equivpatch} & $\mathsf{param} = \nil \implies  \cok: \{\} \wedge \ret=\nil$\\
+
+{}& $\mathsf{param} \neq \nil \implies \cok: \{X\}  \wedge \ret=\mathsf{param}$
+~\\[5pt]
+
+\autoref{fig:nonsol4} & $\mathsf{param} = \nil \implies  \text{\tt{abort}}: \{\} $\\
+
+{} & $\mathsf{param} \neq \nil \implies \cerr: \{X,Y\}  \wedge \ret=\mathsf{param}$\\
+
+\end{tabular}
+}
+~\\
+
+We notice that the memory footprints corresponding to the buggy program and that of the correctly fixed one are almost identical, hence very close,  except for the exit condition label, while the incorrectly patched one differs in the size of the heap too (for the previously non-buggy path) reflecting the calls to the two \mcode{malloc} wrappers as well as the labels for both paths. This justifies why the correct patches receive a high reward.
+
+ \saver \cite{HongLLO20}, the state of the art in repairing memory related bugs, is unable to generate a fix for our running example since the object flow analysis on which it operates manipulates events and non-allocation cannot be modelled as an event. \footpatch does handle null pointer dereferences but its search and template-based methodology cannot always generate fixes on specific paths, if the fix template has not been seen before - leading to restrictive fixes.
+ 
+
+\section{Repair Framework}
+ 
+ \autoref{fig:overview} offers a summary view of our APR framework based on static analysis.
+  A static bug detector running on an abstract domain \domaindetect~(ISL in our case)
+  takes as input a buggy program and creates a summary of the 
+   the bug (the footprint of the buggy method, the path condition on which the bugs manifests, and the culprit statement). 
+   A patch is then synthesised using a PCFG. We investigate the effects the patch has on the memory footprint by creating a summary of the buggy method after having applied the newly created patch. 
+   Synthesised patches are then clustered into equivalence classes according to their effect on the symbolic heap. 
+   Before refining the equivalence classes by checking which class this patch belongs to, we further abstract the patch's summary using a simplified abstract domain, so as to avoid having to check for the equivalence of ISL formulae. This meta-domain, \domainequiv, mostly retains information about what memory cells have been allocated and deallocated, and about the program paths and exit conditions. 
+   Identifying the patch's equivalence class takes into consideration the ``distance" from the bug, and classifies patches accordingly. 
+   If the synthesised patch does not remove the considered bug or if it affects other paths than the buggy ones, then this fact is transmitted to the patch synthesis mechanism  in order for it to fine-tune the probabilities ascribed to the PCFG. In other words, the probabilities implicitly reflect how the search space should be navigated. 
+   Finally, each plausible equivalence class is validated by picking only one representative patch per class.
+   
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.47\textwidth]{new-overview}
+\caption{Framework Overview}\vspace{-2em}
+\label{fig:overview}
+\end{figure}
+

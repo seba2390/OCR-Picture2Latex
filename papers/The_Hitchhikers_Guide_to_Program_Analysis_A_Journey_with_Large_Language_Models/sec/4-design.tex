@@ -1,0 +1,629 @@
+\section{Design} 
+\label{sec:design}
+% \zhiyun{High-Order Consideration? Does this section summarize all considerations or only a subset (most critical?)}
+
+% \yu{more reasons but not just what we do}
+
+% \haonan{I understand the "design consideration" means there are multiple design choices and we pick one and give reasons. Therefore, there're all considerations: 1) LLM vs. static analysis; 2) Muli-step design}
+
+In Section \S\ref{subsec:concept_wf}, we introduced a conceptual workflow. Elaborating on that foundation, Figure~\ref{fig:wf-case} showcases a compelling illustration of our methodological approach. Yet, translating this workflow into practice presents its challenges. 
+% Despite harnessing the robust knowledge and reasoning prowess of leading-edge LLMs, 
+Even with the advanced knowledge and analytical capabilities of cutting-edge LLMs,
+achieving optimal results remains a challenge. Throughout the development of \work, we identified several obstacles and subsequently introduced four distinct design components to effectively address these challenges.
+
+
+
+
+
+\begin{figure}
+    \hspace{-25pt}
+    \includegraphics[width=.51\textwidth]{figures/workflow_case.drawio.pdf}
+\caption{Example run of \work. For each potential bug, \work \  \libcirc{1} (\(\Phi_{1}\)) identifies its initializer, 
+    \libcirc{2} (\(\Phi_{2}\)) extracts the post-constraints of the initializer, and
+     \libcirc{3} (\(\Phi_{3}\)) analyzes the behavior of the initializer with the post-constraints via LLM. }
+     \label{fig:wf-case}
+\end{figure}
+
+
+
+
+
+
+
+\subsection{Design Challenges}
+\label{sec:design_chall}
+
+It is non-trivial to prompt LLMs effectively~\cite{zhao2023survey, prompt_engineering}. We meet the following challenges and propose solutions correspondingly in designing \work.
+
+
+
+\squishlist
+\item \textbf{C1. Limited Understanding of Post-constraint.} 
+% Unlike static analysis and symbolic execution, 
+Despite LLMs (\eg GPT-4) are able to comprehend the definition of post-constraint and apply them in simple scenarios, we found their capacity to utilize this knowledge in actual program analysis—such as summarizing function behavior in line with specific post-constraint —to be limited. This critical limitation often results in unpredictable and inconsistent outcomes.
+%This is because extracting postconditions requires an intricate combination, filtering, and even solving multiple path constraints, which is complicated.
+
+
+
+\item \textbf{C2. Token Limitations.} It is known that \acp{LLM} have token limitations. For example, GPT-3.5 supports 16k tokens and GPT-4 supports 32k 
+tokens \cite{openai_2023_function}. This means that we do not want to copy a large number of function bodies in our prompts to LLMs.
+
+
+
+
+\item \textbf{C3. Unreliable and Inconsistent Response. }
+% \zhiyun{include hallucination?}} 
+LLMs are known to result in unreliable and inconsistent responses due to
+\textit{hallucination} and \textit{stochasticity} \cite{zhao2023survey}.
+Stochasticity refers to the inherent unpredictability in the model's outputs \cite{vaswani_attention_2017}; and the hallucination refers to LLMs generating nonsensical or unfaithful responses \cite{ji_survey_2023, zheng_why_2023}.
+By design, the stochasticity can be mitigated with lower \textit{temperature}, a hyperparameter controlling the degree of randomness in outputs~\cite{salamone_what_temp_2021}; however, 
+ reducing temperature may impair the model's exploring ability  \cite{xu_systematic_2022} and therefore 
+ may miss \text{corner} cases that result in vulnerabilities.
+
+
+
+\squishend
+
+
+
+
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.48\textwidth]{figures/wf-v3.drawio.pdf}
+  % \scalebox{0.9}{
+  %   \hspace{-5pt}
+  %   \input{figures/wf-v.tex}
+  % }
+  \caption{The workflow of \work. Given a potential bug, we let LLM first identify the initializer and then extract its post-constraints (Convo.1),  
+  then leverage them to summarize the behavior of the initializer (Convo.2).
+   A conversation consists of prompts (boxes) and responses (edges).} 
+  \label{fig:wf}
+  % \vspace{-10pt}
+\end{figure}
+
+
+\subsection{Design Overview}
+
+We will discuss our design strategies to address the above challenges in the rest of the section. Before that, we provide a high-level overview of our solution.
+
+\squishlist
+\item To tackle challenge \textbf{C1} (Post-constraint), we propose to encode \textbf{\textit{(D\#1) Post-Constraint Guided Path Analysis}} by teaching LLMs with examples, or \textit{few-shot in-context learning}, of post-constraints.
+This approach enables LLMs to learn from a small number of demonstrative examples, assimilate the underlying patterns, and apply this understanding to process post-constraint guidance in our analysis. 
+
+\item  To tackle challenge \textbf{C2} (Token Limitation), We employ two strategies: 
+ \textbf{\textit{(D\#2) Progressive Prompt}.} 
+Instead of copying a large number of function bodies (\ie subroutines), we only provide function details on demand, \ie when LLMs are not able to conduct a result immediately.
+ \textbf{\textit{(D\#3) Task Decomposition.}} We break down the problem into sub-problems that can be solved in independent conversations, \ie \textit{a sequence of prompt and response pairs}. 
+% Note that the token limit is reset for each independent conversation.
+
+\item To tackle challenge \textbf{C3} (Unreliable Response), we employ the following strategies: 
+\textbf{\textit{(D\#4) Self-Validation.}} We ask LLMs to review and correct their previous responses. This helps improve the consistency and accuracy based on our observation. 
+Besides, \textit{\textbf{(D\#2) Progressive Prompt}} and \textit{\textbf{(D\#3) Task Decomposition}} also help to deal with this challenge. Additionally, we implement \textit{\textbf{majority voting}} by running each case multiple times and use majority voting to combat stochasticity. 
+\squishend
+
+
+
+We elaborate the design of (D\#1 - \#4) \textit{\textbf{Post Constraint Guided Path Analysis}}, \textbf{\textit{Progressive Prompts}}, 
+\textbf{\textit{Task Decomposition}}, and
+\textbf{\textit{Self-Validation}} detailed in the rest of this section.
+The effectiveness and efficiency of these design strategies are rigorously evaluated in \S\ref{sec:comparison}, revealing a substantial enhancement in bug detection within the Linux kernel.
+
+
+\subsection{Design \#1: Post-Constraint Guided Path Analysis}
+\label{subsec:postcondi}
+
+The Linux kernel frequently employs return value checks as illustrated in Table \ref{tab:postcondi_types}. Through our detailed examination of non-bug instances, we found that 
+a path-sensitivity analysis can effectively eliminate over 70\% of these negative cases. However, path-sensitive static analysis usually suffers from path explosion, especially in large-scale codebases like the Linux kernel.
+
+Fortunately, we can prompt the LLM to collect \(\mathcal{C}_{post}\) and summarize the function with respective to the 
+\(\mathcal{C}_{post}\). It is worth noting that current LLMs (\eg GPT-4) are not natively sensitive to the sensitivity; without any additional instructions, LLMs usually overlook the post-constraints.
+Therefore, we teach the LLM to be sensitive to post-constraints rules through few-shots in-context learning. We describe the design details as follows:
+
+
+
+\begin{table}
+
+\caption{Two types of post-constraints and their variants.}
+\label{tab:postcondi_types}
+\vspace{-3pt}
+\includegraphics[width=.48\textwidth]{figures/minted/case_few_shot.pdf}
+% \vspace{-8pt}
+\end{table}
+
+\subsubsection{Post-Constraints Extraction.} 
+To extract the \textit{qualified postcondition}, we first determine the post-constraints that lead to the use of suspicious variables.
+We incorporate few-shot in-context learning to teach LLMs how to extract such constraints from the caller context. Table \ref{tab:postcondi_types} demonstrates how we teach LLM with in-context learning. We focus primarily on two types of code patterns:
+% \yu{why those two?}
+
+\squishlist
+\item \textbf{Check Before Use.} 
+% Type A exemplifies this pattern: for the use of \texttt{a,b,c,d} to be reached, it must first satisfy the check \texttt{sscanf(...)>=4}. 
+Type A is our motivating example; by looking at its check, the post-constraint should be \(ret \ge 4\).
+Type A' describes a similar case with \texttt{switch-cases}, with expected output \(ret \mapsto \texttt{crticial\_case}\).
+% \yu{Type A of post-constraints should be more clear.}
+%\zhiyun{Have we defined this term? I don't understand what it means.}
+\item \textbf{Failure Check.} This pattern captures the opposite of the first pattern. They commonly occur in the Linux kernel where the error conditions cause the use to become unreachable, as illustrated in Type B, the post-constraint is \(err \mapsto 0\).
+Type B' depicts a variant where the initializer keeps retrying til success, and therefore with expected output \(ret \mapsto 0\), which indicates
+its first successful execution to break the endless loop.
+% Teaching LLMs the variants helps them differentiate subtle differences.
+%Here the checks are performed without early returns (\ie without \texttt{break/return/goto} to prevent reaching the usage). In Type B', any sub-scenarios of
+%the postcondition can reach \texttt{use(a)}; therefore, we mark it \texttt{null}.
+\squishend
+
+
+\subsubsection{Function Behavior Summarization.} 
+%Postconditions serve a vital role in weeding out irrelevant paths when summarizing the initializer. 
+Once we obtain the \textit{post-contraints} in Convo.1, we feed them to the LLM to obtain the behavior summary in Convo.2 . For example, we provide the following: 
+
+% \vspace{-3pt}
+\begin{lstlisting}[numbers=none]
+{
+ "initializer": "ret = sscanf(str,'%u.%u.%u.%u%n',&a,&b,&c,&d,&n)",
+ "suspicious": ["a", "b", "c", "d"],
+ "postconstraint": "ret >= 4"
+}
+\end{lstlisting}
+% [breaklines, fontsize=\footnotesize, baselinestretch=0.8]{json}
+
+% \end{minted}
+% \vspace{-5pt}
+
+The LLM may respond with 
+
+% \vspace{-5pt}
+\begin{lstlisting}[numbers=none]
+{
+ "ret": "success",
+ "response": {
+   "must_init": ["a", "b", "c", "d"],
+   "may_init": [{"name":"n", "condition": "ret > 4"}]
+  }
+}
+\end{lstlisting}
+
+\cut{
+We can see that the response encodes the postcondition concisely
+where \texttt{a,b,c,d} are considered \texttt{must\_init} and \texttt{n}
+is considered \texttt{may\_init} because it is initialized only when \(ret > 4\), and not when \(ret \mapsto 4\).
+}
+
+The response succinctly encapsulates the function behavior, where variables \texttt{a,b,c,d} are classified as \texttt{must\_init}, and \texttt{n} is categorized as \texttt{may\_init}. This is due to the initialization of \texttt{n} only occurring when \(ret > 4\), and not when \(ret \mapsto 4\).
+
+Note that this seemingly simple interaction with LLMs can be challenging for static analysis or symbolic execution. Consider the \texttt{sscanf()} example, even if the analysis is aware that the qualified postcondition should be limited to those where \(ret \ge 4\),
+it would still need to enumerate the paths inside of \texttt{sscanf()}, which involves loops and can easily lead to timeouts as explained in \S\ref{sec:ubitect}.
+
+
+
+\subsubsection{Apply Path Analysis}
+\label{subsubsec:postcon_rule}
+
+% \cut{
+Following \S\ref{subsec:postcondi_work}, Figure \ref{fig:postcondi_use} presents a concert example of post-constraint guided path analysis. This case shows a simple initializer \(i(a)\) of the variable \(a\). Given an early return, the initialization in line 4 may not be executed. As such, the \textit{qualified postconditions} become contingent on the \textit{post-constraints} \(\mathcal{C}_{post}\). There are:
+
+\squishlist
+\item If the use of variable \texttt{a} is unconditional, \ie \(\mathcal{C}_{post}=\top\).
+% the relevant path constraints would be empty (\ie \texttt{constraints: null}). 
+In this case, the variable \(a\) is labeled as \texttt{may\_init} given that the initialization \textit{may not} be reached.
+
+In general, if all path constraints and outcomes of \texttt{must\_init} are \textit{disjoint from} \(\mathcal{C}_{post}\),
+no path can be pruned out. We could also conclude \(a\) as \textit{may\_init}.
+\item If the use of variable \(a\) is conditional with constraints, \ie \(\mathcal{C}_{post}\neq\top\), two cases emerge:
+\begin{enumerate}
+\item \(\mathcal{C}_{post}\) clashes with the constraints of the path (e.g., \texttt{some\_condi}), or
+\item \(\mathcal{C}_{post}\) conflicts with the path outcome (e.g., \texttt{return -1}).
+\end{enumerate}
+In these instances, \(\mathcal{C}_{post}\) could be \texttt{some\_condi} or \texttt{func(...)==0} and we can designate \texttt{*a} as \texttt{must\_init}. 
+\squishend
+
+
+
+\cut{
+\vspace{3pt}
+\noindent
+While there are a few other cases we have not considered for postconditions throughout the Linux kernel, the above rules cover most of the scenarios we have encountered. We highlight some interesting examples in \S\ref{subsec:excuse}. It's worth noting that the few-shots in-context learning methodology is extensible, making it easy to incorporate new rules and scenarios.
+}
+
+
+
+
+
+
+
+
+
+\begin{figure}
+\begin{minipage}{.15\textwidth}
+\centering
+\begin{lstlisting}[language=c]
+int func(int* a){  
+  if(some_condi)
+    return -1;
+  *a = ... // init 
+  return 0;
+}
+\end{lstlisting} 
+\end{minipage}%
+\begin{minipage}{.35\textwidth}
+\centering
+\vspace{-8pt}
+\begin{tabular}{p{4.5cm}}
+
+\text{\small \(\texttt{must\_init} =\emptyset\)  if:} \\
+% \texttt{\small\{postconstraint: null\}} \\
+\text{\small \(\mathcal{C}_{post} = \top \)} or  \\
+% \text{\small\(\forall ps \in p(\mathcal{S}): ps \perp \mathcal{C}_{post}\ \wedge
+% \forall o \in \mathcal{O}: o \perp \mathcal{C}_{post}\) } \\
+\text{\small\(\forall ps \in \{ \neg \texttt{some\_condi} \}: ps \perp \mathcal{C}_{post}\ \wedge \)} \\
+\hspace{15pt}\text{\small \(\forall o \in \{ret \mapsto 0\}: o \perp \mathcal{C}_{post}\) } \\
+% \text{\small\(\forall p \in \{ \texttt{some\_condi}, \neg \texttt{some\_condi} \}: p \perp \mathcal{C}_{post}\)} \\
+\hline
+\text{\small  \(\texttt{must\_init} =\{a\}\)  if:} \\
+% \texttt{\small\{postcondi: !some\_condi\}} or\\  
+\text{\small \( (\neg \texttt{some\_condi}) \wedge \mathcal{C}_{post} \) or} \\
+% \texttt{\small\{postcondi: func(...) == 0\}} \\
+\text{\small\( (ret \mapsto 0) \wedge \mathcal{C}_{post} \) }\\
+\end{tabular}
+
+
+\end{minipage}
+
+
+\caption{A sample case of initializer \texttt{func}, \texttt{*a} is \texttt{may\_init} or \texttt{must\_init} under different post-constraints. }
+\label{fig:postcondi_use}
+\end{figure}
+
+
+
+
+\subsection{Design \#2: Progressive Prompt}
+\label{subsec:iter_prompt}
+
+\cut{
+In the Linux kernel, it is common for each function to call many other functions further. Therefore, for the initializer summarizing task, if we do not provide
+any further function definitions and ask LLMs to deliver a response instantly, they might fail due to a lack of knowledge.
+However, if we put every relevant function definition at once, it will quickly exceed the limitation of context windows of LLMs.
+
+To solve this dilemma, we propose to provide function definitions \textit{what LLMs need} selectively. As demonstrated in Figure \ref{fig:wf}, 
+when LLMs analyze the initializer, the \textit{Progressive Prompt} design
+fosters an ongoing interaction with the LLMs instead of soliciting an immediate response.
+In this progressive exchange, 
+we always prompt LLMs with: ``\textit{If you experience uncertainty due to insufficient function definitions, please indicate, and I will provide them}''. Upon receiving a request for additional information from LLM, we animatedly extract the necessary information from the source code and provide them to LLMs, enabling them to reevaluate and generate an improved response.
+This back-and-forth interaction continues until the LLM garners sufficient information to deduce the initializer's behavior or until we exhaust the available information. If we cannot provide further information, for example, we can not find the requested function in the Linux source; we prompt it to continue analysis conservatively.
+} 
+
+The Linux kernel has an extremely large codebase. Summarizing an initializer using LLMs without providing any supplementary function definitions can result in incomplete or erroneous responses. On the other hand, flooding the LLM with every relevant function definition upfront risks exceeding their context window limitations.
+
+To address this dilemma, we choose to progressively provide function definitions as needed. 
+Illustrated in Figure \ref{fig:wf}, this approach, which we refer to as \textit{Progressive Prompt}, fosters a dynamic interaction with the LLM rather than expecting a response in one shot.
+Throughout this iterative exchange, we consistently prompt the LLM: \textit{``If you encounter uncertainty due to a lack of function definitions, please signal your need, and I'll supply them''}. 
+Should the LLM need more information, \work will promptly extract the relevant details on demand from the source code and provide it to the LLM \textit{automatically}, enabling it to reassess and generate a more accurate response. 
+% \yizhuo{highlight the autmation here?}
+
+% \haonan{how to prompt it stably}
+Specifically, We teach the LLM to ask for more information with a specific format:
+\begin{lstlisting}[numbers=none]
+    [{"type":"function_def", "name":"some_func" }]
+\end{lstlisting}
+
+Subsequently, \work scans this format in the LLM's response. For each requested function definition,
+\work supplies its corresponding code along with comments extracted from the Linux source code.
+Though GPT-4 may seek other types of information beyond function definitions (\eg struct definitions), we currently limit our support to requests pertaining to function definitions.
+% \yu{reason?}
+
+The iterative process continues until either the LLM no longer requests additional information, or \work cannot supply the requested details. In certain situations where \work is unable to provide more information (\eg the definition of an indirect call), \work will still prompt the LLM to proceed with the analysis. In these instances, the LLM is encouraged to infer the behavior based on the available data and its inherent knowledge, thereby facilitating continued analysis even when not all information is directly accessible.
+
+\cut{
+Note that our current design has a simple strategy to handle indirect calls. First, \work simply asks the LLM to identify the indirect call target, which can succeed in certain cases as shown in the evaluation. If the LLM fails to identify the target, we will simply force it to generate a summary of postconditions based on its knowledge of the Linux kernel, without the definition of any indirect call target.
+\zhiyun{added a new paragraph.}
+}
+
+%In situations where we cannot provide further data --- for instance, if the requested function cannot be located in the Linux source \zhiyun{how would this happen? limitations of our implementation?} --- we encourage the LLM to continue its analysis with a conservative approach.
+
+
+\cut{
+A key advantage of this progressive design lies in its efficiency. Rather than cluttering the conversation with all potential functions, we only provide those pertinent to the ongoing analysis. This approach considerably reduces the use of tokens, making the process more streamlined and resource-efficient. By fostering iterative, targeted exchanges, the progressive prompt design helps leverage the LLM's capabilities more effectively while maintaining focus on the analysis at hand.
+}
+
+% Interavive promp
+
+% The function summary produced by ChatGPT is intentionally \textit{\textbf{different}} from the one generated by UBITect. In UBITect, the function summary is calculated solely through the analysis of a function and its callees, without considering the context in which the caller invokes the function. As a result, it is correct  for a UBITect function summary to indicate that a specific parameter \textit{``may not''} be initialized, given that a path exists in the function where initialization does not occur.
+% In contrast, \work takes into account the calling context, including concrete arguments and return value checks, when analyzing a function. These elements serve as additional constraints that can influence the function's behavior. By providing this context when invoking a function, \work is better equipped to determine if a parameter will be initialized.
+
+
+
+
+
+
+\subsection{Design \#3: Task Decomposition}
+\label{subsec:multi-step}
+
+We systematically apply the principle of task decomposition, a vital element of our design process. This concept is incorporated primarily in two distinct ways.
+
+\vspace{3pt}
+\noindent
+\textbf{Multistage Problem Solving.} 
+\cut{
+First, as Figure \ref{fig:wf} outlined, 
+\work employs two separate \textit{conversations} to finish the task. Each conversation (\ie independent sessions) contains
+several turns of \textit{prompts and responses}. \work first
+extracts the initializer and its \textit{post-constraints} (subtasks 1 and 2) in Convo.1, 
+and then summarizes the postconditions (subtask 3) based on the \textit{post-constraints} in Convo.2. 
+Without task decomposition, we will combine all three subtasks into a single conversation, and prompt it to finish all three subtasks at once.
+We also evaluate this option in \S\ref{subsec:expr_comp}.
+}
+% Firstly, task decomposition is evident in the way we structure our work. 
+As illustrated in Figure \ref{fig:wf}, we employ a two-conversation approach to complete the task. Each conversation, essentially consists of multiple iterations of prompts and responses. The first conversation (Convo.1) is dedicated to extracting the initializer and its associated post-constraints (subtasks 1 and 2), while the second conversation (Convo.2) focuses on summarizing the function (subtask 3) based on the previously identified post-constraints. This division allows a more manageable and effective way of achieving the task, compared to combining all three subtasks into a single conversation. The efficacy of this task decomposition approach is further evaluated in \S\ref{subsec:expr_comp}.
+
+
+\vspace{3pt}
+\noindent
+\textbf{Thinking in English.} 
+Our workflow necessitates a structured output, such as a JSON format, for automation. However, we observe that LLMs often produce suboptimal results when directly prompted to output in this format. As LLMs build responses incrementally, word-by-word, based on preceding outputs \cite{vaswani_attention_2017}, direct prompts to output JSON may interrupt their thought progression. This emphasizes the importance of initially soliciting responses in natural language to ensure comprehensive and effective reasoning. Consequently, we instruct the LLM to first articulate their thought processes in English, followed by a subsequent prompt to transform their response into a JSON summary.
+
+
+%From our preliminary test, %the zero-step design can hardly identify buggy code, and the one-step design is significantly worse than the multi-step design, which are consistent with recent literature reports \cite{ma_scope_2023, tian_is_2023}.
+% \haonan{can we also cite our own paper?}.
+
+
+
+
+\subsection{Design \#4: Self-Validation}
+\label{subsec:self_refine}
+
+\cut{
+LLMs sometimes exhibit erratic or inconsistent behaviors, especially in complex scenarios that involve intricate logic. For example, for a initializer 
+with postcondition \texttt{must\_init} if \(ret \mapsto 0\), the LLM 
+sometimes might ignore the post-constraint and believe it is
+\texttt{may\_init} even with the exact 
+post-constraint \(ret \mapsto 0\).
+On the other hand, LLM might pretend 
+non-exist post-constraint and mistakenly conclude
+a \texttt{may\_init} case to \texttt{must\_init}.
+Namely, LLMs brings both false positives and false negatives in detecting bugs.
+}
+
+At times, LLMs can display unpredictable or inconsistent behaviors, particularly in complex scenarios involving detailed logical constructs. Consider a case where an initializer carries the postcondition \texttt{must\_init} if \(ret \mapsto 0\). LLMs may still mistakenly assume it to be \texttt{may\_init}, despite the explicit presence of the post-constraint \(ret \mapsto 0\).
+
+Conversely, an LLM might erroneously interpret a non-existent post-constraint and incorrectly infer a \texttt{may\_init} case as \texttt{must\_init}. 
+This phenomenon is known as \textit{hallucination}.
+Essentially, the hallucination can lead to both false positives and false negatives in bug detection, thereby affecting accuracy and reliability. 
+
+
+
+In addition to task decomposition,  we also introduce the concept of \textit{self-validation} to enhance reliability.
+Before the LLM reaches its final conclusion,
+this method reinforces specific rules, allowing the LLM to reassess their previous responses for adherence and make necessary corrections. We observed that this practice yields better results. We evaluate the effect of self-validation in \S\ref{sec:comparison}.
+% \haonan{actually it seems now, it 1) increases the consistency (but we don't have a data?) 
+% 2) improve the recall, instead of precision}
+
+% \textbf{In Postcondition Extraction.} 
+As seen in Figure \ref{fig:wf}, we employ self-validation in both conversations. 
+By prompting a list of  \textit{correct} properties that we expect, LLMs can verify and correct their results by themselves automatically.
+% We specifically request LLMs to follow two crucial rules when performing self-validation: 1) Postconditions should not include any suspicious variables. 
+% 2) A postcondition must directly influence the reachability of the use of the suspicious variable. Therefore, in the case of error checks, without an explicit \texttt{return/break/goto} command rendering subsequent usage impossible, it should not be a valid postcondition.
+%\zhiyun{needs editing after postcondition definition is finalized.}
+
+\cut{
+% \textbf{In Initializer Summary.} 
+When summarizing initializers, we observe a propensity of the LLM to reach a `safe', yet imprecise choice (\ie \texttt{may\_init}) without self-validation. 
+Thus, we incorporate self-validation to encourage the LLM to reassess \texttt{may\_init} and \texttt{must\_init} cases to heighten precision. This strategy is also woven into our progressive prompt design. If the LLM requests more information to complete the analysis, we revert to the progressive prompting stage and sustain the interaction. This synergy between self-validation and progressive prompts leads to a more robust analysis and a more productive engagement with the LLM.
+}
+% we eval
+% \yizhuo{Good to add the prompts.}\yizhuo{The goal of self-validation is to reduce the false positives, and we need to make this clear and describe why the precision benefits from this refinement.}
+% It is interesting that we do not combine the self-validation with the JSON generation step. The combination can improve speed and reduce cost; however, it only works well with some simple rules. If we want LLM to review its last result and correct itself, separation is necessary.
+
+% self-validation need to be designed very carefully as it is actually a double-edged sword. It can improve the precision of LLM mostly, but it can also make the result worse sometimes. We need to keep the consistency with previous prompts to 
+
+
+% \begin{figure}
+% \begin{minted}[xleftmargin=10pt, breaklines, linenos, fontsize=\footnotesize]{c}
+% struct assoc_array_edit *assoc_array_insert(...){
+%   ...
+%   switch (assoc_array_walk(... &result)) {
+%   case assoc_array_walk_tree_empty:
+%     return ...
+%   case assoc_array_walk_found_terminal_node:
+%     if (!assoc_array_insert_into_terminal_node(... &result))
+%     ...
+%   }
+% }
+% \end{minted}
+%     \caption{\haonan{Derived from \texttt{lib/assoc\_array.c}. suspicious variable \texttt{result}, used in Line 7}}
+%     \label{fig:my_label}
+% \end{figure}
+
+
+
+% \subsection{initialization function identify and postcondition collects}
+
+% Given the initial context and the suspicious variable (that being used), we ask
+% ChatGPT which function could potentially initialize the variable. This process could be done via a simple string match; say, if this variable being passed as
+% parameter or a comprehensive def-use analysis. However, a perfect analyzer 
+% working in Linux may require significant efforts to embed much knowledge such as concurrency and callback functions.  
+% To make our life easier,
+% we directly ask ChatGPT for this specific task. 
+
+% With the initialization function, we then prompt ChatGPT to collect all postconditions. We only care that condition that could be expressed in relationship of return values of initialization function.
+% In our tests, most of the cases are perfectly handled by ChatGPT except for a few examples of variable reuse. A light-wight static analyzer could convert 
+% the code to the form of SSA and solve this issue.
+
+
+
+
+
+
+
+
+
+% \vspace{3pt}
+% \noindent\textbf{Prompt Design.}
+\subsection{Additional Prompting Strategies}
+\label{subsec:other_prompt}
+
+In order to further optimize the efficacy of our model, we have incorporated several additional strategies into our prompt design:
+
+\squishlist
+
+\item \textbf{Chain-of-Thought.}
+Leveraging the Chain-of-Thought (CoT) approach, we encourage the LLMs to engage in stepwise reasoning, using the phrase \textit{``think step by step''}. This not only helps generate longer, comprehensive responses, but it also provides intermediate results at each juncture of the thought process. Previous studies suggest the CoT approach considerably enhances the LLMs' reasoning capabilities~\cite{chen_when_2023}. We incorporate the CoT strategy into every prompt.
+
+\item \textbf{Source Code Analysis.}
+Rather than analyzing abstract representations, we opt to focus our attention directly on the functions within the source code. This approach not only economizes on token use compared to LLVM IR, but also allows the model to leverage the semantic richness of variable names and other programming constructs to conduct a more nuanced analysis.
+
+%\item \textbf{Reasoning in Natural Language.}
+%We consistently instruct the LLMs to articulate their thought processes in English, ultimately synthesizing their findings into a JSON summary at the end of the conversation. As LLMs such as GPT construct responses word-by-word, based on preceding outputs, direct prompts to generate JSON can disrupt their reasoning process. The process of thinking aloud in natural language is thus crucial to facilitate thorough and effective reasoning.
+
+\squishend
+
+% \item \textbf{Prioritize Rules and Eliminate Conflicts.} \haonan{it is also important to keep different rules not conflicted...}
+
+
+
+
+
+
+
+
+\cut{
+There are many interesting details in building effective prompts.
+For example, prompting LLM output with \textit{conditions} of each \texttt{may\_init} (\ie in what cases it will initialize) improves its performance. Moreover, sometimes replace a word by its synonym can impact the results. 
+For example, if we tell LLM with \textit{`don't do something'} --
+it sometimes understands exactly the opposite -- \textit{`do something'}.
+Considering they do not affect the overall approach, interested readers can discover these details from our open-sourced detailed prompts implementation and experiments.
+}
+
+
+\cut{
+\vspace{3pt}
+\noindent
+Designing effective prompts involves mastering many intriguing nuances. For instance, enhancing the LLM's output by specifying the \textit{conditions} under which each \texttt{may\_init} (i.e., conditions in which initialization will occur) can boost its performance. 
+Furthermore, equally impactful can be the strategic substitution of words with their synonyms. A striking example is the paradoxical interpretation of negations by the LLM. If prompted with a command like \textit{`don't do something'}, the LLM occasionally comprehends it as \textit{`do something'}, the exact reverse of the intended instruction. 
+% \zhiyun{so what is our solution for this do something example?} \zhiyun{I suggest we remove the paragraph altogether as it seems confusing.}
+\haonan{I personally like it, but can also remove}
+}
+
+\vspace{3pt}
+\noindent
+% While these subtle factors don't alter the overarching strategy, they do enrich its execution and can be pivotal in optimizing performance.
+There are still some interesting details in designing an effective prompt
+but due to space constraints and without changing the overall strategy, we will not list them all. Readers intrigued can delve into the intricacies of our open-sourced prompt\footnote{\href{https://sites.google.com/view/llift-open/prompt}{https://sites.google.com/view/llift-open/prompt}} design and experimental implementations to gain a deeper understanding.
+% \zhiyun{align the prompt language in all detailed conversations. mention demo fully automated.}
+% \zhiyun{need to decide whether we want to provide an end-to-end example for the submission.} \haonan{why not, we can put them later; I also need do for our short paper}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\cut{
+% \noindent
+In a perfect world, an ideal static analysis tool can alternatively perform these steps, too. However, implementing an efficient static analysis is challenging due to the fundamental challenges of static
+analysis, as we mentioned in \S\ref{subsec:funda_chall}.
+Instead, LLM provides a simple integration that makes this workflow possible, especially for these 
+potential bugs that UBITect cannot verify due to time or memory out, as Figure \ref{fig:design-flow} demonstrates.
+}
+% The LLM conducts these three steps.
+% Each stage will be discussed in more detail in the following sections.
+% We discuss each component of the workflow in the following sections.
+% We elaborate on these techniques in the following sections: progressive prompt in \S\ref{subsec:iter_prompt}, self-validation in \S\ref{subsec:self_refine}, few-shots learning of postcondition  in \S\ref{subsec:postcondi}, and the rest in \S\ref{subsec:other_prompt}.
+
+
+\cut{
+\noindent
+\textbf{LLM vs. Static Analysis.} 
+Given the significant challenges of static analysis as highlighted in \S\ref{subsec:funda_chall}, LLM-based approaches  emerge as a flexible and powerful alternative. In an ideal world, a perfect static analysis tool would provide precise and correct answers for these steps.
+% possess the ability to analyze all possible program execution paths and provide precise and comprehensive answers regarding various program properties, including program correctness.} 
+% \yu{it is called Parametric Static Analysis}
+However, the reality is often starkly different, as implementing an efficient and universally applicable static analysis tool is complex, time-consuming, and fraught with inherent limitations.
+
+LLMs, on the other hand, present an innovative avenue to circumvent these challenges. They offer a simple, efficient integration that makes advanced analysis workflows viable, particularly for potential bugs that tools like UBITect struggle to verify due to resource constraints. As depicted in Figure \ref{fig:design-flow}, \work can effectively take these inconclusive cases and find hidden bugs in them.
+% LLMs can facilitate an efficient and effective bug verification process,
+}
+
+
+
+
+
+
+\cut{
+\subsection{Design Exploration}
+\label{design_explo}
+\zhiyun{consider moving to design section}
+
+
+% Before our final three-stage design (referenced as \textit{multi-step}), we initially explored more straightforward design possibilities. 
+It is not trivial to apply the LLM. 
+% Notably, we contemplated employing LLM to directly determine whether a code carries UBI bugs (\textit{zero-step}), or specifying the target function and original context first and then directing it to generate a summary (\textit{one-step}).
+First, prompting LLM to directly judge each potential bug (referred to \textit{zero-step}) is unreliable.
+Second, even taking our workflow, expecting that LLM can give a direct answer in a single conversation (referred to \textit{one-step}) is not a good idea.  We describe these two explorations as follows.
+
+\subsubsection{Zero-step Design}
+
+
+We initially experimented with the zero-step design methodology. In this process, we provided an in-depth definition of a UBI bug, followed by a direct copy of the caller context, pinpointing the suspicious variable that might be used before initialization. We adhered to the guidelines mentioned in \S\ref{sec:design}, such as Chain-of-Thought and progressive prompting.
+
+We validated this methodology on several case studies. One was a false positive (\ie not a bug) case (\texttt{cpuid}), while the other was an actual bug (\texttt{p9pdu\_readf}). Despite our efforts, GPT-4, the most potent LLM, fell short in both instances. 
+% Intriguingly, we observed that even when explicitly encouraged to ask follow-up questions about function definitions, GPT-4 would instead generate a seemingly plausible but incorrect answer without seeking additional information.
+
+Recent research, such as \cite{tian_is_2023}, indicates that ChatGPT struggles with accurately explaining the intentions of incorrect code. This also shows current LLM does not diliver a reliable summariaztion from the code directly.
+% However, this should not lead to the assumption that LLM cannot provide meaningful interpretations of programming languages. Our two subsequent design strategies serve to demonstrate this.
+
+
+
+\subsubsection{One-step Design}
+The one-step design employs our workflow. Specifically, we prompt LLM to summarize a function call whether it \texttt{may\_init} or \texttt{must\_init} the suspicious variable. Therefore, for a potential UBI bug, if there is an initializer that \texttt{must\_init} the suspicous bug, we can conclude there's not a real bug.
+
+While the one-step design surpasses the zero-step, it can still overlook real bugs. As illustrated in Figure \ref{fig:p9_read}, \texttt{p9pdu\_readf} is a case in point. Upon examination of the function \texttt{p9pdu\_vreadf}, GPT-4 occasionally assumes that the \texttt{pdu\_read(...)} in Line 10 - functioning as a protective check - must succeed, thereby leading to the initialization of its parameter at Line 14.
+ 
+
+While the one-step design surpasses the zero-step, it can still overlook real bugs. In the one-step design, we prompt GPT-4 to pay close attention to the \textbf{\textit{postconditions}} of the initializer. However, it often confuses the postcondition in the initial caller context with subsequent checks. This observation laid the groundwork for our multi-step design, which involves the separate extraction of postconditions in advance, providing explicit constraints and prompting for analysis.
+}
+
+% \cut{
+% \begin{figure}
+% \begin{minted}[xleftmargin=10pt, linenos, breaklines, escapeinside=||, fontsize=\footnotesize]{c}
+% int p9_check_zc_errors(...){
+%   err = p9pdu_readf(..., "d", &ecode);
+%   err = -ecode;
+% }
+% // similar to `sscanf/vsscanf`, p9pdu_readf is a wrapper of p9pdu_vreadf with va_args
+% int p9pdu_vreadf(... const char *fmt, va_list ap){
+%    switch (*fmt) {
+%      case 'd':{
+%        int32_t *val = va_arg(ap, int32_t *);
+%        if (pdu_read(...)) {
+%        	errcode = -EFAULT;
+%        	break;
+%        }
+%        val = ...;  // initialization
+%   }
+%   return errcode;
+% }
+% \end{minted}
+%     \caption{Code snippet of \texttt{p9pdu\_readf} and its usecase, derived from \texttt{net/9p} 
+%     }
+%     \label{fig:p9_read}
+% \end{figure}
+% }
+
+% \subsubsection{Multi-step Design}
+
+ % The multi-step design
+ % first only extracts the initializer and its call context: the postconditions. And then performs the analysis. 
+ % Theoretically, this task could be done with a relatively straightforward intraprocedural dependence
+ %  analysis. However, due to the varieties of Linux code, adaptation to the Linux kernel is non-trivial. For simplicity, we chose to implement it using LLM and the experiment
+ %  shows it performs well in most situations.

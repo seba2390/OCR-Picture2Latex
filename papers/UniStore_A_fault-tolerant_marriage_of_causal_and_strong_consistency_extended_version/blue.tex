@@ -1,0 +1,679 @@
+\section{Fault-Tolerant Causal Consistency Protocol}
+
+We first describe the \System protocol for the case when all transactions are
+causal.  We give its pseudocode in Algorithms~\ref{alg:txncoord1} and
+\ref{alg:clock}; for now the reader should ignore highlighted lines, which are
+needed for strong transactions. For simplicity, we assume that each handler in
+the algorithms executes atomically (although our implementation is
+parallelized). We reference pseudocode lines using the format
+algorithm\#:line\#.
+
+
+\subsection{Metadata}
+\label{sec:metadata}
+
+Most metadata in our protocol are represented by vectors with an entry per each
+data center, where each entry stores a scalar timestamp. However, different
+pieces of metadata use the vectors in different ways, which we now describe.
+
+
+\paragraph{Tracking causality.}
+The first use of the vectors is as vector
+clocks~\cite{vectorclocks1,vectorclocks2}, to track causality between
+transactions. Given vectors $V_1$ and $V_2$, we write $V_1 < V_2$ if each entry
+of $V_1$ is no greater than the corresponding entry of $V_2$, and at least one
+is strictly smaller. Each update transaction is tagged with a \emph{commit
+  vector} $\commitvector$. The order on these vectors is consistent with the
+causal order $\prec$ from \S\ref{sec:consistency}: if $\commitvector_1$ and
+$\commitvector_2$ are the commit vectors of two update transactions $t_1$ and
+$t_2$ such that $t_1 \prec t_2$, then $\commitvector_1 < \commitvector_2$. For a
+transaction originating at a data center $d$ with a commit vector $\commitvector$,
+we call $\commitvector[d]$ its {\em local timestamp}.
+
+Each replica $\partition^m_d$ maintains a
+log $\store[k]$ of update operations performed on each data item $k$ stored at
+the replica. Each log entry stores, together with the operation, the commit
+vector of the transaction that performed it. This allows reconstructing
+different versions of a data item from its log.
+
+\paragraph{Representing causally consistent snapshots.}
+The protocol also uses a vector to represent a snapshot of the data store on
+which a transaction operates: a snapshot vector $V$ represents all transactions
+with a commit vector $\le V$. This snapshot is causally consistent. Indeed,
+consider a transaction $t_1$ included into it, i.e., $\commitvector_1 \leq
+V$. Since any causal dependency $t_0$ of $t_1$ is such that
+$\commitvector_0 < \commitvector_1$, we have $\commitvector_0 < V$, so that
+$t_0$ is also included into the snapshot. A client also maintains a vector
+$\past$
+that represents its \emph{causal past}: a causally consistent snapshot including
+the update transactions the client has previously observed.
+
+
+\paragraph{Tracking what is replicated where.}  
+Each replica $\partition^m_d$ maintains three vectors that are used to compute
+which transactions are uniform. These respectively track the sets of
+transactions replicated at $\partition^m_d$, the local data center $d$, and
+$f+1$ data centers. Each of these vectors $V$ represents the set of update
+transactions originating at a data center $i$ with a local timestamp $\le
+V[i]$. Note that this set may not form a causally consistent snapshot. The first
+vector maintained by $\partition^m_d$ is $\replicavectorclock$. For each data
+center $i$, it defines the prefix of update transactions originating at $i$ (in
+the order of local timestamps) that $\partition^m_d$ knows about.
+\begin{property}
+\label{prop:knownvc}
+For each data center $i$, the replica $\partition^m_d$ stores the updates to
+partition $m$ by all transactions originating at $i$ with local timestamps
+$\leq \replicavectorclock[i]$.
+\end{property}
+Our protocol ensures that $\replicavectorclock[d]\leq \clock$ at any replica in
+data center $d$. The vector $\replicavectorclock$ at $\partition^m_d$ records
+whether the updates to partition $m$ by a given transaction are stored at this
+replica. In contrast, the next vector $\stablesnapshot$ records whether the
+updates to {\em all} partitions by a transaction are stored at the local data
+center $d$.
+\begin{property}
+\label{prop:stablevc}
+For each data center $i$, the data center $d$ stores the updates by all
+transactions originating at $i$ with local timestamps $\leq \stablesnapshot[i]$.
+More precisely, we are guaranteed that $\replicavectorclock[i]$ at any replica of $d$ ${}\ge{}$
+$\stablesnapshot[i]$ at any $\partition^m_d$.
+\end{property}
+Finally, the last vector $\uniformsnapshot$ defines the set of update
+transactions that $\partition^m_d$ knows to have been replicated at
+$f+1$ data centers, including $d$.
+\begin{property}
+\label{prop:uniformity}
+Consider $\uniformsnapshot[i]$ at $\partition^m_d$. All update
+transactions originating at $i$ with local timestamps $\leq$
+$\uniformsnapshot[i]$ are replicated at $f+1$ datacenters including
+$d$. More precisely: $\replicavectorclock[i]$
+at any replica of these data centers $\geq \uniformsnapshot[i]$ at $\partition^m_d$.
+\end{property}
+
+
+When $\uniformsnapshot$ is reinterpreted as a causally consistent snapshot, it
+defines transactions that $\partition^m_d$ knows to be uniform according to
+Definition~\ref{def:uniform}:
+\begin{property}
+\label{prop:uniformsnapshot}
+Consider $\uniformsnapshot$ at $\partition^m_d$. All update transactions with
+commit vectors $\leq \uniformsnapshot$ are uniform.
+\end{property}
+\noindent {\em Proof sketch.}
+Consider a transaction $t_1$ that originates at a data center $i$ with a commit
+vector $\commitvector_1\leq \uniformsnapshot$ at $\partition^m_d$. In
+particular, $\commitvector_1[i]\leq\uniformsnapshot[i]$, and by
+Property~\ref{prop:uniformity}, $t_1$ is replicated at $f+1$ data centers. We
+assume at most $f$ failures. Then the transaction forwarding mechanism
+of our protocol 
+(\S\ref{sec:overview}) guarantees that $t_1$
+will eventually be replicated at all correct data centers.
+Consider now any
+causal dependency $t_2$ of $t_1$ with a commit vector $\commitvector_2$. Since
+commit vectors are consistent with causality,
+$\commitvector_2 <\commitvector_1\leq\uniformsnapshot$. Then as above, we can
+again establish that $t_2$ will be replicated at all correct data centers, as
+required by Definition~\ref{def:uniform}.\qed
+
+\subsection{Causal Transaction Execution}
+\label{sec:bluetxs}
+
+\paragraph{Starting a transaction.}
+A client can submit a transaction to any replica in its local data center by
+calling $\STARTTX(\avc)$, where $\avc$ is the client's causal past $\past$
+(\algline{alg:txncoord1}{line:starttx:call}, for brevity, we omit the pseudocode
+of the client). A replica $\partition^m_d$ receiving such a request acts as the
+transaction {\em coordinator}. It generates a unique transaction identifier
+$\tx$, computes a snapshot $\vecsnapshottime[\tx]$ on which the transaction will
+execute, and returns $\tx$ to the client (we explain
+\alglines{alg:txncoord1}{line:starttx:start}{line:starttx:end} and similar ones
+later). The snapshot is computed by combining uniform transactions from
+$\uniformsnapshot$ (\algline{alg:txncoord1}{alg:coord:starttx:init}) with the
+transactions from the client's causal past originating at $d$
+(\algline{alg:txncoord1}{alg:coord:starttx:end}). The former is crucial to
+minimize the latency of strong transactions (\S\ref{sec:overview}), while the
+latter ensures \emph{read your writes}.
+
+
+
+
+\paragraph{Transaction execution.}  The client proceeds to execute the
+transaction $\tx$ by issuing a sequence of operations at its coordinator via
+\UPDATETX{} (\algline{alg:txncoord1}{alg:coord:execop}). When the coordinator
+receives an operation $\op$ on a data item $k$, it sends a $\EXECOP$ message
+with the transaction's snapshot $\vecsnapshottime[\tx]$ to the local replica
+responsible for $k$
+(\algline{alg:txncoord1}{alg:coord:sendop}). Upon receiving the message
+(\algline{alg:txnpartition}{line:updateuniformop:receive}), the replica first
+ensures that it is as up-to-date as required by the snapshot
+(\algline{alg:txnpartition}{line:waitexecute}). It then computes the latest
+version of $k$ within the snapshot by applying the operations from $\store[k]$
+by all transactions
+with commit vectors $\leq \vecsnapshottime[\tx]$. The result is sent to the
+coordinator in a $\OPRET$ message. After receiving it
+(\algline{alg:txncoord1}{line:coord:receive-ret}), the coordinator further
+applies the operations on $k$ previously executed by the transaction, which are
+stored in a buffer $\writeset[\tx]$; this ensures {\em read your writes} within
+the transaction. If the operation is an update, the coordinator then appends
+it to $\writeset[\tx]$. Finally, the coordinator executes the desired operation
+$\op$ and forwards its return value to the client.
+
+
+
+
+\begin{algorithm}
+  \renewcommand{\SpaceHandler}{\vspace{5pt}}
+  \begin{algorithmic}[1]
+    \small
+    \Function{\STARTTX}{\avc}\label{line:starttx:call}
+      \For{$i \in \DC \setminus \{d\}$}\label{line:starttx:start}
+        \State $\uniformsnapshot[i] \gets
+          \max\{\avc[i]$, $\uniformsnapshot[i]\}$\label{line:starttx:end}
+      \EndFor
+       \State \textbf{var} $\tx \gets \newtxid$()
+      \State $\vecsnapshottime[\tx] \gets \uniformsnapshot$\label{alg:coord:starttx:init}
+      \State $\vecsnapshottime[\tx][d] \gets
+        \max\{\avc[d]$, $\uniformsnapshot[d]\}$ \label{alg:coord:starttx:end}
+      \State \colorbox{\BackColor}{{\color{\StrongColor}
+        $\vecsnapshottime[\tx][\red] \,{\gets}\,
+        \max\{\avc[\red]$, $\stablesnapshot[\red]\}$}}\label{alg:coord:starttx:end-red}
+      \State \Return \tx
+    \EndFunction
+
+    \SpaceHandler
+
+    \Function{\UPDATETX}{\tx, $k$, \op}\label{alg:coord:execop}
+      \State {\bf var} $\areplica \gets \partitionof$($k$)
+      \State {\bf send}
+        \EXECOP($\vecsnapshottime[\tx]$, $k$)
+        \textbf{to} $\partition^\areplica_d$\label{alg:coord:sendop}
+      \State \textbf{wait receive} \OPRET(\cstate)
+      \textbf{from} $\partition^\areplica_d$\label{line:coord:receive-ret}
+      \ForAll{$\langle k, \op' \rangle \in \writeset[\tx][\areplica]$}
+        $\cstate \gets \apply(\op', \cstate)$\!\!
+      \EndFor \label{line:formversion:end}
+      \State \colorbox{\BackColor}{{\color{\StrongColor} $\readset[\tx] \gets \readset[\tx] \cup
+        \{ \langle k, \op \rangle\}$}}\label{line:readset}
+      \If{$\op$ is an update}
+        \State $\writeset[\tx][\areplica] \gets
+          \writeset[\tx][\areplica] \cdot \langle k, \op \rangle$
+      \EndIf
+      \State \Return $\effval{\op}{\cstate}$
+    \EndFunction
+
+   \SpaceHandler
+
+       \WhenRcv[\EXECOP(\avecsnapshottime, $k$)]
+    \textbf{from} \partition \label{line:updateuniformop:receive}
+      \For{$i \in \DC \setminus \{d\}$}\label{line:updateuniformop:start}
+        \State $\uniformsnapshot[i] \gets \max\{\avecsnapshottime[i]$,
+          $\uniformsnapshot[i]\}$\label{line:updateuniformop:end}
+      \EndFor
+      \State {\bf wait until}
+        $\replicavectorclock[d] \geq \avecsnapshottime[d] \wedge {}$\label{line:waitexecute}
+          \Statex \hspace{1.69cm}\colorbox{\BackColor}{{\color{\StrongColor} $\replicavectorclock[\red]
+        \geq \avecsnapshottime[\red]$}}
+      \State \textbf{var} $\cstate \gets \bot$
+      \ForAll{\label{line:formversion:start}
+        $\langle \op', \commitvector\rangle {\in} \store[k].\hspace{1pt}
+        \commitvector {\leq} \avecsnapshottime$}
+        \State $\cstate \gets \apply(\op',\cstate)$
+      \EndFor
+      \State
+        \textbf{send}
+        \OPRET(\cstate)
+        \textbf{to} \partition
+    \EndWhenRcv
+
+   \SpaceHandler
+    
+    \Function{\COMMITBLUE}{\tx} \label{alg:line:coordcommit}
+       \State \textbf{var} $L \gets \{ \areplica \mid \writeset[\tx][\areplica] \neq
+      \emptyset\}$
+      \If{$L = \emptyset$}
+        \Return $\vecsnapshottime[\tx]$\label{alg:line:commitro}
+      \EndIf
+      \State {\bf send}
+      \BLUEPREPARE(\tx, $\writeset[\tx][\areplica]$, $\vecsnapshottime[\tx]$)
+      \textbf{to} $\partition^\areplica_d,\, \areplica \in L$\label{alg:line:sendprepare}
+      \State {\bf var} $\commitvector \gets \vecsnapshottime[\tx]$\label{alg:line:commitvectorany}
+      \ForAll{$\areplica \in L$} \label{alg:line:rcvprepare}
+        \State \textbf{wait receive} \BLUEPREPARED(\tx, \ts) \textbf{from} $\partition^\areplica_d$
+        \State $\commitvector[d] \gets \max \{\commitvector[d]$, $\ts\}$\label{alg:line:commitvectorlocal}
+      \EndFor
+      \State {\bf send}
+      \COMMIT(\tx, $\commitvector$)
+      \textbf{to} $\partition^\areplica_d,\, \areplica \in L$\label{alg:line:sendcommit}
+      \State \Return $\commitvector$\label{alg:line:returncommit}
+    \EndFunction
+
+    \SpaceHandler
+
+        \WhenRcv[\BLUEPREPARE(\tx, \aws, $\avecsnapshottime$)] \textbf{from} \partition
+    \label{line:updateuniformprepare:receive}
+      \For{$i \in \DC \setminus \{d\}$}\label{line:updateuniformprepare:start}
+        \State $\uniformsnapshot[i] \gets \max\{\avecsnapshottime[i]$,
+          $\uniformsnapshot[i]\}$\label{line:updateuniformprepare:end}
+      \EndFor
+      \State \textbf{var} $\ts \gets \clock$ \label{alg:line:PrepTime}
+      \State $\preparedblue \gets \preparedblue \cup
+        \{ \langle \tx, \aws, \ts\rangle \}$
+      \State \textbf{send} \BLUEPREPARED(\tx, \ts) \textbf{to} \partition
+    \EndWhenRcv
+
+    \SpaceHandler
+
+    \WhenRcv[\COMMIT($\tx$, $\commitvector$)]
+    \label{alg:line:commit:receive}
+      \State \textbf{wait until} $\clock \geq \commitvector[d]$ \label{alg:line:commitwait}
+      \State $ \langle \tx, \aws, \_\rangle \gets$
+        $\mathtt{find}(\tx, \preparedblue)$
+      \State $\preparedblue \gets \preparedblue \setminus \{ \langle \tx,
+        \_, \_\rangle \}$
+      \ForAll{$\langle k, \op \rangle \in \aws$}
+        \State $\store[k] \gets \store[k] \cdot
+          \langle \op, \commitvector \rangle$
+      \EndFor
+      \State $\committedset[d] \gets \committedset[d] \cup {}$
+        \Statex\hspace{4.5cm}$\{\langle \tx, \aws,
+        \commitvector\rangle\}$
+    \EndWhenRcv
+              
+
+    \SpaceHandler
+
+    \Function{\MAKEUNIFORM}{\avc}\label{line:barrier}
+      \State \textbf{wait until} $\uniformsnapshot[d] \ge \avc[d]$ \label{line:waituniform}
+    \EndFunction
+
+    \SpaceHandler
+
+    \Function{\ATTACH}{\avc}\label{line:attach}
+    \State \textbf{wait until} $\forall i \in \DC \setminus \{d\}.\, \uniformsnapshot[i] \ge \avc[i]$\label{line:waitattach}
+    \EndFunction
+  \end{algorithmic}
+  \caption{Transaction execution at $\partition^m_d$.}
+  \label{alg:txncoord1}
+  \label{alg:txnpartition}
+\end{algorithm}
+
+\paragraph{Commit.}
+A client commits a causal transaction by calling $\COMMITBLUE$
+(\algline{alg:txncoord1}{alg:line:coordcommit}). This returns immediately if the
+transaction is read-only, since it already read a consistent snapshot
+(\algline{alg:txncoord1}{alg:line:commitro}).  To commit an update transaction,
+\System uses a variant of two-phase commit protocol (recall that for simplicity
+we only consider whole-data center failures, not those of individual replicas,
+\S\ref{sec:sysmodel}).
+The coordinator first sends a $\BLUEPREPARE$ message to the replicas in the
+local data center storing the data items updated by the transaction
+(\algline{alg:txncoord1}{alg:line:sendprepare}). The message to each replica
+contains the part of the write buffer relevant to that replica. When a replica
+receives the message
+(\algline{alg:txncoord1}{line:updateuniformprepare:receive}), it computes the
+transaction's \emph{prepare time} $\ts$ from its local clock and adds the
+transaction to $\preparedblue$, which stores the set of causal transactions that
+are prepared to commit at the replica. The replica then returns $\ts$ to the
+coordinator in a $\BLUEPREPARED$ message.
+
+When the coordinator receives replies from all replicas updated by the
+transaction, it computes the transaction's commit vector $\commitvector$: it
+sets the local timestamp $\commitvector[d]$ to the maximum among the prepare
+times proposed by the replicas
+(\algline{alg:txncoord1}{alg:line:commitvectorlocal}), and it copies the other
+entries of $\commitvector$ from the snapshot vector $\vecsnapshottime[\tx]$
+(\algline{alg:txncoord1}{alg:line:commitvectorany}). The latter reflects the
+fact that the transactions in the snapshot become causal dependencies of $\tx$.
+
+
+After computing $\commitvector$, the coordinator sends it in a $\COMMIT$ message
+to the relevant replicas at the local data center
+(\algline{alg:txncoord1}{alg:line:sendcommit}) and returns it to the client
+(\algline{alg:txncoord1}{alg:line:returncommit}). The client then sets its
+causal past $\past$ to the commit vector. When a replica receives the $\COMMIT$
+message (\algline{alg:txnpartition}{alg:line:commit:receive}), it removes the
+transaction from $\preparedblue$, adds the transaction's updates to $\store$,
+and adds the transaction to a set $\committedset[d]$, which stores transactions
+waiting to be replicated to sibling replicas at other data centers.
+
+
+
+
+
+
+
+
+
+
+              
+
+
+\subsection{Transaction Replication}
+\label{sec:replication}
+
+Each replica $\partition^m_d$ periodically replicates locally committed update
+transactions to sibling replicas in other data centers by executing
+$\PROPAGATELOCAL$ (\algline{alg:replication}{line:replicatelocal}). Transactions
+are replicated in the order of their local timestamps. The prefix of
+transactions that is ready to be replicated is determined by
+$\replicavectorclock[d]$: according to Property~\ref{prop:knownvc},
+$\partition^m_d$ stores updates to $m$ by all transactions originating at $d$
+with local timestamps $\leq \replicavectorclock[d]$. Thus, the replica first
+updates $\replicavectorclock[d]$ while preserving Property~\ref{prop:knownvc}.
+
+There are two cases of this update. If the replica does not have any prepared
+transactions ($\preparedblue=\emptyset$), it sets $\replicavectorclock[d]$ to
+the current value of the $\clock$
+(\algline{alg:replication}{line:updateknownvc-start}). This preserves
+Property~\ref{prop:knownvc} because in this case a new transaction originating
+at $d$ and updating $m$ will get a prepare time at $m$ higher than the current
+$\clock$ (\algline{alg:txnpartition}{alg:line:PrepTime}), and thus also a higher
+local timestamp (\algline{alg:txncoord1}{alg:line:commitvectorlocal}). If the
+replica has some prepared transactions, then they may end up getting local
+timestamps lower than the current $\clock$. In this case, the replica sets
+$\replicavectorclock[d]$ to just below the smallest prepared time
+(\algline{alg:replication}{line:localknownprepared}). This preserves
+Property~\ref{prop:knownvc} because: {\em (i)} currently prepared transactions
+will get a local timestamp no lower than their prepare time; and {\em (ii)} as
+we argued above, new transactions will get a prepare time higher than the
+current $\clock$ and, hence, than the smallest prepare time.
+
+
+After updating $\replicavectorclock[d]$, the replica sends a $\REPLICATE$
+message to its siblings with the transactions in $\committedset[d]$ such that
+$\commitvector[d]\leq\replicavectorclock[d]$, and then removes them from
+$\committedset[d]$. In other words, the replica sends all transactions from the
+prefix determined by $\replicavectorclock[d]$ that it has not yet replicated.
+
+\begin{algorithm}[t]
+  \renewcommand{\SpaceHandler}{\vspace{6pt}}
+  \begin{algorithmic}[1]
+    \small
+    \Function{\PROPAGATELOCAL}{$ $} \Comment{Run
+      periodically}\label{line:replicatelocal}
+
+        \If{$\preparedblue = \emptyset$}
+        $\replicavectorclock[d] \gets \clock$\label{line:updateknownvc-start}
+          \Else {}
+          $\replicavectorclock[d] \,{\gets}\, \min\{\ts \,{\mid}\,
+          \langle \_,\_, \ts\rangle\,{\in}\,\preparedblue\}{-}1$\label{line:localknownprepared}
+          \EndIf
+          \State {\bf var} $\atxs \gets \{\langle \_, \_, \commitvector\rangle
+          \in \committedset[d] \mid $
+          \Statex \hspace{3.7cm} $\commitvector[d]\leq\replicavectorclock[d]\}$
+          \If{$\atxs \neq \emptyset$}
+              \State {\bf send}
+                $\REPLICATE(d, \atxs)$
+                \textbf{to} $\partition^m_i,\, i \in \DC \setminus \{d\}$
+                \State $\committedset[d] \gets \committedset[d]\setminus \atxs$
+          \Else{}
+          {\bf send}
+              $\BHEARTBEAT(d, \replicavectorclock[d])$
+              \textbf{to} $\partition^m_i,\, i \in \DC \setminus \{d\}$\!\!\!\!\label{line:updateknownprepared}
+          \EndIf
+    \EndFunction
+
+    \SpaceHandler
+
+  \WhenRcv[\REPLICATE($i$, $\atxs$)]\label{line:receivereplicate}
+      \ForAll{$\langle \tx, \aws, \commitvector\rangle \,{\in}\, \atxs$ in
+        $\commitvector[i]$ order}
+      \If{$\commitvector[i]>\replicavectorclock[i]$}\label{line:receivepreparedprecondition}
+      \ForAll{$\langle k, \op \rangle \in \aws$}
+        \State $\store[k] \gets \store[k] \cdot
+          \langle \op, \commitvector \rangle$
+      \EndFor
+      \State $\committedset[i] \gets \committedset[i] \cup {}$
+        \Statex\hspace{4.6cm}$
+        \{\langle \tx, \aws, \commitvector\rangle\}$
+       \State $\replicavectorclock[i] \gets \commitvector[i]$
+       \EndIf
+       \EndFor
+    \EndWhenRcv
+
+    \SpaceHandler
+
+    \vspace{-1pt}
+
+    \WhenRcv[\BHEARTBEAT($i$, $\ts$)]\label{line:heartbeatreceive}
+      \State \textbf{pre:} $\ts > \replicavectorclock[i]$
+      \State $\replicavectorclock[i] \gets \ts$
+    \EndWhenRcv
+
+    \SpaceHandler
+
+    \vspace{-1pt}
+
+    \Function{\PROPAGATEREMOTE}{$i, j$}\label{line:forward}
+          \State {\bf var} $\atxs \gets \{\langle \_, \_, \commitvector\rangle
+            \in \committedset[j] \mid $\label{line:txstoforward}
+          \Statex \hspace{3cm} $\commitvector[j]>\rvc[i][j]\}$
+          \If{$\atxs \neq \emptyset$}
+                  {\bf send}
+                $\REPLICATE(j, \atxs)$
+                \textbf{to} $\partition^m_i$
+          \Else {}
+            {\bf send}
+              $\BHEARTBEAT(j, \replicavectorclock[j])$
+              \textbf{to} $\partition^m_i$\label{line:heartbeatforward}
+          \EndIf
+    \EndFunction
+
+    
+    \SpaceHandler
+    \vspace{-1pt}
+
+    \Function{\CASTVC}{$ $} \Comment{Run periodically} \label{alg:line:bcast}
+    \State {\bf send} $\UPDCSS(m, \replicavectorclock)$ 
+    \textbf{to} $\partition^\areplica_d,\, \areplica \in \Partitions$ \label{alg:line:send-knownvc}
+    \State {\bf send}
+    $\UPDUSS(d, \stablesnapshot)$ \textbf{to} $\partition^m_i,\, i \in \DC$\label{alg:line:updategsssend}
+    \State {\bf send}
+    $\UPDRCV(d, \replicavectorclock)$ \textbf{to} $\partition^m_i,\, i \in \DC$\label{line:updateglobalmatrixsend}
+    \EndFunction
+
+    \SpaceHandler
+    \vspace{-1pt}
+
+    \WhenRcv[\UPDCSS($\areplica$, $\areplicavectorclock$)] \label{alg:line:updategss}
+      \State $\pmc[\areplica] \gets \areplicavectorclock$\label{alg:line:localknownmatrix}
+      \For{$i \in \DC$}
+        $\stablesnapshot[i] \gets \min \{\pmc[\asecondreplica][i] \mid \asecondreplica \in \Partitions\}$\label{line:computestable}
+      \EndFor
+      \State \colorbox{\BackColor}{{\color{\StrongColor}
+          $\stablesnapshot[\red]\gets \min\{\pmc[\asecondreplica][\red] \mid \asecondreplica \in \Partitions\}$}}\label{line:stablered}
+    \EndWhenRcv
+
+    \SpaceHandler
+    \vspace{-1pt}
+
+    \WhenRcv[\UPDUSS($i$, $\astablesnapshot$)]\label{line:updateuniformvc}
+      \State $\gmc[i] \gets \astablesnapshot$\label{line:updatestablematrix}
+      \State $G\gets$ all groups with $f+1$ replicas that include $\partition^m_d$\label{line:enumerate}
+      \For{$j \in \DC$}
+        \State \textbf{var} $\ts \gets \max \{ \min \{ \gmc[\athirddc][j] \mid \athirddc \in g \} \mid g \in G\}$
+        \State $\uniformsnapshot[j] \gets \max \{ \uniformsnapshot[j]$, $\ts\}$
+      \EndFor
+    \EndWhenRcv
+
+    \SpaceHandler
+    \vspace{-1pt}
+
+    \WhenRcv[\UPDRCV($\areplica$, $\areplicavectorclock$)]\label{line:updateglobalmatrix}
+      \State $\rvc[\areplica] \gets \areplicavectorclock$
+    \EndWhenRcv
+  \end{algorithmic}
+  \caption{Transaction replication at $\partition^m_d$.}
+  \label{alg:replication}
+  \label{alg:clock}
+\end{algorithm}
+
+
+
+
+
+
+
+
+
+When a replica $\partition^m_d$ receives a $\REPLICATE$ message with a set of
+transactions $\atxs$ originating at a sibling replica $\partition^m_i$
+(\algline{alg:replication}{line:receivereplicate}), it iterates over $\atxs$ in
+$\commitvector[i]$ order. For each new transaction in $\atxs$ with commit vector
+$\commitvector$, the replica adds the transaction's operations to its log and
+sets $\replicavectorclock[i]=\commitvector[i]$. Since communication channels are
+FIFO, $\partition^m_d$ processes all transactions from $\partition^m_i$ in their
+local timestamp order. Hence, the above update to $\replicavectorclock[i]$
+preserves Property~\ref{prop:knownvc}: $\partition^m_d$ stores updates
+originating at $\partition^m_i$ by all transactions with
+$\commitvector[i]\leq \replicavectorclock[i]$.  Finally, the replica adds the
+transactions to $\committedset[i]$, which is used to implement transaction
+forwarding (\S\ref{sec:overview}).  Due to the forwarding, $\partition^m_d$ may
+receive the same transaction from different data centers. Thus, when processing
+transactions in the $\REPLICATE$ message, it checks for duplicates
+(\algline{alg:replication}{line:receivepreparedprecondition}).
+
+
+
+
+
+
+
+
+
+\subsection{Advancing the Uniform Snapshot}
+\label{sec:clockcomputation}
+
+Replicas run a background protocol that refreshes the information about uniform
+transactions.
+This proceeds in two stages. First, a replica keeps track of which transactions
+have been replicated at the replicas of other partitions in the same data
+center. To this end, replicas in the same data center periodically exchange
+$\UPDCSS$ messages with their $\replicavectorclock$ vectors, which they store in
+a matrix $\pmc$
+(\algtwolines{alg:clock}{alg:line:send-knownvc}{alg:line:updategss});
+in our implementation this is done via a dissemination tree. This
+matrix is then used to compute the vector $\stablesnapshot$, which represents
+the set of transactions that have been fully replicated at the local data center
+as per Property~\ref{prop:stablevc}. To ensure this, a replica computes an entry
+$\stablesnapshot[i]$ as the minimum of $\replicavectorclock[i]$ it received from
+the replicas of other partitions in the same data center
+(\algline{alg:clock}{line:computestable}).
+
+
+
+In the second stage of the background protocol, sibling replicas periodically
+exchange $\UPDUSS$ messages with their $\stablesnapshot$ vectors, which they
+store in a matrix $\gmc$
+(\algtwolines{alg:clock}{alg:line:updategsssend}{line:updateuniformvc}). This
+matrix is then used by a replica
+to compute $\uniformsnapshot$, which characterizes the update transactions that
+are replicated at $f+1$ data centers as per Property~\ref{prop:uniformity}. To
+this end, a replica first enumerates all groups $G$ of $f+1$ data centers that
+include its local data center (\algline{alg:clock}{line:enumerate}). For each
+data center $j$ the replica performs the following computation. First, for each
+group $g \in G$, it computes the minimum $j$-th entry in the stable vectors of
+all data centers $\athirddc \in g$:
+$\min\{\gmc[\athirddc][j]\mid \athirddc\in g\}$. By Property~\ref{prop:stablevc}
+all update transactions originating at $j$ with local timestamp $\le$ the
+minimum have been replicated at all data centers in $g$. The replica then sets
+$\uniformsnapshot[j]$ to the maximum of the resulting values computed for all
+groups $g \in G$, to cover transactions that are replicated at any such group.
+According to Property~\ref{prop:uniformsnapshot}, the transactions with commit
+vectors $\leq \uniformsnapshot$ are uniform, and now become visible to
+transactions coordinated by $\partition^m_d$ (\S\ref{sec:bluetxs}).
+
+
+Replicas also update $\uniformsnapshot$ in lines
+\ref{alg:txncoord1}:\ref{line:starttx:start}-\ref{line:starttx:end},
+\ref{alg:txnpartition}:\ref{line:updateuniformop:start}-\ref{line:updateuniformop:end}
+and
+\ref{alg:txnpartition}:\ref{line:updateuniformprepare:start}-\ref{line:updateuniformprepare:end}
+by incorporating $\vecsnapshottime[i]$ for remote data centers $i$. This is
+safe because a transaction executes on a snapshot that only includes uniform
+remote transactions.
+
+Finally, if a replica does not receive new transactions for a long time, it
+sends the value of its $\replicavectorclock[d]$ as a heartbeat
+(\algtwolines{alg:replication}{line:updateknownprepared}{line:heartbeatreceive}).
+This allows advancing $\stablesnapshot$ and $\uniformsnapshot$ even under skewed
+load distributions.
+
+
+
+
+\subsection{Transaction Forwarding}
+\label{sec:forward}
+
+
+As we explained in \S\ref{sec:overview}, to guarantee that a transaction
+originating at a correct data center eventually becomes exposed at all correct
+data centers despite failures (\liveness), replicas may have to forward remote
+update transactions. To determine which transactions to forward, each replica
+keeps track of the update transactions that have been replicated at sibling
+replicas in other data centers. To this end, sibling replicas periodically
+exchange $\UPDRCV$ messages with their $\replicavectorclock$ vectors, which they
+store in a matrix $\rvc$
+(\algtwolines{alg:clock}{line:updateglobalmatrixsend}{line:updateglobalmatrix}).
+Thus, $\partition^m_i$ has received all update transactions from
+$\partition^m_j$ with $\commitvector[j]\leq \rvc[i][j]$.
+
+A replica $\partition^m_d$ only forwards transactions when it suspects that a
+data center $j$ may have failed before replicating all the update transactions
+originating at it to a data center $i$ (this information is provided by a
+separate module).
+In this case, $\partition^m_d$ executes $\PROPAGATEREMOTE(i, j)$
+(\algline{alg:replication}{line:forward}). The function forwards the set of 
+transactions $\atxs$ received from $\partition^m_j$ that have not been
+replicated at $\partition^m_i$ according to
+$\rvc[i][j]$. For example, in
+Figure~\ref{fig:execution-causal}, \System will eventually invoke
+$\PROPAGATEREMOTE(d_1, d_3)$ at replicas in $d_2$ to forward {\color{\CausalTxColor}$t_1$}. The replica
+$\partition^m_d$ sends the transactions in $\atxs$ to $\partition^m_i$ in a $\REPLICATE$
+message. If there are no update transactions to forward, $\partition^m_d$ sends
+a heartbeat to $\partition^m_i$ with $\replicavectorclock[j]$.
+
+
+
+
+
+\System periodically deletes from $\committedset$ transactions that have been
+replicated at every data center (omitted from the pseudocode for brevity).
+
+
+\subsection{On-Demand Durability and Client Migration}
+\label{sec:clientmigration}
+
+
+A client may wish to ensure that the transactions it has observed so far are
+durable. To this end, the client can call $\MAKEUNIFORM(\avc)$ at any replica in
+its local data center $d$, where $\avc$ is the client's causal past $\past$
+(\algline{alg:txncoord1}{line:barrier}). The replica returns to the client only
+when all the transactions from $\past$ that originate at $d$ are uniform, and
+thus durable. Then the same holds for all transactions from $\past$, because the
+protocol only exposes remote transactions to clients when they are already
+uniform (\S\ref{sec:bluetxs}).
+
+
+
+
+
+
+A client wishing to migrate from its local data center $d$ to another data
+center $i$ first calls $\MAKEUNIFORM(\avc)$ at any replica in $d$ with
+$\avc = \past$, to ensure that the transactions the client has observed or
+issued at $d$ will eventually become visible at $i$. The client then calls
+$\ATTACH(\avc)$ at any replica in $i$ %
+(\algline{alg:txncoord1}{line:attach}). The replica returns when its
+$\uniformsnapshot$ includes all remote transactions from $\avc$
+(\algline{alg:txncoord1}{line:waitattach}). The client can then be sure that its
+transactions at $i$ will operate on snapshots including all the transactions it
+has observed before.
+
+
+
+
+
+
+
+

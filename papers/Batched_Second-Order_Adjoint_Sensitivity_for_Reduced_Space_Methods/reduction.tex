@@ -1,0 +1,445 @@
+\section{Parallel reduction algorithm}
+It remains now to compute the reduced Hessian.
+We present in \refsec{sec:reduction:soc}
+the adjoint-adjoint method and describe in~\refsec{sec:reduction:ad}
+how to evaluate efficiently the second-order sensitivities with Autodiff. By combining together
+the Autodiff and the adjoint-adjoint method, we devise in \refsec{sec:reduction:algorithm}
+a parallel algorithm to compute the reduced Hessian.
+
+\subsection{Second-Order Adjoint over Adjoint Method.}
+\label{sec:reduction:soc}
+Among the different Hessian reduction schemes presented in~\cite{papadimitriou2008direct} (direct-direct, adjoint-direct,
+direct-adjoint, adjoint-adjoint), the \emph{adjoint-adjoint} method
+has two key advantages to evaluate the reduced Hessian on the GPU.
+First, it avoids forming explicitly the dense tensor $\nabla^2_{\bm{p}\bm{p}} x$
+and the dense matrix $\nabla_{\bm{p}} x$, leading to important memory savings on the larger cases.
+Second, it enables us to compute the reduced Hessian slice by slice, in an embarrassingly parallel
+fashion.
+
+Conceptually, the adjoint-adjoint method extends the adjoint method (see \refsec{sec:background:adjoint})
+to compute the second-order derivatives $\nabla^2 f \in \mathbb{R}^{n_p\times n_p}$ of the
+objective function $f((x(\bm{p}), \bm{p})$.
+The adjoint-adjoint method computes the matrix $\nabla^2 f$ slice by slice,
+by using $n_p$ Hessian-vector products $(\nabla^2 f) \bm{w}$ (with $\bm{w} \in \mathbb{R}^{n_p}$).
+
+By definition of the first-order adjoint $\bm{\lambda}$,
+the derivative of the Lagrangian function~\refeqn{eq:lagrangian} with respect to $\bm{x}$ is null:
+\begin{equation}
+  \label{eq:first_order}
+    \grad{f}{\bm{x}}(\bm{x}, \bm{p}) + \bm{\lambda}^\top \grad{g}{\bm{x}}(\bm{x}, \bm{p})  = 0
+    \; .
+\end{equation}
+Let $\hat{g}(\bm{x}, \bm{p}, \bm{\lambda}) :=  \grad{f}{\bm{x}}(\bm{x}, \bm{p}) + \bm{\lambda}^\top \grad{g}{\bm{x}}(\bm{x}, \bm{p})$.
+We define a new Lagrangian associated with \refeqn{eq:first_order}
+by introducing two second-order adjoints $\bm{z}, \bm{\psi} \in \mathbb{R}^{n_x}$
+and a vector $\bm{w} \in \mathbb{R}^{n_p}$:
+\begin{multline}
+  \hat{\ell}(\bm{x}, \bm{p}, \bm{w}, \bm{\lambda}; \bm{z}, \bm{\psi}) :=
+  (\nabla_{\bm{p}} \ell)^\top \bm{w} + \\ \bm{z}^\top g(\bm{x}, \bm{p})
+  + \bm{\psi}^\top \hat{g}(\bm{x}, \bm{p}, \bm{\lambda})
+  \; .
+\end{multline}
+By computing the derivative of $\hat{\ell}$ and eliminating
+the terms corresponding to $\nabla_{\bm{x}} \bm{\lambda}$
+and $\nabla_{\bm{p}} \bm{\lambda}$, we get the following
+expressions for the second-order adjoints $(\bm{z}, \bm{\psi})$:
+\begin{equation}
+  \label{eq:socadjoint}
+  \left\{
+  \begin{aligned}
+    & (\grad{g}{\bm{x}}) \bm{z} = - \big(\nabla_{\bm{p}} g\big)^\top \bm{w} \\
+    & (\grad{g}{\bm{x}})^\top \bm{\psi} =
+    - (\nabla^2_{\bm{x}\bm{p}} \ell) \bm{w} \;
+    - (\nabla^2_{\bm{x}\bm{x}} \ell) \bm{z} \; .
+  \end{aligned}
+  \right.
+\end{equation}
+Then, the reduced-Hessian-vector product reduces to
+\begin{equation}
+  \label{eq:hessvecprod}
+  \big(\nabla^2 f\big) \bm{w} = (\hhess{\ell}{\bm{p}\bm{p}}) \, \bm{w}
+  +  (\hhess{\ell}{\bm{p}\bm{x}})^\top \bm{z}
+  +  (\grad{g}{\bm{p}})^\top\bm{\psi}
+  \;.
+\end{equation}
+As $\nabla^2 \ell = \nabla^2 f + \bm{\lambda}^\top \nabla^2 g$,
+we observe that both Equations~\refeqn{eq:socadjoint}
+and \refeqn{eq:hessvecprod} require evaluating the product
+of the three tensors $\nabla^2_{\bm{x}\bm{x}} g,$ $\nabla^2_{\bm{x}\bm{p}} g
+,$ and $\nabla^2_{\bm{p}\bm{p}} g$, on the left with the adjoint
+$\bm{\lambda}$ and on the right with the vector $\bm{w}$.
+Evaluating the Hessian-vector products
+$(\nabla^2_{\bm{x}\bm{x}} f) \bm{w}$, $(\nabla^2_{\bm{x}\bm{p}}f)\bm{w}$ and $(\nabla^2_{\bm{p}\bm{p}} f) \bm{w}$
+is generally easier, as $f$ is a real-valued function.
+
+\subsection{Second-order derivatives.}
+\label{sec:reduction:ad}
+To avoid forming the third-order tensors $\nabla^2 g$  in the reduction procedure
+presented previously in \refsec{sec:reduction:soc}, we exploit
+the particular structure of Equations~\refeqn{eq:socadjoint}
+and \refeqn{eq:hessvecprod} to implement with automatic differentiation
+an adjoint-tangent accumulation of the derivative information.
+For any adjoint $\bm{\lambda} \in \mathbb{R}^{n_x}$ and vector $\bm{w} \in \mathbb{R}^{n_p}$, we build a tangent
+$\bm{v} = (\bm{z}, \bm{w}) \in \mathbb{R}^{n_x + n_p}$, with $\bm{z} \in \mathbb{R}^{n_x}$
+solution of the first system in Equation~\refeqn{eq:socadjoint}.
+Then, the adjoint-forward accumulation evaluates a vector $\bm{y} \in \mathbb{R}^{n_x + n_p}$
+as
+\begin{equation}
+  \label{eq:ADreduction}
+  \bm{y} =  \begin{pmatrix}
+   \bm{\lambda}^\top\nabla^2_{\bm{x}\bm{x}} g & \bm{\lambda}^\top\nabla^2_{\bm{x}\bm{p}} g \\
+   \bm{\lambda}^\top\nabla^2_{\bm{p}{x}} g & \bm{\lambda}^\top\nabla^2_{\bm{p}\bm{p}} g
+  \end{pmatrix}
+  \bm{v} \; ,
+\end{equation}
+(the tensor projection notation will be introduced more thoroughly
+in \refsec{sec:so:ad}).
+We detail next how to compute the vector $\bm{y}$ by
+using forward-over-reverse AutoDiff.
+
+\subsubsection{AutoDiff.}
+\label{sec:autodiff}
+AutoDiff transforms a code that implements a multivariate vector function $\bm{y} = g(\bm{x}),\, \REAL^n \mapsto \REAL^m$ with inputs $\bm{x}$ and outputs $\bm{y}$ into its differentiated implementation. We distinguish  two modes of AutoDiff. Applying AutoDiff in {\it forward mode} generates the code for evaluating the Jacobian vector product $\bm{y}^{(1)} = \nabla g(\bm{x}) \cdot \bm{x}^{(1)}$, with the superscript $^{(1)}$ denoting first-order
+tangents---also known as directional derivatives.  The {\it adjoint or reverse mode}, or backpropagation in machine learning, generates the code of the transposed Jacobian vector product $\bm{x}_{(1)} = \bm{y}_{(1)}\cdot \nabla g(\bm{x})^T$, with the subscript $_{(1)}$ denoting first-order adjoints. The adjoint mode is useful for computing gradients of scalar functions ($m=1$) (such as Lagrangian) at a cost of $\bigo{cost(g)}$.
+
+\subsubsection{Sparse Jacobian Accumulation.}
+To extract the full Jacobian from a tangent or adjoint AutoDiff
+implementation, we have to let $\bm{x}^{(1)}$ and $\bm{y}_{(1)}$ go over the
+Cartesian basis of $\REAL^n$ and $\REAL^m$, respectively. This incurs the
+difference in cost for the Jacobian accumulation: $\bigo{n} \cdot cost(g)$
+for the tangent Jacobian model and $\bigo{m} \cdot cost(g)$ for the adjoint
+Jacobian model. In our case we need the full square ($m=n$) Jacobian $\nabla_{\bm{x}} g$
+of the nonlinear function~\refeqn{eq:nonlinearsystem} to run the Newton--Raphson
+algorithm. The tangent model is preferred whenever $m \approx n$.
+Indeed, the adjoint model incurs a complete
+reversal of the control flow and thus requires storing intermediate variables,
+leading to high cost in memory.
+Furthermore, SIMD architectures are particularly well suited for propagating
+the $n$ independent tangent Jacobian vector products in parallel \cite{revels2018-ixedmode}.
+
+If $n$ becomes larger (>>1000), however, the memory requirement of all $n$
+tangents may exceed the GPU's memory. Since our Jacobian is sparse, we apply
+the technique of Jacobian coloring that compresses independent columns of
+the Jacobian and reduces the number of required {\it seeding} tangent vectors
+from $n$ to the number of colors~$c$ (see Figure~\ref{fig:coloring}).
+
+
+\begin{figure}
+  \centering
+\includegraphics[width=0.7\linewidth]{figures/jacobian_compression.pdf}
+\caption{Jacobian compression via column coloring. On the left, the original Jacobian.
+On the right, the compressed Jacobian.}
+\label{fig:coloring}
+\end{figure}
+
+
+%\begin{figure}
+%  \centering
+%  \fbox{
+%    \begin{tikzpicture}[scale=2]
+%    \foreach \i in {0,...,\nrows}{
+%      \foreach \j in {0,...,\ncols}{
+%      \pgfplotstablegetelem{\i}{\j}\of\matrixJ
+%      \ifnum\pgfplotsretval=0
+%        \relax
+%      \fi
+%      \ifnum\pgfplotsretval=1
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=red] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=2
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=green] at (\j pt,-\i pt) {};
+%      \fi8
+%      \ifnum\pgfplotsretval=3
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=blue] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=4
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=cyan] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=5
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=magenta] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=6
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=yellow] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=7
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=black] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=8
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=gray] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=9
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=brown] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=10
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=lime] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=11
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=olive] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=12
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=orange] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=13
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=pink] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=14
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=purple] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=15
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=teal] at (\j pt,-\i pt) {};
+%      \fi
+%      };
+%    };
+%    \end{tikzpicture}
+%  }
+%  \hspace{0.5cm}
+%  %
+%  \fbox{
+%    \begin{tikzpicture}[scale=2]
+%    \foreach \i in {0,...,\nrows}{
+%      \foreach \j in {0,...,\ncolors}{
+%      \pgfplotstablegetelem{\i}{\j}\of\matrixJc
+%      \ifnum\pgfplotsretval=0
+%        \relax
+%      \fi
+%      \ifnum\pgfplotsretval=1
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=red] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=2
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=green] at (\j pt,-\i pt) {};
+%      \fi8
+%      \ifnum\pgfplotsretval=3
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=blue] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=4
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=cyan] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=5
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=magenta] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=6
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=yellow] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=7
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=black] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=8
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=gray] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=9
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=brown] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=10
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=lime] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=11
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=olive] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=12
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=orange] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=13
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=pink] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=14
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=purple] at (\j pt,-\i pt) {};
+%      \fi
+%      \ifnum\pgfplotsretval=15
+%        \node[rectangle, minimum size=1pt, inner sep=0pt, fill=teal] at (\j pt,-\i pt) {};
+%      \fi
+%      };
+%    };
+%    \end{tikzpicture}
+%  }
+%  \caption{Jacobian compression via column coloring.}
+%  \label{fig:coloring}
+%\end{figure}
+
+\subsubsection{Second-Order Derivatives.}
+\label{sec:so:ad}
+For higher-order derivatives that involve derivative tensors (e.g.,
+Hessian $\nabla^2 g \in \REAL^{m \times n \times n}$) we introduce the projection notation $<\cdots>$ introduced in
+\cite{naumann2012art} and illustrated in \reffig{fig:hessianprojection} with
+$<\bm{x}_{(1)}, \nabla^2 g(\bm{x}), \bm{x}^{(1)}>$, whereby adjoints are
+projected from the left to the Jacobian and tangents from the right.
+To compute second-order derivatives and the Hessian projections in
+Equation~\refeqn{eq:ADreduction}, we use the adjoint model implementation given by
+\begin{equation}
+  \bm{y}=g(\bm{x}),\
+  \bm{x}_{(1)} = < \bm{y}^{(1)}, \nabla g(\bm{x})> = \bm{y}_{(1)} \cdot \nabla
+  g(\bm{x})^T  \,,
+  \label{eq:adjoint}
+\end{equation}
+and we apply over it the tangent model given by
+\begin{equation}
+\begin{array}{llll}
+  \bm{y}=g(\bm{x}), &
+  \bm{y}^{(1)} = < \nabla g(\bm{x}), \bm{x}^{(1)}> = \nabla
+  g(\bm{x}) \cdot \bm{x}^{(1)} \,,
+  \label{eq:tlm}
+\end{array}
+\end{equation}
+yielding
+\begin{equation}
+\begin{array}{llll}
+  \bm{y}&=g(\bm{x}), \\
+  \bm{y}^{(2)}&=< \nabla g(\bm{x}), \bm{x}^{(2)}>, \\
+  \text{and} \\
+  \bm{x}_{(1)}& = < \bm{y}_{(1)}, \nabla g(\bm{x})>, \\
+  \bm{x}^{(2)}_{(1)} &= <\bm{y}_{(1)}, \nabla^2 g(\bm{x}), \bm{x}^{(2)}> +
+  <\bm{y}^{(2)}_{(1)}, \nabla g(\bm{x})>\,.
+\end{array}
+\label{eq:so_model}
+\end{equation}
+Notice that every variable has now a value component and three
+derivative components denoted by $_{(1)}$, $^{(2)}$, and $^{(2)}_{(1)}$
+amounting to first-order adjoint, second-order tangent, and second-order
+tangent over adjoint, respectively. In  \refsec{sec:reduction:algorithm}, we  compute
+the term $x_{(1)}^{(2)}$ on the GPU
+by setting $\bm{y}_{(1)}^{(2)} = 0$ and extracting the result from $\bm{x}_{(1)}^{(2)} \in \REAL^n$.
+
+\begin{figure}
+  \centering
+\includegraphics[width=.8\linewidth]{figures/projection.pdf}
+\caption{Hessian derivative tensor projection $<\bm{y}_{(1)}, \nabla^2 g(\bm{x}), \bm{x}^{(2)}>$. Notice that the Hessian slices along the $n$ directions are symmetric.}
+\label{fig:hessianprojection}
+\end{figure}
+
+
+\subsection{Reduction Algorithm.}
+\label{sec:reduction:algorithm}
+We are now able to write down the reduction algorithm to compute the
+Hessian-vector products $\nabla^2 F \cdot \bm{w}$. We first present a sequential
+version of the algorithm, and then detail how to design a parallel variant
+of the reduction algorithm.
+
+\begin{algorithm2e}
+  \KwData{Vector $\bm{w} \in \mathbb{R}^{n_p}$}
+  {\tt SpMul}: $\bm{b} = \big(\nabla_{\bm{u}}g  \big) \bm{w}$ \;
+  {\tt SparseSolve}: $(\grad{g}{\bm{x}}) \bm{z} = - \bm{b}$ \;
+  {\tt TensorProjection}: Compute $(\bm{y}_{\bm{x}}, \bm{y}_{\bm{p}})$ with~\refeqn{eq:ADreduction} and $\bm{v} = (\bm{z}, \bm{w})$\;
+  {\tt SparseSolve}: $(\grad{g}{\bm{x}})^\top \bm{\psi} = - \bm{y}_{\bm{x}}$ \;
+  {\tt MulAdd}: $(\nabla^2 F)\bm{w} = \bm{y}_{\bm{p}} + (\grad{g}{\bm{p}})^\top\bm{\psi}$ \;
+ \caption{Reduction algorithm}
+ \label{algo:reduction}
+\end{algorithm2e}
+
+\subsubsection{Sequential algorithm.}
+We observe that by default the Hessian reduction algorithm encompasses four sequential steps:
+\begin{enumerate}
+  \item {\tt SparseSolve}: Get the second-order adjoint $\bm{z}$
+    by solving the first linear system in~\refeqn{eq:socadjoint}.
+  \item {\tt TensorProjection}: Define the tangent $\bm{v} := (\bm{z}, \bm{w})$, and evaluate the
+    second-order derivatives using~\refeqn{eq:ADreduction}. {\tt TensorProjection}
+    returns a vector $\bm{y} = (\bm{y}_{\bm{x}}, \bm{y}_{\bm{p}})$,
+    with
+    \begin{equation}
+      \label{eq:reduction}
+      \left\{
+        \begin{aligned}
+          \bm{y}_{\bm{x}} =&
+         <\bm{\lambda}^\top,\nabla_{\bm{x}\bm{x}}^2g,\bm{z}>+
+         <\bm{\lambda}^\top,\nabla_{\bm{x}\bm{p}}^2g,\bm{w}>+ \\
+         &<\nabla_{\bm{x}\bm{x}}^2f,\bm{z}>+
+         <\nabla_{\bm{x}\bm{p}}^2f,\bm{w}>\; ,\\
+          \bm{y}_{\bm{p}} =&
+         <\bm{\lambda}^\top,\nabla_{\bm{p}\bm{x}}^2g,\bm{z}>+
+         <\bm{\lambda}^\top,\nabla_{\bm{p}\bm{p}}^2g,\bm{w}>+\\
+         &<\nabla_{\bm{p}\bm{x}}^2f,\bm{z}>+
+         <\nabla_{\bm{p}\bm{p}}^2f,\bm{w}>\; ,
+        \end{aligned}
+      \right.
+    \end{equation}
+    with ``$<>$" denoting the derivative tensor projection introduced in \refsec{sec:so:ad}
+    (and illustrated in \reffig{fig:hessianprojection}).
+  \item {\tt SparseSolve}: Get the second-order adjoint $\bm{\psi}$ by solving the second
+    linear system in Equation~\refeqn{eq:socadjoint}: $
+    (\grad{g}{\bm{x}})^\top \bm{\psi} = - \bm{y}_{\bm{x}}$.
+  \item {\tt SpMulAdd}: Compute the reduced Hessian-vector product with Equation~\refeqn{eq:hessvecprod}.
+\end{enumerate}
+The first {\tt SparseSolve} differs from the second {\tt SparseSolve} since the left-hand side is different: the first
+system considers the Jacobian matrix $(\nabla_{\bm{x}}g)$, whereas the second system considers
+its transpose $(\nabla_{\bm{x}}g)^\top$.
+
+To compute the entire reduced
+Hessian $\nabla^2 F$, we have to let $\bm{w}$ go over all the Cartesian basis vectors of $\REAL^{n_p}$.
+The parallelization over these basis vectors is explained in the next paragraph.
+
+\subsubsection{Parallel Algorithm.}
+Instead of computing the Hessian vector products $(\nabla^2 F)\bm{w}_1,\cdots, (\nabla^2 F)\bm{w}_n$
+one by one, the parallel algorithm takes as input a \emph{batch} of $N$ vectors $W = \big(\bm{w}_1, \cdots,
+\bm{w}_N\big)$ and evaluates the Hessian-vector products
+$\big((\nabla^2 F)\bm{w}_1, \cdots, (\nabla^2 F)\bm{w}_N\big)$ in a parallel fashion.
+By replacing respectively the {\tt SparseSolve} and {\tt TensorProjection} blocks by
+{\tt BatchSparseSolve} and {\tt BatchTensorProjection},  we get the
+parallel reduction algorithm presented in Algorithm~\ref{algo:batchreduction}
+(and illustrated in Figure~\ref{fig:reduction}).
+On the contrary to Algorithm~\ref{algo:reduction}, the block
+{\tt BatchSparseSolve} solves a sparse linear system with multiple right-hand-sides
+$B = (\nabla_{\bm{p}}g) W$, and the block {\tt BatchTensorProjection} runs the Autodiff
+algorithm introduced in \refsec{sec:reduction:ad} in batch.
+As explained in the next section,
+both operations are fully amenable to the GPU.
+\begin{algorithm2e}
+  \KwData{$N$ vectors $\bm{w}_1, \cdots, \bm{w}_N \in \mathbb{R}^{n_p}$}
+  Build $W = (\bm{w}_1, \cdots, \bm{w}_N)$ $, W \in \mathbb{R}^{n_p \times N}$  \;
+  {\tt SpMul}: $B = \big(\nabla_{\bm{p}}g  \big) W$ $, B \in \mathbb{R}^{n_x \times N}$, $\nabla_{\bm{p}}g \in \mathbb{R}^{n_x \times n_p}$\;
+  {\tt BatchSparseSolve}: $(\grad{g}{\bm{x}}) Z = - B$ \;
+  {\tt BatchTensorProjection}: Compute $(Y_{\bm{x}}, Y_{\bm{p}})$ with $V = (Z, W)$ \;
+  {\tt BatchSparseSolve}: $(\grad{g}{\bm{x}})^\top \Psi = - Y_{\bm{x}}$ \;
+  {\tt SpMulAdd}: $(\nabla^2 F)\bm{W} = Y_{\bm{p}} + (\grad{g}{\bm{p}})^\top\Psi$ \;
+ \caption{Parallel reduction algorithm}
+ \label{algo:batchreduction}
+\end{algorithm2e}
+
+\begin{figure*}
+    \centering
+    \begin{tikzpicture}[font=\small\sffamily\bfseries,thick,auto, yscale=0.3]
+      \node [input] (state) at (-2, 5) {$W$};
+      \node [seq] (spmul) at (0, 5) {$B$};
+      \node [seq] (spmul2) at (12, 5) {$(\nabla^2 f)W$};
+
+        \path [draw] (state) -- (spmul);
+        \foreach \x in {1,...,4}
+        {
+          \node [parallel]  (\x1) at (2.5,2*\x) {$z_{\x}$};
+          \path [line] (spmul) -- (\x1);
+
+          \node [n] (\x2) at (4.25, 2*\x) {};
+          \path [line] (\x1) -- (\x2);
+
+          \node [parallel]  (\x3) at (6,2*\x) {$y_{\x}$};
+          \path [line] (\x2) -- (\x3);
+
+          \node [n] (\x4) at (7.5, 2*\x) {};
+          \path [line] (\x3) -- (\x4);
+
+          \node [parallel] (\x5) at (9, 2*\x) {$\psi_{\x}$};
+          \path [line] (\x4) -- (\x5);
+
+          \path [line] (\x5) -- (spmul2);
+        }
+
+        \path [draw] (12) -- (42);
+        \path [draw] (14) -- (44);
+
+        \node (sync1) at (4.25, 0.7) {{\footnotesize sync}};
+        \node (sync2) at (7.5, 0.7) {{\footnotesize sync}};
+        % Legend
+        \node (l11) at (0, -1) {{\tt SpMul}};
+        \node (l12) at (0, 10) {$B = (\nabla_p g)W$};
+
+        \node (l21) at (2.5, -1) {{\tt BatchSparseSolve}};
+        \node (l22) at (2.5, 10) {$z_i = -(\nabla_x g)^{-1} b_i$};
+
+        \node (l31) at (6, -1) {{\tt BatchAutoDiff}};
+
+        \node (l41) at (9, -1) {{\tt BatchSparseSolve}};
+        \node (l42) at (9, 10) {$\psi_i = -(\nabla_x g)^{-\top} y_i$};
+
+        \node (l51) at (12, -1) {{\tt SpMullAdd}};
+    \end{tikzpicture}
+
+    \caption{Parallel computation of the reduced Hessian vector products on the GPU}
+    \label{fig:reduction}
+\end{figure*}

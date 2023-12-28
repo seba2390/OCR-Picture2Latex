@@ -1,0 +1,250 @@
+\section{Evaluation}
+\label{sec:eval}
+
+
+
+
+
+We have implemented \System and several other protocols (listed in the
+following) in the same codebase, consisting of
+10.3K SLOC of Erlang. We evaluate the protocols on Amazon EC2 using
+\texttt{m4.2xlarge} VMs from 5 different
+regions. 
+Each VM has 8 virtual cores and 32GB of RAM. 
+The RTT between regions ranges from 26ms to 202ms. 
+Unless otherwise stated, our experiments deploy 3 data centers, thus tolerating
+a single data center failure: Virginia (US-East), California (US-West) and
+Frankfurt (EU-FRA).
+All Paxos leaders are located in Virginia.  By default we use 4 replica machines
+per data center. Each machine stores replicas of 8
+partitions, matching the number of cores. 
+Clients are hosted on separate machines in each data center.
+We run each experiment for at least 5 minutes, with the first and the last
+minute ignored. Replicas propagate local update transactions
+(\algline{alg:replication}{line:replicatelocal}) and broadcast vectors
+(\algline{alg:clock}{alg:line:bcast}) every 5ms.
+
+
+
+\subsection{Does \System combine causal and strong consistency
+  effectively?}
+\label{sec:performance}
+
+We start by analyzing the performance of \System using RUBiS -- a popular
+benchmark that emulates an online auction website such as eBay~\cite{por,
+  red-blue}. It defines 11 read-only transactions and 5 update transactions,
+e.g., selling items, bidding on items, and consulting outstanding auctions. As
+in previous work~\cite{por}, to make the benchmark more challenging, we add an
+extra update transaction \texttt{closeAuction} to declare the winner of an
+auction. We also borrow from~\cite{por} a conflict relation between RUBiS
+transactions that preserves key integrity invariants in the PoR
+consistency model. This marks four transactions as strong
+(\texttt{registerUser}, \texttt{storeBuyNow}, \texttt{storeBid} and
+\texttt{closeAuction}) and declares three conflicts between them. For example,
+\texttt{storeBid}, which places a bid on a item, conflicts with
+\texttt{closeAuction} if both act on the same item: this is needed to preserve
+the invariant that the winner of an auction is the highest bidder. Our RUBiS
+database is configured according to the benchmark specification: it is populated
+with 33,000 items for sale and 1 million users; client think times are
+500ms.
+We run the bidding mix workload of RUBiS with 15\% of update
+transactions, which yields 10\% of strong transactions.
+
+We compare \System with \Strong, \RedBlue and \Causal.
+\Strong implements serializability~\cite{wv} as a special case of \System where
+all transactions are strong and all pairs of operations conflict.
+\RedBlue implements red-blue consistency~\cite{red-blue}, which like PoR,
+combines causal and strong consistency. However, it declares conflicts between
+all strong transactions. \RedBlue certifies strong transactions at a centralized
+replicated service, with a replica at each data center. \Causal implements causal
+consistency as a special case of \System where
+all transactions are causal. It cannot
+preserve the integrity invariants of RUBiS, but gives an upper bound on the
+expected performance.
+
+
+
+\begin{figure}[t]
+\includegraphics[width=\columnwidth]{figures/rubis}
+\caption{RUBiS benchmark: throughput vs. average latency.}
+\label{fig:rubis}
+\end{figure}
+
+\paragraph{Throughput and average latency.}
+Figure~\ref{fig:rubis} evaluates
+average transaction latency and throughput. As the figure shows, \System
+exhibits a high throughput: 72\% and 183\% higher than \RedBlue and \Strong
+respectively at their saturation point. This is expected, as \System implements 
+the consistency model that enables the most concurrency. \Strong
+classifies all transactions as strong. This impacts performance 
+because executing a strong transaction is significantly more expensive
+than executing a causal one. \RedBlue uses a centralized certification service
+that saturates before the \System's distributed service, creating
+a bottleneck. \System exhibits an average latency of 16.5ms, lower than 
+80.4ms of \Strong. The latency of \RedBlue is comparable to that of
+\System. This is because both systems mark the same set of
+transactions as strong. Still, \RedBlue declares conflicts between all
+strong transactions and thus aborts more transactions than
+\System: 0.12\% vs 0.027\%. The clients whose transactions abort have to retry
+them, thus increasing latency. Since the abort rate remains low in both cases, 
+the difference in latency is negligible in our experiment.
+We expect a more significant difference in workloads with higher contention.
+Finally, in comparison
+to \Causal, \System penalizes throughput by 45\%. This is the unavoidable price
+to pay to preserve application-specific invariants.
+
+
+
+\paragraph{Latency of each transaction type.}
+In \System, the latency of strong transactions is dominated by
+the RTT between Virginia (the leader's
+region) and California (Virginia's closest data center) -- 61ms. Strong transactions
+exhibit a latency of 73.9ms on average. The latency varies depending on
+the client's location: from 65.4ms on average at the leader's site to 93.2ms at the
+site furthest from the leader (Frankfurt). Since causal transactions do not
+require coordination between data centers, they
+exhibit a very low latency -- 1.2ms on average, which is comparable to
+that of \Causal. This
+demonstrates that \System is able to mix causal and strong
+consistency effectively, as the latency of causal transactions remains
+low regardless of concurrently executing strong transactions.
+
+
+
+
+\subsection{How does \System scale with the number of machines?}
+\label{sec:scalability}
+
+We evaluate the
+peak throughput of \System as we increase
+the number of machines per each data center from 2 to
+8, i.e., the number of partitions from 16 to 64. We
+use a microbenchmark with 100\% of update transactions, 
+where each transaction accesses three data items. We vary the ratio of
+strong transactions from 0\% to 100\%
+to understand their impact on scalability. 
+
+
+
+\begin{figure}[t]
+\includegraphics[width=\columnwidth]{figures/scalability}
+\caption{Scalability when varying the ratio of strong transactions
+  with uniform data access (top) and under contention (bottom).}
+\label{fig:scalability}
+\end{figure}
+
+
+\paragraph{Scalability under low contention.}
+For this set of experiments, the data items accessed by each
+transaction are picked uniformly at random. This yields a very low contention: e.g., with 16 partitions, the
+probability of two transactions accessing the same partition is
+0.031. As shown by the top plot of Figure~\ref{fig:scalability}, \System is able to scale almost linearly even when the
+workload includes strong transactions: a 9.76\% throughput drop compared
+to the optimal scalability.  This is because, with uniform accesses, the task of committing
+transactions is balanced among partitions. Thus, when the number of
+partitions increases, so does the system's capacity. The
+scalability is not perfect due to the cost of the background
+protocol that computes $\stablesnapshot$, which grows logarithmically with the
+number of partitions.
+The plot also shows that strong transactions are expensive: 25.72\% of
+throughput drop on average with 10\% of strong 
+transactions. The performance is dominated by the
+number of strong transactions that a partition can certify per
+second. 
+
+
+
+
+
+\paragraph{Impact of contention.}
+For this set of experiments, we set the ratio of strong transactions that access
+a designated partition to 20\% to create contention. 
+As shown by the bottom plot of Figure~\ref{fig:scalability}, \System is still able to
+scale fairly well under contention. But, as expected,
+contention has an impact on scalability: a 17.15\% throughput drop
+from the optimal scalability compared to the 9.76\% throughput drop in
+the experiments without contention.
+
+
+
+
+
+
+\subsection{What is the cost of uniformity?}
+\label{sec:cost-uniformity}
+We compare \CureFT to \Uniform. 
+\CureFT implements Cure~\cite{cure}, a causally consistent data store,
+and makes it fault tolerant by adding transaction forwarding (\S\ref{sec:overview}).
+\Uniform is a simplified version
+of \System that removes
+all the mechanisms related to strong transactions. \Uniform tracks uniformity and makes remote transactions visible only
+when these are uniform; \CureFT does not. We use a microbenchmark with only causal
+transactions and 15\% of update transactions. Each transaction
+accesses three data items. 
+
+\paragraph{Throughput penalty.}
+
+\begin{figure}[t]
+\includegraphics[width=\columnwidth]{figures/thpenalty}
+\caption{Throughput penalty of tracking uniformity.}
+\label{fig:thpenalty}
+\end{figure}
+
+Figure~\ref{fig:thpenalty} evaluates the cost of tracking
+uniformity. It shows the peak throughput when the number of data centers increases from 3 to
+5. We first add Ireland and then Brazil. As we do this, the throughput
+remains almost constant. This is because each
+data center stores replicas of all partitions and the
+computational power gained when adding a data center is 
+offset by the cost of replicating update transactions. As the
+figure shows, the cost of tracking 
+uniformity is small: a 7.97\% drop on average. The gap grows as we
+increase the number of data centers: a 10.61\% drop on average with 5
+data centers.
+This is because, to track uniform transactions, sibling replicas exchange
+messages: the more data centers, the more messages exchanged.
+The penalty can be 
+reduced by decreasing the frequency at which sibling replicas
+exchange their $\stablesnapshot$
+(\algline{alg:clock}{alg:line:updategsssend}), at the expense of an extra delay
+in the visibility of remote transactions. 
+
+
+
+\begin{figure}[t]
+\includegraphics[width=\columnwidth]{figures/updatevisibility}
+\caption{Left: California to Brazil (best case). Right: California to
+  Virginia (worst case).}
+\label{fig:visibility}
+\end{figure}
+
+\paragraph{Reading from a uniform snapshot.}
+
+Figure~\ref{fig:visibility} evaluates the delay on the visibility
+of remote transactions when reading from a uniform
+snapshot. We deploy four data centers: Virginia,
+California, Frankfurt and Brazil. We set $f=2$ to tolerate 2 data
+center failures (when $f=1$, \Uniform shows no delay). Under such a configuration, a data
+center makes a transaction visible when it knows that
+3 data centers store the transaction and its dependencies
+(\S\ref{sec:clockcomputation}). The figure shows
+the cumulative distribution of the delay before updates
+from California are visible in Brazil
+and Virginia. 
+
+The extra delay at Brazil is only of 5ms at the 90$^{\rm th}$
+percentile. This is the best case scenario for
+\Uniform because Brazil learns that Virginia
+stores a transaction originating at California only 2ms after 
+receiving it. The worst case scenario for \Uniform is when the origin and the
+destination data center are the closest ones. This is why the extra
+delay at Virginia is 92ms at the 90$^{\rm th}$
+percentile: Brazil learns that Frankfurt stores a transaction
+originating at California 88ms after receiving it. Note that when clients 
+communicate only via the data store, the delay is
+unnoticeable. Even if clients communicate out of band, as the maximum extra
+delay is less than 100ms, it is unlikely that a client will
+miss an update.
+
+
+

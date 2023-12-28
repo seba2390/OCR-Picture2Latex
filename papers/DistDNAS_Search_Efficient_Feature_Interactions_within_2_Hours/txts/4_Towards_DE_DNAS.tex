@@ -1,0 +1,93 @@
+\section{Towards Efficiency in DNAS}
+Search efficiency and serving efficiency are two major considerations in deploying DNAS algorithms in large-scale CTR datasets.
+In this section, we first revisit DNAS and address the efficiency bottleneck via a distributed search mechanism. Then, we propose our solution to reduce the service cost of feature interaction via a cost-aware regularization approach. 
+Figure \ref{fig:distributed_dnas} provides the core methodology of DistDNAS.
+
+\label{sec4:dist}
+\subsection{Revisiting DNAS on Recommender Systems}
+A Click-Through Rate (CTR) prediction task usually contains multiple days of training data. In recommender systems, we typically use a few days of data (i.e., day 1 to day $T$) as the training source and evaluate the trained model based on its CTR prediction over subsequent days. DNAS carries bilevel optimization to find the optimal candidate architecture $C^{*}=(A^{*}, B^{*})$ as follows:
+\begin{equation}
+    (\mathrm{A}^{*}, \mathrm{B}^{*}) = \argmin_{\mathrm{A}, \mathrm{B}} LogLoss_{x \sim D}[x; w^{*}(\mathrm{A}, \mathrm{B}), \mathrm{A}, \mathrm{B}].
+\end{equation}
+Here, $BCE$ denotes binary cross-entropy, $D=(D_1, ..., D_{T})$ indicates the training data from day 1 to day $T$, $w$ indicates the weight parameters within the DNN architecture, and $t$ indicates a certain day of data. 
+The previous DNAS workflow must iterate over $T$ days of data, with a significant search cost. More specifically, the large search cost originates from the following considerations in search efficiency and scalability:
+\begin{itemize}[noitemsep,leftmargin=*]
+    \item Sequentially iterating over $T$ days of data requires $T$ times the search cost of DNAS on a single day of data. This creates challenges for model freshness in production environments where $T$ can be extremely large. 
+    \item Deploying the search over multiple devices may suffer from poor scalability due to communication. For example, the forward/backward process needs to shift from model parallelism to data parallelism when offloading tensors from embedding table shards to feature interaction modules.
+    \item Within our implementation on Criteo Terabyte, the throughput on multiple NVIDIA A5000 GPUs is lower than the throughput on a single GPU during search, as demonstrated in the Queries-Per-Second (QPS) analysis in Figure \ref{fig:dnas_qps}. 
+    Thus, it is difficult to realize good scalability in the growth of computing devices in DNAS.
+\end{itemize}
+ The above considerations point to a distributed version of DNAS, where we partition the training data, launch a DNAS procedure on each day of training data, and average the results to derive the final architecture.
+ We hereby propose a DistDNAS search with the following bilevel optimization.
+\begin{equation}
+\small
+    (\mathrm{A}^{*}, \mathrm{B}^{*})^{(t)} = \argmin_{\mathrm{A}, \mathrm{B}} LogLoss_{x \sim D_{t}}[x; w^{*}(\mathrm{A}, \mathrm{B}), \mathrm{A}, \mathrm{B}],
+\end{equation}
+such that
+\begin{equation}
+\small
+    w^{*}(\mathrm{A}, \mathrm{B})^{(t)} = \argmin_{w} LogLoss_{x \sim D_{t}}[x; w(\mathrm{A}, \mathrm{B}), \mathrm{A}, \mathrm{B}].
+\end{equation}
+
+
+\begin{figure}[t]
+    \begin{center}
+    \includegraphics[width=0.8\linewidth]{figs/dnas_qps_gain.pdf}
+    \vspace{-1em}
+    \caption{QPS comparison between DistDNAS and DNAS.}
+    \label{fig:dnas_qps}
+    \end{center}
+    \vspace{-1em}
+\end{figure}
+
+Here, $t \in \{1, 2, ..,, T\}$ indicates a certain day of training data. 
+DistDNAS aggregates the learned weights on each day to retrieve the final architecture coefficients with a simple averaging aggregator as follows:
+\begin{equation}
+\small
+    (\mathrm{A}^{*}, \mathrm{B}^{*})^{(*)} = \sum_{t=1}^{T} \frac{1}{T}(\mathrm{A}^{*}, \mathrm{B}^{*})^{(t)}
+\end{equation}
+The simple averaging scheme incorporates the statistics from each day of data to obtain the learned architecture weights. 
+In addition, DistDNAS can be asynchronously paralleled on different computing devices, accelerating the scalability of search and reducing the total wall-clock run-time in recommender systems. Figure \ref{fig:dnas_qps} presents a comparison of DistDNAS versus DNAS on 1-8 NVIDIA A5000 GPUs, with 4K batch size. Due to communication savings with 1-GPU training, DistDNAS benefits from significantly lower search cost compared to vanilla DNAS.
+
+
+
+\begin{figure}[b]
+    \vspace{-2em}
+    \begin{center}
+    \includegraphics[width=0.9\linewidth]{figs/FLOPS_importance.pdf}
+    \vspace{-1em}
+    \caption{Normalized cost importance in a 7-block supernet.}
+    \label{fig:flops_feature_interactions}    
+    \end{center}
+\end{figure}
+
+
+\subsection{Cost-aware Regularization}
+Serving cost of feature interactions, e.g. FLoating-point OPerations (FLOPs), is critical in recommender systems. A lower servicing cost indicates a shorter response time to process a user query request. As a result, optimizing the cost of recommender models is as important as optimizing the performance of recommender models in the production environment.
+
+In DNAS, we measure the cost as a combination of training FLOPs and inference latency.
+The cost of a feature interaction in discovery is dependent on the weights of the learned architecture $C^{*}=(A^{*}, B^{*})$. An intuition to optimize the feature interaction module is rewarding cost-efficient operators (e.g., Linear, Identity) while penalizing cost-inefficient operators (e.g., Transformer, CrossNet) during differentiable search.
+Motivated by this, we introduce a differentiable cost regularizer to penalize large models in discovery.
+The cost regularizer adds an additional regularization term $R$ to the loss function during DNAS to induce cost-effective feature interactions in discovery.
+
+
+We use $j$ to represent an index of a feature interaction module in $\mathcal{C}$, for example, the index of a dense interaction module.
+We first sample a few pairs of architecture and cost metrics from the DistDNAS search space and create a cost mapping $cost: \mathrm{C} \to \mathrm{R}$ to model the relationship between feature interactions and FLOPs.
+Then, we use the permutation importance~\cite{breiman2001random} to obtain the importance of offline cost $s_{j}$ in the cost mapping $cost$, illustrating the offline FLOPs importance of an interaction module $i$. 
+Finally, we formulate a cost-aware loss and incorporate it to regularize all interaction modules: $R(\mathrm{A}, \mathrm{B}) = \gamma \sum_{op^{j} \in (\mathrm{A}, \mathrm{B})}s_{j}$.
+Here, $\gamma$ is an adjustable coefficient to control the strength of cost-aware regularization. With cost-aware regularization, the final architecture of DNAS with cost-aware loss searched on a single day $t$ can be formulated as follows.
+\begin{equation}
+    \small
+    (\mathrm{A}^{*}, \mathrm{B}^{*})^{(t)} = \argmin_{\mathrm{A}, \mathrm{B}} LogLoss_{x \sim D_{t}}[x; w^{*}(\mathrm{A}, \mathrm{B}), \mathrm{A}, \mathrm{B}] + R(\mathrm{A}, \mathrm{B}),
+\end{equation}
+such that 
+\begin{equation}
+\small
+    w^{*}(\mathrm{A}, \mathrm{B})^{(t)} = \argmin_{w} LogLoss_{x \sim D_{t}}[x; w(\mathrm{A}, \mathrm{B}), \mathrm{A}, \mathrm{B}] + R(\mathrm{A}, \mathrm{B}).
+\end{equation}
+
+As the feature interaction search space adopts a fixed connectivity and dimension configuration during the search, the cost importance of different interaction modules is unique in the first choice block, and identical across all other choice blocks.
+We demonstrate the normalized cost importance of each interaction module in Figure \ref{fig:flops_feature_interactions}. 
+Among all interaction modules, the DotProduct contributes to a significant amount of FLOPs consumption by integrating dense and/or sparse features. Except for Transformer, sparse interaction modules contribute significantly fewer serving costs compared to their dense counterparts.
+Thus, despite the strong empirical performance of Transformer models, recommender models choose Transformer sparingly to build an efficient feature interaction.
+

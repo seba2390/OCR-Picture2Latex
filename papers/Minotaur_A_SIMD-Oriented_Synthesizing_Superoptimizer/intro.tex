@@ -1,0 +1,145 @@
+\section{Introduction}
+
+Generating high-quality code for vector instruction set extensions
+remains challenging.
+%
+For programs in high-level languages, it can be difficult to extract
+the necessary parallelism and to map source-level constructs onto
+semantically rich SIMD instructions.
+%
+On the other hand, writing vector code in assembly is slow and
+expensive, and makes it difficult to support a wide variety of
+platforms.
+%
+A popular middle ground---mostly writing high-level code, but
+employing SIMD intrinsic functions in hot loops---is workable but has
+its own issues such as an impedance mismatch where mid-level compiler
+optimizations lack semantics for intrinsics and cannot
+optimize around them effectively.
+
+
+This paper presents \tool{}, a synthesis-based superoptimizer for the
+LLVM intermediate representation~\cite{LLVM:CGO04}, that focuses on
+supporting LLVM's portable vector operations as well as Intel-specific
+intrinsics.
+%
+Our goal is to automatically discover useful optimizations that LLVM
+cannot currently perform.
+%
+Since \tool{}'s search-based approach requires significant compilation
+time, its primary intended audience is compiler developers, who can
+then implement the missing transformations.
+%
+Even so, we have implemented a cache that allows synthesis results to
+persist across compilations; with a warm cache, the compile-time
+overhead when building SPEC CPU 2017 is 26\%.\footnote{\tool's effect
+on compile time in the case of a cold cache is somewhat arbitrary,
+since the aggressiveness of its synthesis algorithm is highly tunable.}
+%
+Our current work is limited to integer operations; it is not
+technically difficult to support floating point operations, but the
+current state of the art in SMT solving is simply too slow to make
+this practical.
+
+
+\tool{} works on code fragments that do not span multiple loop
+iterations; it is based on the assumption that existing compiler
+optimization passes such as loop unrolling, software pipelining, and
+automatic vectorization will create the necessary opportunities for
+its optimizations to work effectively.
+%
+For example, consider this loop, in C, from the
+compression/decompression utility gzip, where \texttt{name} is the
+base address of a string and \texttt{p} is a pointer into the string:
+
+\iffalse
+\begin{verbatim}
+void make_simple_name(char *name) {
+  char *p = strrchr(name, '.');
+  if (p == NULL) return;
+  if (p == name) p++;
+  do {
+      if (*--p == '.') *p = '_';
+  } while (p != name);
+}
+\end{verbatim}
+\fi
+
+%https://godbolt.org/z/cfbTsMrcv
+%https://alive2.llvm.org/ce/z/Q9JPSg
+{\small\begin{quote}
+\begin{verbatim}
+do {
+  if (*--p == '.') *p = '_';
+} while (p != name);
+\end{verbatim}
+\end{quote}}
+
+When this loop is compiled by LLVM 15 for a target supporting AVX2
+vector extensions, this code is found inside the loop:
+
+% original
+% {\small\begin{quote}
+% \begin{verbatim}
+% %1 = shufflevector <32 x i8> %0, poison, <31, 30, 29, 28, 27, ... 4, 3, 2, 1, 0>
+% %2 = icmp eq <32 x i8> %1, <46, 46, 46, 46, 46, ... 46, 46, 46, 46, 46>
+% %3 = shufflevector <32 x i1> %2, poison, <31, 30, 29, 28, 27, ... 4, 3, 2, 1, 0>
+% \end{verbatim}
+% \end{quote}}
+
+%shorter
+{\small\begin{quote}
+\begin{verbatim}
+%1 = shufflevector %0, <31, 30, 29, ... , 0>
+%2 = icmp eq %1, <46, 46, 46, ... , 46>
+%3 = shufflevector %2, <31, 30, 29, ... , 0>
+\end{verbatim}
+\end{quote}}
+
+The first shufflevector reverses a 32-byte chunk of the string, the
+\texttt{icmp} instruction checks which elements of the chunk are equal
+to 46 (ASCII for the period character), and then the second
+shufflevector reverses the vector containing the results of the
+computation.
+%
+This code cannot be optimized further by LLVM; when it is lowered to
+object code and executed on an Intel Cascade Lake processor, it
+requires 13 uOps, or ``micro-operations,'' processor-internal
+RISC-like instructions that modern x86 implementations actually
+execute.
+%
+This is according to LLVM-MCA, LLVM's machine code analyzer, which
+estimates execution costs using a microarchitectural model.
+
+
+\tool{}, on the other hand, observes that the vector reversals are
+unnecessary, and that this code fragment performs the same job as the
+original instruction sequence, but more cheaply (3 uOps):
+
+% original
+% {\small\begin{quote}
+% \begin{verbatim}
+% %1 = icmp eq <32 x i8> %0, <46, 46, 46, 46, 46, ... 46, 46, 46, 46, 46>
+% \end{verbatim}
+% \end{quote}}
+
+%shorter
+{\small\begin{quote}
+\begin{verbatim}
+%1 = icmp eq %0, <46, 46, 46, ... , 46>
+\end{verbatim}
+\end{quote}}
+
+Our work builds on the Alive2 translation validation tool for LLVM
+% 135 + 30 masked
+IR~\cite{alive2}, to which we added support for 165 vector
+instructions, and LLVM-MCA~\cite{llvmmca}, which we use to build a
+cost model.
+%
+On top of these foundations, we implemented a synthesis engine that
+searches for improved code sequences, a cache that stores previously
+derived optimizations, and an LLVM plugin that runs as a middle-end
+optimization pass.
+%
+We evaluate \tool{} on a variety of benchmarks, showing that it can
+achieve speedups of up to 2.3x.

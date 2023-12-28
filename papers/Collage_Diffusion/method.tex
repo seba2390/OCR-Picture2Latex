@@ -1,0 +1,127 @@
+\vspace{-0.5em}
+\section{Collage Diffusion}
+\vspace{-0.5em}
+
+To frame discussion of layer-based image harmonization, we first recap how text-conditioned diffusion models can perform image harmonization by leveraging added noise. 
+Then, we describe how \textit{Collage Diffusion} leverages additional information from individual layers to increase both spatial and appearance fidelity for harmonized output.
+\vspace{-0.5em}
+
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=.8\linewidth,valign=m]{figures/MethodFigureICCV.pdf}
+    \vspace{-1.5em}
+    \caption{\textit{Collage Diffusion} takes as input a sequence of layers of RGBA images paired with text (the image of sushi and the text ``sushi''), along with a full-image text string (``A bento box with rice, edamame, ginger, and sushi''). Layer information enables 1) manipulating cross-attention to map individual layers to the corresponding image regions, creating improved diffusion model $D^*$, 2) learning layer-specific representations using textual inversion (TI), 3) having the option to preserve per-layer image structures with ControlNet (CN), and 4) harmonizing layers according to per-layer noise levels $t_i$. \textit{Collage Diffusion} outputs globally-harmonized images that contain objects in the specified locations, and share visual characteristics with the input layer images. 
+	\textbf{\emph{In the rest of the paper, for brevity we only display the layer composite image and prompt, and we use underlined substrings to indicate contents of individual layers.}} }
+    \label{fig:method}
+\end{figure*}
+
+\subsection{Global image harmonization} \label{method:SDEdit}
+\vspace{-0.5em}
+
+Leveraging only layer composite image $x_c$ and full-image string $c$, the SDEdit algorithm \cite{sdedit} improves image quality by adding Gaussian noise with standard deviation $\sigma(t)$ to $x_c$, then denoising the noised image $x_t = x_c + \mathcal{N}(0,\sigma(t)^2)$ to generate output image $x^*_c$, using a text-conditional diffusion U-Net $D_\theta(x,\sigma(t),c)$ as an image prior \cite{latentDiffusion} ($x$ is a noisy input image, $\sigma(t)$ is the noise level at time $t$, and $c$ is the text conditioning).
+Unfortunately, added noise can make it difficult to map objects to the correct image regions and can obscure key visual details, reducing spatial and appearance fidelity to the original layers (\cref{figure:ca_ft_motivation}). 
+Layer input, with text $c_i$ and image $x_i$ corresponding to each region of the image, provides additional information facilitating more precise control over individual components of the generated image. 
+
+\subsection{Spatial fidelity: cross-attention manipulation} \label{method:CAC}
+\vspace{-0.5em}
+
+To generate an image with the desired objects in the desired locations, 
+\textit{Collage Diffusion} modifies the text-image cross-attention 
+in text-conditional U-Net model $D_\theta$. 
+Not all tokens in full-image input text $c$ correspond to layer strings $c_i$---the start token, end token, several words in the input string, and padding tokens lack specific regional influence. 
+We refer to these tokens as ``global'' tokens, while layer-specific tokens are ``layer'' tokens. 
+For instance, in \cref{fig:method}, ``with'' is a global token and ``rice'' is a layer token. 
+\textit{Collage Diffusion} constrains image generation by restricting the influence of layer tokens to the regions of the image where the corresponding layer is visible.%
+The visible layer at pixel coordinate $(a,b)$ is defined as $j = \max\limits_{k \in 1 \dots n}(\{k | (x^\alpha_{k})_{ab} > 0\})$, where $j$ is the layer index of the highest of the $n$ layers with non-zero alpha at pixel coordinate $(a,b)$. 
+
+Cross-attention in $D_\theta$ is computed as $\mathrm{softmax}\big(\frac{QK^T}{\sqrt{d}}\big)V$, where $Q$ is a matrix of query embeddings from image tokens, $K$ is a matrix of key embeddings from text tokens, $V$ is a matrix of value embeddings from text tokens, and $d$ is the embedding dimensionality.
+To increase or decrease the influence of a particular token on a part of the image, \textit{Collage Diffusion} alters $QK^T$, an approach similar to the mechanism proposed by eDiffI \cite{ediffi}. 
+Like eDiffI, \textit{Collage Diffusion} uses positive attention map $A^{pos}$ to increase the influence of layer tokens on a region relative to global tokens, but unlike eDiffI, \textit{Collage Diffusion} also constructs negative map $A^{neg}$ to prevent layer tokens from influencing regions outside the desired location.
+
+To alter $QK^T$, \textit{Collage Diffusion} constructs attention maps $A^{pos}, A^{neg} \in \mathbb{R}^{N_v \times N_t}$, where $N_v$ is the number of image tokens and $N_t$ is the number of text tokens, and each column $A^{pos}_j$, $A^{neg}_j$ is a flattened alpha mask dependent on visibility of text token $j$. $A_{ij} = 0$ for all global tokens $j$. $A^{pos}_{ij} = 1$ if image token $i$ corresponds to a region of the image that layer token $j$ should influence, and $A^{neg}_{ij} = 1$ if image token $i$ corresponds to a region of the image that layer token $j$ should not influence. 
+Along with scalar weights $w^{pos}$ and $w^{neg}$, attention maps $A^{pos}$ and $A^{neg}$ are incorporated into the softmax operation: $\mathrm{softmax}\big(\frac{QK^T + w^{pos}A^{pos} - w^{neg}A^{neg}}{\sqrt{d}}\big)V$. 
+With larger weights $w^{pos}$ and $w^{neg}$, the influence of attention maps $A^{pos}$ and $A^{neg}$ on image layout is greater.
+Weights $w^{pos}$ and $w^{neg}$ vary dependent on noise level $\sigma(t)$ throughout the diffusion process: $w^{pos} = v^{pos} \cdot \log(1 + \log(1 + \sigma(t))) \cdot \max(QK^T)$ and $w^{neg} = v^{neg} \cdot \log(1 + \log(1 + \sigma(t))) \cdot \max(QK^T)$, where $v^{pos}$ and $v^{neg}$ are scalars specified by the user. 
+Denote this modified diffusion model as $D^*_\theta$.
+
+\subsection{Appearance fidelity: inversion and ControlNet} \label{method:TI}
+\vspace{-0.5em}
+
+Layer text $c_i$ for a given layer often fails to adequately capture the intended appearance of layer image $x_i$.
+For instance, in \cref{fig:method}, layer text ``ginger'' does not capture that the ginger is pickled and sliced. 
+Starting image $x_c$ provides some guidance on the desired look of each layer, but the influence of $x_c$ is reduced when noise is added to the image. 
+Therefore, to preserve visual fidelity, we refine the layer text to more accurately capture the layer's appearance. To do this, \textit{Collage Diffusion} builds upon Textual Inversion\,\cite{TextualInversion}:
+layer text $c_i$ is specialized to image $x_i$ by learning a \textit{modifier} token $a_i$ per layer, prepended to the layer text: $(a_i,c_i)$. 
+$a_i$ serves as an adjective describing the object in layer $l_i$, subject to the constraints of the existing layer description $c_i$. 
+For instance, string ``ginger'' is modified into new string ``$\langle a_i \rangle$ ginger''. 
+The embedding for $a_i$ is learned by optimizing the following loss:
+
+\vspace{-0.5em}
+\begin{dmath}
+a^*_i = \mathrm{arg}\min_{a_i} E_{\epsilon \sim N(0,\sigma)}[x^\alpha_i\cdot(x_{target_i} - D_\theta(x_{target_i} + \epsilon, \sigma, (a_i,c_i)))]
+\end{dmath}
+\vspace{-0.5em}
+
+\noindent target image $x_{target_i}$ is constructed by alpha-compositing the first $i$ layers $l_1 \dots l_i$, and layer alpha mask $x^\alpha_i$ restricts the loss to the relevant region of $x_{target_i}$. 
+
+Textual Inversion\,\cite{TextualInversion} learns token $a_i$ as a standalone prompt, and performs optimization using several images of the same object that communicate invariances in pose, lighting, etc. 
+\textit{Collage Diffusion} operates in a single-image setting, where $x_{target_i}$ is the only reference for learning $a_i$. Therefore, it leverages the layer textual description $c_i$ to help regularize optimization. 
+
+We also extend ControlNet \cite{zhang2023adding} to preserve image structure on a per-layer basis. 
+The ControlNet auxiliary network outputs 2-d feature maps $m_k \in R^{h, w, c}$ from its zero convolutions, where $h$ is height, $w$ is width, and $c$ is number of channels. 
+In standard ControlNet, we multiply feature maps $m_k$ by scalar ControlNet weight $w_{all} \in [0, 1]$ that controls the ``strength'' with which ControlNet influences the generated image. 
+We replace $w_{all}$ with weight map $w_{layer}$:
+the user sets ControlNet weights $w_i$ for each layer $l_i$, and the $w_i$ are converted into single-channel weight map $w_{layer}$: $w_{layer_ab} = t_j$, where $j = \max\limits_{k \in 1 \dots n}(\{k | (x^\alpha_{k})_{ab}  > 0\})$ is the layer index of the highest of the $n$ layers with nonzero alpha for pixel coordinate $(a,b)$, and $w_{layer_ab}$ is the value of $w_{layer}$ at pixel $(a,b)$.
+We resize $w_{layer}$ to $[0, 1]^{h,w}$ using bilinear interpolation, then elementwise-multiply $w_{layer} * m_k$ to produce re-weighted ControlNet outputs. 
+Now, the user can control the influence of ControlNet on regions corresponding to each layer with per-layer weights $w_i$. 
+
+\vspace{-0.5em}
+\subsection{Tuning the Harmonization-Fidelity Tradeoff}
+\label{method:layerNoise} 
+\vspace{-0.5em}
+The content in the input layers must be modified to globally harmonize the image, and users may be willing to accept more variation for some objects than others. 
+Layer input allows users to control the harmonization-fidelity tradeoff on a per-object basis by having users specify the desired level of harmonization per layer. 
+The user sets noise levels $t_i$ for each layer $l_i$, and the $t_i$ are converted into single-channel noise image $h$: $h_{ab} = t_j$, where $j = \max\limits_{k \in 1 \dots n}(\{k | (x^\alpha_{k})_{ab}  > 0\})$ is the layer index of the highest of the $n$ layers with nonzero alpha for pixel coordinate $(a,b)$, and $h_{ab}$ is the value of $h$ at pixel $(a,b)$.
+A Gaussian blur is applied to $h$ to smooth boundaries where the noise level changes sharply. 
+Building upon Blended Diffusion \cite{avrahami2022blended}, \textit{Collage Diffusion} modifies the diffusion process so that different levels of noise are added to different regions of the image according to $h$, controlling the harmonization-fidelity tradeoff per layer:
+
+\vspace{-1em}
+\begin{dmath}
+x'(t-1) = x(t-1) \cdot m(t) + (x_c + \mathcal{N}(0,\sigma(t-1)^2)) \cdot (1 - m(t))
+\end{dmath}
+\vspace{-0.5em}
+
+\begin{dmath}
+m_{ab}(t) =
+\begin{cases}
+    1 & \text{if }h_{ab}<t\\    
+    0 & \text{if }h_{ab}\ge t
+\end{cases}
+\end{dmath}
+\vspace{-0.5em}
+
+\noindent where $x(t)$ is the original solver output at time $t$, $x'(t)$ is the modified solver output at time $t$, and $m(t)$ is a binary mask computed at time $t$ based on the noise image $h$. 
+For instance, in \cref{fig:method}, $t_i=0.5$ for both the ``bento box'' and ``rice'' layers, $t_i=0.6$ for the ``edamame'' layer, and $t_i=0.8$ the ``sushi'' and ``ginger'' layers, indicating that the user would like a greater level of harmonization for the ginger and sushi than for the bento box and the rice. 
+
+\vspace{-0.5em}
+\subsection{Editing Individual Layers in Generated Images}
+\label{method:sequentialGeneration}
+\vspace{-0.5em}
+
+Per-layer noise controls also enable layer-by-layer image editing. 
+Especially for scenes with many objects, it can be difficult to look through large output galleries to find an example where all objects in the scene look \emph{exactly} as desired.
+Rather, the user can simply select a generated image where nearly all the objects look as desired, then refine the image by generating alternate possibilities for the remaining objects. 
+
+Per-layer noise controls enable users to keep a part of an input collage ``fixed'' by setting the noise level to $t=0$ for the layers that should remain constant. 
+Having generated an image using \textit{Collage Diffusion}, an individual object may be edited by creating a new two-layer collage, where the generated image is the background layer, and the object to be re-generated is the foreground layer. Setting per-layer noise $t=0$ to the background layer, a variety of possibilities are generated for the foreground layer, harmonized and combined with the fixed background layer. 
+Especially for complex scenes, a small part of a generated image might not quite look right.
+Here, iterative, layer-driven editing can be the difference between obtaining a final image that is \emph{nearly} satisfactory and one that precisely satisfies the user's image generation goals.   
+
+\vspace{-0.5em}
+\subsection{Auto-adjust parameters}
+\label{method:parameters} 
+\vspace{-0.5em}
+
+The additional parameters provided for tuning spatial and appearance fidelity substantially improve user control over the image harmonization process, but can pose difficultly for novice users to tune. 
+Therefore, we introduce a heuristic-based algorithm that automatically generates parameters that qualitatively produce aesthetically pleasing images.
+We discuss our parameter-setting algorithm in detail in the Appendix. 

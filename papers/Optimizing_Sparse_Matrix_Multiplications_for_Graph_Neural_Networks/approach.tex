@@ -1,0 +1,190 @@
+\vspace{-4mm}
+\section{Our Approach}
+\vspace{-4mm} Our work aims to choose the most efficient sparse matrix storage format for accelerating GNN performance or finding a
+trade-off between the memory footprint and runtime. As the right choice depends on the characteristics of the input matrix processed by a
+GNN layer, and the optimal storage format can change over the duration of the training, we wish to develop an approach to automatically
+derive a storage format (and the SpMM kernel) on a per input basis.
+
+To this end, we employ machine learning to build a classifier to predict the sparse matrix storage format to use from a pool of candidate
+formats. The predictive model takes as input a feature vector of numerical values, which describe the essential characteristics of the
+input matrix. It then produces a label, indicating which of the storage formats to be used by a GNN layer. We provide APIs (Section \ref{sec:deployment}) to monitor the input matrix sparsity and dynamically adjust the storage format to use before entering a GNN layer at runtime. If the chosen format is
+different from the one used by the previous layer or a prior training epoch, our library will convert the input matrix to the chosen format. Note that we include the overhead of format conversion and feature extraction in all our experimental results.
+
+\vspace{-2mm}
+\subsection{Predictive Modeling}
+\vspace{-2mm}
+Our predictive model builds upon the XGBoost classifier \cite{chen2015xgboost}. We have evaluated a number of alternative classification
+techniques, including multilayer perceptron (MLP) neural networks, K-Nearest neighbour (KNN), and support vector machines (SVM).  We
+choose XGBoost because of its good generalization ability \cite{chen2015xgboost}, its decision-tree-like structure is interpretable, and
+its better and more robust performance over alternatives on our problem (Section \ref{sec:optp}). In the remainder of this section, we describe our predictive model by following the classical 4-step process for supervised
+learning: i) problem modeling, ii) training  data generation, iii) train a predictor and iv) implement the predictor.
+
+\vspace{-2mm}
+\subsection{Problem Modeling}
+\vspace{-2mm}
+\label{sec:ms}
+\begin{figure}[t!]
+\begin{minipage}[t]{0.5\linewidth}
+\centering
+\includegraphics[width=\textwidth]{approach_overview.pdf}
+\vspace{-4mm}
+\caption{Overview of our predictive model for choosing sparse matrix storage format.}
+\label{fig:approach_overview}
+\end{minipage}
+\begin{minipage}[t]{0.5\linewidth}
+\centering
+\includegraphics[width=\textwidth]{training.pdf}
+\vspace{-4mm}
+\caption{Overview of our training process}
+\label{fig:training}
+\end{minipage}
+\vspace{-3mm}
+\end{figure}
+
+Figure \ref {fig:approach_overview} depicts the workflow of our approach. The deployed model extracts features from the adjacency
+and feature matrices and uses the feature values to predict the sparse matrix storage format to use. Our library automatically converts the input matrix to the selected storage format if needed.
+Note that a SpMM computation kernel can be chosen based on the object type of the input. Since we implemented our prototype in PyTorch, this computation kernel selection process is performed automatically by the Python library.
+
+As depicted in Figure \ref{fig:training}, our model is trained offline using training samples. The trained model can be applied to
+any previously unseen matrix. Training involves finding the best storage format, extracting feature values for each training
+matrix and learning a model from the training data, described as follows.
+
+\vspace{-2mm}
+\subsection{Training Data Generation}\label{sec:dg}
+%\begin{figure}[t!]
+%\includegraphics[width=\textwidth]{figures/datageneration.pdf}
+%\caption{Training data generation process.}
+%\label{fig:datageneration}
+%\end{figure}
+\vspace{-1.5mm}
+
+We use 300 synthetically generated square matrices to train the XGBoost model. The matrix size of our training samples ranges from $1,000$
+to $15,000$, increased with a step of 200. We populate the matrix with random values of 0 and 1 with a sparsity ranging from 0.1\% to 70\%,
+to simulate the matrix sparsity seen at the initial model graph input and later message propagation stages.
+For each training matrix, we exhaustively execute the
+SpMM computation kernel with each sparse matrix storage format and record the best performing format for each matrix sample on each kernel. We then label each best-performing configuration with a unique number (i.e., class label). Note that we apply cross-validation in our evaluation to make sure we always test the trained model on unseen datasets.
+
+\cparagraph{Optimization goal.} Our approach allows the user to find a trade-off between the memory footprint and the GNN performance and
+train a predictive model for their optimization goal. Specifically, in this work, we consider the following optimization formulation,
+but other formulas can also be used:
+\begin{equation}
+\small
+\min_{O} O_{l \in L} = w \times R + (1.0 - w) \times M
+\label{equ:nomarlization}
+\end{equation}
+where $R$ and $M$ are the normalized running time and memory footprint for a sparse matrix storage format from a collection of candidate
+formats ($L$), and $w$ is a configurable weight parameter. Note that we scale the execution time and memory footprint to the $(0,1)$ range
+using the min-max values found from the profiled training data. Essentially, our goal is to minimize the weighted sum, $O$ in
+Eq \ref{equ:nomarlization} to trade runtime for a lower memory footprint. For example, setting $w$ to $0$ and $1.0$ means we only optimize for memory overhead and speeds respectively.
+
+Our training data includes the raw measurements of the execution time and memory footprint for each storage format under each matrix. We then apply the Eq \ref{equ:nomarlization} to label the storage format that gives the smallest $O$ for each training
+sample. Figure \ref{fig:frequency} lists the frequency of a storage format to be found to be optimal on our training dataset. Here, the x-axis shows different settings of $w$ in Eq \ref{equ:nomarlization}. As can be seen from the diagram, the optimal storage format can vary depending on the optimization criterion. Our approach can adapt to such changes by automatically learning from the training samples (see Section \ref{sec:tm}).
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.75\textwidth]{frequency.pdf}
+\vspace{-5mm}
+\caption{How often a storage format is considered to be optimal on our synthetic training data when varying the weight $w$ in Eq \ref{equ:nomarlization}. Noted that there might be multiple optimal formats for a single input if the final output $O$ is very similar ($\pm 0.0001$). }
+\label{fig:frequency}
+\vspace{-4mm}
+\end{figure}
+
+ For each training data
+sample, we also extract the values of a selected set of features (described in Section \ref {sec:fe}). We note that training is a one-off cost, and the trained predictive model can be used by any GNN model to optimize the SpMM computation kernel.
+
+\vspace{-2mm}
+\subsection{Feature Engineering\label{sec:fe}}
+\vspace{-2mm}
+
+\begin{table}[t!]
+\caption{Matrix feature used by in our predictive model}
+    \centering
+    \scriptsize
+    \begin{tabularx}{\textwidth}{ssb||ssb}
+    \toprule
+    \textbf {No.}& \textbf{Featur.} & \textbf{Description} &  \textbf {No.}& \textbf{Featur.} & \textbf{Description} \\
+    \midrule
+    \rowcolor{Gray} F1 & numRow & \# rows &
+    F2 &  numCol & \# columns \\
+    F3 & NNZ & \# Non-zeros &
+    F4 & N\_diags & \# diagonals \\
+	 \rowcolor{Gray} F5 & aver\_RD &  Avg. \# non-zero elements per row &
+    F6 & max\_RD &  Max. \# non-zeros per row  \\
+     F7 & min\_RD &  Min. \# non-zeros  per row  &
+     F8 & dev\_RD &  Standard deviation of non-zero numbers per row  \\
+   \rowcolor{Gray} F9 & aver\_CD &  Avg. \# non-zeros  per column  &
+    F10 & max\_CD &  Max.  \# non-zero values per column  \\
+      F11 & min\_CD &  Min. \# non-zero values per column &
+    F12 & dev\_CD &  The deviation number of non-zeros per column\\
+    \rowcolor{Gray} F13 & ER\_DIA &  Ratio of non-zeros in diagonals  &
+    F14 & ER\_CD &  Ratio of non-zeros in column-packed structure \\
+    F15 & row\_bounce & Avg. differences between non-zeros of adjacent rows &
+    F16 & col\_bounce &  Avg. difference between non-zeros of adjacent columns \\
+    \rowcolor{Gray} F17 & density &  Density of non-zeros &
+    F18 & cv &  Normalized variation of non-zeros per row \\
+    F19 & max\_mu &  max. RD - avg. RD \\
+    \bottomrule
+    \end{tabularx}
+    \label{tab:Feature_Detail}
+    \vspace{-6mm}
+\end{table}
+
+%\begin{figure}[t!]
+%\includegraphics[width=\textwidth]{figures/feature_importance.pdf}
+%\caption{XGBoost feature scores for individual raw features given in Table \ref{tab:Feature_Detail}.}
+%\label{fig:feature_importance}
+%\end{figure}
+
+
+\cparagraph{Feature selection.}
+A key aspect in building a good machine learning predictor is finding the right representation, or \emph{features}, to capture
+the essential characteristics of the input workload.
+ We start by considering over 30 raw features chosen based on previous work of SPMV optimization \cite{sedaghati2015automatic}. Most of the features are used to capture the distribution of non-zero elements of the input matrix, which can be extracted
+in parallel to reduce the overhead of feature extraction.
+
+To learn effectively over a small training dataset, we use the feature score given as a by-product of the XGBoost training process to  select a compact set of features. The feature score is computed summing up how many times each feature is split on the decision tree. We then keep features that contribute to 95\% of the aggregated importance scores across all raw features.
+Using a fewer number of features also help us to reduce the overhead of
+runtime feature extraction. Table \ref{tab:Feature_Detail} summarizes our chosen matrix features.
+
+\cparagraph{Feature normalization.}
+In the final step, we scale each of the extracted feature values to a common range (between 0 and 1) to prevent the range of any single
+feature from being a factor in its importance. We record the minimum and maximum values of each feature in the training dataset in order to
+scale the feature values of an unseen matrix. We also clip a feature value to make sure it is within the expected range during deployment.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.75\textwidth]{acclossforfeature.pdf}
+\vspace{-4mm}
+\caption{Top-8 features which can lead to a high loss
+in accuracy if they are not used.}
+\vspace{-5mm}
+\label{fig:acclossforfeature}
+\end{figure}
+
+\cparagraph{Feature importance.}
+Figure \ref{fig:acclossforfeature} shows the top 8 dominant features based on their impact on our predictive model accuracy. We calculate
+feature importance by first training a model using all 19 of our chosen features, and record the accuracy of our model. In turn, we then
+remove each of our features, retraining and evaluating our model on the other 18, noting the drop in prediction accuracy. We then normalize
+the values to produce a percentage of importance for each of our features. Features for measuring the non-zero element distribution, like
+ER\_DIA and cv in Table \ref {tab:Feature_Detail}, are important for choosing the storage format. The similar distribution of feature importance is
+an indication that each of our features is able to represent distinct information about the matrix workload, all of which is important for
+the prediction task at hand.
+
+\vspace{-3mm}
+\subsection{Training The Model} \label{sec:tm}
+\vspace{-2mm} The collected feature values, together with the desired label for each training matrix, are passed to a supervised learning
+algorithm to learn the XGBoost model. The time for training the predictor is dominated by generating the training data. In this work, it
+takes less than a week to label all the training samples using a single multi-core server.  In comparison, processing the raw data and
+building the models took a negligible amount of time, less than an hour run in a RTX 2060 GPU. Since training is only performed once, it is
+a \emph{one-off} cost.
+
+
+\vspace{-3mm}
+\subsection{Using The Model\label{sec:deployment}}
+\vspace{-2mm} The trained predictor can be applied to a new, unseen matrix used by a SpMM kernel. We implement our predictive model using
+the Python Scikit-learn \cite{sklearn_api} package, which can be easily integrated with mainstream deep learning frameworks. We have
+encapsulated all of the inner workings, such as feature extraction, prediction and storage format conversion and kernel selection, into a
+single package. Prediction is done by calling a dedicated \texttt{SpMMPredict} function (provided by our library) before each GNN layer.
+The function takes as input a matrix object and outputs a matrix object stored using the predicted storage format. Depending on the matrix
+object type, the corresponding SpMM kernel will be automatically chosen. Our current implementation supports PyTorch, but it can be easily
+ported to other deep learning frameworks.

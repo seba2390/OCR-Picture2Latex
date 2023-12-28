@@ -1,0 +1,184 @@
+%!TEX root = ../main.tex
+
+\section{Indexing and Super Key Generation}\label{sec:index}
+We propose an index structure that retains the space efficiency of the single-attribute inverted index as introduced in Section~\ref{sec:preliminaries}.
+% Table~\ref{tab:variables} summarizes the variables used in this paper.
+
+% \input{charts_and_tables/variables}
+
+\subsection{Desiderata}
+\label{sec:desiderata}
+As generating a multi-attribute inverted index requires an exponential number of index entries per table,
+it is important to extend the traditional single-attribute inverted index to be applicable for n-ary joins.
+Ideally, we need an additional index element per table row that exposes the existence of join attribute value combinations.
+We, thus, add an additional element to the index structure named \textit{super key}. This changes the inverted index defined in Equation~\ref{eq_conventional_inverted_index} to $v_i \mapsto \{(T_{i1},\ C_{i1},\ R_{i1},\ S_{i1}), (T_{i2},\ C_{i2},\ R_{i2},\ S_{i2}),\ ... \}$, where $S_{ij}$ is a fixed-size bit array, i.e.,~\textit{Super Key}.
+
+As one cannot anticipate which attribute combinations are relevant for n-ary joins, we need a hash value that retains them all.
+The idea is to have a fixed size super key that aggregates hash values for each row value so that we can verify the existence of a composite key without checking all values of the row.
+\system aggregates the hash results of individual values into a fixed-sized bit vector using the logical bit-wise \texttt{OR} operation. Thus, the super key masks the hash values of each single row value, which ensures that no value is missed, when probing with the super key with the same hash function.
+
+
+
+Consider our previous example once again. Rows $2$, $5$, and $6$ are candidate rows to be joined with the first key in the input dataset d based on the first value ``Muhammad''. Now, to drop the $5^{th}$ and $6^{th}$ row from the candidate rows, the super key for these rows should convey that the values ``Lee'' and ``US'' do not simultaneously exist in these candidate rows.
+Yet, the drawback of the aggregated hash value within a fixed hash table is that the super key might mask the hash values of non-existent values as well.
+
+Therefore, the goal is to design a hash function where the aggregation of cell values from different columns results in different super keys.
+A general approach to this problem is to use a bloom filter.
+However, off-the-shelf bloom filters have two drawbacks.
+First, they use hash functions that assume a uniform distribution.
+Therefore, any arbitrary pair of cell values can result in overlapping bits in the final bit array, which increases the chance of FPs.
+Second, they are agnostic to the distinguishing properties within columns, i.e., character distributions and positions.
+
+%\vspace{0.1cm}
+%\noindent{\bf Desired Hash Function.} To overcome the aforementioned shortcomings of bloom filters, we need a hash function whose parameters are independent of the query table and the individual tables of the corpus. The {\em desired hash function} should encode values in a way that syntactically similar values in different columns and syntactically different values of the same column fall into different bit positions of the super key. As the hash space and ultimately the number of bits are limited, we can only hash a finite number of value features, which have to be the most differentiating properties of a row value.
+
+\subsection{\hash}\label{subsec:synhash}
+We propose \hash, a hash function that encodes syntactic features into distinguishable hashes.
+As the super key is an OR-aggregation of these hash results, it may mask non-existent values and pass FPs. 
+Thus, our goal is to disperse 1-bits in a way that we decrease the likelihood of two different values from different columns turning the same set of bits to 1. Ideally we want as few 1-bits as possible in the super key to reduce the probability that it covers the super key of random value combinations.
+\hash leverages three syntactic properties of the cell values to meet this goal:
+the {\em least frequent characters}, {\em their location}, and the {\em value length}.
+
+\subsection{Feature Generation and Encoding} \label{subsec:hash_generation_process}
+We now turn our attention to how we extract the aforementioned features to apply \hash on a row value.
+We first discuss the number of bits to generate the hash and its relationship to the table corpus.
+Then, we explain our segmentation process that allocates different parts of the hash table for different features of a value.
+Then, we elaborate on the process of mapping the character features to hash bits.
+Finally, we explain how to use the hash space to relocate the generated bits per cell value to prevent partial matches.
+We use the example in Figure~\ref{fig:hash_array_example} to elaborate each hash generation step.
+
+\subsubsection{Required number of bits}
+The super key encodes each value into a fixed-size bit array $a$. 
+On the one hand, as we want the hash values of different individual strings to differ, we want to use all possible bits to encode as many values as possible, i.e.,~$2^{|a|}$, to reduce the number of collisions.
+On the other hand, the super key should contain as few `$1$s' as possible to avoid masking FPs.
+As a result, underpinning \hash results should be constructed in a way that there is an upper bound of $1$ bits for each hash.
+With this goal in mind, Equation~\ref{eq:number_of_ones} calculates $\alpha$, i.e., the optimum number of `$1$s' that is required to generate unique hash values, where $C_{unique}$ is the number of unique values in the corpus and $|a|$ is the hash size.
+\begin{equation}\label{eq:number_of_ones}
+\small
+    \argmin_{\alpha} {|a| \choose \alpha} > C_{unique}.
+\end{equation}
+The binomial term calculates the number of possible bit combinations of size $\alpha$ over $|a|$ bits.
+The minimum value for $\alpha$
+corresponds to the number of `$1$' bits needed per \hash result.
+For a $128$-bit hash space and $700M$ unique values as existing in DWTC webtables, $\alpha$ is equal to $6$. 
+In fact, out of the $\alpha$ bits, one bit is always reserved to encode the value size and $\alpha-1$ bits for the actual value.
+Assume that the hash size in our illustrating example is $128$ bits and $\alpha = 4$ ($3$ for the characters and $1$ for the value length).
+
+\subsubsection{Encoding the characters}\label{subsubsec:encoding_chars}
+As we use $\alpha-1$ bits to encode each value, we want different values to use different bit segments of $a$.
+Thus the characters should be maximally different across words. We can obtain this property based on the character frequency.
+\textbf{Lemma.} Least frequent characters lead to fewer collisions.
+% \vspace{-.3cm}
+\begin{proof}[Proof.]
+Given a random word $w_1$ consisting of letters ${l_1,..l_n}$ each with a probability of occurrence $P(l_i)$, we sample $K<n$
+letters $S= {s_1,..,s_k}$, where $K=\alpha - 1$. 
+Given a random word $w_2$ from the same alphabet, we want to reduce the probability to sample the same set of characters $K$.
+The probability to obtain a word with the same $K$ characters is $P(s_1)\cdot P(s_2)\cdot\dots\cdot P(s_k)$. 
+This product is minimised whenever a factor is replaced with a smaller probability. Thus, when picking the $K$ least frequent character of the alphabet we obtain $\forall \hat{s}_i \in \{w_1 - S\}, \forall s_i\in S: P(s_i) < P(\hat{s}_i)$. 
+Replacing any $s_i$ with $\hat{s}_i$ results in $P(s_1)\cdot P(s_2)\cdot\dots\cdot P(s_k) < P(s_1)\cdot P(\hat{s}_i)\cdot\dots\cdot P(s_k)$, which leads to a higher probability for a collision.
+\end{proof}
+
+
+To further distinguish the frequencies across domains, we pick the $\alpha-1$ least frequent characters inside a word as the differentiator. For single-word cell values with flat frequency distributions we draw based on lexicographical order of the characters.
+
+\noindent\textit{Segmentation.}
+We segment the hash space into smaller blocks, depending on the length of the hash array to encode the features of a cell value.
+This segmentation specifies how many bits each feature needs. 
+Depending on the number of possible characters, \hash splits the hash array into as many smaller fixed-size segments, one for each character. 
+In our case, we consider all 37 alphanumeric characters including space, which results in 37 segments of size $\beta$.
+We create an additional segment to encode the length of the string value.
+Sticking with 37 as the number of characters, we can calculate $\beta$ as follows:
+\begin{equation}
+\small
+    \argmax_{\beta} {(37 \cdot \beta < |a|)}
+\end{equation}
+$|a|$ is the length of the hash array: we have $\beta=3$ with a hash size of \textit{128} bits.
+This segmentation dedicates the largest possible sub-array to encode character features, because the character features, including the position of the characters, are more discriminative than the length of the value.
+The rest of the hash array can be allocated to the length segment: $|a_l| = |a| - (37 \cdot \beta)$.
+For a hash size of $128$ bits, the length segment would comprise of $17$ bits ($128 - 37 \cdot 3$). 
+$99.99\%$ of the English words have fewer than $17$ characters~\cite{mayzner1965tables}. Therefore, the explained segmentation can cover almost all possible words in English language. In our real-world data lakes, Dresden webtable and German open data, over $83\%$ of the cell values have at most $17$ characters. For larger hash sizes, i.e., $512$, $|a_l|=31$  and covers the length of more than $98\%$ of the cell values in our corpora.
+
+In Figure~\ref{fig:hash_array_example}, we want to obtain the hash results for values ``muhammad'' ($C_1$), ``lee'' ($C_2$), and ``us'' ($C_3$) using \hash and then aggregate them into the super key of the row. The red characters in the table cells represent the selected least-frequent characters.
+
+\subsubsection{Encoding the character locations}
+Generally, one bit per character would be enough to encode its occurrence in a value.% i.e., ``0'' for absence and ``1'' for the existence of the character.
+However, if more bits are available ($\beta>1$), we can use them to encode the relative character position inside the original string to further distinguish the hash results of different values. For this purpose, we divide the string in $\beta$ equal areas from left to right. 
+We encode a character by checking in which area the character appears and then we set only the corresponding bit among the $\beta$ character bits from left to right.
+More formally, if $l_v$ is the length of the value, i.e., the number of characters in the value, and $\lambda$ is the location of the character we would like to encode (we take average of the locations in case of character repetition), then, $x$, i.e., the bit index in the character segment that represents the relative location of the character is calculated as: $x = \ceil*{\frac{\lambda\cdot \beta}{l_{v}}}$
+
+% We illustrate this with an example:
+% For $\beta=1$, we can only store the absence/existence of a character, therefore, the hash values would be equal for the two words ``loop'' and ``pool''. This is because both values are comprised of the same characters thus, the same character segments would be set and the length is equal. However with $\beta=3$, we assign $3$ bits per character in the hash array and consider three consecutive areas of each string. Now, character hash segments will look differently. In the hash of the value ``loop'', the left most bit of segment ``L'' turns to 1, i.e.,~$<100>$, because character ``L'' is located in the most left part of the string.
+% For ``pool'', this bit assignment of character ``L'' would be $<001>$ because ``l'' appears in the last third area of ``pool''.
+% The opposite applies to the encoding of ``P''.
+% The encoding for ``O'' as the average of the two middle positions turns the middle bit of the ``O'' segment for both hash results.
+
+Returning to our illustrating example, we calculate the average location in the original value for each of the least frequent characters.
+For instance, the average location of the characters ``u'' and ``d'' in cell $C_1$ are $1$ and $8$ respectively.
+The first hash array represents the \hash result of $C_1$.
+With 3 bits for each character ($\beta = 3$):
+the characters with the average location of less than $3$ ($\frac{8}{3}=3$) turn the first bit (100);
+between and including $3$ and $5$ turn the second bit (010); and
+above $5$ are encoded with the third bit of their corresponding segments (001).
+For example, characters ``u'' and ``d'' in $C1$ are located in the first and the third bits of their segments respectively.
+We use blue color to trace the character ``u'' in the hash array.
+
+\subsubsection{Encoding the length}\label{subsub_length}
+With the segmentation step of \hash, a fixed-size segment is dedicated to the length of the value $l_v$.
+Storing the actual binary representation of the value length can be problematic as it leads to an unknown number of $1$ bits in the segment. This can also mask the length values of the columns with shorter values. For instance, the encoding of $l_v=7$,i.e., $<111>$, can mask the encoding of a value with $l_v=2$, i.e., $<010>$.
+To address this problem, we reserve one bit per possible $l_v\mod |a_l|$. This way, we maintain the number of used bits $i$ and different length values do not mask each other because each length turns a distinguished bit to set.
+Encoding the length feature of the values introduces another benefit to the system:
+Positioning the length segment as the left-most segment allows the system to use short circuit optimization, which skips unnecessary bit operations.
+If there is no value in the candidate row with the same length as a query value, \system does not need to check the character segments.
+%\ma{do we need the next example now? because we have the illustrating example now here?}
+Consider our running example. The cell values ``Boxer'' and ``Birder'' in rows $5$ and $6$ respectively. Both of these values start with the encoded character ``B''. Therefore, ``B'' and its position cannot differentiate these two cell values. However, the values have different lengths, which makes their hashes distinguishable.
+
+% Going back to our example, as $|C1|=8$, it will be encoded as $8\ mod\ 17 = 8$ and turn the eighth bit of the length segment.
+
+\subsubsection{Bit rotation}\label{subsubsec:bitrotation}
+As a final measure to differentiate hash values without using more $1$ bits than $i$, we reduce the likelihood of so-called random matches through rotation of the character segments.
+A random match occurs when a key value that is partially masked by the individual hash functions of individual row values is masked by the aggregated super key.
+For example, we could have a query key that contains rare characters that occur in two different columns. Or if one value shares the length of the key and the other only shares the characters of the key value that we are searching for.
+To prevent these kinds of FPs, \hash rotates the character hash segments of a value $v$ by its length $l_v$ to left.
+The most left bits that fall off will be moved to the beginning of the bit vector.
+For example, a 3-bit rotation of '01100101' equals '00101011'. Note that the rotation only applies to the character-related segments.
+%This rotation ensures that the hash of the same value is always rotated into the same bit structure.
+As a result, a random match becomes less likely because the length of the random key value must match the length of the column that overlaps in terms of the least frequent characters.
+%With bit rotation, \hash connects the value length and the character features without additional $1$ bits.
+% Continuing our example in \ref{subsub_length}, we exploit the length of the values to re-locate the character bits so that the character ``B'' in ``Boxer'' is mapped to a completely different bit than the one for the same ``B'' in ``Birder''.
+
+\begin{figure}
+    \center{\includegraphics[scale=0.14]
+          {figures/aggregation_example_2.pdf}}
+            %   \vspace{-.6cm}
+    \caption{Example of \hash and the results aggregation.}
+    \label{fig:hash_array_example}
+\end{figure}
+
+
+\textbf{Lemma.} Rotation reduces inter-column bit collisions. 
+% \vspace{-.3cm}
+\begin{proof}[Proof.]
+Given that two cell values $c_1$ and $c_2$ are masked by a given super key $sk$, there are two general cases that lead to $sk$ masking false positives. In both cases the length bits must overlap. Either two values from the same domain or from different domains have the same length respectively. In all collision cases, the $K$ characters of each cell value $c_1$ and $c_2$ are masked, where $K = \alpha - 1$. 
+Now assume that each of the $K$ characters is rotated based on the length of $c_1$ and $c_2$ respectively. Now, for a join candidate $\hat{c}_1$ and $\hat{c}_2$, the collision occurs only if there is an exact match of characters and length between any pair of $c_i$ and $\hat{c}_j$. In all other cases there is a 1-bit in a position that is not masked by $sk$.
+We now prove that the opposite leads to a contradiction.
+There is a collision under rotation of two cell values with different length where there is no exact match between any pair of $c_i$ and $\hat{c}_j$. It follows that $\forall c_i \exists \hat{c}_j: |c_i|=|\hat{c}_j|$ with an injective mapping. 
+Thus, there is a pair of $c_i$ and $\hat{c}_j$ with the same length, where one of the encoded $K$ characters is different. Therefore $K-1$ character bits will be rotated the same way and are covered. Every other $c_i$ covers at most $K$ characters. Thus, there must be an exact match between $c_i$ and $\hat{c}_j$.
+\end{proof}
+
+The previous lemma shows that rotation reduces the number of collisions. This is also shown in our micro-benchmarks where we analyze its impact on filtering.
+Continuing our illustrating example, the character segment bits all rotate by $8$ positions to the left.
+As can be seen in the rotated array, the segment for ``u'' moved from the 108th to the 100th most left bit.
+The final aggregated results for C2 and C3 are shown in separate hash array excerpts.
+Note that because of the rotation in the hash results, the character ``u'' appears in different locations for $C_1$ and $C_2$ respectively.
+
+\subsection{Index Updates}
+There are three possible types of edits on table corpora that lead to updates in the index-level: {\em insert}, {\em update}, and {\em delete}.
+Inserting a new table to the corpus requires the following updates.
+Other than generating the PL items for the cell values in the newly added table, a super key is generated for each row. 
+Inserting a new row to an existing table also follows the same procedure. 
+Adding a new column to an existing table requires applying \hash on each individual column value and replacing the corresponding super key by the result of a bit-wise \texttt{OR} operation with the new \hash result.
+Updating the value of a cell requires a complete re-hash of the corresponding super key.
+Deleting a table/row only requires deleting the PL items for the table/row.
+Yet, deleting a column from a table might change the super key entries, triggering a rehashing of all rows.
+Although some of the aforementioned updates require regeneration of the super key, the system can handle the changes locally to the affected table.
+%Generally, the most frequent index updates in a data lake would be \textit{table inserts}, which do not affect any of the already generated index values.

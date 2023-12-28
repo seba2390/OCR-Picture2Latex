@@ -1,0 +1,694 @@
+
+\documentclass{article}
+\usepackage{iclr2024_conference,times}
+
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+
+\usepackage{xcolor} % colors
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{wrapfig}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{subfig}
+
+
+\title{Automating Continual Learning}
+
+\iclrfinalcopy
+
+\let\svthefootnote\thefootnote
+\newcommand\freefootnote[1]{%
+  \let\thefootnote\relax%
+  \footnotetext{#1}%
+  \let\thefootnote\svthefootnote%
+}
+
+\author{Kazuki Irie$^{1}$$\footnotemark[2]$ ~~ R\'obert Csord\'as$^{2}$ ~ J\"urgen Schmidhuber$^{2,3}$\\
+  $^1$Center for Brain Science, Harvard University, Cambridge, MA, USA \\
+  $^2$The Swiss AI Lab, IDSIA, USI \& SUPSI, Lugano, Switzerland \\
+  $^3$AI Initiative, KAUST, Thuwal, Saudi Arabia \\
+  \texttt{kirie@fas.harvard.edu}, \texttt{\{robert, juergen\}@idsia.ch}
+}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+General-purpose learning systems should improve themselves in open-ended fashion in ever-changing environments. Conventional learning algorithms for neural networks, however, suffer from catastrophic forgetting (CF)---previously acquired skills are forgotten when a new task is learned. Instead of hand-crafting new algorithms for avoiding CF, we propose Automated Continual Learning (ACL) to train self-referential neural networks to meta-learn their own in-context continual \mbox{(meta-)learning} algorithms. ACL encodes all desiderata---good performance on both old and new tasks---into its meta-learning objectives.
+Our experiments demonstrate that
+ACL effectively solves ``in-context catastrophic forgetting''; our ACL-learned algorithms outperform hand-crafted ones, e.g., on the Split-MNIST benchmark in the replay-free setting, 
+and enables continual learning of diverse tasks consisting of multiple few-shot and standard image classification datasets.\footnote{Our code is public: \url{https://github.com/IDSIA/automated-cl}.  $^\dagger$Work done at IDSIA.}
+\end{abstract}
+
+
+\section{Introduction}
+\label{sec:intro}
+Enemies of memories are other memories \citep{eagleman2020livewired}.
+Continually-learning artificial neural networks (NNs) are memory systems in which their \textit{weights} store memories of task-solving skills or programs, and their \textit{learning algorithm} is responsible for memory read/write operations.
+Conventional learning algorithms---used to train NNs in the standard scenarios where all training data is available \textit{at once}---are known to be inadequate for continual learning (CL) of multiple tasks where data for each task is available \textit{sequentially and exclusively}, one at a time.
+They suffer from ``catastrophic forgetting'' (CF; \citet{mccloskey1989catastrophic, ratcliff1990connectionist, french1999catastrophic,mcclelland1995there}); the NNs forget, or rather, the learning algorithm erases, previously acquired skills, in exchange of learning to solve a new task.
+Naturally, a certain degree of forgetting is unavoidable when the memory capacity is limited, and the amount of things to remember exceeds such an upper bound.
+In general, however, capacity is not the fundamental cause of CF;
+typically, the same NNs, suffering from CF when trained on two tasks sequentially, can perform well on both tasks when they are jointly trained on the two tasks at once instead (see, e.g., \citet{irie2022dual}).
+The real root of CF lies in the learning algorithm as a memory mechanism.
+A ``good'' CL algorithm should preserve previously acquired knowledge while also leveraging previous learning experiences to improve future learning, by maximally exploiting the limited memory space of model parameters.
+All of this is the \textit{decision-making problem of learning algorithms}.
+In fact, we can not blame the conventional learning algorithms for causing CF, since they are not aware of such a problem.
+They are designed to train NNs for a given task at hand; they treat each learning experience independently (they are stationary up to certain momentum parameters in certain optimizers),
+and ignore any potential influence of current learning on past or future learning experiences.
+Effectively, more sophisticated algorithms previously proposed against CF \citep{kortge1990episodic, french1991using}, such as elastic weight consolidation \citep{kirkpatrick2017overcoming, Schwarz0LGTPH18} or synaptic intelligence \citep{ZenkePG17}, often introduce manually-designed constraints as regularization terms to explicitly penalize current learning for deteriorating knowledge acquired in past learning.\looseness=-1
+
+Here, instead of hand-crafting learning algorithms for continual learning, we train self-referential neural networks \citep{Schmidhuber:92selfref,schmidhuber1987evolutionary} to meta-learn their own ``in-context'' continual learning algorithms. We train them through gradient descent on learning objectives that reflect desiderata for continual learning algorithms---good performance on both old and new tasks, including forward and backward transfer.
+In fact, by extending the standard settings of few-shot or meta-learning based on sequence-processing NNs \citep{hochreiter2001learning, younger1999fixed, cotter1991learning, cotter1990fixed, mishra2018a}, the continual learning problem can also be formulated as a long-span sequence processing task \citep{IrieSCS22}.
+Corresponding sequences can be obtained by concatenating multiple few-shot/meta-learning sub-sequences, where each sub-sequence consists of input/target examples corresponding to the task to be learned in-context.
+As we'll see in Sec.~\ref{sec:method}, this setting also allows us to seamlessly express classic desiderata for continual learning (knowledge preservation, forward/backward transfer, etc.) as part of objective functions of the meta-learner.
+
+Once formulated as such a sequence-learning task, we let gradient descent search for CL algorithms achieving the desired CL behaviors in the program space of NN weights.
+In principle, all typical challenges of CL---such as the stability-plasticity dilemma \citep{grossberg82studies}---are automatically discovered and handled by the gradient-based program search process.
+Once trained, CL is automated through recursive self-modification dynamics of the trained NN, without requiring any 
+human intervention such as adding extra regularization or setting hyper-parameters for continual learning.
+Therefore, we call our method, Automated Continual Learning (ACL).
+
+ACL requires training settings and datasets similar to those of few-shot/meta learning problems: training sequences are constructed by shuffling target labels for various combinations of underlying class categories, such that each such sequence represents a new learning experience for the model.
+Our experiments focus on supervised image classication, and make use of the standard few-shot image classification datasets for meta-training, namely, Mini-ImageNet \citep{VinyalsBLKW16, RaviL17}, Omniglot \citep{lake2015human}, and FC100 \citep{OreshkinLL18}, while we also meta-test on standard image classification datasets including MNIST families \citep{lecun1998mnist, xiao2017fashion} and CIFAR-10 \citep{krizhevsky}.
+While these datasets remain in the realm of toy tasks,
+they still allow us to clearly demonstrate the effectiveness and promise of our ACL principle.\looseness=-1
+
+\section{Background}
+\label{sec:background}
+Here we briefly review some background concepts that are essential for describing our method in Sec.~\ref{sec:method}: continual learning and its desiderata (Sec.~\ref{sec:cl}), few-shot/meta-learning via sequence processing (Sec.~\ref{sec:fsl}),
+and linear Transformer/fast weight programmer architectures (Sec.~\ref{sec:fwp}) that are foundations of the self-referential neural network we use in our experiments.
+
+\subsection{Continual Learning}
+\label{sec:cl}
+Continual or lifelong learning is a special form of multi-task learning \citep{thrun1998lifelong,caruana1997multitask}.
+In conventional multi-task learning scenarios, all datasets for different tasks are available \textit{at once}, and NNs are trained jointly on all of them (e.g., training batches mix examples from different datasets without any particular order).
+In contrast, in continual learning settings, presentation of tasks/datasets is \textit{sequential}; an NN training process only has access to one task/dataset at a time.
+When a dataset for a new task becomes available, we lose access to the training examples from the previous task, and so on.\looseness=-1
+
+The main focus of this work is on continual learning in \textit{supervised} learning settings even though high-level principles we discuss here also transfer to reinforcement learning settings \citep{ring1994continual}.
+In addition, we focus on the realm of CL methods that keep model sizes constant (unlike certain CL methods that incrementally add more parameters as more tasks are presented; see, e.g., \citet{rusu2016progressive}), and do not make use of any external replay memory (used in other CL methods; see, e.g., \citet{robins1995catastrophic,ShinLKK17,RolnickASLW19,RiemerCALRTT19,ZhangPFBLJ22}).
+
+Classic desiderata for a CL system (see, e.g., \citet{LopezPazR17, VeniatDR21}) are typically summarized as good performance on three metrics:
+\textit{classification accuracies} on each dataset (or their average), \textit{backward transfer} (i.e., impact of learning a new task on the model's performance on previous tasks; e.g., catastrophic forgetting is a negative backward transfer), and \textit{forward transfer} (impact of learning a task for the model's performance on a future task).
+From a broader perspective of meta-learning systems,
+we may also measure other effects such as \textit{learning acceleration} (i.e., whether the system leverages previous learning experiences to accelerate future learning); here we only briefly discuss this as our primary focus remains the classic CL metrics above.\looseness=-1
+
+\subsection{Few-shot/meta-learning via Sequence Learning}
+\label{sec:fsl}
+In Sec.~\ref{sec:method}, we'll formulate continual learning as a long-span sequence processing task.
+This is a direct extension of the classic few-shot/meta learning formulated as a sequence learning problem.
+In fact, since the seminal works by \citet{hochreiter2001learning, younger1999fixed, cotter1991learning, cotter1990fixed} (see also \citet{naik1992meta}),
+many sequence processing neural networks  (see, e.g., \citet{bosc2015learning, SantoroBBWL16, duan2016rl, wang2016learning, munkhdalai2017meta, munkhdalai2018metalearning, miconi18a, miconi2018backpropamine, MunkhdalaiSWT19, KirschS21, sandler21, huisman2023lstms} including ``quadratic'' Transformers \citep{trafo} as in \citet{mishra2018a}) have been trained as 
+a meta-learner \citep{schmidhuber1987evolutionary, Schmidhuber:92selfref}
+that learn by observing sequences of training examples (i.e., pairs of inputs and their labels) in-context.
+Here we briefly review such a formulation.
+% to solve a task
+
+Let $d$, $N$, $K$, $P$ be positive integers.
+% with synchronous label feeding
+In sequential $N$-way $K$-shot classification settings, a sequence processing NN with a parameter vector $\theta \in \mathbb{R}^P$ observes a pair ($\vx_t$, $y_t$) where $\vx_t \in \mathbb{R}^{d}$ is the input and $y_t \in \{1,..., N\}$ is its label at each step $t \in \{1, ..., N\cdot K\}$, corresponding to $K$ examples for each one of $N$ classes.
+After the presentation of these $N\cdot K$ examples (often called the \textit{support set}), one extra input $\vx \in \mathbb{R}^{d}$ (often called the \textit{query}) is fed to the model without its true label but an ``unknown label'' token $\varnothing$ (number of input labels accepted by the model is thus $N+1$).
+The model is trained to predict its true label, i.e., the parameters of the model $\theta$ are optimized to maximize the probability $p(y|(\vx_1,y_1), ..., (\vx_{N\cdot K},y_{N\cdot K}), (\vx, \varnothing);\theta)$ of the correct label $y \in \{1,..., N\}$ of the input query $\vx$.
+Since class-to-label associations are randomized and unique to each sequence ($(\vx_1,y_1), ..., (\vx_{N\cdot K},y_{N\cdot K}), (\vx, \varnothing)$), each such a sequence represents a new (few-shot or meta) learning experience to train the model.
+To be more specific, this is the \textit{synchronous} label setting of \citet{mishra2018a} where the learning phase (observing examples $(\vx_1,y_1), ..., (\vx_{N\cdot K},y_{N\cdot K})$) is separated from the prediction phase (predicting label $y$ given $(\vx, \varnothing)$).
+We opt for this variant in our experiments as we empirically find this (at least in our specific settings) more stable than the \textit{delayed} label setting \citep{hochreiter2001learning} where the model has to make a prediction for every input, and the label is fed to the model with a delay of one time step.
+
+
+\subsection{Self-Referential Weight Matrices or Recursive Linear Transformers}
+\label{sec:fwp}
+Our method (Sec.~\ref{sec:method}) can be applied to any sequence-processing NN architectures in principle.
+Nevertheless, certain architectures naturally fit better to parameterize a self-improving continual learner.
+Here we use the \textit{modern self-referential weight matrix} (SRWM; \citet{IrieSCS22,irie2023practical}) to build a generic self-modifying NN.
+An SRWM is a weight matrix that sequentially modifies itself as a response to a stream of input observations \citep{Schmidhuber:92selfref, Schmidhuber:93selfreficann}.
+The modern SRWM belongs to the family of linear Transformers (LTs) a.k.a.~Fast Weight Programmers (FWPs; \citet{Schmidhuber:91fastweights, schmidhuber1992learning, katharopoulos2020transformers, choromanski2020rethinking, peng2021random, schlag2021linear, irie2021going}).
+Linear Transformers and FWPs are an important class of the now popular Transformers \citep{trafo}:
+unlike the standard ones whose computational requirements grow quadratically and whose state size grows linearly with the context length, LTs/FWPs' complexity is linear and the state size is constant w.r.t.~sequence length (like in the standard RNNs).
+This is an important property for in-context CL, since, conceptually, we want such a CL system to continue to learn for an arbitrarily long, lifelong time span.
+Moreover, the duality between linear attention and FWPs \citep{schlag2021linear}---and likewise, between linear attention and gradient descent-trained linear layers \citep{irie2022dual, aizerman1964theoretical}---have played a key role in certain theoretical analyses of in-context learning capabilities of Transformers \citep{von2022transformers, dai2022can}.\looseness=-1
+
+The dynamics of an SRWM \citep{IrieSCS22} are described as follows. Let $d_\text{in}$, $d_\text{out}$, $t$ be positive integers, and $\otimes$ denote outer product.
+At each time step $t$, an SRWM $\mW_{t-1} \in \mathbb{R}^{(d_\text{out} + 2 * d_\text{in} + 1) \times d_\text{in}}$ observes an input $\vx_t \in \mathbb{R}^{d_\text{in}}$, and outputs $\vy_t \in \mathbb{R}^{d_\text{out}}$, while also updating itself to $\mW_{t}$:
+\begin{align}
+\label{eq:srm_start}
+[\vy_t, \vk_t, \vq_t, \beta_t] &= \mW_{t-1} \vx_t \\
+\label{eq:srm_key}
+\vv_t = \mW_{t-1} \phi(\vq_t)
+&; \, \bar{\vv}_t = \mW_{t-1} \phi(\vk_t) \\
+\mW_{t} = \mW_{t-1} + \sigma(&\beta_t)(\vv_t - \bar{\vv}_t) \otimes \phi(\vk_t)
+\label{eq:update}
+\end{align}
+where $\vv_t, \bar{\vv}_t \in \mathbb{R}^{(d_\text{out} + 2 * d_\text{in} + 1)}$ are value vectors, $\vq_t \in \mathbb{R}^{d_\text{in}}$
+ and $\vk_t \in \mathbb{R}^{d_\text{in}}$ are query and key vectors,
+ and $\sigma(\beta_t) \in \mathbb{R}$ is the learning rate.
+ $\sigma$ and $\phi$ denote sigmoid and softmax functions respectively.
+  $\phi$ is typically also applied to $\vx_t$ in Eq.~\ref{eq:srm_start}; here we follow \citet{IrieSCS22}'s few-shot image classification setting, and use the variant without it.
+Eq.~\ref{eq:update} corresponds to a
+rank-one update of the SRWM, from $\mW_{t-1}$ to $\mW_{t}$, through the \textit{delta learning rule} \citep{widrow1960adaptive, schlag2021linear}
+where the self-generated patterns, $\vv_t$, $\phi(\vk_t)$, and $\sigma(\beta_t)$, play the role of \textit{target}, \textit{input}, and \textit{learning rate} of the learning rule respectively.
+The delta rule in FWPs is typically reported to be crucial broadly across many practical tasks \citep{schlag2021linear, irie2021going,irie2022neural,irie2023image}.
+  
+The initial weight matrix $\mW_0$ is the only trainable parameters of this layer, that encodes the initial self-modification algorithm.
+In practice, we use the layer above as a direct replacement to the self-attention layer in the Transformer architecture \citep{trafo};
+we also use the multi-head version of the SRWM computation above.
+For further details, we refer to \citet{IrieSCS22}.
+
+\begin{figure}[t]
+%    \vskip 0.2in
+    \begin{center}
+        \includegraphics[width=0.95\columnwidth]{figures/fig_acl.pdf}
+        \caption{An illustration of meta-training in Automated Continual Learning (ACL) for a self-referential/modifying weight matrix $\mW_0$. 
+        Weights $\mW_{\mathcal{A}}$ obtained by observing examples for Task A (\textit{blue}) are used to predict a test example for Task A.
+        Weights $\mW_{\mathcal{A}, \mathcal{B}}$ obtained by observing examples for Task A then those for Task B (\textit{yellow}) are used to predict a test example for Task A (backward transfer) as well as a test example for Task B (forward transfer).
+        }
+        \label{fig:acl}
+    \end{center}
+    % \vspace{-3mm}
+\end{figure}
+
+\section{Method}
+\label{sec:method}
+
+\textbf{Task Formulation.} We formulate continual learning as a long-span sequence learning task.
+Let $D$, $N$, $K$, $L$ denote positive integers.
+Consider two $N$-way classification tasks $\rmA$ and $\rmB$ to be learned sequentially (as we'll see, this can also be straightforwardly extended to three or more tasks; also the formulation here applies to both ``meta-training'' and ``meta-test'' phases, see Appendix \ref{app:jargon} for more on the terminology).
+We denote the respective training datasets as $\mathcal{A}$ and $\mathcal{B}$, and test sets as $\mathcal{A'}$ and $\mathcal{B'}$.
+We assume that each datapoint in these datasets consists of one input feature $\vx \in \mathbb{R}^D$ of dimension $D$ (generically denoted as vector $\vx$, but it is an image in all our experiments) and one label $y \in \{1, ..., N\}$ denoting one out of $N$ classes.
+We consider two sequences of $L$ training examples $\left((\vx^{\mathcal{A}}_1, y^{\mathcal{A}}_1), ..., (\vx^{\mathcal{A}}_L, y^{\mathcal{A}}_L)\right)$ and $\left((\vx^{\mathcal{B}}_1, y^{\mathcal{B}}_1), ..., (\vx^{\mathcal{B}}_L, y^{\mathcal{B}}_L)\right)$ sampled from the respective training sets $\mathcal{A}$ and $\mathcal{B}$.
+In practice, $L=NK$ where $K$ is the number of training examples for each class.
+By concatenating these two sequences, we obtain one long sequence representing continual learning examples to be presented as an input sequence to a (left-to-right) auto-regressive model.
+At the end of the sequence, the model is tasked to make predictions on test examples sampled from both $\mathcal{A'}$ and $\mathcal{B'}$;
+we assume a single test example for each task (hence, without index):
+$(\vx^{\mathcal{A'}}, y^{\mathcal{A'}})$ and $(\vx^{\mathcal{B'}}, y^{\mathcal{B'}})$ respectively;
+let us further simplify the notation and denote them as $(\vx^{\mathcal{A}}_\text{test}, y^{\mathcal{A}}_\text{test})$ and $(\vx^{\mathcal{B}}_\text{test}, y^{\mathcal{B}}_\text{test})$ instead.\looseness=-1
+
+Our model is a self-referential neural network that modifies its own weight matrices as a function of input observations.
+To simplify the notation, we denote the \textit{state} of our self-referential NN as a \textit{single} SRWM $\mW_*$ (even though, in practice, it may have many of them) where we'll replace $*$ by various symbols representing the context/inputs it has observed.
+Given a training sequence $\left((\vx^{\mathcal{A}}_1, y^{\mathcal{A}}_1), ..., (\vx^{\mathcal{A}}_L, y^{\mathcal{A}}_L), (\vx^{\mathcal{B}}_1, y^{\mathcal{B}}_1), ..., (\vx^{\mathcal{B}}_L, y^{\mathcal{B}}_L)\right)$,
+our model consumes one input at a time, from left to right, in the auto-regressive fashion.
+Let $\mW_{\mathcal{A}}$ denote the state of the SRWM that has consumed the first part of the sequence corresponding to the examples from Task $\rmA$, i.e., $(\vx^{\mathcal{A}}_1, y^{\mathcal{A}}_1), ..., (\vx^{\mathcal{A}}_L, y^{\mathcal{A}}_L)$, and let $\mW_{\mathcal{A}, \mathcal{B}}$ denote the state of our SRWM having observed the entire sequence.
+
+\textbf{ACL Meta-Training Objectives.} The ACL objective function consists in tasking the model to correctly predict the test examples of all tasks learned so far at each task boundaries.
+That is, in the case of two-task scenario described above (learning Task $\rmA$ then Task $\rmB$), we use the weight matrix $\mW_{\mathcal{A}}$ to predict the label $y^{\mathcal{A}}_\text{test}$ from input $(\vx^{\mathcal{A}}_\text{test}, \varnothing)$, and we use the weight matrix $\mW_{\mathcal{A}, \mathcal{B}}$ to predict the label $y^{\mathcal{B}}_\text{test}$ from input $(\vx^{\mathcal{B}}_\text{test}, \varnothing)$ \textit{as well as} the label $y^{\mathcal{A}}_\text{test}$ from input $(\vx^{\mathcal{A}}_\text{test}, \varnothing)$.
+By letting $p(y|\vx; \mW_{*})$ denote the model's output probability for label $y \in \{1,.., N\}$ given input $\vx$ and model weights/state $\mW_{*}$, the ACL objective function can be expressed as:
+\begin{align}
+\mathop\text{minimize}_{\theta} -\left(\log(p(y^{\mathcal{A}}_\text{test}|\vx^{\mathcal{A}}_\text{test}; \mW_{\mathcal{A}})) + \log(p(y^{\mathcal{B}}_\text{test}|\vx^{\mathcal{B}}_\text{test}; \mW_{\mathcal{A, B}})) + \log(p(y^{\mathcal{A}}_\text{test}|\vx^{\mathcal{A}}_\text{test}; \mW_{\mathcal{A, B}})) \right)
+\label{eq:acl_loss}
+\end{align}
+for an input meta-training sequence $\left((\vx^{\mathcal{A}}_1, y^{\mathcal{A}}_1), ..., (\vx^{\mathcal{A}}_L, y^{\mathcal{A}}_L), (\vx^{\mathcal{B}}_1, y^{\mathcal{B}}_1), ..., (\vx^{\mathcal{B}}_L, y^{\mathcal{B}}_L)\right)$
+(extensible to mini-batches with multiple such sequences), where $\theta$ denotes the model parameters (for the SRWM layer, it is the initial weights $\mW_0$).
+Figure \ref{fig:acl} illustrates the overall meta-training process of ACL.\looseness=-1
+
+The ACL objective function above (Eq.~\ref{eq:acl_loss}) is simple but  encapsulates desiderata for continual learning (reviewed in Sec.~\ref{sec:cl}).
+The last term of Eq.~\ref{eq:acl_loss} with $p(y^{\mathcal{A}}_\text{test}|\vx^{\mathcal{A}}_\text{test}; \mW_{\mathcal{A, B}})$
+or schematically $\vp(\mathcal{A}'|\mathcal{A}, \mathcal{B})$, optimizes for \textit{backward transfer}: (1) remembering the first task $\rmA$ after learning $\rmB$ (combatting catastrophic forgetting), and
+(2) leveraging learning of $\rmB$ to improve performance on the past task $\rmA$.
+The second term of Eq.~\ref{eq:acl_loss}, $p(y^{\mathcal{B}}_\text{test}|\vx^{\mathcal{B}}_\text{test}; \mW_{\mathcal{A, B}})$
+or schematically $\vp(\mathcal{B}'|\mathcal{A}, \mathcal{B})$, optimizes \textit{forward transfer} leveraging the past learning experience of $\rmA$ to improve predictions in the second task $\rmB$, in addition to simply learning to solve Task $\rmB$ from the corresponding training examples.
+To complete, the first term of Eq.~\ref{eq:acl_loss} is a simple single-task meta-learning objective for Task $\rmA$.
+
+
+\textbf{Overall Model Architecture.} As we mention in Sec.~\ref{sec:background}, in our NN architecture,
+the core sequential dynamics of continual learning are learned by the self-referential layers.
+However, as an image-processing NN, our model makes use of a vision backend consisting of multiple convolutional layers.
+In practice, we use the ``Conv-4'' architecture of \citet{VinyalsBLKW16} typically used in the context of few-shot learning.
+Overall, the model takes an image as input, process it through a feedforward convolutional NN, whose output is fed to the SRWM-layer block.
+Note that this is one of the limitations of this work.
+While our architecture with fixed vision components still allows us to experimentally demonstrate the principle of ACL, more general ACL should make use of self-modifying NNs that also learn to modify the vision components.
+One straightforward architecture fitting the bill is an MLP-mixer architecture (\citet{TolstikhinHKBZU21}; built of several linear layers),
+where all linear layers are replaced by the self-referential linear layers of Sec.~\ref{sec:fwp}.
+While we implemented such a model, it turned out to be too slow for us to conduct corresponding experiments.
+Our public code includes a self-referential MLP-mixer implementation, but for further experiments, we leave the future work with such an architecture using more efficient CUDA kernels.\looseness=-1
+
+Another crucial architectural choice that is specific to continual/multi-task image processing is normalization layers (see also \citet{Bronskill0RNT20}).
+Typical NNs used in few-shot learning (e.g., \citet{VinyalsBLKW16}) contain batch normalization (BN; \citet{IoffeS15}) layers.
+All our models use instance normalization (IN; \citet{ulyanov2016instance}) instead of BN because
+in our preliminary experiments, as expected, we found IN to generalize much better than BN layers in the CL setting.
+\looseness=-1
+
+
+\section{Experiments}
+\label{sec:exp}
+
+\textbf{Base Settings.}
+Unless otherwise indicated (e.g, for classic Split-MNIST; Sec.~\ref{sec:more_tasks}), all tasks are configured to be a 5-way classification task.
+This is one of the classic configurations for few-shot learning tasks, and also allows us to evaluate the principle of ACL with reasonable computational costs (like any sequence learning-based meta-learning methods, scaling this to many more classes is challenging; we also discuss this in Sec.~\ref{sec:disc}).
+For standard datasets such as MNIST, we split the dataset into sub-datasets of disjoint classes \citep{SrivastavaMKGS13}: for example for MNIST which is originally a 10-way classification task, we split it into two 5-way tasks, one consisting of images of class `0' to `4' (`MNIST-04'), and another one made of class `5' to `9' images (`MNIST-59').
+When we refer to a dataset without specifying the class range, we refer to the first sub-set.
+Unless stated otherwise, we concatenate 15 examples for each class for each task in the context for both meta-training and meta-testing (resulting in sequences of length 75 for each task).
+All images are resized to $32\times32$-size $3$-channel images, and normalized according to the original dataset statistics. Appendix \ref{app:exp_detail} provides further details. \looseness=-1
+
+
+\begin{table}[t]
+\small
+\setlength{\tabcolsep}{0.3em}
+\caption{5-way classification accuracies using 15 (meta-test training) examples for each class in the context. Each row corresponds to a single model. \textbf{Bold} numbers highlight cases where in-context catastrophic forgetting is avoided through ACL.}
+\vspace{-2mm}
+\label{tab:two_task_acl}
+\begin{center}
+\begin{tabular}{llrrrrrrrrrrrr}
+\toprule
+ & & & \multicolumn{6}{c}{Meta-Test Tasks: Context/Train (top) \& Test (bottom)} \\ \cmidrule(lr){4-9}
+\multicolumn{2}{l}{Meta-Training Tasks} &  & \multicolumn{1}{c}{A} & \multicolumn{2}{c}{A $\rightarrow$ B} & \multicolumn{1}{c}{B} & \multicolumn{2}{c}{B $\rightarrow$ A}  \\ \cmidrule{1-2} \cmidrule(lr){4-4} \cmidrule(lr){5-6}  \cmidrule(lr){7-7} \cmidrule(lr){8-9}
+  Task A & Task B & \multicolumn{1}{c}{ACL}  & \multicolumn{1}{c}{A}  & \multicolumn{1}{c}{B} & \multicolumn{1}{c}{A} & \multicolumn{1}{c}{B}  & \multicolumn{1}{c}{A} & \multicolumn{1}{c}{B} \\ \midrule
+ Omniglot & Mini-ImageNet & No & 97.6 $\pm$ 0.2 & 52.8 $\pm$ 0.7 & 22.9 $\pm$ 0.7 & 52.1 $\pm$ 0.8 & 97.8 $\pm$ 0.3 & 20.4 $\pm$ 0.6 \\ % & 57  \\
+  & & Yes & 98.3 $\pm$ 0.2 & 54.4 $\pm$ 0.8 & \textbf{98.2} $\pm$ 0.2  & 54.8 $\pm$ 0.9 & 98.0 $\pm$ 0.3 & \textbf{54.6} $\pm$ 1.0  \\  \midrule 
+ FC100 & Mini-ImageNet   & No & 49.7 $\pm$ 0.7 & 55.0 $\pm$ 1.0 & 21.3 $\pm$ 0.7 & 55.1 $\pm$ 0.6 & 49.9 $\pm$ 0.8 & 21.7 $\pm$ 0.8 \\
+ & & Yes & 53.8 $\pm$ 1.7 & 52.5 $\pm$ 1.2 &  \textbf{46.2} $\pm$ 1.3 & 59.9 $\pm$ 0.7 & 45.5 $\pm$ 
+ 0.9 & \textbf{53.0} $\pm$ 0.6 \\
+\bottomrule
+\end{tabular}
+\vspace{5mm}
+\caption{Similar to Table \ref{tab:two_task_acl} above but using MNIST and CIFAR-10 (unseen domains) for meta-testing.
+}
+\vspace{-2mm}
+\label{tab:two_task_acl_extra}
+\begin{tabular}{llrrrrrrrrrrrr}
+\toprule
+ & & & \multicolumn{6}{c}{Meta-Test Tasks: Context/Train (top) \& Test (bottom)} \\ \cmidrule(lr){4-9}
+\multicolumn{2}{l}{Meta-Training Tasks} &  & \multicolumn{1}{c}{MNIST} & \multicolumn{2}{c}{MNIST $\rightarrow$ CIFAR-10} & \multicolumn{1}{c}{CIFAR-10} & \multicolumn{2}{c}{CIFAR-10 $\rightarrow$ MNIST}  \\ \cmidrule{1-2} \cmidrule(lr){4-4} \cmidrule(lr){5-6}  \cmidrule(lr){7-7} \cmidrule(lr){8-9}
+  Task A & Task B & \multicolumn{1}{c}{ACL}  & \multicolumn{1}{c}{MNIST}  & \multicolumn{1}{c}{CIFAR-10} & \multicolumn{1}{c}{MNIST} & \multicolumn{1}{c}{CIFAR-10}  & \multicolumn{1}{c}{MNIST} & \multicolumn{1}{c}{CIFAR-10} \\ \midrule
+ Omniglot & Mini-ImageNet & No & 71.1 $\pm$ 4.0 & 49.4 $\pm$ 2.4 & 43.7 $\pm$ 2.3 & 51.5 $\pm$ 1.4 & 68.9  $\pm$ 4.1 & 24.9 $\pm$ 3.2    \\ % & 57  \\
+ & & Yes & 75.4 $\pm$ 3.0 & 50.8 $\pm$ 1.3 & \textbf{81.5} $\pm$ 2.7 & 51.6  $\pm$ 1.3 & 77.9 $\pm$ 2.3 & \textbf{51.8} $\pm$ 2.0  \\  \midrule 
+ % & & Yes & 77.1 & 52.7 & 84.5 & 52.8 & 66.3 & 53.5 \\  \midrule 
+ FC100 & Mini-ImageNet   & No & 60.1 $\pm$ 2.0 & 56.1 $\pm$ 2.3 & 17.2 $\pm$ 3.5 & 54.4 $\pm$ 1.7 & 58.6 $\pm$ 1.6 & 21.2 $\pm$ 3.1 \\
+ & & Yes & 70.0 $\pm$ 2.4 & 51.0 $\pm$ 1.0 & \textbf{68.2} $\pm$ 2.7 & 59.2 $\pm$ 1.7 & 66.9 $\pm$ 3.4 & \textbf{52.5} $\pm$ 1.3  \\
+\bottomrule
+\end{tabular}
+
+\end{center}
+\vspace{-3mm}
+\end{table}
+
+
+\subsection{Two-Task Evaluation}
+\label{sec:exp_two_task}
+\vspace{-2mm}
+We first demonstrate the essence of our method (Sec.~\ref{sec:method}) in the two-task ``domain-incremental'' CL setting (see Appendix \ref{app:jargon}).
+We consider two meta-training task combinations: Omniglot \citep{lake2015human} and Mini-ImageNet \citep{VinyalsBLKW16, RaviL17} or FC100 \citep{OreshkinLL18} (which is based on  CIFAR100 \citep{krizhevsky}) and Mini-ImageNet.
+The order of appearance of two tasks within meta-training sequences is alternated for every batch.
+We compare systems trained with or without the backward transfer term in the ACL loss (the last term in Eq.~\ref{eq:acl_loss}).
+
+Table \ref{tab:two_task_acl} shows the results when the models are meta-tested on the test sets of the corresponding few-shot learning datasets used for meta-training.
+We observe that in both pairs of training tasks, the models without the ACL loss catastrophically forget the first task after learning the second one: the accuracy on the first task is at the chance level of about 20\% for 5-way classification after learning the second task in-context.
+The ACL loss clearly addresses this problem: the ACL-learned CL algorithms preserve the performance of the first task.
+This effect is particularly pronounced in the Omniglot/Mini-ImageNet case (involving two very different domains).
+
+Table \ref{tab:two_task_acl_extra} shows a similar evaluation but on two standard datasets, 5-way MNIST and CIFAR-10.
+Again, ACL-trained models better preserve the memory of the first task after learning the second one.
+In the Omniglot/Mini-ImageNet case,
+we even observe certain positive backward tranfer effects: in particular,
+in the ``MNIST-then-CIFAR10'' continual learning case, the performance on MNIST noticeably improves after learning CIFAR10 (possibly leveraging `more data' provided in-context).\looseness=-1
+
+
+\subsection{In-Context Catastrophic Forgetting in the Baselines}
+\label{sec:analysis}
+
+Here we report some empirical observations on the baseline models trained \textbf{without} the backward transfer term (the last/third term in Eq.~\ref{eq:acl_loss}) in the ACL objective loss (corresponding to the \textbf{ACL/No} cases in Tables \ref{tab:two_task_acl} and \ref{tab:two_task_acl_extra}), namely emergence of ``in-context catastrophic forgetting'' during training.
+We focus on the Omniglot/Mini-ImageNet case, but similar trends can also be observed in the FC100/Mini-ImageNet case.
+Figures \ref{sfig:case_a} and \ref{sfig:case_b} show two cases we typically observe. 
+These figures show an evolution of six individual meta-training loss terms (the lower the better), reported separately for the cases where Task A (here Omniglot) or Task B (here Mini-ImageNet) appears at the first (1) or second (2) position in the 2-task continual learning training sequences.
+4 out of 6 curves correspond to the learning progress, showing
+whether the model becomes capable of in-context learning the given task (A or B) at the given position (1 or 2).
+The 2 remaining curves are the ACL backward tranfer loss, also measured for Task A and B separately here.
+
+Figure \ref{sfig:case_a} shows the case where two tasks are learned about at the same time.
+We observe that when the learning curves go down, the ACL losses go up,
+indicating that more the model learns, more it tends to forget the task  in-context learned previously.
+This trend is similar when one task is learned before the other one as is the case in Figure \ref{sfig:case_b}.
+Here Task A alone is learned first; while Task B is not learned, both learning and ACL curves go down for Task A (essentially, as the model does not learn the second task, there is no force that encourages forgetting).
+At around 3000 steps, the model also starts learning Task B.
+From this point, the ACL loss for Task A also starts to go up, indicating again an \textit{opposing force effect} between learning a new task and remembering a past task.
+These observations clearly indicate that, without explicitly taking into account the backward transfer loss as part of learning objectives, the gradient descent search tends to find solutions/CL algorithms that prefer to erase previously learned knowledge (this is rather intuitive; it seems easier to find such algorithms that ignore any influence of the current learning to past learning than those that also preserve prior knowledge).
+In all cases, we find our ACL objective to be crucial for the learned CL algorithms to be capable of remembering the old task while also learning the new task at the same.
+
+\begin{figure}[t]
+	\subfloat[Case: Two tasks are learned simultaneously.
+ ]{
+		\centering
+		\includegraphics[width=.465\linewidth]{figures/cf.pdf}
+		\label{sfig:case_a}
+	} 
+ \hspace{3mm}
+ 	\subfloat[Case: One task is learned first (here Task A).
+  ]{
+		\centering
+        \includegraphics[width=.48\linewidth]{figures/cf_2.pdf}
+		\label{sfig:case_b}
+	}
+	\caption{\textbf{ACL/No}-case meta-training curves displaying 6 individual meta-training loss terms,  when the last term of the ACL objective (the backward tranfer loss; ``\textit{Task A ACL bwd}'' and ``\textit{Task B ACL bwd}'' in the legend) is \textbf{not} minimized (\textbf{ACL/No} case in Tables \ref{tab:two_task_acl} and \ref{tab:two_task_acl_extra}). Here Task A is Omniglot and Task B is Mini-ImageNet. We observe that, in both cases, without explicit minimization, backward transfer capability (\textit{purple} and \textit{brown} curves) of the learned learning algorithm gradually degrades as it learns to learn a new task (all other colors), causing in-context catastrophic forgetting. Note that \textit{blue/orange} and \textit{green/red} curve pairs almost overlap; indicating that when a task is learned, the model can learn it whether it is in the first or second segment of the continual learning sequence.}
+	\label{fig:dmlab}
+		\vspace{-3mm}
+\end{figure}
+
+\subsection{General Evaluation}
+\label{sec:more_tasks}
+\begin{table}[t]
+\small
+\setlength{\tabcolsep}{0.3em}
+\caption{Classification accuracies (\%) on the \textbf{Split-MNIST} domain-incremental (DIL) and class-incremental learning (CIL) settings \citep{hsu2018re}. Both tasks are 5-task CL problems. For the CIL case, we also report the 2-task case for which we can directly evaluate our out-of-the-box ACL meta-learner of Sec.~\ref{sec:exp_two_task} (trained with a 5-way output and the 2-task ACL loss) which, however, is not applicable (N.A.) to the 5-task CIL requiring a 10-way output. Mean/std over 10 training/meta-testing runs. \textbf{None of the methods here requires replay memory}. See Appendix \ref{app:split_mnist}/\ref{app:meta-val} for further details.}
+\vspace{-2mm}
+\label{tab:split_mnist}
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & Domain Incremental & \multicolumn{2}{c}{Class Incremental} \\ \cmidrule(lr){2-2} \cmidrule(lr){3-4}
+Method & \multicolumn{1}{c}{5-task} & 2-task & 5-task \\ \midrule 
+Plain Stochastic Gradient Descent (SGD) & 63.2 $\pm$  0.4 & 48.8 $\pm$ 0.1 & 19.5 $\pm$ 0.1 \\
+Adam & 55.2 $\pm$  1.4 & 49.7 $\pm$ 0.1 & 19.7 $\pm$ 0.1 \\   \midrule 
+Adam + L2 &  66.0 $\pm$ 3.7 & 51.8 $\pm$ 1.9  & 22.5 $\pm$  1.1 \\
+Elastic Weight Consolidation (EWC) & 58.9 $\pm$  2.6 & 49.7 $\pm$ 0.1  &  19.8 $\pm$ 0.1 \\  
+Online EWC & 57.3 $\pm$ 1.4 & 49.7 $\pm$ 0.1 & 19.8 $\pm$ 0.1 \\  
+Synaptic Intelligence (SI) & 64.8 $\pm$ 3.1 & 49.4 $\pm$ 0.2 & 19.7 $\pm$ 0.1 \\ 
+Memory Aware Synapses (MAS) & 68.6 $\pm$ 6.9 &  49.6 $\pm$ 0.1 & 19.5 $\pm$ 0.3 \\ 
+Learning w/o Forgetting (LwF) & 71.0 $\pm$ 1.3 & - & 24.2 $\pm$ 0.3 \\  \midrule 
+Online-aware Meta Learning (OML; Out-of-the-box) & 69.9 $\pm$ 2.8 & 46.6 $\pm$ 7.2 & 24.9 $\pm$ 4.1 \\ 
+\quad + optimized \# meta-testing iterations & 73.6 $\pm$ 5.3 & 62.1 $\pm$ 7.9 & 34.2 $\pm$ 4.6 \\ 
+\midrule \midrule 
+ACL (Out-of-the-box, DIL, 2-task ACL model; Sec.~\ref{sec:exp_two_task}) & 72.2 $\pm$ 0.9 & 71.5 $\pm$ 5.9 & N.A. \\ 
+\quad + meta-finetuned with 5-task ACL loss, Omniglot & \textbf{84.3} $\pm$ 1.2 & \textbf{93.4} $\pm$ 1.2 & \textbf{74.6} $\pm$ 2.3 \\ 
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{-5mm}
+
+\end{table}
+
+\textbf{Evaluation on standard Split-MNIST.}
+Here we evaluate ACL on the standard Split-MNIST task in domain-incremental and class-incremental settings \citep{hsu2018re,van2019three}, and compare its performance to existing CL and meta-CL algorithms (see Appendix \ref{app:split_mnist} for full references of these methods).
+Our comparison focuses on methods that do not require replay memory.
+Table \ref{tab:split_mnist} shows the results.
+Since our ACL-trained models are general-purpose learners, they can be directly evaluated (meta-tested) on a new task, here Split-MNIST.
+``ACL (Out-of-the-box model)'' row of Table \ref{tab:split_mnist} corresponds to our model from Sec.~\ref{sec:exp_two_task} meta-trained on Omniglot and Mini-ImageNet using the 2-task ACL objective.
+It performs very competitively with the best existing methods in the domain-incremental setting, while it largely outperforms them in the 2-task class-incremental setting.
+The same model can be further meta-finetuned using the 5-task version of the ACL loss (here we only used Omniglot as the meta-training data).
+The resulting model (the last row of Table \ref{tab:split_mnist}) outperforms all other methods in all settings studied here.
+We refer to Appendix \ref{app:split_mnist}/\ref{app:meta-val} for further discussions.
+
+\textbf{Evaluation on diverse task domains.} Here we evaluate our ACL-trained models for CL involving more tasks/domains;
+using meta-test sequences made of MNIST, CIFAR-10, and Fashion MNIST (FMNIST). We also evaluate the impact of the number of tasks in the ACL objective:
+in addition to the model meta-trained on Omniglot/Mini-ImageNet (Sec.~\ref{sec:exp_two_task}), we also meta-train a model (with the same architecture and hyper-parameters) using 3 tasks, Omniglot, Mini-ImageNet, and FC100, using the 3-task ACL objective (see Appendix \ref{app:3_task}); which is not only meta-trained for longer CL, but also uses more data.
+Table \ref{tab:more_task_acl} shows the results.
+The two ACL-trained models are indeed capable of retaining the knowledge without catastrophic forgetting for multiple tasks during meta-testing, while the performance on prior tasks gradually degrades as the model learns new tasks, and performance on new tasks becomes moderate (see Sec.~\ref{sec:disc} on limitations).
+The 3-task version outperforms the 2-task one overall, encouragingly indicating a potential for further improvements even with a fixed parameter count.\looseness=-1
+
+
+\begin{table}[th]
+\small
+\caption{5-way classification accuracies using 15 examples for each class for each task in the context. 2-task models are meta-trained on Omniglot and Mini-ImageNet, while 3-task models are in addition meta-trained on FC100. `A, B' in `Context/Train' column indicates that models sequentially observe meta-test training examples of Task A then B; evaluation is only done at the end of the sequence.}
+\vspace{-2mm}
+\label{tab:more_task_acl}
+\begin{center}
+\begin{tabular}{lcrrr}
+\toprule
+ \multicolumn{2}{c}{Meta-Testing Tasks}  & \multicolumn{3}{c}{Number of Meta-Training Tasks} \\ \cmidrule(lr){1-2} \cmidrule(lr){3-5}
+Context/Train & Test & 2 (no ACL) & 2 & 3 \\ \midrule
+A: MNIST-04 & A & 71.1 $\pm$ 4.0 & 75.4 $\pm$ 3.0 & 89.7 $\pm$ 1.6 \\
+B: CIFAR10-04 & B & 51.5 $\pm$ 1.4 & 51.6 $\pm$ 1.3 & 55.3 $\pm$ 0.9 \\
+C: MNIST-59 & C & 65.9 $\pm$ 2.4 & 63.0 $\pm$ 3.3 & 76.1 $\pm$ 2.0 \\
+D: FMNIST-04 & D & 52.8 $\pm$ 3.4 & 54.8 $\pm$ 1.3 & 59.2 $\pm$ 4.0 \\ 
+ & Average & 60.3 & 61.2 & 70.1 \\ 
+\midrule
+A, B & A & 43.7 $\pm$ 2.3 & 81.5 $\pm$ 2.7 & 88.0 $\pm$ 2.2 \\ 
+     & B &  49.4 $\pm$ 2.4 & 50.8 $\pm$ 1.3 & 52.9 $\pm$ 1.2 \\ 
+     &  Average & 46.6 & 66.1 & 70.5 \\ \midrule
+A, B, C & A & 26.5 $\pm$ 3.2 & 64.5 $\pm$ 6.0 & 82.2 $\pm$ 1.7 \\ 
+ & B & 32.3 $\pm$ 1.7 & 50.8 $\pm$ 1.2 & 50.3 $\pm$ 2.0 \\ 
+ & C & 56.5 $\pm$ 8.1 & 33.7 $\pm$ 2.2 & 44.3 $\pm$ 3.0 \\ 
+ & Average & 38.4 & 49.7 & 58.9 \\ \midrule
+A, B, C, D & A & 24.6 $\pm$ 2.7 & 64.3 $\pm$ 4.8 & 78.9 $\pm$ 2.3 \\ 
+ & B & 20.6 $\pm$ 2.3 & 47.5 $\pm$ 1.0 & 49.2 $\pm$ 1.3 \\ 
+ & C & 38.5 $\pm$  4.4 & 32.7 $\pm$ 1.9 & 45.4 $\pm$ 3.9 \\
+ & D & 36.1 $\pm$ 2.5 & 31.2 $\pm$ 4.9 & 30.1 $\pm$ 5.8 \\  
+ & Average & 30.0 & 43.9 & 50.9 \\ 
+\bottomrule
+\end{tabular}
+
+\end{center}
+\vspace{-3mm}
+\end{table}
+
+\section{Discussion}
+\label{sec:disc}
+
+\textbf{Prior work.}
+While there are several recent works that are catagorized as `meta-continual learning' or `continual meta-learning' (see, e.g., \citet{JavedW19,BeaulieuFMLSCC20,CacciaRONLPLRLV20,he2019task,yapRB21,munkhdalai2017meta},
+most of them are based on ``model-agnostic meta-learning'' (MAML; \citet{FinnAL17,FinnL18}) and learn \textit{representations} for CL but still make use of classic CL algorithms.
+In particular, tuning of the learning rate and number of iterations is still required for optimal performance (see, e.g., Appendix \ref{app:split_mnist}).
+In contrast, our approach learn \textit{learning algorithms} in the spirit of \citet{hochreiter2001learning, younger1999fixed}; this may be categorized as `in-context continual learning.'
+Several recent works (see, e.g., \citet{irie2023accelerating,coda2023meta,von2023uncovering}) mention the possibility of such in-context CL without any concrete study.
+We show that in-context learning also suffers from catastrophic forgetting (Sec.~\ref{sec:exp_two_task}-\ref{sec:analysis})
+and propose ACL to address this problem.
+We also note that the use of SRWM is relevant to `continual meta-learning' since with a regular sequence processor with slow weights, there remains the question of how to continually learn the slow weights (meta-parameters). In principle, recursive self-modification as in SRWM is an answer to this question as it collapses such meta-levels into single self-reference \citep{Schmidhuber:92selfref}.
+We also refer to \citet{Schmidhubermeta2,schmidhuber1995beyond,schmidhuber1997shifting} for other prior work on meta-continual learning.\looseness=-1
+
+\textbf{Artificial v. Natural ACL in Large Language Models?}
+Recently, ``on-the-fly'' few-shot/meta learning capability of sequence processing NNs has attracted broader interests in the context of large language models (LLMs; \citet{gpt2}).
+In fact, the task of language modeling itself has a form of \textit{sequence processing with error feedback} (essential for meta-learning \citep{schmidhuber1990making}): the correct label to be predicted is fed to the model with a delay of one time step in an auto-regressive manner.
+Trained on a large amount of text covering a wide variety of credit assignment paths, LLMs exhibit certain sequential few-shot learning capabilities in practice \citep{gpt3}.
+This was rebranded as \textit{in-context learning}, and
+has been the subject of numerous recent studies (e.g., \citet{XieRL022, MinLHALHZ22, YooKKCJLLK22, chan2022data, chan2022transformers, kirsch2022general, akyurek2022learning, von2022transformers, dai2022can}).
+Here we explicitly/artificially construct ACL meta-training sequences and objectives,
+but in modern LLMs trained on a large amount of data mixing a large diversity of dependencies using a large backpropagation span, it is conceivable that some ACL-like objectives may naturally appear in the data.
+
+\textbf{Limitations.}
+While we argue that our ACL is a promising approach for automating development of CL algorithms, there are also several limitations.
+First of all, directly scaling ACL for real-world tasks requiring many more classes does not seem straightforward: it would require very long training sequences.
+That said, it is also possible that ACL could be achieved without exactly following the process we propose; as we mention above for the case of LLMs, certain real-world data may naturally give rise to an ACL-like objective.
+Another limitation of this work is training within the limited span.
+We noted that unlike the standard ``quadratic" Transformers, linear Transformers/FWPs-like SRWMs can be trained by \textit{carrying over states} across two consecutive batches for arbitrarily long sequences.
+Such an approach has been successfully applied to language modeling with FWPs \citep{schlag2021linear}. This possibility, however, has not been investigated here, and is left for future work.
+This work is also limited to the task of image classification, which can be solved by feedforward NNs.
+Future work may investigate the possibility to extend ACL to continual learning of sequence learning tasks, such as continually learning new languages.
+Finally, ACL learns CL algorithms that are specific to the pre-specified model architecture; more general meta-learning algorithms may aim at achieving learning algorithms that are applicable to any model, as is the case for many classic learning algorithms.\looseness=-1
+
+
+
+\section{Conclusion}
+Our novel Automated Continual Learning (ACL) formulates continual learning as sequence learning across long time lags, and trains sequence-processing self-referential neural networks (SRNNs) to learn their own in-context continual (meta-)learning algorithms. ACL encodes classic desiderata for continual learning (such as knowledge preservation, forward and backward transfer, etc.) into the objective function of the meta-learner. ACL uses gradient descent to deal with classic challenges of CL, to automatically discover CL algorithms with good behavior. Once trained, our SRNNs autonomously run their own continual learning algorithms without requiring any human intervention. Our experiments demonstrate the effectiveness and promise of the proposed approach.
+
+\section*{Acknowledgements}
+This research was partially funded by ERC Advanced grant no: 742870, project AlgoRNN,
+and by Swiss National Science Foundation grant no: 200021\_192356, project NEUSYM.
+We are thankful for hardware donations from NVIDIA and IBM.
+The resources used for this work were partially provided by Swiss National Supercomputing Centre (CSCS) projects s1145 and d123.
+
+\bibliography{main}
+\bibliographystyle{iclr2024_conference}
+
+\clearpage
+
+\appendix
+
+\section{Experimental Details}
+\label{app:exp_detail}
+
+\subsection{Continual and meta-learning Terminologies}
+\label{app:jargon}
+Here we review the following classic terminologies of continual learning and meta-learning used throughout this paper.
+
+\paragraph{Continual learning.}
+``Domain-incremental learning (DIL)'' and ``class-incremental learning (CIL)'' are two classic settings in continual learning \citep{van2018generative,van2019three,hsu2018re}.
+They differ as follows.
+Let $M$ and $N$ denote positive integers.
+Consider continual learning of $M$ tasks where each task is an $N$-way classification.
+In the DIL case, a model has an $N$-way output classification layer, i.e., the class `0' of the first task shares the same weights as the class `0' of the second task, and so on.
+In the CIL case, a model's output dimension is $N * M$; the class indices of different tasks are not shared, neither are the corresponding weights in the output layer.
+In our experiments, all CIL models have the $(N * M)$-way output from the first task (instead of progressively increasing the output size).
+In this work, we skip the third variant called ``task-incremental learning'' which assumes that we have 
+access to the task identity as an extra input, as it makes the CL problem almost trivial.
+CIL is typically reported to be the hardest setting among them.
+
+
+
+\paragraph{Meta-learning.}
+We need to introduce ``meta-training'' and ``meta-test'' terminologie since  each of these phases involve ``training/test'' processes within itself.
+Each of them requires the corresponding training and test examples.
+We refer to these as ``meta-training training/test examples'', and ``meta-test training/test examples'' following the terminology of  \citet{BeaulieuFMLSCC20}.
+While these are rather ``heavy'' terminologies, they are unambiguous and help avoid potential confusions.
+In both phases, our sequence-processing neural net observes a sequence of (meta-training or meta-test) training examples---each consisting of input features and a correct label---, and the resulting states of the sequence processor (i.e., weights in the case of SRWM) are used to make predictions on (meta-training or meta-test) test examples---input features presented to the model without its label.
+During the meta-training phase, we modify the trainable parameters of the meta-learner through gradient descent minimizing the meta-learning loss function (using backpropagation through time).
+During meta-testing, no human-designed optimization for weight modification is used anymore; the SRWMs modify their own weights following their own learning rules defined as their forward pass (Eqs.~\ref{eq:srm_start}-\ref{eq:update}).
+In connection with the now-popular in-context learning \citep{gpt3}, we also refer to a (meta-training or meta-test) training-example sequence as \textit{context}.
+
+
+\subsection{Datasets}
+\label{app:data}
+For classic image classification datasets such as MNIST \citep{lecun1998mnist}, CIFAR10 \citep{krizhevsky}, and FashionMNIST (FMNIST; \citet{xiao2017fashion})
+we refer to the original references for details.\looseness=-1
+
+For Omniglot \citep{lake2015human}, we use \citet{VinyalsBLKW16}'s 1028/172/432-split for the train/validation/test set, as well as their data augmentation methods using rotation of 90, 180, and 270 degrees.
+Original images are grayscale hand-written characters from 50 different alphabets. There are 1632 different classes with 20 examples for each class.
+
+Mini-ImageNet contains color images from 100 classes with 600 examples for each class.
+We use the standard train/valid/test class splits of 64/16/20 following \citep{RaviL17}.
+
+FC100 is based on CIFAR100 \citep{krizhevsky}.
+100 color image classes (600 images per class, each of size $32\times 32$) are split into train/valid/test classes of 60/20/20 \citep{OreshkinLL18}.
+
+We use \texttt{torchmeta} \citep{deleu2019torchmeta} which provides common few-shot/meta learning settings for these datasets to sample and construct their meta-train/test datasets.
+The construction of “meta-training training” sequences for an 
+$N$-way classification, using a dataset containing $C$
+ classes works as follows; for each sequence, we sample $N$
+ random but distinct classes out of $C$
+ ($N < C$). 
+ The resulting classes are re-labelled such that each class is assigned to one out of $N$ 
+ distinct random label index which is unique to the sequence. 
+  For each of these $N$ classes, we sample $K$ examples.
+  We randomly order these $N*K$ examples to obtain a sequence.
+ Each such a sequence ``simulates'' an unknown task the model has to learn.
+
+\subsection{Hyper-Parameters}
+\label{app:hyp}
+We use the same model and training hyper-parameters in all our experiments.
+All hyper-parameters are summarized in Table \ref{tab:hyperparameters}.
+We use the Adam optimizer with the standard Transformer learning rate warmup scheduling \citep{trafo}.
+The vision backend is the classic 4-layer convolutional NN of \citet{VinyalsBLKW16}.
+Most configurations follow those of \citet{IrieSCS22};
+except that we initialize the `query' sub-matrix in the self-referential weight matrix using a normal distribution with a mean value of 0 and standard deviation of $0.01 / \sqrt{d_\text{head}}$ while other sub-matrices use an std of $1 / \sqrt{d_\text{head}}$ (motivated by the fact that a generated query vector is immediately multiplied with the same SRWM to produce a value vector).
+For any further details, we'll refer the readers to our public code we'll release upon acceptance.
+
+\begin{table}[h]
+\caption{
+Hyper-parameters.
+}
+\label{tab:hyperparameters}
+\begin{center}
+\begin{tabular}{rc}
+\toprule
+Parameters & Values  \\ \midrule
+Number of SRWM layers & 2  \\
+Total hidden size & 256 \\
+Feedforward block multiplier & 2 \\
+Number of heads & 16 \\
+Batch size & 16 or 32 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{Evaluation Procedure}
+\label{app:eval}
+For evaluation on few-shot learning datasets (i.e., Omniglot, Mini-Imagenet and FC100),
+we use 5 different sets consisting of 32\,K random test episodes each, and report mean and standard deviation.
+
+For evaluation on standard datasets,
+we use 5 different random support sets for in-context learning, and evaluate on the entire test set. We report the corresponding mean and standard deviation across these 5 evaluation runs.
+
+For the Split-MNIST experiment, we do 10 meta-testing runs to compute the mean and standard deviation as the baseline models are also trained for 10 runs in \citet{hsu2018re} (see other details in Appendix \ref{app:split_mnist}.
+
+\subsection{Three-Task ACL}
+\label{app:3_task}
+We can straightforwardly extend the 2-task version of ACL presented in Sec.~\ref{sec:method} to more tasks.
+In the 3-task case (we denote the three tasks as $\rmA$, $\rmB$, and $\rmC$) used in Sec.~\ref{sec:more_tasks}, the objective function contains six terms.
+Following three terms are added to Eq.~\ref{eq:acl_loss}:
+
+\begin{align}
+-\left(\log(p(y^{\mathcal{C}}_\text{test}|\vx^{\mathcal{C}}_\text{test}; \mW_{\mathcal{A, B, C}})) + \log(p(y^{\mathcal{B}}_\text{test}|\vx^{\mathcal{B}}_\text{test}; \mW_{\mathcal{A, B, C}})) + \log(p(y^{\mathcal{A}}_\text{test}|\vx^{\mathcal{A}}_\text{test}; \mW_{\mathcal{A, B, C}})) \right)
+\end{align}
+
+This also naturally extends to the 5-task loss used in the Split-MNIST experiment (Table \ref{tab:split_mnist}).
+As one can observe, the number of terms rapidly/quadratically increases with the number of tasks.
+Nevertheless, computing these loss terms isn't immediately impractical because they essentially just require forwarding the network for one step, for many independent inputs/images. This can be heavily parallelized as a batch operation.
+While this can be a concern when scaling up more, a natural open research question is whether we really need all these terms in the case we have many more tasks. Our experiments effectively show that using more terms in the ACL loss improves performance. That said, ideally, we want these models to `systematically generalize' to more tasks even when they are trained with only a handful of them \citep{fodor1988connectionism}. This as an interesting research question on generalization to be studied in a future work.
+
+
+\subsection{Auxiliary 1-shot Learning Objective}
+\label{app:one_shot}
+In practice, instead of training the models only for ``15-shot learning,'' we also add an auxiliary loss for 1-shot learning.
+This naturally encourages the models to learn in-context from the first examples.
+
+\subsection{Details of the Split-MNIST experiment}
+\label{app:split_mnist}
+
+Here we provide details of the Split-MNIST experiments presented in Sec.~\ref{sec:exp} and Table \ref{tab:split_mnist}.
+
+Split-MNIST is obtained by transforming the classic 10-class single-task MNIST dataset into a sequence of 5  tasks by partitioning the 10 classes into 5 groups/pairs of two classes each, in a fixed order from 0 to 9 (i.e., grouping 0/1, 2/3, 4/5, 6/7, and 8/9).
+For the difference between domain/class-incremental settings, we refer to Appendix \ref{app:jargon}.
+
+The baseline methods presented in Table \ref{tab:split_mnist} include: standard SGD and Adam optimizers, Adam with the L2 regularization, elastic weight consolidation \citep{kirkpatrick2017overcoming} and its online variant \citep{Schwarz0LGTPH18}, synaptic intelligence \citep{ZenkePG17}, memory aware synapses \citep{AljundiBERT18}, learning without forgetting (LwF; \citet{LiH16}).
+For these methods, we directly take the numbers reported in \citet{hsu2018re}
+for the 5-task domain/class-incremental settings.
+
+For the 2-task class incremental setting, we use  \citet{hsu2018re}'s code to train the correspond models (the number for LwF is currently missing as it is not implemented in their code base; we will add the corresponding/missing entry in Table \ref{tab:split_mnist} for the final version of this paper).
+
+Finally we also evaluate a MAML-based meta-learning approach, OML \citep{JavedW19}.
+We note that as reported by \citet{JavedW19} in their public code repository; after some critical bug fix, the performance of their OML matches that of \citet{BeaulieuFMLSCC20} (which is a direct application of OML to another model architecture).
+Therefore, we focus on OML as our main meta-continual learning baseline.
+We take the out-of-the-box model (meta-trained for Omniglot, with a 1000-way output) made publicly available by \citep{JavedW19}.
+We evaluate the corresponding model in two ways.
+In the first, `out-of-the-box' case, we take the meta-pre-trained model and only tune its meta-testing learning rate (which is done by \citet{JavedW19} even for meta-testing in Omniglot).
+We find that this setting does not perform very well;
+in the other case (`optimized \# meta-testing iterations'), we additionally tune the number of meta-test training iterations.
+We've done a grid search of the meta-test learning rate in $3 * \{1e^{-2}, 1e^{-3}, 1e^{-4}, 1e^{-5}\}$ and the number of meta-test training steps in $\{1, 2, 5, 8, 10\}$ using a meta-validation set based on an MNIST validation set (5\,K held-out images from the training set);
+we found the learning rate of $3e^{-4}$ and $8$ steps to consistently perform the best in all our settings.
+We've also tried it `with' and `without' the standard mean/std normalization of the MNIST dataset; better performance was achieved without such normalization (which is in fact consistent as they do not normalize the Omniglot dataset for their meta-training/testing).
+Their performance on the 5-task class-incremental setting is somewhat surprising/disappointing (since genenralization from Omniglot to MNIST is typically straightforward, at least, in common non-continual few-shot learning settings; see, e.g., \citet{munkhdalai2017meta}). At the same time, to the best of our knowledge, OML-trained models have not been tested in such a condition in prior work; from what we observe, the publicly available out-of-the-box model might be overtuned for Omniglot/Mini-ImageNet or the frozen `representation network' is not ideal for genenralization.
+We note that the sensitivity of these MAML-based methods \citep{JavedW19,BeaulieuFMLSCC20} w.r.t.~meta-test hyper-parameters has been also noted by \citet{BanayeeanzadeMH21}; these are characteristics of hand-crafted learning algorithms that we want to avoid with learned learning algorithms.
+
+
+Unlike any other methods above, our out-of-the-box ACL models (trained on Omniglot and Mini-ImageNet) do not require any tuning at meta-test time.
+Nevertheless, we've checked the effect of the number of meta-test training examples (5 vs.~15; 15 is the number used in meta-training); we found the consistent number, i.e., 15, to work better than 5.
+For the version that is meta-finetuned using the 5-task ACL objective (using only the Omniglot dataset), we use 5 examples for both meta-train and meta-test training.
+To obtain a sequence of 5 tasks, we simply sample 5 tasks from Omniglot (in principle, we should make sure that different tasks in the same sequence have no class overlap; in practice, our current implementation simply randomly draws 5 independent tasks from Omniglot).\looseness=-1
+
+
+\section{Extra Experimental Results and Comments}
+
+\subsection{Ablation Studies on the choice of meta-validation sets}
+\label{app:meta-val}
+Here we conduct ablation studies on the choice of meta-validation sets to select model checkpoints.
+In general, when dealing with out-of-domain generalization, the choice of validation procedures to select final model checkpoints plays a crucial role in the evaluation of the corresponding method \citep{csordas2021devil,irie2021improving}.
+The out-of-the-box models are chosen based on the average meta-validation performance on the validation set corresponding to the few-shot learning datasets used in meta-training: Omniglot and mini-ImageNet (or Omniglot, mini-ImageNet, and FC100 in the case of 3-task ACL), independently of any potential meta-test datasets.
+In contrast, in the meta-finetuning process of Table \ref{tab:split_mnist}, we selected our model checkpoint by meta-validation on the MNIST validation dataset (we held out 5\,K images from the training set).
+Here we evaluate ACL models meta-finetuned for the ``5-task domain-incremental binary classification'' on three Split-'X' tasks where 'X' is MNIST, FashionMNIST (FMNIST) or CIFAR-10 for various choices of meta-validation sets (in each case we hold out 5\,K images from the corresponding training set).
+In addition, we also evaluate the effect of meta-finetuning datasets (Omniglot only v.~Omniglot and mini-ImageNet).
+Table \ref{tab:metaval} shows the results (we use 15 meta-training and meta-testing examples except for the Omniglot-finedtuned/MNIST-validated model from Table \ref{tab:split_mnist} which happens to be configured with 5 examples; this will be fixed in the final version).
+Effectively, meta-validation on the matching validation set is useful.
+Also, meta-finetuning only on Omniglot is beneficial for the performance on MNIST when meta-validated on MNIST or FMNIST.
+However, importantly, we emphasize that our ultimate goal is not to obtain a model that is specifically tuned for certain datasets; we aim at building models that generally work well across a wide range of tasks (ideally on any tasks); in fact, several existing works in the few-shot learning literature evaluate their methods in such settings (see, e.g., \citet{Requeima0BNT19,Bronskill0RNT20,TriantafillouZD20}).
+This also goes hand-in-hand with scaling up ACL (our current model is tiny; see hyper-parameters in Table \ref{tab:hyperparameters}; the vision component is also a shallow `Conv-4' net) and various other considerations on self-improving continual learners (see, e.g., \citet{schmidhuber2018one}), such as automated curriculum learning \citep{GravesBMMK17}.
+
+
+\begin{table}[t]
+\small
+\setlength{\tabcolsep}{0.3em}
+\caption{Impact of the choice of meta-validation datasets. Classification accuracies (\%) on three datasets: \textbf{Split-CIFAR-10}, \textbf{Split-Fashion MNIST} (Split-FMNIST), and \textbf{Split-MNIST} in the \textbf{domain-incremental} setting.
+``OOB'' denotes ``out-of-the-box''. ``mImageNet'' here refers to mini-ImageNet.}
+\vspace{-2mm}
+\label{tab:metaval}
+\begin{center}
+\begin{tabular}{llccc}
+\toprule
+ & &  \multicolumn{3}{c}{Meta-Test on Split-} \\ \cmidrule(lr){3-5} 
+ Meta-Finetune Datasets & Meta-Validation Sets & MNIST & FMNIST & CIFAR-10 \\ \midrule 
+ None (OOB: 2-task ACL; Sec.~\ref{sec:exp_two_task}) & Omniglot + mImageNet & 72.2 $\pm$ 0.9 & 75.6 $\pm$ 0.7 &  65.3 $\pm$ 1.6 \\ \midrule
+ Omniglot & MNIST & \textbf{84.3} $\pm$ 1.2 & 78.1 $\pm$ 1.9 & 55.8 $\pm$ 
+ 1.2 \\ 
+   & FMNIST & 81.6 $\pm$ 1.3 & \textbf{90.4} $\pm$  0.5 & 59.5 $\pm$ 2.1 \\ 
+   & CIFAR10 & 75.2 $\pm$ 2.3 & 78.2 $\pm$ 0.9 & \textbf{63.4} $\pm$ 1.4 \\ \midrule
+ Omniglot + mImageNet & MNIST & \textbf{76.6} $\pm$ 1.4 & 85.3 $\pm$ 1.1 & 66.2 $\pm$ 1.1 \\ 
+  & FMNIST & 73.2 $\pm$ 2.3 & \textbf{89.9} $\pm$ 0.6 & 66.6 $\pm$  0.7 \\ 
+& CIFAR10 & 76.3 $\pm$ 3.0 & 88.1 $\pm$ 1.3 & \textbf{68.6} $\pm$ 0.5 \\ 
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{table}
+
+\subsection{A Comment on Meta-Generalization}
+We also note that in general, ``unseen'' datasets do not necessarily imply that they are harder tasks than ``in-domain'' test sets; when meta-trained on Omniglot and mini-ImageNet, meta-generalization on unseen MNIST is easier (the accuracy is higher) than on the ``in-domain'' test set of mini-ImageNet with heldout classes (compare Tables \ref{tab:two_task_acl} and \ref{tab:two_task_acl_extra}).
+
+\end{document}

@@ -1,0 +1,279 @@
+\section{Implementation: Ring Abstraction}
+\label{sec:implement}
+\subsection{Distributed \mbox{$G_t$} in QMC Solver}
+\label{distributedG4}
+Before introducing the communication phase of the ring abstraction layer,
+it is important to understand how the authors distributed the large device array $G_t$ across MPI ranks.
+%
+Original $G_t$ was compared, and $G^d_t$ versions were distributed
+(Figure~\ref{fig:compare_original_distributed_g4}). 
+
+
+In the original $G_t$ implementation, the measurements---which were computed by matrix-matrix multiplication---are distributed statically and independently over the MPI ranks to avoid
+inter-node communications. Each MPI rank keeps its partial copy of $G_{t,i}$ to accumulate 
+measurements within a rank, where $i$ is the rank index. 
+After all the measurements are finished, a reduction step is 
+taken to accumulate $G_{t,i}$ across all MPI ranks into a final and complete
+$G_t$ in the root MPI rank. The size of the $G_{t,i}$ in each rank is 
+the same size as the final and complete $G_t$. 
+
+With the distributed $G^d_t$ implementation, this large device array 
+$G_t$ was evenly partitioned across all MPI ranks; each portion of it is local to each MPI rank.
+%
+Instead of keeping its partial copy of $G_t$, 
+each rank now keeps an instance of $G^d_{t,i}$ to accumulate measurements 
+of a portion or sub-slice of the final and complete $G_t$, where the notation
+$d$ in $G^d_t$  refers to the distributed version, and $i$ means the $i$-th rank.
+%
+The $G^d_{t,i}$ size in each rank is 
+reduced to $1/p$ of the size of the final and complete $G_t$, comparing the same configuration 
+in original $G_t$ implementation, where $p$ is the number of MPI ranks used. 
+%
+For example, in Figure~\ref{fig:distributed_g4}, there are four ranks, and rank $i$
+now only keeps $G^d_{t,i}$, which is one-fourth the size of the original $G_t$ array size.
+% and contains values indexing from range of $[0, ..., N/4)$ in original $G_t$ array where $N$ is the 
+% number of entries in  $G_t$  when viewed as a one-dimensional array.
+
+To compute the final and complete $G^d_{t,i}$ for the distributed $G^d_t$ implementation, 
+each rank must see every $G_{\sigma,i}$ from all ranks. 
+%
+In other words, each rank must broadcast the
+locally generated $G_{\sigma,i}$ to the remainder of the other ranks at every measurement step. 
+%
+To efficiently perform this ``all-to-all'' broadcast, a ring abstraction layer was built (Section. \ref{section:ring_algorithm}), which circulates
+all $G_{\sigma,i}$ across all ranks.
+
+% over high-speed GPUs interconnect (GPUDirect RDMA) to facilitate the communication phase.
+
+% \begin{figure}
+% \centering
+% \subfloat[Original $G_t$ implementation.]
+%     {\includegraphics[width=\columnwidth]{original_g4.pdf}}\label{fig:original_g4}
+
+% \subfloat[Distributed $G_t$ implementation.]
+%     {\includegraphics[width=0.99\columnwidth]{distributed_g4.pdf} \label{fig:distributed_g4}}
+
+% \caption{Comparison of the original $G_t$ vs. the distributed $G^d_t$ implementation. Each rank contains one GPU resource.}
+% \label{fig:compare_original_distributed_g4} 
+% \end{figure} 
+
+\begin{figure}
+\centering
+     \begin{subfigure}[b]{\columnwidth}
+         \centering
+         \includegraphics[width=\textwidth]{images/original_g4.pdf}
+         \caption{Original $G_t$ implementation.}
+         \label{fig:original_g4}
+     \end{subfigure}
+     
+    \begin{subfigure}[b]{\columnwidth}
+         \centering
+         \includegraphics[width=\textwidth]{images/distributed_g4.pdf}
+         \caption{Distributed $G_t$ implementation.}
+         \label{fig:distributed_g4}
+     \end{subfigure}
+     
+\caption{Comparison of the original $G_t$ vs. the distributed $G^d_t$ implementation. Each rank contains one GPU resource.}
+\label{fig:compare_original_distributed_g4}
+\end{figure}
+
+\subsection{Pipeline Ring Algorithm}
+\label{section:ring_algorithm}
+A pipeline ring algorithm was implemented that broadcasts the $G_{\sigma}$ 
+array circularly during every measurement. 
+%
+The algorithm (Algorithm \ref{alg:ring_algorithm_code}) is 
+visualized in Figure~\ref{fig:ring_algorithm_figure}.
+
+\begin{algorithm}
+\SetAlgoLined
+    generateGSigma(gSigmaBuf)\; \label{lst:line:generateG2}
+    updateG4(gSigmaBuf)\;       \label{lst:line:updateG4}
+    %\texttt{\\}
+    {$i\leftarrow 0$}\;         \label{lst:line:initStart}
+    {$myRank \leftarrow worldRank$}\;          \label{lst:line:initRankId}
+    {$ringSize \leftarrow mpiWorldSize$}\;      \label{lst:line:initRingSize}
+    {$leftRank \leftarrow (myRank - 1 + ringSize) \: \% \: ringSize $}\;
+    {$rightRank \leftarrow (myRank + 1 + ringSize) \: \% \: ringSize $}\;
+    sendBuf.swap(gSigmaBuf)\;           \label{lst:line:initEnd}
+    \While{$i< ringSize$}{
+        MPI\_Irecv(recvBuf, source=leftRank, tag = recvTag, recvRequest)\; \label{lst:line:Irecv}
+        MPI\_Isend(sendBuf, source=rightRank, tag = sendTag, sendRequest)\; \label{lst:line:Isend}
+        MPI\_Wait(recvRequest)\;        \label{lst:line:recevBuffWait}
+        
+        updateG4(recvBuf)\;             \label{lst:line:updateG4_loop}
+        
+        MPI\_Wait(sendRequest)\;        \label{lst:line:sendBuffWait}
+        
+        sendBuf.swap(recvBuf)\;         \label{lst:line:swapBuff}
+        i++\;
+    }
+\caption{Pipeline ring algorithm}
+\label{alg:ring_algorithm_code}
+\end{algorithm}
+
+\begin{figure}
+	\centering
+	\includegraphics[width=\columnwidth, trim=0 5cm 0 0, clip]{images/ring_algorithm.pdf}
+	\caption{Workflow of ring algorithm per iteration. }
+	\label{fig:ring_algorithm_figure}
+\end{figure}
+
+At the start of every new measurement, a single-particle Green's function $G_{\sigma}$
+ (Line~\ref{lst:line:generateG2}) is generated 
+and then used to update $G^d_{t,i}$ (Line~\ref{lst:line:updateG4})
+via the formula in Eq.~(\ref{eq:G4}).
+%
+% Different from original method that performs 
+% full matrix-matrix multiplication (Equation~(\ref{eq:G4})), the current ring algorithm only performs partial
+% matrix-matrix multiplication that contributes to $G^d_{t,i}$, a subslice of the final and complete $G_t$.
+%
+Between Lines \ref{lst:line:initStart} to \ref{lst:line:initEnd}, the algorithm 
+initializes the indices
+of left and right neighbors and prepares the sending message buffer from the
+previously generated $G_{\sigma}$ buffer. 
+%
+The processes are organized as a ring so that the first and last rank are considered to be neighbors to each other. 
+%
+A \textit{swap} operation is used to avoid unnecessary memory copies for \textit{sendBuf} preparation.
+%
+A walker-accumulator thread allocates an additional \textit{recvBuf} buffer of the same size 
+as \textit{gSigmaBuf} to hold incoming 
+\textit{gSigmaBuf} buffer from \textit{leftRank}. 
+
+The \textit{while} loop is the core part of the pipeline ring algorithm. 
+%
+For every iteration, each thread in a rank 
+receives a $G_{\sigma}$ buffer from its left neighbor rank and sends a $G_{\sigma}$ buffer to its right neighbor rank. 
+A synchronization step (Line~\ref{lst:line:recevBuffWait}) is performed
+afterward to ensure that each rank receives a new buffer to update the 
+local $G^d_{t,i}$ (Line~\ref{lst:line:updateG4_loop}). 
+%
+Another synchronization step
+follows to ensure that all send requests are finalized 
+(Line~\ref{lst:line:sendBuffWait}). Lastly, another \textit{swap} operation is used to exchange
+content pointers between \textit{sendBuf} and \textit{recvBuf} to avoid unnecessary memory copy and prepare
+for the next iteration of communication.
+%
+In the multi-threaded version (Section~\ref{subsec:multi-thread}), the thread of index, \textit{i}, only communicates with
+	threads of index, \textit{i}, in neighbor ranks, and each thread allocates two buffers: \textit{sendBuff} and \textit{recvBuff}.
+
+The \textit{while} loop will be terminated after $\mbox{\textit{ringSize}} - 1$ steps. By that time, 
+each locally generated $G_{\sigma,i}$ will have traveled across all MPI ranks and
+updated $G^d_{t,i}$ in all ranks. Eventually, each $G_{\sigma,i}$ reaches
+to the left neighbor of its birth rank. For example, $G_{\sigma,0}$ generated from rank $0$ will end 
+in last rank in the ring communicator.
+
+Additionally, if the $G_t$ is too large to be stored in one node, 
+it is optional to accumulate all $G^d_{t,i}$
+at the end of all measurements. 
+%
+Instead, a parallel write into the file system could be taken.
+
+\subsubsection{Sub-Ring Optimization.}
+
+A sub-ring optimization strategy is further proposed to reduce message communication
+times if the large device array $G_t$ can fit in fewer devices. 
+%
+The sub-ring algorithm is visualized in Figure~\ref{fig:subring_algorithm_figure}.
+
+For the ring algorithm (Section~\ref{section:ring_algorithm}), the size of the ring communicator
+(\textit{mpiWorldSize}) is set to the same size of the global \mbox{\texttt{MPI\_COMM\_WORLD}}, and thus the size of $G_t$ is equally 
+distributed across all MPI ranks.
+
+However, to complete the update to $G^d_{t,i}$ in one measurement, 
+one $G_{\sigma,i}$
+must travel \textit{mpiWorldSize} ranks. In total, 
+there are \textit{mpiWorldSize} numbers of $G_{\sigma,i}$
+being sent and received concurrently in one measurement 
+in the global
+\mbox{\texttt{MPI\_COMM\_WORLD}} 
+communicator. If the size of $G^d_{t,i}$ is relatively small per rank, then this will cause high communication overhead.
+
+If $G_t$ can be distributed and fitted in fewer devices, then a shorter travel distance is required 
+for $G_{\sigma,i}$, thus reducing the communication overhead. One reduction
+step was performed at the end of all measurements to accumulate $G^d_{t,s_i}$, 
+where $s_i$ means $i$-th rank on the $s$-th sub-ring.
+
+At the beginning of MPI initialization, the global \mbox{\texttt{MPI\_COMM\_WORLD}} was partitioned  into several new sub-ring communicators by using \mbox{\texttt{MPI\_Comm\_split}}. 
+% where each new communicator represents conceptually a subring. 
+The new
+communicator information was passed to the DCA++ concurrency class by substituting the original global 
+\mbox{\texttt{MPI\_COMM\_WORLD}} with this new communicator. Now, only a few minor modifications
+are needed to transform the ring algorithm (Algorithm~\ref{alg:ring_algorithm_code})
+to sub-ring Algorithm~\ref{alg:sub_ring_algorithm}. In Line~\ref{lst:line:initRankId}, \textit{myRank} is 
+initialized to \textit{subRingRank} instead of \textit{worldRank}, where 
+\textit{subRingRank} is the rank index in the local sub-ring communicator. 
+%
+In Line~\ref{lst:line:initRingSize}, \textit{ringSize} is initialized to \textit{subRingSize}
+instead of \textit{mpiWorldSize}, where \textit{subRingSize} is the
+size of the new communicator.
+%
+The general ring algorithm is a special case for the sub-ring algorithm because the
+\textit{subRingSize} of the general ring algorithm is equal to \textit{mpiWorldSize}, and
+there is only one sub-ring group throughout all MPI ranks.
+
+
+\LinesNumberedHidden
+\begin{algorithm}
+    {$\mbox{\textit{myRank}} \leftarrow \mbox{\textit{subRingRank}}$}\;         
+    {$\mbox{\textit{ringSize}} \leftarrow \mbox{\textit{subRingSize}}$}\;      
+\caption{Modified ring algorithm to support sub-ring communication}
+\label{alg:sub_ring_algorithm}
+\end{algorithm}
+
+
+\begin{figure}
+	\centering
+	\includegraphics[width=\columnwidth, trim=0 5cm 0 0, clip]{images/subring_alg.pdf}
+	\caption{Workflow of sub-ring algorithm per iteration. Every consecutive $S$ rank forms a sub-ring communicator, 
+	and no communication occurs between sub-ring communicators until all measurements are finished. Here, $S$ is the number of ranks in a sub-ring.}
+	\label{fig:subring_algorithm_figure}
+\end{figure}
+
+\subsubsection{Multi-Threaded Ring Communication.}
+\label{subsec:multi-thread}
+To take advantage of the multi-threaded QMC model already in DCA++, 
+multi-threaded ring communication support was further implemented in the ring algorithm.
+%
+Figure~\ref{fig:dca_overview} shows that in the original DCA++ method,
+each walker-accumulator
+thread in a rank is independent of each other, and all the threads in a 
+rank synchronize only after all rank-local measurements are finished.
+%
+Moreover, during every measurement, each walker-accumulator thread
+generates its own thread-private $G_{\sigma, i}$ to update $G_t$. 
+%
+
+The multi-threaded ring algorithm now allows concurrent message exchange so that threads of same rank-local thread index exchange their thread-private $G_{\sigma, i}$. 
+%
+Conceptually, there are $k$ parallel and independent rings, where $k$ 
+is number of threads per rank, because threads of the same local thread ID
+form a closed ring. 
+%
+For example, a thread of index $0$ in rank $0$ will send its $G_\sigma$ to 
+the thread of index $0$ in rank $1$ and receive another $G_\sigma$ from thread index of $0$ 
+from last rank in the ring algorithm.
+%
+
+The only changes in the ring algorithm are offsetting the tag values 
+(\texttt{recvTag} and \texttt{sendTag}) by the thread index value. For example,
+Lines~\ref{lst:line:Irecv} and ~\ref{lst:line:Isend} from 
+Algorithm~\ref{alg:ring_algorithm_code} are modified to Algorithm~\ref{alg:multi_threaded_ring}.
+
+\LinesNumberedHidden
+\begin{algorithm}
+        MPI\_Irecv(recvBuf, source=leftRank, tag = recvTag + threadId, recvRequest)\; 
+        MPI\_Isend(sendBuf, source=rightRank, tag = sendTag + threadId, sendRequest)\;
+\caption{Modified ring algorithm to support multi-threaded ring}
+\label{alg:multi_threaded_ring}
+\end{algorithm}
+
+To efficiently send and receive $G_\sigma$, each thread
+will allocate one additional \textit{recvBuff} to hold incoming 
+\textit{gSigmaBuf} buffer from \textit{leftRank} and perform send/receive efficiently.
+%
+In the original DCA++ method, there are $k$ numbers of buffers of $G_\sigma$ 
+size per rank, and in the multi-threaded ring method, there are $2k$
+numbers of buffers of $G_\sigma$ size per rank, where $k$ is number of 
+threads per rank.

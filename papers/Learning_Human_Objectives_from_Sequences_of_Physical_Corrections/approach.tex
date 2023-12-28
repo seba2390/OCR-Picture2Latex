@@ -1,0 +1,182 @@
+\section{Learning from Sequences of Physical Corrections}
+\label{sec:approach}
+
+In the previous section we outlined how robots can learn from physical corrections using Equation~(\ref{eq:bayesian}). However, we still do not know how to evaluate $P(\xi_H^1, \ldots, \xi_H^K \mid \xi_R^0, \theta)$, which captures the relationship between a sequence of human corrections and the human's underlying objective. Prior work \cite{bajcsy2017learning, bajcsy2018learning, losey2018including, bobu2020quantifying} has avoided this problem by assuming that the human's corrections are \textit{conditionally independent}:
+\begin{equation} \label{eq:independent}
+    P(\xi_H^1, \ldots, \xi_H^K \mid \xi_R^0, \theta) = \prod_{t = 1}^K P(\xi_H^t \mid \xi_R^t, \theta)
+\end{equation}
+Intuitively, this assumption means that there is no relationship between the human's previous corrections and their current correction. But we know this is not always the case --- think about our motivating example, where the human's corrections are intricately coupled! Accordingly, here we propose a method for evaluating $P(\xi_H^1, \ldots, \xi_H^K \mid \xi_R^0, \theta)$ \textit{without} assuming conditional independence.
+
+\subsection{Reasoning over Sequences of Physical Corrections}
+\label{sec:approach:sequence}
+
+To learn from sequences of human corrections online, we introduce an auxiliary reward function. In this section we also describe the modeling assumptions made by this auxiliary reward function, as well as an algorithm for leveraging this function for real-time inference.
+
+
+\smallskip
+\prg{Accumulated Evidence.} We start by introducing the auxiliary reward function: $D(\xi_H^1, \ldots, \xi_H^K, \theta)$. Let's refer to $D$ as the \textit{accumulated evidence} of a sequence of preferred trajectories $\xi_H^1, \ldots, \xi_H^K$ under reward parameter $\theta$. We hypothesize that the accumulated evidence should \textbf{(a)} reward not only the behavior of the final trajectory after all corrections, but also the intermediate trajectories the robot follows during the sequence of corrections. This recognizes that --- when users make corrections --- they don't sacrifice long-term reward for short-term failure. Consider our motivating example: the human is not willing to correct the robot into crushing the bag, even if that will reduce the overall number of corrections needed to avoid the obstacle. Of course, \textbf{(b)} humans also try to minimize their overall effort when making corrections --- and any rewards for which the human's corrections are redundant or unnecessary are therefore not likely to be the human's true reward. Combining these two terms:
+\begin{multline}
+D\big(\xi_H^1, \ldots, \xi_H^{k},  \theta\big) =\\   
+\sum_{t = 1}^{K} \alpha ^{K-t}R(\xi_H^t, \theta) - \gamma \Big(\sum_{t = 1}^K\|a_H^t\|^2\Big) 
+\label{eq:D_def}
+\end{multline}
+$\alpha$ and $\gamma$ are two hyperparameters decaying the importance of previous corrections, and determining the relative trade-off between intermediate reward and human effort respectively.
+% There are two hyperparameters here: $\alpha$ is a decay factor that decreases the importance of previous corrections, while $\gamma$ determines the relative trade-off between intermediate reward and human effort.
+
+\smallskip
+\prg{Learning Rule.} Similar to prior work in inverse reinforcement learning \cite{ziebart2008maximum, ramachandran2007bayesian, osa2018algorithmic, jeon2020reward}, we model humans as noisily rational agents whose corrections maximize accumulated evidence for their preferred $\theta$:
+\begin{equation} \label{eq:likely}
+    P(\xi_H^1, \ldots, \xi_H^{K} \mid \xi_R^0, \theta) \propto \exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{k}, \theta\big)\Big)
+\end{equation}
+Equation (\ref{eq:likely}) expresses our likelihood function for learning from human corrections. Using Laplace's method (as applied in \cite{dragan2013policy}), we can approximate the normalization factor:
+\begin{flalign}
+\begin{aligned}
+&P(\xi_H^1, \ldots, \xi_H^{K} ~|~ \theta)\\
+& =\frac{\exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{k}, \theta\big)\Big)}{\int_{\xi_H^1, \ldots, \xi_H^{K}}\exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{k}, \theta\big)\Big)d\xi_H^1 \ldots d\xi_H^{K}} \\
+& \approx \frac{\exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{k}, \theta\big)\Big)}{\exp\Big(\max_{ \xi_H^1, \ldots, \xi_H^{K}}D\big(\xi_H^1, \ldots, \xi_H^{k}, \theta\big)\Big)}.
+\end{aligned} &&
+\label{eq:full_normalizer}
+\end{flalign}  
+
+\smallskip
+\prg{Monte-Carlo Mixed-Integer Optimization.} Inspecting the denominator of Equation (\ref{eq:full_normalizer}), we see that --- in order to evaluate the likelihood of a sequence of corrections --- we need to find the \textit{highest possible} accumulated evidence the human \textit{could} have achieved given that their objective is $\theta$. Put another way, we need to search for the sequence of $K$ corrections that maximize Equation~(\ref{eq:D_def}) under $\theta$:
+\begin{eqnarray}
+\begin{aligned}
+    D_K^*(\theta) &= \max_{ \xi_H^1, \ldots, \xi_H^{K}}D\big(\xi_H^1, \ldots, \xi_H^{k}, \theta\big) \\
+    &= \max_{ (t_1, a_H^1), \ldots, (t_K, a_H^{K})}D\big(\xi_H^1, \ldots, \xi_H^{k}, \theta\big)
+    \label{eq:optim_objective}
+\label{eq:D_optimization}
+\end{aligned}
+\end{eqnarray}
+Unfortunately, solving Equation~(\ref{eq:optim_objective}) is hard because we need to figure out both \textit{when} to make each correction ($t_1, \ldots, t_K$), which is a discrete decision, as well as \textit{what} to correct during each interaction ($a_H^1, \ldots, a_H^K$), which is a continuous action. 
+
+To tackle this mixed-integer optimization problem, we develop a Monte-Carlo mixed-integer optimization method, where we first randomly sample discrete ($t_1, \ldots, t_K$), and then solve ($a_H^1, \ldots, a_H^K$) with gradient-based continuous optimization methods. The full pipeline for the optimization is summarized in Algorithm~\ref{algo:mixed_optimization}.
+
+Importantly, the inputs to this optimization are only the robot's initial trajectory $\xi_R^0$, the reward parameter $\theta$, and our model hyperparameters. Hence, we can conduct \textit{offline} optimization to solve Equation~(\ref{eq:D_optimization}) for several sampled values of $\theta$. We then use the resulting library of stored $D^*$ values to learn online, during physical interaction.
+
+\begin{algorithm}[t]
+ \caption{Monte-Carlo Mixed-Integer Program
+ }
+ \label{algo:mixed_optimization}
+ \SetAlgoLined
+ \KwOut{Maximum accumulated evidence $D_K^*(\theta)$, and $K$ optimized human corrections $(t_1, a_H^1), \ldots, (t_K, a_H^{K})$}
+ \KwIn{The suboptimal initial robot plan $\xi_R^0$, reward parameter $\theta$, and hyperparmeters in \eref{eq:D_def}. \newline $G(t_1, \ldots, t_K)$ is a continuous optimizer.}
+ Initialize maximum accumulated evidence and correction times: $D_K^* = -\infty$, $T = \emptyset$.\\
+ 
+ \For{$i\gets0$ \KwTo $T_{\text{max}}$}{
+    \While{$(t_1,\ldots, t_K) \in T$}{
+        Randomly sample $(t_1,\ldots, t_K)$
+    } 
+    $T = T \cup \{(t_1,\ldots, t_K)\}$
+    
+    $D_i ~,~ (a_1, \ldots, a_K) = G(t_1, \ldots, t_K, \xi_R^0, \theta)$
+    
+    \If{$D_i > D_K^*$}{
+        $D_K^* = D_i$
+
+        $T_H^* = (t_1, \ldots, t_K)$
+        
+        $A_H^* = (a_1, \ldots, a_K)$
+        }
+}
+return $D_K^*, T_H^*, A_H^*$
+% \vspace{-1em}
+\end{algorithm}
+
+% \begin{algorithm}[h!]
+%  \caption{Monte-Carlo Mixed-Integer Optimization
+%  }
+%  \label{algo:mixed_optimization}
+%  \SetAlgoLined
+%  \KwResult{Maximum accumulated evidence $D_K^*(\theta)$, and optimized $K$ human corrections $(t_1, a_H^1), \ldots, (t_K, a_H^{K})$}
+%  \KwIn{The suboptimal initial robot plan $\xi_R^0$, reward parameter $\theta$, and hyperparmeters in \eref{eq:D_def}: (reward decaying factor $\alpha$ and human effort coefficient $\gamma$). \newline $G(t_1, \ldots, t_K)$ is a gradient-based continuous optimizer that returns the optimized $D$ and $(a_1, \ldots, a_K)$ given specified correction times $(t_1, \ldots, t_K)$.}
+%  Initialize maximum accumulated evidence: $D_K^* = -\infty$.
+
+% %  Initialize maximum accumulated evidence to be infinitely small $D_K^* = -\infty$.
+ 
+%  Initialize $Tset = \emptyset$. Set MAX\_SAMPLES to be the number of sampling $t_1, \dots, t_K$.
+ 
+%  \For{$i\gets0$ \KwTo MAX\_SAMPLES}{
+%     \While{$(t_1,\ldots, t_K) \in Tset$}{
+%         Randomly sample $(t_1,\ldots, t_K)$
+%     } 
+%     $Tset = Tset \cup \{(t_1,\ldots, t_K)\}$
+    
+%     $D_i ~,~ (u_1, \ldots, u_K) = G(t_1, \ldots, t_K)$
+    
+%     \If{$D_i > D_K^*$}{
+%         $D_K^* = D_i$
+
+%         $T_H^* = (t_1, \ldots, t_K)$
+        
+%         $A_H^* = (a_1, \ldots, a_K)$
+%         }
+% }
+% return $D_K^*, T_H^*, A_H^*$
+% \end{algorithm}
+
+\smallskip
+\prg{Online Inference.}
+We have a way for solving for the denominator in Equation~(\ref{eq:full_normalizer}) offline. What remains to be evaluated is the numerator $\exp{\Big(D\big(\xi_H^1, \ldots, \xi_H^{k}, \theta\big)}\Big)$. This can be easily computed online when the human is physically correcting the robot. Thus, we can now evaluate $P(\xi_H^1, \ldots, \xi_H^{K} \mid \xi_R^0, \theta)$ while accounting for the relationships between corrections.
+
+Our overall pipeline is as follows. Offline, we compute $D_K^*(\theta)$ with Alg.~\ref{algo:mixed_optimization}.
+Online, the robot starts by following the optimal trajectory $\xi_R^0$ \mx{with respect to its prior over $\theta$. However, this initial reward might not capture the human reward and thus the human physically corrects the robot.} \mx{The robot would then perform inference and update its belief over the reward when it receives new human corrections.}
+At time $t$, the human has provided a total of $K$ corrections $(t_1, a_H^1), \ldots, (t_{K}, a_H^{K})$, where $t_1 < t_2 < \cdots <t_{K} \leq t$. We propagate these human corrections to get the deformed trajectories $\xi_H^1, \ldots, \xi_H^{K}$ with Equation~(\ref{eq:traj_prop}).
+We then perform Bayesian inference by solving Equation~(\ref{eq:full_normalizer}) and plugging the likelihood function into Equation~(\ref{eq:bayesian}).
+Finally, the robot uses its new understanding of $\theta$ to solve for an updated optimal trajectory $\xi_R^t$.
+
+% At time $t$, the human has provided a total of $N_t$ corrections $(t_1, u_H^1), \ldots, (t_{N_t}, u_H^{N_t})$, where $t_1 < t_2 < \ldots <t_{N_t} \leq t$. We propagate the human corrections to get deformed trajectories $\xi_H^1, \ldots, \xi_H^{N_t}$ with \eref{eq:traj_prop}, then perform online inference with the deformed trajectories as in \eref{eq:online_prob}.
+
+
+% \begin{flalign}
+% \label{eq:online_prob}
+% \begin{aligned}
+% P\big(\theta&|(t_1, a_H^1), \ldots, (t_{N_t}, a_H^{K})\big) \\
+% &\propto P(\theta) P\big((t_1, a_H^1), \ldots, (t_{K}, a_H^{N_t})|\theta\big)\\
+% &\approx P(\theta)P(\xi_H^1, \ldots, \xi_H^{K}|\theta) \\
+% &=\frac{P(\theta)\exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{K}, \theta\big)\Big)}{\int_{\xi_H^1, \ldots, \xi_H^{K}}\exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{K}, \theta\big)\Big)d\xi_H^1 \ldots d\xi_H^{K}}\\
+% & \approx  \frac{P(\theta) \exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{K}, \theta\big)\Big)}{\exp D_{K}^*(\theta)}.
+% \end{aligned}&&
+% \end{flalign}
+
+% \begin{flalign}
+% \label{eq:online_prob}
+% \begin{aligned}
+% P\big(\theta&|(t_1, u_H^1), \ldots, (t_{N_t}, u_H^{N_t})\big) \\
+% &\propto P\big((t_1, u_H^1), \ldots, (t_{N_t}, u_H^{N_t})|\theta\big)P(\theta)\\
+% &\approx P(\xi_H^1, \ldots, \xi_H^{N_t}|\theta)P(\theta) \\
+% &=\frac{\exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{N_t}, \theta\big)\Big)}{\int_{\xi_H^1, \ldots, \xi_H^{K}}\exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{N_t}, \theta\big)\Big)d\xi_H^1 \ldots d\xi_H^{N_t}}P(\theta) \\
+% & \approx \frac{\exp\Big(D\big(\xi_H^1, \ldots, \xi_H^{N_t}, \theta\big)\Big)}{\exp D_{N_t}^*(\theta)} P(\theta)
+% \end{aligned}&&
+% \end{flalign}
+\subsection{Relation to Prior Works: Independent \& Final Baselines}
+To evaluate the effectiveness of our proposed method that reasons over correction sequences, we compare against two baselines: \emph{Independent} and \emph{Final}. 
+
+
+\begin{figure*}[th!]
+	\begin{center}
+		\includegraphics[width=2.0\columnwidth]{figs/combined_sim_final.png}
+\vspace{-1em}
+		\caption{Navigation Simulation. We show the sequence of corrections in the multi-agent task, and the accuracy results of the single- and multi-agent tasks.}
+
+		\label{fig:results_navi}
+	\end{center}
+	
+	\vspace{-2em}
+\end{figure*}
+
+\smallskip
+\prg{Independent Baseline (Online).}
+This baseline follows the same formalism as our approach, but assumes each human correction is conditionally independent. Hence, here we use Equation~(\ref{eq:independent}) to learn from each correction separately. The likelihood of observing an individual correction is related to the reward and effort associated with that correction \cite{bajcsy2017learning}:
+\begin{equation}
+    \label{eq:ind}
+    P(\xi_H^i \mid \xi_R^{i}, \theta) \propto \exp\big(R(\xi_H^i, \theta) - \gamma\|\xi_H^i - \xi_R^i\|^2\big)
+\end{equation}
+
+\smallskip
+\prg{Final Baseline (Offline).}
+At the other end of the spectrum, we can always look at the final trajectory when all corrections are finished \cite{jain2015learning}. In this case, the robot learns by comparing the final trajectory, $\xi_H^K$, to the initial trajectory, $\xi_R^0$:
+\begin{equation} \label{eq:final}
+    P(\xi_H^K \mid \xi_R^0, \theta) \propto \exp\big(R(\xi_H^K, \theta) - \gamma\|\xi_H^K - \xi_R^0\|^2\big)
+\end{equation}
+To summarize, both our method and these baselines use a Bayesian inference approach. The difference is the likelihood function: \textit{Independent} assumes conditional independence, while \textit{Final} only considers the initial and final trajectory.

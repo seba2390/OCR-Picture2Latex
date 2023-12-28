@@ -1,0 +1,542 @@
+\section{Evaluation}
+\label{sec:evaluation}
+
+This section evaluates \tool{}.
+%
+We begin by showing some optimizations that it has found, and then we
+examine its efficacy in making code faster.
+
+
+
+\subsection{Optimizations Discovered by \tool}
+
+The purpose of this section is to examine \tool's strengths by
+presenting some optimizations that it found while compiling benchmark
+programs.
+%
+None of these optimizations can be performed by the version of LLVM
+that \tool{} is based on,\footnote{The version of \tool{} used for all
+results in this paper is based on an LLVM snapshot from March 15,
+2023. Thus, our version of LLVM is slightly newer than LLVM~16, which
+was tagged on March 12.} at its \texttt{-O3} optimization level.
+%
+We present optimizations in an SSA format that is close to LLVM IR,
+but we have edited it slightly for compactness and legibility.
+
+
+One might be inclined to ask, while reading this section, ``Why is
+LLVM incapable of performing this transformation?''
+%
+Alas, there is no single answer.
+%
+In some cases, performing the transformation would require the
+optimizer to have a semantic model of a processor-specific intrinsic
+function, but mostly these models do not exist.
+%
+In other cases, such as Example~5 below, generic reasoning about the
+code would be very difficult, and a specific pattern matcher might not
+be robust enough to be worth implementing.
+%
+Finally, our observation is that vector support in LLVM is somewhat
+newer and less mature than support for other IR features, and the
+optimizers have simply not had enough time to accumulate the requisite
+optimizations.
+
+
+\paragraph{Example 1}
+
+This code is from perlbench in SPEC CPU 2017:
+
+{\small\begin{quote}\begin{verbatim}
+%0 = zext <16 x i8> %x to <16 x i16>
+%1 = zext <16 x i8> %y to <16 x i16>
+%2 = call @avx2.pavg.w(%0, %1)
+%3 = trunc <16 x i16> %2 to <16 x i8>
+ret <16 x i8> %3
+  =>
+%0 = call @sse2.pavg.b(%x, %y)
+ret <16 x i8> %0
+\end{verbatim}
+\end{quote}}
+
+The unoptimized code zero-extends each 8-bit element of the two input
+vectors to 16~bits, calls the AVX2 variant of \texttt{pavg} to perform
+element-wise averaging of the extended vectors, and then truncates
+elements of the resulting vector back to eight bits.
+%
+The optimized code simply calls an SSE2 version of the \texttt{pavg}
+instruction that operates on 8-bit elements, reducing the uOp cost
+of the operation from four to one.
+
+
+\paragraph{Example 2}
+%https://godbolt.org/z/vjjr7MGzb
+
+This code is from libYUV, ``... an open source project that includes
+YUV scaling and conversion
+functionality'':\footnote{\url{https://chromium.googlesource.com/libyuv/libyuv/}}
+
+{\small\begin{quote}\begin{verbatim}
+%0 = call @avx2.pmadd.wd(%x, <0, 1, 0, 1, ...>)
+%1 = call @avx2.pmadd.wd(%x, <1, 0, 1, 0, ...>)
+%2 = sub nsw <8 x i32> %1, %0
+ret <8 x i32> %2
+  =>
+%0 = call @avx2.pmadd.wd(%x, <1, -1, 1, -1, ...>)
+ret <8 x i32> %0
+\end{verbatim}
+\end{quote}}
+
+The \texttt{pmadd.wd} (multiply and add packed integers) instruction multiplies
+signed 16-bit integers element-wise from two input vectors, and then
+computes its output by adding adjacent pairs of elements from the
+resulting vector.
+%
+Thus, the input to this instruction is two 16-way vectors containing
+16-bit elements, and its output is a single 8-way vector of 32-bit
+elements.
+
+
+In this example, the second argument to each \texttt{pmadd.wd}
+instruction in the unoptimized code is a vector of alternating zeroes
+and ones, which has the effect of selecting odd-indexed elements into
+\texttt{\%0} and even-indexed elements into \texttt{\%1}.
+%
+Then, after the \texttt{sub} instruction, which simply performs
+element-wise subtraction of \texttt{\%0} and \texttt{\%1}, the overall
+effect of this code is to compute the difference between adjacent
+pairs of elements of \texttt{\%x}.
+%
+\tool{} is able to perform this same computation using a single
+\texttt{pmadd.wd} instruction which negates odd-numbered elements of
+\texttt{\%x} before performing the addition.
+%
+The optimized code requires $5$ uOps to execute whereas the original
+code requires $8$.
+
+\newpage
+\paragraph{Example 3}
+
+This code is from libYUV:
+
+%https://godbolt.org/z/7ooobqofK
+{\small\begin{quote}\begin{verbatim}
+%0 = shufflevector <32 x i8> %x, poison,
+     <3, 7, 11, 15, 19, 23, 27, 31>
+%1 = lshr <8 x i8> %0, <6, 6, 6, 6, 6, 6, 6, 6>
+%2 = zext <8 x i8> %1 to <8 x i32>
+ret <8 x i32> %2
+  =>
+%0 = bitcast <32 x i8> %x to <8 x i32>
+%1 = call @avx2.psrli.d(<8 x i32> %0, i32 30)
+ret <8 x i32> %1
+\end{verbatim}
+\end{quote}}
+
+The \texttt{shufflevector} instruction in the unoptimized code selects
+every fourth byte-sized element from the input \texttt{\%x}.
+%
+The resulting 8-way vector is right-shifted element-wise by six bit
+positions, and that result is zero-extended to an 8-way vector of
+32-bit elements.
+%
+\tool's optimized version (which executes in 4 uOps instead of 11)
+first reinterprets the input vector's data as 32-bit elements; this
+bitcast is relevant to LLVM's type system, but it is a nop at the CPU
+level.
+%
+Then, the \texttt{prsli} instruction shifts each 32-bit element to the
+right by 30 bit positions.
+%
+This right-shift-by-30 achieves the same effect as the unoptimized
+code, where the \texttt{shufflevector} can be seen as a
+right-shift-by-24, followed by an explicit right-shift-by-6.
+
+\paragraph{Example 4}
+
+This code, from compiling perlbench from SPEC CPU 2017, illustrates
+\tool's ability to reason about control flow:
+
+% control flow divergence
+%https://godbolt.org/z/e8jTsTMMz
+{\small\begin{quote}\begin{verbatim}
+entry:
+  br i1 %c, label %body, label %if.end
+body:
+  br label %if.end
+if.end:
+  %p1 = phi [ %a, %body ], [ %b, %entry ]
+  %p2 = phi [ %b, %body ], [ %a, %entry ]
+  %r = call @avx2.pavg.b(%p1, %p2)
+  ret <32 x i8> %r
+
+  =>
+
+  %r = call @avx2.pavg.b(%a, %b)
+  ret <32 x i8> %r
+\end{verbatim}
+\end{quote}}
+
+The intent of the code is to compute the element-wise average of input
+vectors \texttt{\%a} and \texttt{\%b}, with a Boolean value
+\texttt{\%c} determining the order in which the input vectors are
+presented to the \texttt{pavg} instruction.
+%
+However, the order of arguments to this instruction does not matter, and
+\tool's version executes in 4 uOps while the original code requires
+10.
+%
+Note that \tool{} was not explicitly taught that \texttt{pavg} is
+commutative; the necessary information was inferred naturally from the
+formal specification.
+
+
+\paragraph{Example 5}
+
+This is an optimization discovered
+by \tool{} when it was used to compile GMP, the GNU Multiple Precision
+Arithmetic Library, a widely-used library for arbitrary precision
+integer computation:\footnote{\url{https://gmplib.org/}}
+
+% before 19 after 13
+
+{\small\begin{quote}\begin{verbatim}
+%0 = lshr i64 %x, 1
+%1 = and i64 %0, 0x5555555555555555
+%2 = sub i64 %x, %1
+%3 = lshr i64 %2, 2
+%4 = and i64 %2, 0x3333333333333333
+%5 = and i64 %3, 0x3333333333333333
+%6 = add nuw nsw i64 %4, %3
+%7 = lshr i64 %6, 4
+%8 = add nuw nsw i64 %7, %6
+%9 = and i64 %8, 0xf0f0f0f0f0f0f0f
+ret i64 %9
+  =>
+%0 = bitcast i64 %x to <8 x i8>
+%1 = call @llvm.ctpop(<8 x i8> %0)
+%2 = bitcast <8 x i8> %1 to i64
+ret i64 %2
+\end{verbatim}
+\end{quote}}
+%
+% \vspace{0.1in}
+% %
+% \caption{On the left, LLVM IR extracted from GMP; when compiled to
+%   x86-64 code and run on an Intel Cascade Lake processor, its
+%   predicted execution cost is 19 uOps. On the right, \tool's
+%   optimized version of this code, which requires 13 uOps on the same
+%   target.}
+% \label{fig:ctpop}
+% \end{figure*}
+%
+The original code performs a series of bit-level
+manipulations on a 64-bit integer value, with the net result of
+performing an 8-way vectorized 8-bit popcount operation.\footnote{The
+popcount, or Hamming weight, of a bitvector is the number of ``1''
+bits in it.}
+%
+The optimized code simply calls an intrinsic function to do the
+popcount; it costs 13 uOps instead of the original code's 19.
+%
+Although robust recognition of open-coded idioms is not the focus
+of our work, \tool{} does sometimes manage to achieve this.
+
+
+\subsection{A Loop Micro-Benchmark Suite}
+\label{sec:loops}
+
+%1345 loops are integer only + vectorizable
+%plot only shows 879 loops, these are the loops touched by minotaur.
+
+\begin{figure*}[tbp]
+  \centering
+  \subfloat[Targeting Intel Cascade Lake; geomean=1.061x\label{plot:loops-intel}]{
+    \includegraphics[page=1,width=\linewidth]{figures/data.pdf}
+  }
+  \hfill
+  \subfloat[Targeting AMD Zen 3; geomean=1.021x\label{plot:loops-amd}]{
+    \includegraphics[page=2,width=\linewidth]{figures/data.pdf}
+  }
+  \caption{Speedups---estimated by LLVM-MCA---due to running \tool{}
+    on a loop micro-benchmark suite}
+\end{figure*}
+
+We obtained a collection of 5,409 compilable loops in C that were
+automatically extracted, using a custom Clang-based tool, from FFMPEG,
+FreeImage, DarkNet, xz, bzip2, and the LivermoreC
+benchmark.\footnote{The loop data set was provided by Alexander
+Brauckmann and Michael O'Boyle at the University of Edinburgh, UK\@.
+At present, no citable reference for this work exists.}
+%
+All of the extracted loops are inner-most loops, and they can be
+compiled because they are extracted along with sufficient context:
+type declarations, variable declarations, etc.
+%
+However, these extracted loops are not runnable---they lack necessary
+runtime context such as code for actually allocating the arrays that
+they access.
+%
+The intended purpose of this collection is to support empirical
+research into loop-based codes.
+
+
+From the original set of loops that we obtained, we created a loop
+micro-benchmark for \tool{} by eliminating loops that process
+floating-point values, and also eliminating loops that, when compiled
+by LLVM, fail to contain any usage of a vector register in the XMM,
+YMM, or ZMM families.
+%
+(A lot of the loops that we filtered out contain trivial or empty loop
+bodies, and were completely optimized away.)
+%
+This resulted in 1,337 loops for our Intel Cascade Lake experiment,
+and 1,234 loops for our AMD Zen~3 experiment.
+
+
+Figure~\ref{plot:loops-intel} shows the effect of \tool{} on these
+loops, when LLVM's code generation and also \tool's cost model are
+targeted at Intel's Cascade Lake microarchitecture.
+%
+Then, since we cannot run the loops, we used LLVM-MCA again to
+estimate the performance of the baseline generated code (compiled
+using \texttt{clang -O3 -march=cascadelake}) and the code as optimized
+by \tool, which in this case obtains a mean speedup of 6.1\%.
+%
+(The graph does not show 661 loops that \tool{} was unable to
+optimize, but we did include these loops when computing mean speedup.)
+%
+Figure~\ref{plot:loops-amd} shows the analogous result when targeting
+the AMD Zen~3 microarchitecture; here the mean speedup is 2.1\%.
+
+
+\subsection{Speedups for Benchmarks and Applications}
+
+In this section, we show how \tool{} speeds up real-world benchmarks
+and applications.
+
+\paragraph{Experimental setup}
+%
+We used two machines for our evaluation: one with an Intel Xeon Gold
+6210U processor running at 2.5\,GHz (this implements the Cascade Lake
+microarchitecture~\cite{cascadelake}) and the other with an
+AMD Ryzen 5950x processor
+running at 3.4\,GHz (this implements the Zen~3 microarchitecture~\cite{zen3}).
+The Intel machine supports the AVX-512 instruction set.
+%
+Both machines run Linux and were idle except for a single core running
+our benchmarks.
+%
+To reduce the performance variation caused by frequency scaling, we
+disabled turbo boost on the Intel machine and the core performance
+boost on the AMD machine.
+%
+We invoked LLVM with the \texttt{-march=native} compilation flag to
+ask it to take maximum advantage of processor features; we left other
+compilation flags unchanged, except where noted.
+%
+All benchmarks are compiled at the \texttt{-O3} optimization level.
+%
+We set the timeout for Z3~\cite{z3} queries to 20 seconds.
+%
+Finally, for each SSA value that it tries to optimize, \tool{} gives
+up if no solution is found within 20 minutes.
+
+
+\paragraph{Benchmark selection}
+%
+We evaluate on SPEC CPU 2017\footnote{\url{https://www.spec.org/cpu2017/}}
+because it is a widely accepted standard
+benchmark.
+%
+We only evaluate on the integer subset of the SPEC suite, and we omit
+648.exchange as it is a Fortran benchmark.
+%
+We additionally use GMP, the GNU Multiple Precision Library, and
+libYUV, which is used by Google Chrome/Chromium for manipulating
+images in the YUV format.
+%
+We chose these libraries because they have been heavily tuned for
+performance, they rely on loops containing integer operations, and
+they come with performance benchmark suites that we could simply
+reuse.
+
+
+\paragraph{Compile times}
+%
+Table~\ref{tab:compiletime} shows how long it takes \tool{} to process
+our benchmarks, along with the number of potentially optimizable
+values and the number of optimizations found.
+%
+In most cases, \tool{} found more optimizations when targeting the AMD
+processor.  We believe this is because LLVM is more mature targeting
+AVX2 than AVX512.  As a result, \tool{} extracts more slices.  Solving
+queries with 256-bit vectors is also less likely to cause Z3 to timeout
+than are 512-bit vectors.
+%
+Minotaur is quite slow when it runs with a cold cache because it
+performs a large number of solver queries.
+
+
+\begin{table*}[t]
+  \centering
+  \scriptsize
+  \begin{tabular}{| r | r r  r | r r | r r r | r r |}
+    \hline
+    \multirow{2}{*}{}& \multicolumn{5}{c|}{Intel Cascade Lake} & \multicolumn{5}{c|}{AMD Zen3} \\
+    \cline{2-11}
+    & \multicolumn{3}{c|}{Compilation Time (min)} & \multicolumn{2}{c|}{Optimizations Found} & \multicolumn{3}{c|}{Compilation Time (min)} & \multicolumn{2}{c|}{Optimizations Found}  \\
+    \hline
+    Benchmarks & cold cache & warm cache & clang & \# expr. & \# opt. & cold cache & warm cache & clang & \# expr. & \# opt. \\
+    \hline\hline
+    SPEC CPU 2017 & 1,645 & 3 & 2 & 93,281 & 2,401 & 1,731 & 4 & 3 & 95,185 & 2,537\\
+    \hline
+    gmp-6.2.1 & 440 & less than 1 & less than 1 & 9,170 & 336 & 445 & less than 1 & less than 1 & 9,265 & 387\\
+    \hline
+    libYUV & 2,196 & less than 1 & less than 1 & 6,849 & 334  & 2,193 & less than 1 & less than 1 & 6,809 & 357 \\
+    \hline
+  \end{tabular}
+  \caption{Compile-time statistics}
+  \label{tab:compiletime}
+\end{table*}
+
+
+\paragraph{Optimizing GMP with \tool{}}
+
+\begin{figure*}[tbp]
+  \centering
+  \subfloat[Speedups on Intel Cascade Lake, geomean = 1.073x\label{plot:gmp-intel}]{
+    \includegraphics[page=3,width=\linewidth]{figures/data.pdf}
+  }
+  \hfill
+  \subfloat[Speedups on AMD Zen 3, geomean = 1.065x\label{plot:gmp-amd}]{
+    \includegraphics[page=4,width=\linewidth]{figures/data.pdf}
+  }
+  \caption{GNU Multiple Precision Library (GMP) speedups}
+  \label{fig:gmp}
+\end{figure*}
+
+
+GMP provides a portable C-language implementation and then, for
+several platforms, a faster assembly language implementation.
+%
+For this evaluation, we selected the C implementation, because \tool{}
+works on LLVM IR and cannot process assembly code at all.
+%
+The benchmark suite that we used is
+GMPbench.\footnote{\url{https://gmplib.org/gmpbench}}
+%
+Figure~\ref{fig:gmp} summarizes the results.
+%
+When \tool{} targets the Intel Cascade Lake processor, and when the
+resulting executables are run on that same microarchitecture,
+all the benchmarks sped up;
+across all of the benchmarks, the mean speedup was 7.3\%.
+%
+The analogous experiment using the AMD Zen~3 microarchitecture
+resulted in one benchmark slowing down, and the rest of benchmarks
+speeding up, for an overall mean speedup of 6.5\%.
+
+
+\paragraph{Optimizing libYUV with \tool{}}
+
+
+\begin{figure*}[tbp]
+  \centering
+  \subfloat[Speedups on Intel Cascade Lake, geomean = 1.022x\label{plot:libyuv-intel}]{
+    \includegraphics[page=5,width=\linewidth]{figures/data.pdf}
+  }
+  \hfill
+  \subfloat[Speedups on AMD Zen 3, geomean = 1.029x\label{plot:libyuv-amd}]{
+    \includegraphics[page=6,width=\linewidth]{figures/data.pdf}
+  }
+  \caption{LibYUV Library speedups}
+  \label{fig:yuv}
+\end{figure*}
+
+
+This library has an extensive test suite, part of which is explicitly
+intended for performance testing; we used this part as a benchmark.
+%
+Each of them scales, rotates, or converts a 1280 by 728 pixel
+image 1,000 times.
+%
+Figure~\ref{fig:yuv} shows the results of this experiment.
+%
+When \tool{} targets an Intel processor, $148$ programs slowed down, $72$
+did not change performance, and $2,312$ sped up, for an overall speedup of
+2.2\%.
+%
+Targeting an AMD processor, $188$ programs slowed down, $85$ did not
+change performance, and $2,259$ sped up, for an overall speedup of 2.9\%.
+%
+\tool{} can make code slower because it looks at optimizations in
+isolation; it does not attempt to model interactions between
+optimizations.
+
+
+libYUV is portable code, but it has already been heavily tuned for
+performance; most commits to its repository over the last several
+years have been performance-related.
+%
+Our hypothesis is that this manual tuning has already eaten up most of
+the performance gains that we would have hoped to gain from \tool{}.
+%
+For some time now, Google's released versions of Chrome have been
+compiled using LLVM; the Chrome engineers have had ample time to
+ensure that this compiler achieves decent code generation for
+performance-critical libraries.
+
+\begin{figure*}[tbp]
+  \centering
+  \subfloat[Normalized speedup; geomean = 1.013x\label{fig:spec-intel-speed-ups}]{
+    \includegraphics[width=\columnwidth]{figures/spec/spec-intel.pdf}
+  }
+  \hfill
+  \subfloat[Compilation time in seconds\label{fig:spec-intel-compilation-time}]{
+    \includegraphics[width=\columnwidth]{figures/spec/spec-intel-compiletime.pdf}
+  }
+  \caption*{Targeting Intel Cascade Lake\label{fig:spec-intel}}
+  \hfill
+  \subfloat[Normalized speedup; geomean = 1.012x\label{fig:spec-amd-speed-ups}]{
+    \includegraphics[width=\columnwidth]{figures/spec/spec-amd.pdf}
+  }
+  \hfill
+  \subfloat[Compilation time in seconds\label{fig:spec-amd-compilation-time}]{
+    \includegraphics[width=\columnwidth]{figures/spec/spec-amd-compiletime.pdf}
+  }
+  \caption*{Targeting AMD Zen 3\label{fig:spec-amd}}
+  \caption{SPEC CPU2017 integer benchmark performance and compilation time}
+  \label{fig:spec}
+\end{figure*}
+
+
+\paragraph{Optimizing SPEC CPU2017 with \tool{}}
+
+Figure~\ref{fig:spec} shows the effect of optimizing the integer-heavy
+benchmarks from SPEC CPU2017 using \tool.
+%
+When optimizing for, and running on, the Intel processor, we observed a
+mean speedup of 1.3\%.
+%
+When optimizing for, and running on, the AMD processor, we observed a
+mean speedup of 1.2\%.
+%
+It is notoriously difficult to speed up the SPEC CPU benchmarks
+because compiler engineers have already put considerable effort into
+achieving good code generation for them.
+
+
+\iffalse
+\paragraph{Why does \tool{} sometimes make code run slower?}
+%
+\tool's cost model looks only at the (predicted) performance
+ of an extracted fragment.
+%
+It could be the case that a locally profitable transformation is
+unprofitable in a larger context.
+%
+Moreover, we fundamentally rely on LLVM-MCA to accurately assess the cost
+on the target microarchitecture.%
+However, LLVM-MCA is known to contain inaccuracies~\cite{ithemal,difftune,laukemann}.
+\fi

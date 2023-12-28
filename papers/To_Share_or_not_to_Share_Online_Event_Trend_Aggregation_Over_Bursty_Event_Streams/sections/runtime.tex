@@ -1,0 +1,420 @@
+\section{Dynamic Sharing Optimizer}
+\label{sec:runtime}
+
+% \ear{Should we  call this section the Dynamic Sharing Optimizer?}
+% olga: done
+
+
+We first model the runtime benefit of sharing trend aggregation  (Section~\ref{sec:dynamic-benefit}). Based on this benefit model, our \app\ optimizer makes runtime sharing decisions for a given set of queries (Section~\ref{sec:decisions}).
+% \ear{the sentence above and the one below sound the same --
+% both choose that same set of queries?? what is the difference?
+% if the above queries did not have this
+% kleene subpattern, they could not share as per our definition and thus there would be no benefit calculated for that query set.}
+% chuan - fixed.
+Lastly, we describe how to choose a set of queries that share a Kleene sub-pattern (Section~\ref{sec:queries}).
+
+% chuan - optimizer sounds static/offline. Shall we rename it as \app dynamic or online optimizer?
+% olga - fixed
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Dynamic Sharing Benefit Model}
+\label{sec:dynamic-benefit}
+
+On the up side, shared trend aggregation avoids the re-computation overhead for each query in the workload. 
+On the down side, it introduces overhead to maintain snapshots. 
+Next, we quantify the trade-off between shared versus non-shared execution.
+
+Equations~\ref{eq:nonshared-cost} and \ref{eq:shared-cost} determine the cost of non-shared and shared strategies of all events within the  window for the entire workload $Q$ based on stream statistics.
+In contrast to these coarse-grained static decisions, the \app\ optimizer makes \textbf{\textit{fine-grained runtime decisions}} for each burst of events for a sub-set of queries $Q_E \subseteq Q$. 
+%
+Intuitively, a burst is a set of consecutive events of type $E$, the processing of which can be shared by  queries $Q_E$ that contain a $E+$ Kleene sub-pattern. The \app\ optimizer decides at runtime if sharing a burst is beneficial. In this way, beneficial sharing opportunities are harvested for each burst at runtime.
+
+% More specifically, if $E+$ is a Kleene sub-pattern that is shareable by queries $Q_E$ and a burst of events of type $E$ arrives, our dynamic \app\ optimizer computes the benefit of sharing the graphlet $G_E$ of type $E$ by the queries $Q_E$. It then instructs the executor to either extend existing graphlets, 
+%or split a shared graphlet $G_E$ into a set of non-shared graphlets $G_E^i$, 
+%or merge non-shared graphlets $G_E^i$ into one shared graphlet $G_E$
+%(Section~\ref{sec:decisions}).
+
+% chuan - define burst
+% chuan - the more i read this E+, the more i think we should make it as the GENERAL case in Sec. 2. and say E without Kleene is a special/easy case to handle.
+% olga - added this clarification after Definition 3
+
+\begin{definition}(\textbf{Burst of Events})
+%
+Let $E+$ be a sub-pattern that is sharable by queries $Q_E$.
+Let $T$ be the set of event types that appear in the patterns of queries $Q_E$, $E \in T$. 
+%
+A set of events of type $E$ within a pane is called a \textit{burst} $B_E$, if no events of type $E' \in T,\ E' \neq E,$ are matched by the queries $Q_E$ during the time interval $(e_\mathit{f}.time, e_l.time)$, where $e_\mathit{f}.time$ and $e_l.time$ are the time\-stamps of the first and the last events in $B_E$, respectively.
+%
+If no events can be added to a burst $B_E$ without violating the above constraints, the burst $B_E$ is called \textit{complete}.
+\label{def:burst}
+\end{definition}
+
+Within each pane, events that belong to the same burst are buffered until a burst is complete. The arrival of an event of type $E'$ or the end of the pane indicates that the burst is complete. In the following, we refer to complete bursts as bursts for compactness.
+% Since we require that all events in a burst are consecutive, there can be only one burst at a time per pane.
+
+\app\ restricts event types in a burst for the following reason. Assuming that a burst contained an event $e$ of type $E'$, the event $e$ could be matched by one query $q_1$ but not by another query $q_2$ in $Q_E$. Snapshots would have to be introduced to differentiate between the aggregates of $q_1$ and $q_2$ (Section~\ref{sec:shared-approach}). Maintenance of these snapshots may reduce the benefit of sharing. Thus, the previous sharing decision may have to be reconsidered as soon as the first event arrives that is matched  by some queries in $Q_E$. 
+
+
+%\ear{Figure 6 caption - why is it so short and none-descript? try to make it more helpful.}
+% olga: done
+
+%--------------------------
+\begin{definition}(\textbf{Dynamic Sharing Benefit})
+%
+Let $E+$ be a Kleene sub-pattern that is shareable by queries $Q_E$,
+$B_E$ be a burst of events of type $E$,
+$b$ be the number of events in $B_E$,
+$s_c$ be the number of snapshots that are created from this burst $B_E$, and
+$s_p$ be the number of snapshots that are propagated to compute the intermediate trend counts for the burst $B_E$. 
+Let $G_E$ denote a shared graphlet and $G_E^i$ denote a set of non-shared graphlets (one graphlet per each query in $Q_E$).
+Other notations are consistent with previous sections (Table~\ref{tab:notation}).
+
+The \textit{benefit} of sharing a graphlet $G_E$ by the queries $Q_E$ is computed as the difference between the cost of the non-shared and shared execution of the burst $B_E$.
+
+\vspace{-4mm}
+\begin{align}
+&\mathit{Shared}(G_E,Q_E) 
+= b \times n \times s_p
++ s_c \times k \times g \times t
+\nonumber\\
+&\mathit{NonShared}(G_E^i,Q_E) 
+= k \times b \times n
+\nonumber\\
+&\mathit{Benefit}(G_E,Q_E) 
+= \mathit{NonShared}(G_E^i,Q_E)
+- \mathit{Shared}(G_E,Q_E)
+\label{eq:dynamic-benefit}
+\end{align}
+
+If $\mathit{Benefit}(G_E,Q_E)>0$, then it is beneficial to share trend aggregation within the graphlet $G_E$ by the queries $Q_E$.
+%
+\label{def:dynamic-benefit}
+\end{definition}
+
+Based on Definition~\ref{def:dynamic-benefit}, we conclude that the more queries $k$ share trend aggregation, the more events $g$ are in shared graphlets, and the fewer snapshots $s_c$ and $s_p$ are maintained at a time, the higher the benefit of sharing will be. Based on this conclusion, our dynamic \app\ optimizer decides to share or not to share online trend aggregation (Section~\ref{sec:decisions}).
+
+% The formal proof is omitted here for compactness.
+
+% chuan - this is not intuitive from Eq. 5. Do we want to prove it?
+% olga - no space here, but Allison has a proof of this
+
+% chuan - the distinction between Def.8 (Eq. 5) and Def.9 (Eq. 6) is not clear to me. the dynamic part is simply using the up-to-date statistics to compute the benefit.
+% olga - correct. I merged these sections.
+
+%--------------------------
+\begin{definition}(\textbf{Dynamic Sharing Benefit})
+%
+Let $E+$ be a Kleene sub-pattern that is shareable by queries $Q_E$,
+$b$ be the number of events of type $E$ in a burst,
+$s_c$ be the number of snapshots that are created from this burst, and
+$s_p$ be the number of snapshots that are propagated to compute the intermediate trend counts for the burst. 
+Let $G_E$ denote a shared graphlet and $G_E^i$ denote a set of non-shared graphlets (one graphlet per each query in $Q_E$).
+Other notations are consistent with previous sections (Table~\ref{tab:notation}).
+
+The \textit{benefit} of sharing a graphlet $G_E$ by the queries $Q_E$ is computed as the difference between the cost of the non-shared and shared execution of the event burst.
+
+\vspace{-3mm}
+\begin{align}
+\mathit{Shared}(G_E,Q_E) 
+&= s_c \times k \times g \times p 
++ b \times (\log_2(g) + n \times s_p) \nonumber\\
+\mathit{NonShared}(G_E^i,Q_E) 
+&= k \times b \times (\log_2(g) + n) \nonumber\\
+\mathit{Benefit}(G_E,Q_E) 
+&= \mathit{NonShared}(G_E^i,Q_E)
+- \mathit{Shared}(G_E,Q_E)
+\label{eq:dynamic-benefit}
+\end{align}
+
+If $\mathit{Benefit}(G_E,Q_E)>0$, then it is beneficial to share trend aggregation within the graphlet $G_E$ by the queries $Q_E$.
+%
+\label{def:dynamic-benefit}
+\end{definition}
+
+Based on Definition~\ref{def:dynamic-benefit}, we conclude that the more queries $k$ share trend aggregation, the more events $g$ are in shared graphlets, and the fewer snapshots $s_c$ and $s_p$ are maintained at a time, the higher the benefit of sharing will be. Based on this conclusion, our dynamic \app\ optimizer decides to share or not to share online trend aggregation (Section~\ref{sec:decisions}).
+
+% The formal proof is omitted here for compactness.
+
+% chuan - this is not intuitive from Eq. 5. Do we want to prove it?
+% olga - no space here, but Allison has a proof of this
+
+% chuan - the distinction between Def.8 (Eq. 5) and Def.9 (Eq. 6) is not clear to me. the dynamic part is simply using the up-to-date statistics to compute the benefit.
+% olga - correct. I merged these sections.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\input{sections/figure_decisions}
+
+\subsection{Decision to Split and Merge Graphlets}
+\label{sec:decisions}
+% chuan - i like this subsection, clear and convincing.
+
+Our dynamic \app\ optimizer monitors the sharing benefit depending on changing stream conditions at runtime.
+Let $B+$ be a sub-pattern sharable by queries $Q_B = \{q_1,q_2\}$.
+In Figure~\ref{fig:desicions}, 
+pane boundaries are depicted as dashed vertical lines
+and bursts of newly arrived events of type $B$ are shown as bold empty circles. For each burst, the optimizer has a choice of sharing (Figure~\ref{fig:benefit-monitoring-shared}) versus not sharing (Figure~\ref{fig:benefit-monitoring-non-shared}). It concludes that it is beneficial to share based on calculations in Equation~\ref{eq:benefit-monitoring}.
+ 
+\vspace{-4mm}
+\begin{align}
+&\mathit{Shared}(B_3,Q_B) 
+= 4 \times 7 \times 1 
++ 1 \times 2 \times 4 \times 2
+= 44
+\nonumber\\
+&\mathit{NonShared}(\{B_3,B_4\},Q_B) 
+= 2 \times 4 \times 7 = 56
+\nonumber\\
+&\mathit{Benefit}(B_3,Q_B)
+= 56 - 44  = 12 > 0
+\label{eq:benefit-monitoring}
+\end{align}
+
+%--------------------------------------------------------------------------------
+\textbf{Decision to Split}.
+%
+However, when the next burst of events of type $B$ arrives, a new snapshot $y$ has to be created due to predicates during the shared execution in Figure~\ref{fig:decision-not-to-share-shared}. 
+In contrast, the non-shared strategy processes queries $q_1$ and $q_2$ independently from each other (Figure~\ref{fig:decision-not-to-share-non-shared}). 
+Now the overhead of snapshot maintenance is no longer justified by the benefit of sharing (Equation~\ref{eq:decision-not-to-share}).
+
+\vspace{-4mm}
+\begin{align}
+&\mathit{Shared}(B_3,Q_B) 
+= 4 \times 11 \times 2 
++ 1 \times 2 \times 8 \times 2
+= 120
+\nonumber\\
+&\mathit{NonShared}(\{B_4,B_5\},Q_B) 
+= 2 \times 4 \times 11 = 88
+\nonumber\\
+&\mathit{Benefit}(B_3,Q_B)
+= 88 - 120 = -32 < 0
+\label{eq:decision-not-to-share}
+\end{align}
+
+Thus, the optimizer decides to split the shared graph\-let $B_3$ into two non-shared graphlets $B_4$ and $B_5$ for the queries $q_1$ and $q_2$ respectively in Figure~\ref{fig:decision-not-to-share-non-shared}. Newly arriving events of type $B$ then must be inserted into both graphlets $B_4$ and $B_5$. Their intermediate trend counts are computed separately for the queries $q_1$ and $q_2$. The snapshot $x$ is replaced by its value for the query $q_1$ ($q_2$) within the graphlet $B_4$ ($B_5$). The graphlets $A_1$ and $C_2$ are collapsed.
+
+%--------------------------------------------------------------------------------
+\textbf{Decision to Merge}.
+%
+When the next burst of events of type $B$ arrives, we could either continue the non-shared trend count propagation within $B_4$ and $B_5$ (Figure~\ref{fig:decision-to-share-non-shared}) or merge $B_4$ and $B_5$ into a new shared graphlet $B_6$ (Figure~\ref{fig:decision-to-share-shared}). The \app\ optimizer concludes that the latter option is more beneficial in Equation~\ref{eq:decision-to-share}. As a consequence, a new snapshot $z$ is created as input to $B_6$. $z$ consolidates the intermediate trend counts of the snapshot $x$ and the graphlets $B_3$--$B_5$ per query $q_1$ and $q_2$.
+
+\vspace{-4mm}
+\begin{align}
+&\mathit{Shared}(B_6,Q_B) 
+= 4 \times 15 \times 1 
++ 1 \times 2 \times 4 \times 2 
+= 76
+\nonumber\\
+&\mathit{NonShared}(\{B_4,B_5\},Q_B) 
+= 2 \times 4 \times 15 = 120 
+\nonumber\\
+&\mathit{Benefit}(B_6,Q_B)
+= 120 - 76 = 44 > 0
+\label{eq:decision-to-share}
+\end{align}
+
+% The algorithm that makes sharing decisions, splits and merges graphlets is straightforward. We omit it here due to space constraints.
+
+
+%--------------------------------------------------------------------------------
+\textbf{Complexity Analysis}.
+%
+The runtime sharing decision per burst has constant time complexity because it simply plugs in locally available stream statistics into Equation~\ref{eq:dynamic-benefit}.
+%
+A graphlet split comes for free since we simply continue graph construction per query (Figure~\ref{fig:decision-not-to-share-non-shared}).
+%
+Merging graphlets requires creation of one snapshot and calculation of its values per query (Figure~\ref{fig:decision-to-share-shared}). Thus, the time complexity of merging is $O(k \times g \times t)$ (Equation~\ref{eq:shared-cost}).
+Since our workload is fixed (Section~\ref{sec:basic}), the number of queries $k$ and the number of types $t$ per query are constants. Thus, the time complexity of merge is linear in the number of events per graphlet $g$.
+Merging graphlets  requires storing the value of one snapshot per query. Thus, its space complexity is $O(k)$.
+
+%\lei{Doesn't duplicates of split graphlets introduce space overhead?}
+% olga: no. I rephrased
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Choice of Query Set}
+\label{sec:queries}
+
+To relax the assumption from Section~\ref{sec:decisions} that a set of queries $Q_E$ that share a Kleene sub-pattern $E+$ is given, we now select a sub-set of queries $Q_E$ from the workload $Q$ for which sharing $E+$ is the most beneficial among all other sub-sets of $Q$.
+%
+% Search space
+In general, the search space of all sub-sets of $Q$ is exponential in the number of queries in $Q$ since all combinations of shared and non-shared queries in $Q$ are considered. 
+For example, if $Q$ contains four queries, Figure~\ref{fig:search-space} illustrates the search space of 12 possible execution plans of $Q$. 
+Groups of queries in braces are shared. For example, the plan (134)(2) denotes that queries 1, 3, 4 share their execution, while query 2 is processed separately.
+The search space ranges from maximally shared (top node) to non-shared (bottom node) plans. 
+Each plan has its execution cost associated with it. For example, the cost of the plan (134)(2) is computed as the sum of $Shared(G_E,\{1,3,4\})$ and $NonShared(G_E^i,2)$ (Equation~\ref{eq:dynamic-benefit}). 
+The goal of the dynamic \app\ optimizer is to find a plan with minimal execution cost.
+
+%\vspace*{-1mm}
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.6\columnwidth]{figures/search-space.png}
+\caption{Search space of sharing plans}
+\label{fig:search-space}
+\end{figure}
+%\vspace*{-2mm}
+
+% 2 pruning principles
+Traversing the exponential search space for each Kleene sub-pattern and each burst of events would jeopardize real-time responsiveness of \app. Fortunately, most plans in this search space can be pruned without loosing optimality  (Theorems~\ref{theo:pruning-1} and \ref{theo:pruning-2}). 
+Intuitively, Theorem~\ref{theo:pruning-1} states that it is always beneficial to share the execution of a query that introduces no new snapshots.
+
+%-----------------------
+\begin{theorem}
+%
+Let $E+$ be a Kleene sub-pattern that is shared by a set of queries $Q_E$ and not shared by a set of queries $Q_N$,
+$Q_E \cap Q_N = \emptyset$,
+$k_s = |Q_E|$, and
+$k_n = |Q_N|$.
+For a burst of events of type $E$,
+let $q \in Q_E$ be a query that does not introduce new snapshots due to predicates for this burst of events (Definition~\ref{def:snapshot2}). 
+Then the following follows:
+%
+\begin{align}
+& \mathit{Shared}(Q_E) + \mathit{NonShared}(Q_N) \leq \nonumber\\
+& \mathit{Shared}(Q_E \setminus \{q\}) + \mathit{NonShared}(Q_N \cup \{q\}) \nonumber
+\end{align}
+%
+\label{theo:pruning-1}
+\end{theorem}
+\vspace{-5mm}
+
+\begin{proof}
+%
+Equation~\ref{eq:one} summarizes the cost of sharing the execution of queries $Q_E$ where $q \in Q_E$. 
+%
+\begin{align}
+&\mathit{Shared}(Q_E) + \mathit{NonShared}(Q_N) \nonumber\\
+&= k_s \times \underline{s_c \times g \times p} \nonumber\\
+&+ b \times (\log_2(g) + n \times s_p) \nonumber\\
+&+ k_n \times b \times (\log_2(g) + n)
+\label{eq:one}
+\end{align}
+
+Now assume the execution of $q$ is not shared with other queries in $Q_E$. That is, $q$ is removed from set $Q_E$ and added to set $Q_N$. Then, $k_s$ is decremented by one and $k_n$ is incremented by one in Equation~\ref{eq:two}. All other cost factors remain unchanged. In particular, the number of created $s_c$ and propagated $s_p$ snapshots do not change.
+
+\begin{align}
+&\mathit{Shared}(Q_E \setminus \{q\}) + \mathit{NonShared}(Q_N \cup \{q\}) \nonumber\\
+&= (k_s-1) \times s_c \times g \times p \nonumber\\
+&+ b \times (\log_2(g) + n \times s_p) \nonumber\\
+&+ (k_n+1) \times \underline{b \times (\log_2(g) + n)} 
+\label{eq:two}
+\end{align}
+
+Equations~\ref{eq:one} and \ref{eq:two} differ by one additive factor $(s_c \times g \times p)$ if $q$ is shared versus one additive factor $(b \times (\log_2(g) + n))$ if $q$ is not shared. These additive factors are underlined in Equations~\ref{eq:one} and \ref{eq:two}. Since $s_c \leq b$, $g \leq n$, and the number of predecessor types $p$ per type per query is negligible compared to other cost factors, we conclude that $(s_c \times g \times p) \leq (b \times (\log_2(g) + n))$, i.e., it is beneficial to share the execution of $q$ with other queries in $Q_E$.
+%
+\end{proof}
+
+We formulate the following pruning principle per Theorem~\ref{theo:pruning-1}.
+
+%%%%%%%%%%%%%%%%%%%%%
+\textbf{\textit{Snapshot-Driven Pruning Principle}}. 
+Plans at Level 2 of the search space that do not share queries that introduced no snapshots are pruned. All descendants of such plans are also pruned.
+
+\begin{example}
+%
+In Figure~\ref{fig:search-space}, assume queries 1 and 3 introduced no snapshots, while queries 2 and 4 introduced snapshots.
+Then, four plans are considered because they share queries 1 and 3 with other queries. These plans are highlighted by frames. The other eight plans are pruned since they are guaranteed to have higher execution costs.
+%
+\end{example}
+
+Theorem~\ref{theo:pruning-2} below states that 
+if it is beneficial to share the execution of a query $q$ with other queries $Q$, a plan that processes the query $q$ separately from other queries $Q_E \subseteq Q$ will have higher execution costs than a plan that shares $q$ with $Q_E$.
+The reverse of the statement also holds. Namely, if it is not beneficial to share the execution of a query $q$ with other queries $Q$, a plan that shares the execution of $q$ with other queries $Q_E \subseteq Q$ will have higher execution costs than a plan that processes $q$ separately from $Q_E$.
+
+% chuan - Theorem 2 is not clear to me, esp. Q_E = Q_E' \cup Q.
+% olga - i changed the notation
+
+%------------------------
+\begin{theorem}
+%
+Let $E+$ be a Kleene sub-pattern that is shareable by a set of queries $Q$, 
+$Q = Q_E \cup Q_N$, and 
+$q \in Q_E$. Then:
+%
+\begin{align}
+\text{If } 
+& \mathit{Shared}(Q) \leq \mathit{Shared}(Q \setminus \{q\}) + \mathit{NonShared}(q) \text{,} 
+\label{eq:three}\\
+\text{then } 
+& \mathit{Shared}(Q_E) + \mathit{NonShared}(Q_N) \leq
+\mathit{Shared}(Q_E \setminus \{q\}) +
+\mathit{NonShared}(Q_N \cup \{q\}) 
+\label{eq:four}
+\end{align}
+
+This statement also holds if we replace all $\leq$ by $\geq$.
+%
+\label{theo:pruning-2}
+\end{theorem}
+
+\begin{proof}[Proof Sketch]
+%
+In Equation~\ref{eq:three}, if we do not share the execution of query $q$ with queries $Q$ and the execution costs increase, this means that the cost for re-computing $q$ is higher than the cost of maintenance of snapshots introduced by $q$ due to predicates.
+Similarly in Equation~\ref{eq:four}, if we move the query $q$ from the set of queries $Q_E$ that share their execution to the set of queries $Q_N$ that are processed separately, the overhead of recomputing $q$ will dominate the overhead of snapshot maintenance due to $q$.
+The reverse of Theorem~\ref{theo:pruning-2} can be proven analogously. 
+%
+\end{proof}
+
+We formulate the following pruning principle per Theorem~\ref{theo:pruning-2}.
+
+%%%%%%%%%%%%%%%%%%%%
+\textbf{\textit{Benefit-Driven Pruning Principle}}.
+Plans at Level 2 of the search space that do not share a query that is beneficial to share are pruned.
+Plans at Level 2 of the search space that share a query that is not beneficial to share are pruned.
+All descendants of such plans are also pruned.
+
+\begin{example}
+%
+In Figure~\ref{fig:search-space}, if it is beneficial to share query 2, then we can safely prune all plans that process query 2 separately. That is, the plan (134)(2) and all its descendants are pruned.
+Similarly, if it is not beneficial to share query 4, we can safely exclude all plans that share query 4. That is, all siblings of (123)(4) and their descendants are pruned.
+The plan (123)(4) is chosen (highlighted by a bold frame).
+%
+\label{ex:search_space}
+\end{example}
+
+\textbf{\textit{Consequence of Pruning Principles}}.
+Based on all plans at Levels 1 and 2 of the search space, the optimizer classifies each query in the workload as either shared or non-shared. Thus, it chooses the optimal plan without considering plans at levels below 2.
+
+%------------------------
+\textbf{Complexity Analysis}.
+%
+Given a burst of new events, let $m$ be the number of queries that introduce new snapshots to share the processing of this burst of events. The number of plans at Levels 1 and 2 of the search space is $m+1$. 
+Thus both time and space complexity of sharing plan selection is $O(m)$.
+
+% The sharing plan selection algorithm is straightforward. It is skipped here in the interest of space.
+
+% chuan - i am not sure if you want to skip the algorithm here. also it is not clear to me why we want to stop at level 2? is it possible that the queries in Q should be executed separately from each other?
+% olga - i changed the description
+
+%\footnote{A stream is bursty if many of events of the same type arrive together and they are not interleaved by events of other types (Definition~\ref{def:burst}).}
+
+%------------------------------------------------------------------
+\begin{theorem}
+%
+Within one burst, \app\ has optimal time complexity.
+%
+\label{theo:optimality}
+\end{theorem}
+
+\begin{proof}
+%
+For a given burst of events, \app\ optimizer makes a decision to share or not to share depending on the sharing benefit in Section~\ref{sec:decisions}. 
+If it is not beneficial to share, each query is processed separately and has optimal time complexity~\cite{PLRM18}.
+If it is beneficial to share a pattern $E+$ by a set of queries $Q_E$, the time complexity is also optimal since it is optimal for one query $q \in Q_E$~\cite{PLRM18} and other queries in $Q_E$ are processed for free.
+The set of queries $Q_E$ is chosen such that the benefit of sharing is maximal (Theorems~\ref{theo:pruning-1} and \ref{theo:pruning-2}).
+%
+\end{proof}
+
+
+%--------------------------------------------------------------------------------
+\textbf{Granularity of \app\ Sharing Decision}.
+%
+\app\ runtime sharing decisions are made per burst of events (Section~\ref{sec:decisions}). There can be several bursts per window (Definition~\ref{def:burst}). Within one burst, \app\ has optimal time complexity (Theorem~\ref{theo:optimality}).
+According to the complexity analysis in Section~\ref{sec:decisions}, the choice of the query set has linear time complexity in the number of queries $m$ that introduce snapshots due to predicates. 
+By Section~\ref{sec:queries}, the merge of graphlets has linear time complexity in the number of events $g$ per graphlet. 
+\app\ would be optimal per window if it could make sharing decisions at the end of each window. However, waiting until all events per window arrive could introduce delays and jeopardise real-time responsiveness. Due to this low latency constraint, \app\ makes sharing decisions per burst, achieving significant performance gain over competitors (Section~\ref{sec:exp_results}).
+
+
+%\footnote{A stream is bursty if many of events of the same type arrive together and they are not interleaved by events of other types (Definition~\ref{def:burst}).}
+
+

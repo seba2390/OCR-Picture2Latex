@@ -1,0 +1,145 @@
+\section{GPU Implementation}
+\label{sec:implementation}
+
+In the previous section, we have devised a parallel algorithm to compute
+the reduced Hessian. This algorithm involves two key ingredients, both
+running in parallel: {\tt BatchSparseSolve} and {\tt BatchTensorProjection}.
+We present in \refsec{sec:implementation:autodiff} how to implement
+{\tt BatchTensorProjection} on GPU by leveraging the Julia language. Then,
+we focus on the parallel
+resolution of {\tt BatchSparseSolve} in \refsec{sec:implementation:linearalgebra}.
+The final implementation is presented in \refsec{sec:implementation:parallel}.
+
+\subsection{Batched AutoDiff.}
+\label{sec:implementation:autodiff}
+
+\subsubsection{AutoDiff on GPU.}
+\label{sec:implementation:design}
+
+Our implementation attempts to be architecture agnostic, and to this
+end we rely heavily on the just-in-time compilation capabilities of the Julia language.
+Julia has two key advantages for us: (i) it implements state-of-the-art automatic differentiation
+libraries and (ii) its multiple dispatch capability allows to write code in
+an architecture agnostic way.
+Combined together, this allows to run AutoDiff on GPU accelerators.
+On the architecture side we rely on the array
+abstraction implemented by the package \lstinline{GPUArrays.jl}~\cite{besard2018effective} and on the
+kernel abstraction layer \KA.
+The Julia community provides three GPU backends for these two packages:
+NVIDIA, AMD, and Intel oneAPI. Currently, \lstinline{CUDA.jl} is the most
+mature package, and we are leveraging this infrastructure to run our code on an
+x64/PPC CPU and NVIDIA GPU. In the future our solution will be rolled out
+transparently onto AMD and Intel accelerators with minor code changes.
+
+\subsubsection{Forward Evaluation of Sparse Jacobians.}
+\label{sec:jacobian:ad}
+The reduction algorithm in \refsec{sec:reduction:algorithm} requires (i) the Jacobian
+$\nabla_x g$ to form the linear system in \refeqn{eq:socadjoint} and (ii)
+the Hessian vector product of $\bm{\lambda}^\top \nabla^2 g$ in \refeqn{eq:reduction}.
+We use the Julia package \lstinline{ForwardDiff.jl}~\cite{revels2016forward} to apply the first-order
+tangent model \refeqn{eq:tlm} by instantiating every variable as a dual type
+defined as \verb+T1S{T,C} = ForwardDiff.Dual{T, C}}+,
+where \lstinline{T} is the type ({\tt double} or {\tt float}) and
+\lstinline{C} is the number of directions that are propagated together in
+parallel. This allows us to apply AutoDiff both on the CPU and on the GPU in a
+vectorized fashion, through a simple type change:
+for instance,
+\lstinline+Array{TIS{T, C}}(undef, n)+ instantiates a vector of dual numbers on the CPU,
+whereas \lstinline+CuArray{TIS{T, C}}(undef, n)+ does the same on a CUDA GPU.
+(Julia allows us to write code where all the types are abstracted away).
+This, combined with \KA, allows us to write a portable residual kernel for
+$g(\bm{x}, \bm{p})$ that is both differentiable and architecture agnostic. By setting the
+number of Jacobian colors $c$ to the parameter \lstinline|C| of type \lstinline|T1S{T,C}| we
+leverage the GPUs by propagating the tangents in a SIMD way.
+
+\subsubsection{Forward-over-Reverse Hessian Projections.}
+\label{sec:hessian:ad}
+As opposed to the forward mode,
+generating efficient adjoint code for GPUs is known to be hard.
+Indeed, adjoint automatic differentiation implies a reversal of the computational flow,
+and in the backward pass every read of a variable translates to a write adjoint,
+and vice versa. The latter is particularly complex for parallelized
+algorithms, especially as the automatic parallelization of algorithms
+is hard. For example, an
+embarrassingly parallel algorithm where each process reads the data of all
+the input space leads to a challenging race condition in its adjoint.
+Current state-of-the-art AutoDiff tools use specialized
+workarounds for certain cases. However, a generalized solution to this
+problem does not exist. The promising AutoDiff tool Enzyme
+\cite{enzymeNeurips} is able to differentiate CUDA kernels in Julia, but  it
+is currently not able to digest all of our code.
+
+To that end, we hand differentiate our GPU kernels for the
+forward-over-reverse Hessian projection. We then apply
+\lstinline{ForwardDiff} to these adjoint kernels to extract second-order
+sensitivities according to the forward-over-reverse model.
+Notably, our test case (see \refsec{sec:background:powerflow}) involves reversing a
+graph-based problem (with vertices $V$ and edges $E$). The variables of the
+equations are defined on the vertices. To adjoin or reverse these kernels, we
+pre-accumulate the adjoints first on the edges and then on the nodes, thus
+avoiding a race condition on the nodes. This process yields a fully
+parallelizable adjoint kernel. Unfortunately, current AutoDiff tools are not
+capable of detecting such structural properties. Outside the kernels we use a
+tape (or stack) structure to store the values computed in the forward pass
+and to reuse them in the reverse (split reversal). The kernels themselves are
+written in joint reversal, meaning that the forward and reverse passes are
+implemented in one function evaluation without intermediate storage of
+variables in a data structure. For a more detailed introduction to writing
+adjoint code we recommend \cite{griewank2008evaluating}.
+
+\subsection{Batched Sparse Linear Algebra.}
+\label{sec:implementation:linearalgebra}
+
+The block {\tt BatchSparseSolve} presented in \refsec{sec:reduction:algorithm}
+requires the resolution of two sparse linear systems with multiple right-hand sides,
+as illustrated in Equation~\eqref{eq:socadjoint}.
+This part is critical because in practice a majority of the time
+is spent inside the linear algebra library in the parallel reduction algorithm.
+To this end, we have wrapped the library
+\cusolverrf\ in Julia to get an efficient LU solver on the GPU.
+For any sparse matrix $A \in \mathbb{R}^{n \times n}$,
+the library \cusolverrf\ takes as input an LU factorization of the matrix $A$ precomputed on the host,
+and transfers it to the device. \cusolverrf\ has two key advantages to implement
+the resolution of the two linear systems in {\tt BatchSparseSolve}.
+(i) If a new matrix $\tilde A$ needs to be factorized and has the same
+sparsity pattern as the original matrix $A$, the refactorization routine
+proceeds directly on the device, without any data transfer with the host
+(allowing to match the performance of the state-of-the-art CPU sparse library UMFPACK~\cite{davis2004algorithm}).
+(ii) Once the LU factorization has been computed, the forward and backward solves
+for different right-hand  sides $\bm{b}_1, \cdots, \bm{b}_N$ can be computed in batch mode.
+
+\subsection{Implementation of the Parallel Reduction.}
+\label{sec:implementation:parallel}
+
+By combining  the batch AutoDiff with the batch sparse linear
+solves of \cusolverrf, we  get a fully parallel algorithm to
+compute the reduced Hessian projection. We compute the reduced
+Hessian $\nabla^2 F \in \mathbb{R}^{n_p \times n_p}$ by blocks of $N$ Hessian-vector products.
+If we have enough memory to set $N = n_p$, we can compute the full reduced
+Hessian in one batch reduction. Otherwise, we set $N < n_p$ and compute
+the full reduced Hessian in $N_b = div(n, N) + 1$ batch reductions.
+
+Tuning the number of batch reductions $N$ is nontrivial and depends on
+two considerations.
+How efficient is the parallel scaling when we run the two parallel blocks {\tt BatchTensorProjection} and {\tt BatchSparseSolve}? and
+ Are we fitting into the device memory?
+This second consideration is indeed one of the bottlenecks of the algorithm.
+In fact, if we look more closely at the memory usage of the parallel
+reduced Hessian, we observe that the memory grows linearly with the number
+of batches $N$. First, in the block {\tt BatchTensorProjection}, we need to duplicate $N$ times the
+tape used in the reverse accumulation of the Hessian in \refsec{sec:implementation:autodiff},
+leading to memory increase from $\mathcal{O}(M_T)$ to $\mathcal{O}(M_T \times N)$, with $M_T$ the memory of the tape.
+The principle is similar in {\tt SparseSolve}, since the second-order
+adjoints $\bm{z}$ and $\bm{\psi}$ are also duplicated in batch mode,
+leading to a memory increase from $\mathcal{O}(2 n_x)$ to $\mathcal{O}(2 n_x  \times N)$.
+This is a bottleneck on large cases when the number of variables $n_x$
+is large.
+
+The other bottleneck arises when we combine together the blocks {\tt BatchSparseSolve}
+and {\tt BatchTensorProjection}. Indeed, {\tt BatchTensorProjection} should wait for the first
+block {\tt BatchSparseSolve} to finish its operations. The same
+issue arises when passing the results of {\tt BatchTensorProjection} to the second
+{\tt BatchSparseSolve} block. As illustrated by Figure~\ref{fig:reduction},
+we need to add two explicit synchronizations in the algorithm.
+Allowing the algorithm to run the reduction algorithm in a purely asynchronous
+fashion would require a tighter integration with \cusolverrf.

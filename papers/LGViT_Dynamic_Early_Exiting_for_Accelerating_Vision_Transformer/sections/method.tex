@@ -1,0 +1,344 @@
+
+\section{Method}
+\label{sc:method}
+
+In this section, we first provide the motivation and an overview of the proposed LGViT framework. 
+Then we illustrate the heterogeneous exiting heads and two-stage training strategy. 
+Lastly, we depict the exit policy employed during the inference process. 
+
+% To address the limitations of directly implementing the early exiting strategy in ViT, 
+% we propose the LGViT framework, which integrates local and global information to obtain rich feature representations.  
+% In this section, we first present an overview of the proposed framework, followed by a detailed description of the early exiting architecture and the two-stage training scheme. 
+% Lastly, we depict the exit policy employed during the inference process. 
+
+\subsection{Motivation}
+The early exiting method can halt the forward propagation of neural networks prematurely to provide an efficiency-accuracy trade-off, 
+which has achieved significant performance improvements for CNNs and transformers in NLP. 
+However, naively implementing early exiting on ViT may not yield performance gains for internal classifiers. 
+% 5-th 69; 10-th 86.8; original 90.8
+For instance, the performance of the internal classifier on the fifth and tenth layers decreases by 21.8\% and 4.0\%, respectively, 
+compared to the original classifier for ViT-B/16 \cite{vit} on CIFAR-100 \cite{cifar}. 
+As illustrated in Figure \ref{fig:motivation}, we compare the attention maps at different exiting points for DeiT-B 
+(the detailed description of probing experiments is presented in Appendix \ref{sc:investigation}). 
+The deep classifiers can extract target semantic features to identify objects. Therefore, 
+we obtain the following observations: 
+\begin{itemize}
+  \item \textbf{\textit{Observation 1}:} Shallow internal classifiers cannot learn sufficient feature representation. 
+  \item \textbf{\textit{Observation 2}:} Deep internal classifiers cannot capture target semantic information. 
+\end{itemize}
+
+We also discover that if both convolution and self-attention are employed as exiting architectures, positioned on shallow and deep layers respectively, 
+the model would gain access to a more comprehensive combination of local and global information compared to the vanilla head architecture. 
+%Motivated by these observations, we propose an early exiting framework for ViTs that incorporates heterogeneous early exiting architectures.
+
+\begin{figure}
+  \includegraphics[width=0.38\textwidth]{src/motivation.pdf}
+  \vspace{-8pt}
+  \caption{Comparison of attention maps at different exiting positions. 
+  The classifiers are omitted. 
+  The shallow internal classifiers are difficult to identify object due to inadequate feature capture. 
+  The deep internal classifiers do not capture target semantic information compared to the last classifiers. 
+  }
+  \Description{Motivation.}
+  \label{fig:motivation}
+  \vspace{-10pt}
+\end{figure}
+
+\subsection{Overview}
+
+\begin{figure*}
+    \includegraphics[width=0.84\textwidth]{src/framework.pdf}
+    \vspace{-6pt}
+    \caption{Overview of the proposed early-exiting ViT framework. 
+    1) Given a backbone of ViT, we first attach local perception head (LPH) at lower half exiting points and global aggregation head (GAH) at top half of exiting points. 
+    2) During the training phase, after an end-to-end training of the backbone, 
+    all exiting heads are jointly trained through a novel self-distillation utilizing heterogeneous features, homogeneous features and prediction logits as supervision with the backbone frozen. 
+    3) In the inference stage, each input sample dynamically adjusts its exiting path according to the prediction confidence.}
+    \Description{An overview image.}
+    \label{fig:Overview}
+    \vspace{-8pt}
+  \end{figure*}
+
+Motivated by the aforementioned observations, we propose an early exiting framework for ViTs that incorporates heterogeneous early exiting architectures.
+%We propose a framework for constructing early exiting ViT networks by incorporating heterogeneous exiting architectures.
+%Our goal is to alleviate the latency burden of ViT and achieve a balanced efficiency-accuracy trade-off for on-device inference. 
+An overview of the proposed framework is depicted in Figure \ref{fig:Overview}. 
+It comprises a ViT backbone, multiple local perception heads and multiple global aggregation heads. 
+Initially, a ViT backbone consisting of $L$ encoder blocks is provided. We add $M$ internal classifiers to intermediate blocks of ViT. 
+Generally, $M$ is smaller than the total number of backbone layers, as adding internal classifiers after every layer would result in substantial computation costs. 
+The position of internal classifiers is independent of the backbone layer numbering. 
+
+We follow a three-step procedure to construct the early exiting ViT framework: 
+\begin{itemize}
+  \item \textbf{Attaching heterogeneous exiting heads:} Starting from a backbone of ViT, 
+  we first select several exiting points along its depth. Then we place local perception heads and global aggregation heads at corresponding exiting points according to their positions. 
+  \item \textbf{Two-Stage training:} We train the whole early exiting ViT using a novel two-stage training strategy including end-to-end training and self-distillation with the backbone frozen.  
+  This can facilitate the integration of global and local information for performance improvement. 
+  \item \textbf{Dynamic inference:} When the trained model is deployed for inference, 
+  each input sample can dynamically determine its output at varying depths based on the confidence of each exiting head prediction. 
+\end{itemize}
+
+\subsection{Attaching Heterogeneous Exiting Heads}
+We first introduce the placement of exiting heads, followed by a detailed description of the heterogeneous exiting heads. 
+In this work, exiting points, where exiting heads are positioned, are determined according to an approximately equidistant computational distribution, 
+\textit{i.e.}, the multiply-accumulate operations (MACs) of intermediate blocks between two adjacent points remain consistent. 
+For the sake of simplicity, exiting points are constrained to be placed at the output of individual encoder blocks.
+We attach local perception heads, based on convolution, to the lower half of exiting points to enhance local information exploration. 
+Global aggregation heads, based on self-attention, are integrated into the upper half of points to augment global information acquisition. 
+
+\textbf{Local perception head.} 
+As analyzed in Section \ref{sc:investigation}, directly applying early exiting in ViT leads to severe performance degradation for shallow internal classifiers. 
+% Limited to the model capacity, they cannot learn sufficient feature representations. 
+% Besides, ViT ignores the translation-invariance and local relation inside the patch \cite{DBLP:conf/iclr/IslamJB20, cmt}.
+To mitigate the issue, we introduce a local perception head (LPH) for early exiting framework, which elegantly incorporates convolution into ViT to enhance feature representation learning. 
+It can achieve efficient local information exploration and effective feature integration extracted from the original backbone.   
+As illustrated in the upper right of Figure \ref{fig:Overview}, 
+the proposed LPH first employs a $1\times 1$ convolution layer to expand dimensions. 
+% TODO: PDConv 解释还是不太明确
+Subsequently, the expanded features are passed to a position-wise depth-wise convolution (PDConv) with $k\times k$ kernel size that depends on the exiting positions $m$.
+In order to reduce computation overhead, we employ smaller kernel size convolutions for the deeper exiting points. 
+We employ a decreasing linear mapping function $f(\cdot)$ to determine the kernel size of PDConv, \textit{i.e.}, $k=f(m), m\leq L/2$. 
+For instance, the expanded features at the $m$-th exiting position are passed to $k\times k$ depth-wise convolution. 
+Note that $k=0$ means that the expanded features will bypass PDConv and proceed directly to the subsequent part. 
+Thus, the PDConv can be formulated as: 
+\begin{equation}
+  \text{PDConv}(\mathbf{X}, m)=\begin{cases}
+    \text{DWConv}_{k\times k}(\mathbf{X}), \quad & f(m) > 0 \\
+    \mathbf{X}, \quad & f(m) = 0
+  \end{cases},
+\end{equation}
+where $\text{DWConv}_{k\times k}$ denotes the depth-wise convolution with kernel of size $k\times k$. 
+Then the features are projected back into the original patch space using a $1\times 1$ convolution and then passed to an average pooling layer. 
+Considering that the $[CLS]$ token contains djominant feature representations, 
+it is added to the pooled output to facilitate the fusion of global information from the original backbone and local information from the convolution.
+Concretely, 
+given a ViT encoder output $\mathbf{X}_{en} \in \mathbb{R}^{N\times D} $, 
+where $N$ represents the number of patches and $D$ denotes the hidden dimension, 
+when the position of exiting points is lower than $L/2$, the output of the proposed exiting head is given by: 
+\begin{equation}
+  \begin{aligned}
+    \text{LPH}(\mathbf{X}_{en}, m)&=\text{Pool}(\text{Conv}_{1\times 1}(\mathcal{G}(\mathbf{X}_{en}, m) ) )+\mathbf{X}_{CLS}, \\
+    \mathcal{G}(\mathbf{X}_{en}, m)&=\text{PDConv}(\text{Conv}_{1\times 1}(\mathbf{X}_{en}), m),
+  \end{aligned}
+\end{equation}
+where $\mathbf{X}_{CLS}$ represents $[CLS]$ token and the activation layer is omitted. 
+Gaussian error linear unit (GELU) and batch normalization (BN) are employed after each convolution.
+The output of LPH is finally passed to the internal classifier. 
+By introducing LPH as the exiting head, shallow internal classifiers can learn adequate feature representation and capture local information, thereby enhancing performance in vision tasks. 
+
+\textbf{Global aggregation head.} 
+Based on the discussion in Section \ref{sc:investigation}, the direct application of early-exit methods to ViT hinders the semantic information capture in deep internal classifiers. 
+% Recently, some works show that the strong performance of ViT is mainly attributed to huge training data and multiple stacking blocks, 
+% allowing the model to focus on important regions within a large size context \cite{deeper_vit, vit}. 
+We propose a global aggregation head (GAH) and incorporate it at deep exiting points, as illustrated in the lower right of Figure \ref{fig:Overview}. 
+The proposed GAH integrates features from locally adjacent tokens and then compute self-attention for each subset to facilitate target semantic information exploitation. 
+In GAH,  
+we first employ a position-wise feature convergence (PFC) block to aggregate features from the exiting point. 
+In the PFC block, input features $\mathbf{X}\in \mathbb{R}^{N\times D}$ are reshaped to $D\times H\times W $ dimensions and down-sampled with a size of $s\times s$ window.
+The sampled features $\mathbf{X}_{sample}\in \mathbb{R}^{D\times \frac{H}{s} \times \frac{W}{s}}$ are restored to original dimension format $\frac{N}{s^2}\times D$. 
+The proposed PFC block reshapes the input features to patch format and down-samples them with an $s\times s$ window. 
+The sampled features are then restored to original format. 
+To avoid introducing additional learnable parameters, we employ an average pool with $s$ stride as the implementation of PFC. 
+Analogous to PDConv, the swindow size $s$ of PFC also depends on the exiting position $m$. 
+Deeper exiting points utilize larger window sizes significantly reducing the computational cost. 
+We employ an increasing linear mapping function $g(\cdot)$ to determine the window size of PFC, \textit{i.e.}, $s=g(m), L/2 < m \leq L$. 
+For example, the input features are passed to sub-sample with a size of $g(m)\times g(m)$ window at the $m$-th exiting point. 
+Note that the minimum window size is generally set to $2$. 
+Consequently, the PFC can be expressed as:
+\begin{equation}
+  \text{PFC}(\mathbf{X}_{en}, m)=\text{Pool}_{g(m)}(\mathbf{X}_{en}), 
+\end{equation}
+where $\text{Pool}_{g(m)}$ represents an average pool with $g(m)$ stride. The reshaping and recover operations of features are omitted in the equation. 
+PFC not only reduces the computational redundancy but also helps focus on target patches compared to the original MHSA. 
+Then the integrated features are passed through multi-head self-attention (MHSA) and a pool layer. 
+The $[CLS]$ token is also added to the pooled features. 
+Thus, when the position of exiting points is deeper than $L/2$, the proposed GAH can be formulated as:
+\begin{equation}
+  \begin{aligned}
+    \text{GAH}(\mathbf{X}_{en}, m)&=\text{Pool}(\text{MHSA}(\text{PFC}(\mathbf{X}_{en}, m)))+\mathbf{X}_{CLS}, \\
+    \text{MHSA}(\mathbf{X})&=\text{softmax}\left(\frac{XW_{Q}(XW_{K})^T}{\sqrt{d}}\right)XW_{V},
+  \end{aligned}
+\end{equation}
+where the input $\mathbf{X}$ is linearly transformed into query, key and value vectors using transformation matrices $W_{Q}$, $W_{K}$ and $W_{V}$; 
+$d$ is the vector dimension. 
+By employing GAH as the exiting head, deep internal classifiers can reduce spatial redundancy of self-attention and capture more target semantic information. 
+
+\textbf{Complexity analysis.} 
+To thoroughly understand the computational bottleneck of heterogeneous exiting heads, 
+we compare our proposed LPH + GAH with standard convolution + MHSA by analyzing their floating-point operations (MACs). 
+Given an input feature of size $N\times D$, the FLOPs of standard $k\times k$ convolution are:
+\begin{equation}
+  \mathcal{O} (\text{Conv}_{k\times k})=ND^2k^2. 
+\end{equation}
+The FLOPs of an MHSA module can be calculated as:
+\begin{equation}
+  \mathcal{O} (\text{MHSA})=2ND(D+D)+N^2(D+D)=4ND^2+2N^2D, 
+\end{equation}
+where the activation function is omitted. 
+For a fair comparison, we select the same kernel size $k$ in LPH. The FLOPs of the proposed two exiting head are as follows:
+\begin{equation}
+  \begin{aligned}
+    \mathcal{O}(\text{LPH})&=2ND^2+NDk^2, \\
+    \mathcal{O}(\text{GAH})&=4ND^2/s^2+2N^2D/s^4.
+  \end{aligned}
+\end{equation}
+We observe that the computational complexity of LPH and GAH is lower than that of standard convolution and MHSA, respectively. 
+\begin{equation}
+  \begin{aligned}
+    \frac{\mathcal{O}(\text{LPH})}{\mathcal{O} (\text{Conv}_{k\times k})}&=(2D+k^2)/Dk^2<1, \\
+    \frac{\mathcal{O}(\text{GAH})}{\mathcal{O} (\text{MHSA})}&=\frac{2D+N/s^2}{2D+N}<1.
+  \end{aligned}
+\end{equation}
+Therefore, compared to standard convolution and MHSA, our proposed LPH and GAH heads are more friendly to computational cost and convenient to implement on hardware platforms. 
+
+
+\subsection{Two-Stage Training Strategy}
+To tackle the performance degradation issue caused by early exiting, 
+we propose a novel two-stage training strategy to transfer knowledge from deeper classifiers to shallow classifiers. 
+The process of two-stage training strategy is presented as follows. 
+\begin{itemize}
+  \item In the first stage, we train the backbone ViT and update the parameters of the backbone and the final classifier in an alternating strategy. 
+  As a result, the interference of multiple internal classifiers can be minimized, enabling the final classifier to reach its full potential. 
+  Similar to general training, we utilize the cross entropy function as the training loss. 
+  \item During the second stage, the backbone and final classifier are kept frozen. Only the parameters of exiting heads and internal classifiers can be updated. 
+  We introduce self-distillation to facilitate the imitation of all exiting heads from the last classifier as illustrated in the left of Figure \ref{fig:Overview}. 
+\end{itemize}
+
+The overall distillation loss comprises the heterogeneous distillation, homogeneous distillation and prediction distillation loss.
+
+\textbf{Heterogeneous distillation. }
+Considering the usage of heterogeneous exiting head, the gap between different types of heads is substantial. 
+Directly utilizing the features from the last layer as supervision for internal classifiers can lead to information loss. 
+To tackle this issue, we propose heterogeneous distillation to facilitate learning the knowledge from heterogeneous architectures. 
+To reduce the conflict between multiple losses, we only employ the feature of the last layer as the reference feature for the first and last exiting heads of LPH and GAH. 
+The inductive bias and local visual representations captured by LPH can be elegantly integrated with global information extracted from self-attention. 
+Considering the different shapes of feature maps between exiting heads and the final block, we employ an aligning module to match the dimensions. 
+The module consists of a depth-wise convolution, GELU and BN activation functions. 
+The feature map of the last ViT layer $\mathbf{F}_L \in \mathbb{R}^{N\times D}$ is first reshaped to $D\times \sqrt{N}\times \sqrt{N}$ dimensions. 
+The reshaped feature map is passed to the module to reduce dimensions, and then restored to original dimension format $N'\times D$. 
+The loss function of heterogeneous can be formulated as: 
+\begin{equation}
+  \mathcal{L}_{hete}=\frac{1}{4}\sum_{m \in \mathcal{M} }\mathcal{L}_{KL}(\mathbf{F}_{m}, \text{Align}(\mathbf{F}_L)), 
+\end{equation}
+where $\mathcal{M}= \{1,M/2,M/2+1,M\}$ and $\mathcal{L}_{KL}$ is the Kullback-Leibler divergence function. 
+
+\textbf{Homogeneous distillation. }
+% Although we utilize the heterogeneous distillation to reduce the information loss, 
+% \gy{neighboring exiting heads with similar architectures are left and cannot learn more knowledge. }
+% Thus, 
+We propose homogeneous distillation between exiting heads with the same architectures to further improve performance. 
+In each type of exiting heads, we employ the final heads as the teacher assistant to help the preceding homogeneous heads learn hint knowledge. 
+For example, 
+in all LPHs, the features of final LPH (\textit{i.e.} at $M/2$-th exiting point) is utilized as reference feature for the preceding LPH. 
+Given the feature maps from the first to $m$-th exiting heads $\mathbf{F}_m, (1\leq m\leq M/2)$, 
+the loss function of homogeneous distillation between LPHs is:
+\begin{equation}
+  \mathcal{L}_{homo}^{LPH}=\frac{1}{M/2-1}\sum_{m = 1}^{M/2-1} \mathcal{L}_{MSE}(\mathbf{F}_m, \mathbf{F}_{M/2}), 
+\end{equation}
+where $\mathcal{L}_{MSE}$ is the mean squared error function. 
+Since the feature maps of GAH have different shapes, we apply dot-product operations between feature maps. 
+Given a feature map of GAH $\mathbf{F}_m\in \mathbb{R}^{N/g^2(m) \times D}$ at the $m$-th exiting point, 
+the shape can be transformed to $D\times D$ by computing $\mathbf{F}_m^T\mathbf{F}_m$. 
+The loss function of homogeneous distillation between GAHs can be expressed as: 
+\begin{equation}
+  \mathcal{L}_{homo}^{GAH}=\frac{1}{M/2-1}\sum_{m = M/2+1}^{M-1} \mathcal{L}_{MSE}(\mathbf{F}_m^T\mathbf{F}_m, \mathbf{F}_{M}^T\mathbf{F}_{M}). 
+\end{equation}
+Therefore, the overall loss function of homogeneous distillation can be expressed as: 
+\begin{equation}
+  \mathcal{L}_{homo}=\mathcal{L}_{homo}^{LPH}+\mathcal{L}_{homo}^{GAH}. 
+\end{equation}
+
+
+
+\textbf{Prediction distillation. }
+In order to further improve the performance of internal classifiers, 
+we utilize the final classifier as the reference label of $M/2$-th and $M$-th exiting points where last LPH and GAH are located, respectively. 
+Given an input sample associated with label $y$, and assuming that the predictions at the $M/2$-th and $M$-th exiting points are $\hat{y}_{M/2}$ and $\hat{y}_{M}$, respectively, 
+the loss function of prediction distillation can be formulated as: 
+\begin{equation}
+  \mathcal{L}_{pred}=\mathcal{L}_{KD}(\hat{y}_{M/2}, \hat{y}_{L}, y)+\mathcal{L}_{KD}(\hat{y}_{M}, \hat{y}_{L}, y),
+\end{equation}
+where $\mathcal{L}_{KD}$ is the loss function of vanilla knowledge distillation: 
+\begin{equation}
+  \mathcal{L}_{KD}(\hat{y}^s, \hat{y}^t, y) = (1-\gamma)\mathcal{L}_{CE}(\hat{y}^s, y) + \gamma \mathcal{L}_{KL}(\hat{y}^s/T, \hat{y}^t/T).  
+\end{equation}
+Here, $\mathcal{L}_{CE}$ is the cross-entropy function, 
+$T$ is a temperature value to control the smoothness of logits, 
+and $\gamma$ is a balancing hyperparameter. 
+
+Hence, the overall loss function of our proposed method is:
+\begin{equation}
+  \mathcal{L} = \alpha \mathcal{L}_{hete} + \beta \mathcal{L}_{homo} + \mathcal{L}_{pred}, 
+\end{equation}
+where $\alpha$ and $\beta$ are hyperparameters. 
+
+
+\subsection{Dynamic Inference}
+In this section, we first introduce the exiting metric and then depict the process of early exiting ViT inference. 
+We employ a standard confidence metric following \cite{ztw} as the exiting metric, which represents the probability of the most confident classification class. 
+The prediction confidence $c_m$ at the $m$-th exiting position is:
+\begin{equation}
+  c_m(p^m)= \mathop{max}\limits_{C }p^m,
+\end{equation}
+where $p^m$ is the prediction distribution at $m$-th exiting position and $C$ is the classification label set. 
+During the inference process, input samples go through exits sequentially. 
+Each sample dynamically adjusts its exiting path according to the exiting metric. 
+If the classification confidence of a sample at the $m$-th exiting point exceeds a predefined threshold $\tau$, the forward propagation of ViT will be terminated, 
+and the prediction at the $m$-th exiting point will be output. 
+The threshold $\tau$ can be adjusted according to computation cost and hardware resources to achieve an efficiency-accuracy trade-off. 
+A low threshold may lead to a significant speed-up at the cost of a possible drop in accuracy.
+If the exiting condition is never reached, the ViT will revert to the standard inference process. 
+
+
+\begin{table*}
+  \renewcommand{\arraystretch}{0.9}
+  \centering
+  \setlength{\extrarowheight}{0pt}
+  \addtolength{\extrarowheight}{\aboverulesep}
+  \addtolength{\extrarowheight}{\belowrulesep}
+  \setlength{\aboverulesep}{0pt}
+  \setlength{\belowrulesep}{0pt}
+  \caption{Performance of different methods on three datasets for different ViT backbones. "Acc." represents the Top-1 classification accuracy. "\#Params." represents the number of model parameters.}
+  \label{tb:performance}
+  \vspace{-7pt}
+  \begin{tabular}{c|c|ccc|ccc|ccc} 
+  \toprule
+  \multirow{2}{*}{\textbf{Methods}}               & \multirow{2}{*}{\textbf{\#Params.}} & \multicolumn{3}{c|}{\textbf{Results: CIFAR-100}}                             & \multicolumn{3}{c|}{\textbf{Results: Food-101}}                              & \multicolumn{3}{c}{\textbf{Results: ImageNet-1K}}                             \\
+                                                  &                                     & \textbf{Acc.~}   & \textbf{MACs~$\downarrow$} & \textbf{Speed-up~$\uparrow$} & \textbf{Acc.}    & \textbf{MACs~$\downarrow$} & \textbf{Speed-up~$\uparrow$} & \textbf{Acc.}    & \textbf{MACs~$\downarrow$} & \textbf{Speed-up~$\uparrow$}  \\ 
+  \hline
+  \multicolumn{11}{c}{\textbf{ViT}}                                                                                                                                                                                                                                                                                                   \\ 
+  \hline
+  ViT-B/16                                        & 86 M                                & 90.8 \%          & 16.93 G                    & 1.00~$\times$                & 89.6 \%          & 16.93 G                    & 1.00~$\times$                & 81.8 \%          & 16.93 G                    & 1.00~$\times$                 \\ 
+  \hline
+  SDN                                             & 94 M                                & 86.5 \%          & 10.16 G                    & 1.64~$\times$                & 88.5 \%          & 8.67 G                     & 1.95~$\times$                & 79.5 \%          & 10.95 G                    & 1.55~$\times$                 \\
+  PABEE                                           & 94 M                                & 85.1 \%          & 11.48 G                    & 1.52~$\times$                & 86.7 \%          & 10.93 G                    & 1.81~$\times$                & 78.6 \%          & 12.41 G                    & 1.36~$\times$                 \\
+  BERxiT                                          & 94 M                                & 87.1 \%          & 10.27 G                    & 1.65~$\times$                & 88.3 \%          & 8.56 G                     & 1.98~$\times$                & 79.9 \%          & 11.75 G                    & 1.44~$\times$                 \\
+  ViT-EE                                          & 94 M                                & 87.5 \%          & 11.65 G                    & 1.65~$\times$                & 88.2 \%          & 10.42 G                    & 1.91~$\times$                & 79.6 \%          & 13.66 G                    & 1.38~$\times$                 \\
+  PCEE                                            & 94 M                                & 86.1 \%          & 10.90 G                    & 1.55~$\times$                & 88.1 \%          & 9.50 G                     & 1.81~$\times$                & 80.0 \%          & 12.36 G                    & 1.37~$\times$                 \\
+  \rowcolor[rgb]{0.949,0.949,0.949} \textbf{Ours} & 101 M                               & \textbf{88.5} \% & \textbf{9.76 G}            & \textbf{1.87}~$\times$       & \textbf{88.6} \% & \textbf{7.63 G}            & \textbf{2.36}~$\times$       & \textbf{80.3}~\% & \textbf{10.65 G}           & \textbf{1.70}~$\times$        \\ 
+  \hline
+  \multicolumn{11}{c}{\textbf{DeiT}}                                                                                                                                                                                                                                                                                                  \\ 
+  \hline
+  DeiT-B\alambic\xspace                                  & 86 M                                & 91.3 \%          & 16.93 G                    & 1.00~$\times$                & 90.3 \%          & 16.93 G                    & 1.00~$\times$                & 83.4 \%          & 16.93 G                    & 1.00~$\times$                 \\ 
+  \hline
+  SDN                                             & 94 M                                & 87.4 \%          & 9.65 G                     & 1.75~$\times$                & 88.5 \%          & 8.62 G                     & 1.97~$\times$                & 77.5 \%          & 11.30 G                    & 1.50~$\times$                 \\
+  PABEE                                           & 94 M                                & 86.4 \%          & 11.43 G                    & 1.48~$\times$                & 88.6 \%          & 11.00 G                    & 1.54~$\times$                & 78.5 \%          & 12.40 G                    & 1.36~$\times$                 \\
+  BERxiT                                          & 94 M                                & 88.3 \%          & 10.48 G                    & 1.61~$\times$                & 88.8 \%          & 9.16 G                     & 1.85~$\times$                & 79.1 \%          & 11.12 G                    & 1.53~$\times$                 \\
+  ViT-EE                                          & 93 M                                & 88.3 \%          & 11.07 G                    & 1.75~$\times$                & 88.8 \%          & 10.26 G                    & 1.91~$\times$                & 80.5 \%          & 13.28 G                    & 1.45~$\times$                 \\
+  PCEE                                            & 94 M                                & 87.5 \%          & 10.49 G                    & 1.61~$\times$                & 88.6 \%          & 9.59 G                     & 1.76~$\times$                & 80.4 \%          & 11.87 G                    & 1.43~$\times$                 \\
+  \rowcolor[rgb]{0.949,0.949,0.949} \textbf{Ours} & 102 M                               & \textbf{88.9} \% & \textbf{9.54 G}            & \textbf{1.91}~$\times$       & \textbf{89.5} \% & \textbf{8.53 G}            & \textbf{2.12}~$\times$       & \textbf{81.7}~\% & \textbf{10.90 G}           & \textbf{1.67}~$\times$        \\ 
+  \hline
+  \multicolumn{11}{c}{\textbf{Swin}}                                                                                                                                                                                                                                                                                                  \\ 
+  \hline
+  Swin-B                                          & 87 M                                & 92.6 \%          & 15.13 G                    & 1.00~$\times$                & 93.3 \%          & 15.13 G                    & 1.00~$\times$                & 83.5 \%          & 15.40 G                    & 1.00~$\times$                 \\ 
+  \hline
+  SDN                                             & 88 M                                & 88.3 \%          & 9.41 G                     & 1.72~$\times$                & 90.2 \%          & 7.64 G                     & 2.17~$\times$                & 78.7 \%          & 10.91 G                    & 1.45~$\times$                 \\
+  PABEE                                           & 88 M                                & 83.8 \%          & 9.46 G                     & 1.72~$\times$                & 88.8 \%          & 8.17 G                     & 2.01~$\times$                & 79.0 \%          & 13.19 G                    & 1.18~$\times$                 \\
+  BERxiT                                          & 88 M                                & 88.4 \%          & 9.61 G                     & 1.68~$\times$                & 90.2 \%          & 7.68 G                     & 2.16~$\times$                & 80.2 \%          & 10.35 G                    & 1.54~$\times$                 \\
+  ViT-EE                                          & 91 M                                & 88.1 \%          & 9.71 G                     & 1.82~$\times$                & 90.6 \%          & 8.92 G                     & 2.03~$\times$                & 82.1 \%          & 11.20 G                    & 1.52~$\times$                 \\
+  PCEE                                            & 88 M                                & 88.1 \%          & 10.68 G                    & 1.50~$\times$                & 90.3 \%          & 9.11 G                     & 1.79~$\times$                & 79.8 \%          & 11.51 G                    & 1.37~$\times$                 \\
+  \rowcolor[rgb]{0.949,0.949,0.949} \textbf{Ours} & 97 M                                & \textbf{90.7} \% & \textbf{8.84 G}            & \textbf{1.94}~$\times$       & \textbf{91.9} \% & \textbf{7.05 G}            & \textbf{2.50}~$\times$       & \textbf{82.7} \% & \textbf{9.98 G}            & \textbf{1.69}~$\times$        \\
+  \bottomrule
+  \end{tabular}
+  \vspace{-7pt}
+  \end{table*}

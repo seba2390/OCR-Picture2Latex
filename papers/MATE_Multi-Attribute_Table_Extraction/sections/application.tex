@@ -1,0 +1,94 @@
+%!TEX root = ../main.tex
+
+\section{Joinable Tables Discovery}\label{sec:index_applicaiton}
+We now discuss how we leverage our index structure and \hash to efficiently find n-ary joins.
+Recall the discovery phase is comprised of four main steps (see Figure~\ref{fig:architecture}): initialization, table filtering, row filtering, and joinability calculation.
+Algorithm~\ref{alg:application} shows the pseudocode of this discovery process.
+Overall, \system receives a query table $d$, a set of columns from the query table as the composite key $Q$, and an integer $k$ (Line~\ref{code:inputs}) with the goal of discovering the top-k joinable tables for $d$ and based on $Q$.
+
+\input{charts_and_tables/hash_filtering_algorithm}
+
+In the {\em initialization} step, \system selects the initial column, fetches the candidate tables, and applies our hash procedure, i.e.,~super key generation, on the join columns of the input table (Lines~\ref{code:fetch}-\ref{code:queryhashing}).
+In the {\em table filtering} step, it leverages the number of corresponding index hits per table to prune the tables that cannot be among the top joinable tables (Lines~\ref{code:tablefiltering1}-\ref{code:end_filtering2}).
+We introduce two coarse-grained pruning rules to filter non-promising tables while retaining all relevant tables.
+In the {\em row filtering} step, the system prunes as many non-joinable rows as possible for each candidate table (Lines~\ref{code:corresponding_rows}-\ref{code:increment_checked_vals}).
+It evaluates the rows of candidate tables that are likely to be among the top-k tables, by only checking the membership of the key values through the generated super keys.
+We detail the aforementioned three steps in the following subsections.
+
+In the final {\em calculateJ} step, \system validates the rows that remain after the previous two filtering steps and calculates the joinability score ($\jmath$) of the remaining tables as defined in Section~\ref{sec:problem_statement}.
+To do so, it fetches the actual cell values of each row, compares them to the composite key values (Line~\ref{code:calc_jscore}).
+It then updates the list of the top-$k$ joinable tables (Line~\ref{code:topk_update}).
+\system terminates and reports the discovered joinable tables (Line~\ref{code:return}), once it has discovered the top-$k$ joinable tables or checked all the candidate tables.
+
+\subsection{Initialization Step}
+\system has to initiate the retrieval with one of the key columns in $Q$ using the single column index.
+The initial column can heavily impact the runtime of the system.
+Consider the Kaggle IMDB dataset\footnote{\url{https://www.kaggle.com/carolzhangdc/imdb-5000-movie-dataset}}, which contains information about more than $5000$ movies. If we use it as the query table with the join key <``Director name'', ``Movie title''>, we obtain 500k tables when fetching with the column ``Director, and 38M tables when using ``Movie Title'', respectively.
+
+Yet, selecting the ideal initial query column depends on how many PL items each cell value will match and cannot be known upfront.
+We, thus, resort to a heuristic that only considers the query table at hand.
+We choose the column with the smallest number of unique values, i.e.,~lower cardinality, hoping to match fewer PLs in the index.
+%Our IMDB example confirms our intuition as column ``Movie Title'' contains \textit{5043} and ``Director Name'' contains \textit{2400} unique values.
+Thus, \texttt{init\_column\_selection()} picks the column with the minimum cardinality, $q\textquotesingle \in Q$ (Line~\ref{code:ics}). 
+With the initial column, \system fetches PL items including their generated super key for the corresponding rows (Line~\ref{code:fetch}).
+Then, the fetched PL items are grouped based on the table identifiers~(Line~\ref{code:table_grouping}).
+At the same time, it sorts the tables based on the number of PL items in each table to evaluate more promising tables first and enabling table pruning techniques.
+Next, \system generates the relevant super keys for the join columns of the query table.
+For each column $q \in Q$, it hashes the column values and uses an \texttt{OR} operation to generate the aggregated hash  for each key value combination (Line~\ref{code:queryhashing}).
+We generate a dictionary to map initial query column values to the generated super keys.
+This helps us to efficiently align fetched super keys with query table super keys in later steps.
+
+\subsection{Table Filtering}
+%Although selecting the optimal query column can reduce the number of candidate tables, there are still many tables that need to be verified for top-k selection.
+We propose a {\em coarse-grained} table filtering approach, inspired by prefix-filtering~\cite{chaudhuri2006primitive}, to further reduce the set of candidate tables.
+While traversing over the fetched tables, \system prunes tables that do not stand a chance to be selected as the top-k joinable candidates.
+For each candidate table (Line~\ref{code:tableforloop}), it leverages the corresponding PL items of the table (Line~\ref{code:get_table_pls}).
+Table filtering applies two strategies:
+
+\noindent\textit{(1) } If $\jmath_k$ is the joinability score of the worst table in the top-k list, i.e.,~table with the lowest joinability score, and $L_t$ is the number of PL items for current candidate table $t$, the system drops the candidate table $t$ from further evaluations iff $L_t \leq \jmath_k$ (Line~\ref{code:tablefiltering1}).
+As tables are sorted in decreasing order based on their number of PL items, the remaining tables contain equal or smaller number of PL items and cannot end up among the top-k tables. Thus, the discovery task halts when this rule activates for one table (Line~\ref{code:tablefiltering1_goto}). 
+Going back to our running example, assume that we aim to discover the top one joinable table to $d$ and we find $T_1$ as a joinable table with joinability of $\jmath_k = 5$. The moment that a candidate table arrives for evaluation and it only contains $4$ or less PL items, the system can return $T_1$ as the most joinable table. This is because the new and the following candidate tables in the best case, where all the rows are joinable, will have the joinability of $4$ and cannot replace $T_1$.
+
+\noindent\textit{(2) } If $r_{\text{checked}}$ is the number of already evaluated rows from a table $t$ and $r_{\text{match}}$ is the number of joinable rows among the evaluated rows, \system drops the current table iff $L_t - r_{\text{checked}} + r_{\text{match}} \leq \jmath_k$ (Line~\ref{code:tablefiltering2}).
+This rule skips the current candidate table, because even if all the remaining rows are joinable to the input table, it cannot achieve a higher joinability score than the worst top-k table.
+Already during this check, the system leverages the super key to filter joinable rows. Once a table is skipped, the algorithm evaluates the next table (Line~\ref{code:tablefiltering2_goto}).
+Both table filtering strategies only apply after \system already saw $k$ joinable tables.
+Once again, assume the previous example, where the user wants to find the top one joinable table to $d$ and $T_1$ with $\jmath_k = 5$ is already discovered. Previous rule cannot drop a candidate table with $10$ PL items. Now, assume that \system evaluates the first $7$ PL items of this newcomer table (See Row Filtering in~\ref{subsec:rowfiltering}) and only one of them are in fact joinable to $d$. In this case, the system can ignore the remaining PL items because even if the remaining three rows are joinable, the candidate table only reaches the joinability of $4$ that does not replace $T_1$.
+
+\subsection{Row Filtering}\label{subsec:rowfiltering}
+If there is a prospect of a candidate table to be one of the top-k tables, meaning that the candidate table incorporates enough candidate joinable rows, \system evaluates them. 
+It leverages the super keys generated for both rows in the candidate and query tables to efficiently check the membership of the key values in the candidate rows.
+If the super key of a query table row is not masked by the super key from the candidate joinable table, the system can simply drop the table row from joinability computations. 
+
+For each candidate row, represented by the PL item (Line~\ref{code:for_pl_items}), \system discovers which query rows should be compared with the current candidate row.
+To find the query rows efficiently, the system uses the generated dictionary that maps the initial column values to the corresponding super keys of the composite key value combination (Line~\ref{code:corresponding_rows}). In our running example, row $1$ in $T_1$ is a candidate row and \system binds it to the $5^{th}$ row in $d$ using a dictionary that maps the cell values to the input rows. This step ensures that we do not iterate over all query table rows for each candidate row. Then, for each corresponding input row \texttt{d\_row} (Line~\ref{code:for_corresponding_rows}), the super keys of the current candidate row and its corresponding input rows are compared through bit-wise \texttt{OR} masking (Line~\ref{code:row_filtering}).
+An input row is a join candidate to its corresponding row of the PL item iff the result of the bit-wise \texttt{OR} operation on their super keys is equal with the super key of the PL item (Line~\ref{code:add_into_candidate}).
+%This is because the values in the composite key should be a subset of the values in the joinable row in the joinable table.
+\newline
+\noindent\textit{Example 3.} 
+Consider our running example once again. If the hash values for ``Muhammad'', ``Lee'', ``US'', ``Ali'', ``Germany'', ``Dancer'', ``Boxer'', and ``Birder'' are $1001000$, $01100000$, $00010100$, $00010001$, 
+$10001001$, $10000010$, $10000001$, and $00001001$ respectively, the aggregated super key for the rows with value ``Muhammad'', i.e., rows $2$, $5$, and $6$ in the Table~$T_1$, would be $11111110$, $11011101$ and $11101001$ respectively.
+Likewise the super keys over the columns in $Q$ and for the first row in \textit{d} would be $1001000 \vee 01100000 \vee 00010100 = 1111100$.
+In our example, the resulting super key $1111100$ is not a subset of $11011101$ and $11101001$, which are the super keys of rows $5$ and $6$. Therefore, $5^{th}$ and $6^{th}$ rows are removed from further $\jmath$ calculation.
+On the other hand, $1111100$ is subsumed by $11111110$, i.e., the super key of the second row of $T_1$.
+Therefore, we add the second row to the list of candidate rows.
+Similar to bloom filters, this operation can lead to FPs but never to false negatives (FNs). 
+%After this comparison, \texttt{checked\_values} is increased for the next table filtering check.
+
+\textbf{Lemma.} The super key will never miss a joinable row.
+    % \vspace{-.3cm}
+\begin{proof}[Proof by contradiction.]
+Given a table $R$ with a row $r$ where $c_1$, $c_2$,... are the cell values of the row $r$. Now assume that we have a deterministic hash function $h$ so that $h(c_1) =h_1, h(c_2) = h_2, \dots$. The super key $sk$ is constructed as follows: $sk = h_1 \lor h_2 \lor … \lor h_n.$
+Now assume, there is a table $T$ with a 2-column join key and a row with a value combination ${k1, k2}$ with $k1=c1$ and $k2=c2$, so that the columns are joinable with $r$ but the bitwise OR operation of $h(k_1) \lor h(h_2)$ will not be covered by $sk$, i.e.,
+$h(k_1) \lor h(k_2) \lor sk \neq sk$
+
+However by construction $h_1 \lor h_1 \lor sk = sk$.
+It follows $h_1 \neq h(k_1) \lor h_2 \neq h(k_2)$, which is a contradiction to $k1=c1$ and $k2=c2$. 
+\end{proof}
+
+
+\subsection{Analysis} \label{subsec:proof}
+There are two main features of \hash that lead to higher efficiency over BF:  1) The non-uniform distribution of hash values; 2) the encoding of the length. First, unlike BF that is built on the premise of uniform distribution of its underlying hash functions, 
+\hash exploits the knowledge that different values come from different columns. Building on the premise that each domain has unique syntactic features~\cite{DBLP:journals/pvldb/ZhangSLHDT20}, \hash maps hash results to unique segments based on their domain to prevent random overlaps.
+Assume an $|a|$-bit hash array. The probability of a collision of two words using LHBF~\cite{DBLP:conf/esa/KirschM06} is $\frac{1}{\binom{|a|}{2}}= \frac{2}{|a|\cdot (|a|-1)}$.
+Now consider \hash. To generate a collision one has to hash a value with the same set of $K$ rare characters and the same length, where $K = \alpha -1$. The probability of drawing the same $K$ characters out of 37 in the same set of $\beta$ positions is $\frac{1}{37\cdot\beta}\cdot \frac{1}{36\cdot\beta} \dots \cdot \frac{1}{(37-K+1)\cdot \beta}$. We now solve the inequality $\frac{2}{|a|\cdot (|a|-1)}>\frac{1}{\beta}\cdot \prod_{i=1}^{K}{\frac{1}{37-K+1}}$. For  $|a|=128$ ($ \beta = 3$), the inequality is true for $K>3$ . If we now also include the information about length encoded in the remaining $17$ bits we obtain $\frac{1}{|a|\cdot (|a|-1)}>\frac{1}{17}\cdot \frac{1}{3}\cdot \prod_{i=1}^{K}{\frac{1}{37-K+1}}$, which is already true for $K>2$. Thus, our approach that explicitly leverages character positions and the length of values leads to fewer collisions when encoding $K$ random characters. Note that the rarity of the characters was not included in this setup. 

@@ -1,0 +1,206 @@
+\section{Computation Model}
+\label{sec:model}
+
+%% \kk{This is needed to decouple the programming model and system. Maybe mention this in the introduction too.}
+In this section we describe the core of the serverless computation model that underlies Durable Functions and is implemented by Netherite. By describing this model abstractly using execution graphs, we provide a solid foundation that allows us to state and explain the "causally-consistent-commit" execution guarantee of Netherite. 
+
+%Finally, we demonstrate how speculation enables the aggregation of storage accesses.
+
+%It is a combination of fine grained actors and stateless tasks that communicate through message passing. The model is expressive enough to capture all behaviours expressible in Durable Functions. We opted for a simple and clean computation model to facilitate the formulation of the reliability guarantees of the system, as well as decouple language specific concerns from the execution engine. This allows supporting multiple programming language bindings, which is a necessary requirement for Durable Functions to be used in practice.
+
+% Why a computation model that is different from the programming model? So we can more easily swap backends, and so we can more easily support multiple languages and/or programming models, and add features to the programming model, independently. Makes it easier to formulate, and verify or test, the reliability guarantees. Separates language concerns from engine concerns.
+
+
+\subsection{Tasks and Instances}\label{sec:tasksandinstances}
+
+Computations in our model are built from tasks and instances that communicate via messages. We distinguish two types of messages:
+\begin{itemize}
+    \item \emph{Task messages} are used to start a task. Tasks are stateless and can be executed anywhere. When a task finishes executing, it sends a single result message.
+    \item \emph{Instance messages} target a specific stateful instance, identified by an \emph{instance ID}. When processed, an instance message may read and update the state of that instance, and may also produce additional messages.
+\end{itemize}
+%A fundamental challenge for workflow systems is to be \emph{atomic}: all of the effects of processing a message should take effect together, or if the processing fails, none.
+
+\hide{
+\kk{I am not exactly sure why this is mentioned here. It seems to be a bit detached from the rest of the narrative. Maybe we can say that the model helps in addressing a fundamental challenge for workflow systems (that their steps need to be atomic).}
+\seb{I have removed it since it is explained in other places also.}
+}
+%
+%We show how to precisely specify this intention in \S\ref{sec:faults}, and our solution in \S\ref{sec:netherite}.
+%
+The fine granularity of tasks and instances, and the state encapsulation afforded by the message passing paradigm, facilitate elasticity as they allow us to balance task and instance execution across an elastic cluster. For stateless tasks, load balancing is straightforward. For stateful instances, it requires a bit more work. We describe our solution in \S\ref{sec:netherite}. 
+
+%Processing an instance message require reading and update the latest state of the targeted instance. Each instance is identified using a unique identifier $i$ and is associated with its current state $S_i$ and input message queue $Q_i$. A task message pool $TQ$ contains all messages that request a task execution. To initiate the execution of a task, a message containing information about the task to be initialized has to be sent to the task message pool $TQ$. To initiate the execution of an instance $i$ a message has to be sent to its queue $Q_i$. We assume that the initial task and instance messages contain both the definition of the computation to be executed as well as its input.
+
+\subsection{Execution graphs}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=.8\columnwidth]{images/simplesequence}
+    \caption{Execution graph for a simple sequence of two tasks as in Fig.~\ref{fig:simplesequence}. Vertices are labeled to indicate the vertex type, and message edges are labeled with the value propagated.}
+    \label{fig:ss-graph}
+\end{figure}
+
+To visualize execution states and execution histories, we use \emph{execution graphs}. There are three types of vertices:
+\begin{itemize}
+\item An \emph{input} vertex represents an external input message. 
+\item A \emph{task} vertex represents a stateless task.
+\item A \emph{step} vertex represents the processing of a batch of one or more messages by a stateful instance.
+\end{itemize}
+%
+We call the task and step vertices \emph{work items}, since both represent the processing of messages. Edges in the graph represent direct causal dependencies:
+%
+\begin{itemize}
+    \item A \emph{message} edge from $v_1$ to $v_2$ means that $v_2$ consumes a message produced by $v_1$. 
+    \item A \emph{successor} edge from $v_1$ to $v_2$ means that they are successive steps of the same instance.
+\end{itemize}
+%
+For an example, see Fig.~\ref{fig:ss-graph}. This execution graph corresponds to the simple sequence from Fig.~\ref{fig:simplesequence}. The input is the message that starts the orchestration; the orchestration then proceeds in three steps: (1) receive input and issue first task, (2) receive first task result and issue second task, and (3) receive second task result and finish.
+
+We call an execution graph \emph{consistent} if it is consistent with a sequential execution of atomic processing steps as described in \S\ref{sec:tasksandinstances}. We call an execution graph \emph{complete} if all messages produced are also consumed.
+
+
+\subsection{Faults and Recovery}\label{sec:faults}
+
+%The model that has been described this far is adequate to express concurrent execution of fine-grained stateful instances and stateless tasks that communicate with messages. However, 
+
+%In general, workflow systems recover from failures by restarting incomplete tasks. Note that this solution is not always perfect: tasks can have externally visible effects (such as calls to external services) that are duplicated. It is therefore important to specify the precise semantics.
+A critical reality of service-oriented environments is the prevalence of faults: tasks may time out, nodes may crash (e.g., run out of memory) and reboot, and service connections may be temporarily interrupted. For example, attempts to persist instances to storage, to send a message, or to acknowledge the receipt of a queue message, may fail intermittently. 
+
+What does it mean for a workflow execution to be correct in the presence of faults and recovery? Ideally, faults would be invisible. This is sometimes called an "exactly-once" guarantee, since it means that each message is processed exactly once. In general it is unfortunately not possible to implement this guarantee.
+\hide{
+\kk{I think that this needs to be qualified since it is theoretically possible if one has control over all services and can implement transactions over different services. We could say "...not possible to implement this guarantee in general, for any combination of external services".}
+\seb{I think the statement is already sufficiently qualified with "in general". Also, this is not so much an argument about the consistency model in the sense that I don't say "observationally exactly once", but just that code actually must internally execute more than once. External services are not the only way to observe re-executions. System traces also. And resource consumption.}
+}
+The reason is that, when recovering from a crash, some progress may be lost, and some code must therefore be re-executed, possibly re-performing an irrevocable effect on an external service.
+
+Because of that, many workflow systems settle for an "at-least-once" guarantee, where a message may be processed more than once, and thus its effects may also be duplicated. To handle duplicates correctly, developers usually employ a technique called "effectively-once" \cite{effectively-once-pulsar,effectively-once-tweet}: it combines the at-least-once guarantee with additional  mechanisms that ensure that all effects of processing a message are \emph{idempotent}. It may at first appear that the combination of at-least-once and idempotence is sufficient to hide faults. However, that is not true in the presence of nondeterminism. The reason is that if re-processing a message produces \emph{different effects} (e.g. sends a message to a different queue, or updates a different storage location), the effects of both executions remain, instead of being deduplicated.
+%
+\hide{
+\csm{effectively-once already exists as an industry thing and has for a while -- can we actually propose it here?}\seb{We should perhaps use a different term; it seems that the existing use of this term is based on message deduplication which is not equivalent to our definition, if message processing is not deterministic. Maybe just "atomic" processing?}
+\csm{see; https://twitter.com/viktorklang/status/789036133434978304 "I'm coining the phrase "effectively-once" for message processing with at-least-once + idempotent operations."}
+\csm{I do like ``atomic'' processing better, but I'm not sure.}\seb{My current suggestion is "causally consistent commit", or CCC.}
+}
+
+% To fix the shortcomings of the various "something-once" guarantees, we propose a new guarantee called "causally-consistent-commit". 
+% \kk{I replaced the above to sound less aggressive.}
+
+\paragraph{Causally consistent commit.}
+To address the shortcomings of the aforementioned guarantees we propose a guarantee called "causally-consistent-commit". 
+The intuition behind it is that if we re-execute a work item, we have to ensure that all internal effects that causally depend on the previous execution are \emph{aborted}; in particular, any produced messages are discarded and updated instance states are rolled back. 
+
+Note that work items are aborted only due to transient error conditions in the underlying execution infrastructure, never because of exceptions in the user code. A work item throwing a user-code exception is considered completed, with the exception being the result. 
+
+As far as the system-internal state is concerned, CCC is observationally equivalent to "exactly-once". However, unlike "exactly-once", and like TM opacity \cite{opacity}, CCC gives semantics to aborted work items as well; it does not "pretend that they never happened". This is important because in reality, aborted work items cannot be completely hidden, but remain visible to users. For example, they may have external effects that cannot be undone (e.g. calls to external services), and they may appear in system traces and when debugging. 
+%It is not implicitly retried; but retries can be implemented easily at the application level.
+\hide{
+\kk{Can we bubble this paragraph higher up, maybe where we first describe work items?}
+\seb{Done.}
+}
+
+\subsection{Fault-augmented execution graphs}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=.6\columnwidth]{images/progressstates}
+    \caption{Progress states for work items.}
+    \label{fig:progressstates}
+\end{figure}
+
+We now show how to augment execution graphs with a notion of progress, to precisely describe how to understand the effect of faults and recovery. We use the following \emph{progress states} (Fig.~\ref{fig:progressstates}) to mark the status of work items (= step or task vertices) in the execution graph.
+
+\begin{description}
+\item[In progress] This state represents a work item that is being executed. It is the initial state of a work item, and can change to \textbf{Completed} or \textbf{Aborted}.
+\item[Completed] This state represents a work item whose execution has completed, but whose effects are not yet permanent. It can change to \textbf{Persisted} or \textbf{Aborted}.
+\item[Persisted] This state represents a work item whose execution has completed and whose effects have been permanently persisted.
+\item[Aborted] This state represents a work item that was permanently aborted. 
+\end{description}
+
+For an example, see Fig.~\ref{fig:failure-execution}, which illustrates what may happen to an incomplete execution of the simple sequence (Fig.~\ref{fig:simplesequence}) upon a crash. In \Cref{fig:pre-failure-execution} we show a graph representing the execution right before the crash. It has completed (but not yet persisted) step 2 and task 2, and is in the middle of executing step 3. In \Cref{fig:post-failure-execution} we show the final execution graph after the system recovers from the crash. Upon crash and recovery, step 2, task 2, and step 3 are aborted and then re-executed. Note that we do not assume determinism of tasks or steps: the re-executed task 2' may produce a different result $z'$ than the result $z$ returned by task 2 before the crash. This illustrates the importance of maintaining causal consistency through crashes and recovery. We now define this notion precisely.
+ 
+
+\begin{figure}
+    \centering
+    \begin{subfigure}[b]{\columnwidth}
+        \centering
+        \includegraphics[width=.75\columnwidth]{images/ss-before}
+        \caption{Execution graph immediately before the node crash.}
+        \label{fig:pre-failure-execution}
+    \end{subfigure}
+    \begin{subfigure}[b]{\columnwidth}
+        \centering
+        \vspace{.2in}
+        \includegraphics[width=.75\columnwidth]{images/ss-after}
+        \caption{After the crash, recovery, and re-executing to completion.}
+        \label{fig:post-failure-execution}
+    \end{subfigure}
+    \caption{Execution graphs for the simple sequence (Fig.~\ref{fig:simplesequence}) before and after a node crash.
+    \hide{
+    \kk{It might help if we move the aborted tasks below (essentially mirroring the way the (a) part of the figure looks).}
+    \seb{Yes, I can fix this.}
+    }
+    }
+    \label{fig:failure-execution}
+\end{figure}
+
+\subsection{Causally-Consistent-Commit Guarantee}\label{sec:consistencyguarantees}
+
+We say an implementation guarantees causally-consistent-commit (CCC) if it maintains consistency at each progress level. Concretely, let $\mathcal{I}$, $\mathcal{C}$, $\mathcal{P}$, and $\mathcal{A}$ be the subset of vertices in the respective progress states. Then, at all times, the subgraph $\mathcal{P}$, the subgraph $\mathcal{P}\cup\mathcal{C}$, and the subgraph $\mathcal{P}\cup\mathcal{C}\cup\mathcal{I}$ must each be a consistent execution graph.
+
+In a CCC execution, the following always hold:
+\begin{itemize}
+\item a persisted work item causally depends only on work items that are also persisted.
+\item a work item that causally depends on an aborted work item is also aborted.
+\item each message is consumed by at most one non-aborted work item.
+\item in a complete execution, each message is consumed by exactly one non-aborted work item.
+\end{itemize}
+
+
+%For a given execution graph, le tThe set of vertices in an execution graph $\mathcal{E}$ can be partitioned to be in one of the four statuses above $\mathcal{I}$, $\mathcal{C}$, $\mathcal{P}$, $\mathcal{F}$. \Cref{fig:failure-execution} shows an execution before and after a crash of an underlying node. The last two \textbf{Completed} transitions changed to \textbf{Failed} and were then re-executed. 
+
+\subsection{Speculation}\label{sec:defspeculation}
+
+A benefit of the CCC guarantee is that it enables \emph{speculation}: a work item can proceed even if it causally depends on a not-yet-persisted work item. For example, in \Cref{fig:pre-failure-execution}, task 2 and step 3 are speculative. 
+
+Speculation can boost performance because it allows the aggregation of storage accesses. Consider again the running example from Fig.~\ref{fig:ss-graph}. In a conservative implementation without speculation, we must save progress to storage after each work item. With speculation, however, we may execute the entire orchestration first and then persist all work items at once. Latency and throughput are both improved: a sequence of 5 storage accesses takes much longer, and consumes more system resources, than a single batched storage access.
+% \str
+% \kk{Include a discussion about approximating exactly once by having idempotent external effects in tasks etc.}
+% \seb{It may be wise to stay away from that here since we really haven't done anything in that direction, but we can list it in future work.}
+
+\subsection{Correspondence with DF}
+\label{sec:correspondence}
+
+Our computation model can directly express programs in DF.
+Stateful instances are used to represent DF orchestrations and entities, and tasks are used to represent DF activities. 
+%The instance ID of an orchestration is specified when it is started; by default, it is a fresh Guid. The instance ID of an entity is the entity ID.
+%
+\hide{
+The state of instances that correspond to orchestrations contains the program location, local variables, and the heap.
+\kk{
+The way this is phrased it sounds like we need to store the heap state with every orchestration. Can we rephrase that somehow to avoid this?
+}
+\seb{That is the point I am trying to make...we would need to save the heap state if we weren't using the record/replay trick. That is why that trick is so important. But I think we can say it shorter, so I am removing this piece for now.
+}
+% \kk{I replaced the sentence below because I am not sure I understand what does this have to do with mainstream languages.}
+% Since orchestrations are written in mainstream languages, the state of an orchestration is not just a program location, but includes local variables and the heap. 
+For example, the current state of the orchestration in Fig.~\ref{fig:orchestration} on line 15 includes the list of tasks, a subset of which may have completed and contain a result. 
+}
+
+%
+\hide
+{
+\seb{Explain relationship to DTFx framework.}
+\dajusto{@sb: For disadvantages of the "magic trick" (intro), I suppose we're mostly reciting the MSFT  EventSourcing docs page, right?}
+\dajusto{@sb: And as for relationship with DTFx, does it suffice to say that Durable Functions simply "lifts" the DTFx, normally simply a
+task-parallel SDK, to the serverless setting? In other words, simply augments the library to understand and schedule azure functions as "tasks"?}
+
+% Explain how DF uses multiple language bindings for specifying orchestrations, tasks, and entities.
+
+% \subsection{Compilation of applications into the model}
+
+% Explain how DF workflows are represented as an instance by using the recorded history. We'll do this mainly by example for this paper.
+
+% Briefly mention advanced features (entities, critical sections).
+
+% Explain how DF uses multiple language bindings for specifying orchestrations, tasks, and entities.
+}
+

@@ -1,0 +1,76 @@
+\section{Experiments}
+
+\subsection{Dataset and evaluation metrics}
+We conduct experiments on ImageNet-1K~\cite{Russakovsky2014ImageNetLS} and report the top-1 accuracy trade-off with respect to several cost indicators, as suggested by Dehghani \etal~\cite{Dehghani2021TheEM} To evaluate model efficiency, we report the number of patches/tokens in the input to the Transformer model, the number of giga multiply--accumulate operations (GMACs) per image as estimated by fvcore~\cite{fvcore_flop_counting}, and the throughput (ims/sec) and runtime ($\mu$-secs/im) on a single GeForce RTX 3090 GPU, measured with timm~\cite{rw2019timm} with batch size 512 in mixed precision. We do not use parameter count as a cost indicator since our Quadformer models use the exact same architectures as our vanilla ViT models: ViT-Small (22M params), ViT-Base (86M params) and ViT-Large (307M params). Some Quadformer models use a neural net for saliency estimation, but since it only has 342K parameters (see \S\ref{paragraph:impl_patch_scorers}) its impact on the parameter count is negligible.
+
+\subsection{Implementation details}
+
+\paragraph{Base models.}
+All our base models use image size $256^2$, patch size $16^2$, and $2D$ sinusoidal position embeddings. For our two main ViT architectures --- ViT-Base and ViT-Large --- we start by taking the weights released by the original authors~\cite{Dosovitskiy2020AnII}, which are pretrained on ImageNet-21K and fine-tuned on ImageNet-1K. These pretrained models use learned 1D position embeddings, image size $224^2$, and patch size $16^2$. We adapt them to $2D$ sinusoidal position embeddings and image size $256^2$ by fine-tuning on ImageNet-1K with base learning rate $1\text{e-}4$ for 70 epochs (for ViT-Base) or 20 epochs (for ViT-Large). For each architecture, we choose the checkpoint that achieved the highest validation accuracy. For ViT-Small, we train the DeiT-S architecture~\cite{Touvron2020TrainingDI} from scratch on ImageNet-1K with base learning rate $2\text{e-}3$ for 310 epochs.
+
+\paragraph{Fine-tuning.}
+We use the base models to initialize the weights of all our fine-tuned models, as we have seen much faster conversion times compared to training from scratch. We use the same base models to initialize both vanilla Vision Transformers and Quadformer models, as Quadformers share the exact same architecture with vanilla ViTs and do not introduce any extra parameters, except those used in the tokenizer.
+
+Our Quadformer models use mixed-resolution tokenizations with patch sizes $64^2$, $32^2$ and $16^2$ pixels, all downsampled to a patch representation size of $16^2$ pixels. We fix the image size to $256^2$ pixels and control the number of patches by setting the number of splits done by the Quadtree algorithm. Our vanilla ViT models use patch size $16^2$. We control the number of patches by setting the image size to $(16\sqrt{\#Patches})^2$ pixels. We report detailed hyperparameters in the supplementary material.
+
+\paragraph{Patch scorers.} \label{paragraph:impl_patch_scorers}
+For our feature-based patch scorer, we use a ShuffleNetV2$\times0.5$~\cite{Ma2018ShuffleNetVP} model trained on ImageNet-1K as the feature extractor. We truncate it just before the fully connected classification layer, which results in a $\times32$ downscaling ratio. This feature extraction backbone has only 342K parameters\label{342k_params}, which adds little overhead and makes it practical for real-world inference purposes. For Quadformer models that use ViT-Base or ViT-Small, we perform the scoring on a $\times0.75$ downsampled image (with $192^2$ pixels) and then upsample the saliency map by the same ratio, since the increased speed compensates for the lower fidelity and results in a better speed-accuracy tradeoff.
+
+For Grad-CAM oracle saliency estimation we use a RegNetY-32GF~\cite{Radosavovic2020DesigningND} model with 145M parameters, learned via transfer learning by end-to-end fine-tuning the original SWAG~\cite{Singh2022RevisitingWS} weights on ImageNet-1K data. Weights for ShuffleNetV2$\times0.5$ and RegNetY-32GF are taken from the torchvision library~\cite{torchvision2016}.
+
+\paragraph{Quadtree.} \label{paragraph:impl_quadtree}
+We build our own PyTorch~\cite{Paszke_PyTorch_An_Imperative_2019} implementation of the Quadtree algorithm (Algorithm \ref{algorithm:quadtree}), using z-order curves for efficient tree construction~\cite{Warren1993APH}. Patch scores are computed for an entire batch of input images over all possible spatial locations. Since we use a top-down algorithm, the only valid candidates are subdivisions of the initial patch grid, resulting in a total of 80 splittable patches for images of size $256^2$ pixels. All our patch scorers employ image-wide computation followed by grid-based scoring, making them particularly suitable for this kind of batched computation. The argmax operation used for iterative splitting is also batched, as well as the image slicing and resizing required to create token representations, making the entire implementation very GPU-friendly.
+
+\subsection{Main results}
+Using a feature-based scorer (\S\ref{paragraph:feature_based_scorer}), our Quadformer models consistently beat the accuracy of vanilla Vision Transformers by up to 0.79 (for ViT-Base) or 0.88 (for ViT-Large) absolute percentage points when controlling for the number of patches or GMACs, while using the exact same architecture (see Figure \ref{figure:accuracy_vs_compute_main_results}). Despite not using dedicated tools for accelerated inference, we also show gains when controlling for inference speed, beating vanilla ViT models for almost all values of \#Patches by up to 0.42 (for ViT-Base) or 0.4 (for ViT-Large) absolute percentage points. The traditional pixel-based scorer used for image compression fairs much worse than our feature-based scorer, demonstrating the superiority of semantic meaning over surface details. Full results are provided in the supplementary material.
+
+\begin{figure}[t!]
+  \centering
+  % \vspace*{-0.08\linewidth}
+  \hspace*{-0.035\linewidth}
+  \includegraphics[width=1.035\linewidth]{figures/accuracy_vs_compute_large_base.pdf}
+  \caption{Accuracy vs compute for vanilla ViT and Quadformer models with different saliency scorers. Every point represents a model fine-tuned with a specific number of patches. We expect the performance of Quadformer and vanilla models to converge as \#Patches approaches full resolution (256 patches). Throughput is measured on a single GeForce RTX 3090 GPU in mixed precision.}
+  \label{figure:accuracy_vs_compute_main_results}
+\end{figure}
+
+
+\subsection{Inference-time compute-accuracy tradeoff}
+Both Quadformers and vanilla Vision Transformers can be trained with a certain number of patches and operate on inputs with a different number of patches, providing a way to control the compute-accuracy tradeoff of a single model during inference time. With Quadformers, we use a different number of Quadtree splits to produce tokenizations of different lengths, allowing high granularity as every split increases the number of patches by 3 -- the split patch is replaced with its 4 children patches. With vanilla ViTs, we change the image size to a different multiple of the patch size, thus changing the total number of patches. When using vanilla ViTs with different image sizes, we scale the 2D patch positions to fit the range seen during training time, as we have seen better results when the inference-time position embeddings closely resemble those seen while training.
+
+Figure \ref{figure:accuracy_vs_compute_single_model_comparison} compares the inference-time compute-accuracy tradeoff of a single Quadformer model with a feature-based scorer and a single vanilla ViT model to versions of these models specifically trained for each number of patches. Quadformers are less sensitive to out-of-distribution input lengths, showing a lower accuracy drop with respect to their retrained counterparts, and providing a better inference-time compute-accuracy tradeoff with a single model.
+
+\begin{figure}[t!]
+  \centering
+  \vspace*{-4pt}
+  \hspace*{-0.02\linewidth}
+  \includegraphics[width=1.0\linewidth]{figures/accuracy_vs_compute_single_model_comparison.pdf}
+  \caption{Inference-time compute-accuracy tradeoff for Quadformer models with a feature-based scorer and vanilla ViTs. ``Retrained'' lines show models that are retrained for each value of \#Patches. ``Single'' lines show a single model (trained with 100 patches) evaluated with different \#Patches. Quadformers are less sensitive to out-of-distribution input lengths, providing a better inference-time compute-accuracy tradeoff with a single model.}
+  \label{figure:accuracy_vs_compute_single_model_comparison}
+\end{figure}
+
+
+
+
+\subsection{Small Quadformers}
+Small Transformers pose an interesting challenge. On the one hand, weak models have the most to gain from high-quality saliency estimation, since they lack the capacity required to compensate for low-resolution images or mediocre patch selection. Quadformer-Small beats the accuracy of vanilla ViT-Small by up to $1.98$ absolute percentage points when controlling for the number of patches, and by up to $1.54$ points when controlling for GMACs. On the other hand, small Transformers are so fast that the runtime of the feature-based scorer is too costly compared to the total runtime (Figure \ref{figure:runtime_breakdown}) making it inefficient in terms of runtime-accuracy tradeoff, even compared to the weak, yet speedy, pixel-blur scorer (Figure \ref{figure:accuracy_vs_compute_small}).
+
+Future work may find faster high-quality saliency estimators that would enable small Vision Transformers to use mixed-resolution tokenization efficiently. We note that many previous works dealing with efficient Vision Transformers~\cite{Arar2021LearnedQF,Liu2021SwinTH,Tu2022MaxViTMV,Meng2021AdaViTAV} do not report results for models that are as fast as ViT-Small, perhaps encountering similar issues with speeding up such fast models.
+
+
+\begin{figure}[t!]
+\vspace*{-8pt}
+\centering
+\hspace*{-0.035\linewidth}
+\includegraphics[width=1.045\linewidth]{figures/accuracy_vs_compute_small.pdf}
+\caption{Accuracy vs compute for vanilla ViT-Small and Quadformer-Small models with different saliency scorers. Small Transformers pose an interesting challenge, being so fast that any tokenization overhead is significant.}
+\label{figure:accuracy_vs_compute_small}
+\end{figure}
+
+\begin{figure}[t!]
+\vspace*{-2pt}
+\centering
+\includegraphics[width=0.9\linewidth]{figures/accuracy_vs_compute_oracle.pdf}
+\caption{Quadformers with a Grad-CAM oracle scorer greatly surpass vanilla ViT models, suggesting there is considerable redundancy in standard ViT tokenization.}
+\label{figure:oracle}
+\vspace*{10pt}
+\end{figure}

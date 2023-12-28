@@ -1,0 +1,319 @@
+\section{Experiment}
+\label{sec:experiment}
+\subsection{Evaluation Setup}
+% \subsection{Setup}
+% \label{sec:setup}
+% Our primary evaluation is carried out on an in-house dataset collected from the 1 month of search log. This has the advantage of being 
+% % We used one industrial scale in-house dataset and one public Amazon review dataset. The former has the advantage of being 
+% directly reflected in online experiments, which is the most important way to validate our idea in an industrial setting. 
+% The latter is better suited for reproducibility; furthermore we release our method to generate RL compatibility training and test data from the original public data. 
+% We believe this will serve as a useful benchmark for other RL related studies in the e-commerce context.
+
+
+% talk about details of the two datasets, evaluation metrics, training setup, parameters, implementation in Tensorflow, and so on.
+
+\subsubsection{Training Data Generation}
+We collect 30 days of training data from our in-house search log. Table~\ref{tab:in-house-data} summarizes its basic statistics. The total number of examples in DIN-S (pre-RNN) training is 200m, while under the RNN/S3DDPG data format, we have 6m variable length sessions instead. While the majority of users only have a single session, the number of sessions per user can go as high as 100. This makes our knapsack session packing algorithm~\ref{alg:knapsack_rnn} a key step towards efficient training. 
+\begin{table}[htbp]
+\centering
+\caption{In-house data statistics.}
+\small
+\begin{tabular}{c|c|c|c}
+\hline
+statistics & mean & minimum & maximum \\
+\hline
+Number of unique users & 3788232 & - & - \\
+\hline
+sessions per user &	13.42 & 1 & 113 \\
+\hline
+items per session & 26.97 & 1 & 499 \\
+\hline
+Features per (query, item) & 110 & - & - \\
+\hline
+\end{tabular}
+\label{tab:in-house-data}
+\end{table}
+
+% The variance of number of items across different query sessions is quite high. This is characteristic of e-commerce search, which resembles recommendation streams more than web search. 
+A characteristic of e-commerce search sessions is the huge variance in browsing depth (number of items in a session). In fact, some power user can browse content up to thousands of items within a single session. 
+The short sessions (such as the minimum number of 2 items in the table) are due to lack of relevant results. 
+
+
+
+% \subsubsection{Training Data Generation}
+% For the DIN baseline training, we generate pointwise dataset from $N = 30$ days of search log. 
+Each DIN-S training example consists of a single query and a single item under the query session. To leverage users' historic sequence information, the data also includes the item id, category id, shop id, and brand id of the historical sequence of clicked / purchased / carted items by the current user. The sequence is truncated at a maximum length of 500 for online serving efficiency. 
+
+For RNN and S3DDPG, each example consists of a pair of items under the same query. In order to keep the training data compact, i.e., without expanding all possible item pairs, the training data adopts the User Session Input format (Section~\ref{subsubsec:data_format}). To ensure all sessions under a user are contained within each minibatch, and ordered chronologically, the session data is further sorted by session id as primary key and session timestamp as secondary key during the data generation mapreduce job.
+
+
+% To further ensure each minibatch contains entire history of a user, the data is constructed so that sessions under the same user appear contiguously in the data. This is achieved by relying on sorting by the primary query key and secondary timestamp key in the mapreduce reducer phase. 
+
+During training, a random pair of items is sampled from each session, with one positive label (purchased) and one negative label (viewed/clicked only). Thus each minibatch consists of $\sum_{u=1}^B |S_u|$ item pairs, where $S_u$ stands for the set of all sessions under user $u$ and $B$ is the minibatch size, in terms of number of users. 
+
+\subsubsection{Offline Evaluation}
+We evaluate all models on one day of search log data beyond the training period. For RRNN and S3DDPG, however, 
+% the evluation set also includes the previous 29 days of data, for a total of $N = 30$ days. This is 
+% To evaluate the baseline DIN-S model, we simply take one day of search log data beyond the training period and construct an evaluation set similar to training, that is, each example consists of a query and an item, with binary label being whether or not the item was purchased under that query.
+% For the RNN and S3DDPG evaluation, 
+% we construct the evaluation set in the User Session Input format similar to training. In particular, all sessions under a single user are ordered chronologically and continguously within the data set. in order to capture the historical information,
+we also include $N-1$ days prior to the last day, for a total of $N = 30$ days. The first $29$ days are there to build the user state vector only. Their labels are needed for user state aggregation during RNN forward evolution. Only labels from the last day sessions are used in the evaluation metrics, to prevent any leakage between training and validation.
+% Labels from earlier days are needed only for aggregation of the user states during the RNN forward evolution. 
+
+\subsubsection{Offline Evaluation Metrics}
+While cross entropy loss \eqref{eq:reward_definition} and square loss \eqref{eq:dqn_td_loss} are used during training of S3DDPG, for hold-out evaluation, we aim to assess the ability of the model to generalize forward in time. Furthermore even though the training is performed on sampled item pairs, in actual online serving, the objective is to optimize ranking for an entire session worth of items, whose number of can reach the hundreds. Thus we mainly look at session-wise metrics such as Session AUC or NDCG. Session AUC in particular is used to decide early stopping of model training: 
+
+\begin{align} \label{eq:session_auc}
+    \text{Session AUC}(\eta, \lambda) := \sum_{u = 1}^B \sum_{t = 1}^{|S_u|} \rm{AUC}(\eta_{u, t}, \lambda_{u, t}),
+\end{align}
+where $\eta_{u, t}$ denotes the list of model predictions for \textbf{all items} within the session $(u, t)$ and $\lambda_{u, t}$ the corresponding binary item purchase labels. This is in contrast with training, where $\eta_{u, t}$, $\lambda_{u, t}$ denote predictions and labels for a randomly chosen positive / negative item pair. 
+
+The following standard definition of ROC AUC is used in \eqref{eq:session_auc} above. For two vectors $\boldsymbol{p}, \boldsymbol{t} \in \R^n$, where $t_i \in \{0, 1\}$:
+\begin{align*}
+\rm{AUC}(\boldsymbol{p}, \boldsymbol{t}) := \frac{\sum_{1 \leq i < j \leq n} \sign(p_i - p_j) \sign(t_i - t_j)}{n(n-1) / 2},
+\end{align*}
+where $\sign(x) = x / |x|$ for $x \neq 0$ and $\sign(0) = 0$.
+
+% We systematically extract a model checkpoint that attains the highest session AUC among all saved checkpoints.
+
+NDCG is another popular metric in search ranking, intended to judge full page result relevance \cite{distinguishability2013theoretical}. It again takes the model predictions (which can be converted into ranking positions) as well as corresponding labels for all items, and compute a position-weighted average of the label, normalized by its maximal possible value:
+\begin{align*}
+    \rm{NDCG}(\boldsymbol{p}, \boldsymbol{t}) = \sum_{i=1}^n \frac{2^{t_i} - 1}{\log_2(i + 1)} / \sum_{i=1}^{\sum_j t_j} \frac{2^{t_i} - 1}{\log_2(i + 1)}.
+\end{align*}
+
+% where $\rm{DCG}$ and $\rm{IDCG}$ are in turn defined by
+% \begin{align}
+% \rm{DCG}(\boldsymbol{p}, \boldsymbol{t}) &:= \sum_{i=1}^n \frac{2^{t_i} - 1}{\log_2(i + 1)} \\
+% \rm{IDCG}(\boldsymbol{p}, \boldsymbol{t}) &:= \sum_{i \leq n: t_i = 1} \frac{2^{t_i} - 1}{\log_2(i + 1)}.
+% \end{align}
+
+\subsubsection{Online Metrics}
+For e-commerce search, there are essentially three types of core online metrics. 
+\begin{itemize}
+    \item GMV stands for gross merchandise value, which measures the total revenue generated by a platform. Due to the variation of A/B bucket sizes, it is often more instructive to consider GMV per user.
+    \item CVR stands for conversion rate and essentially measures the number of purchases per click. Again this is averaged over the number of users.
+    \item CTR is simply click-through rate, which measures number of clicks per query request. We do not consider this metric in our online experiments since it is not directly optimized by our models.
+\end{itemize}
+% \subsubsection{Online Serving}
+% The ultimate objective of introducing the sequential search context as well as reinforcement learning architecture is to promote better user experience and personalized result relevance, measured primarily through a set of core metrics such as conversion rate and GMV. Therefore model online serving is a crucial component of the overall evaluation.
+
+% The serving of the baseline DIN model is straightforward. First the model gets loaded into the system. Then upon a query request from a given user, the search engine computes all the required features for all retrieved items under the query, and sends them to the DIN model. The bulk of the feature preparation and transmission lies in the item features (either 1-sided or jointly 2-sided with query and user information), as well as the user behaviorial sequence features, which however are capped at the length of 500. Once the scores are computed for all items, they are sent back to the search engine and sorted to produce a ranking among the retrieved results.
+
+% RNN and S3DDPG models are served essentially identically. Therefore most of the serving infrastructure (Figure~\ref{fig:incremental_update}) has been built when we launched the RNN model. There are two major differences with the DIN or non-RNN types of models:
+% \begin{itemize}
+%     \item In addition to the regular input features required by the model, RNN models also receive a numeric vector for the previous user state. 
+%     \item This user vector is updated in real time after every user query request, so that when the same user comes back next time, he or she gets served a model with an updated state vector.
+% \end{itemize}
+% The updating of the user vector takes the following two inputs
+% \begin{itemize}
+%     \item A list of state vector candidates returned by the model, one for each item scored.
+%     \item The user's behavioral feedback upon viewing the ranked results in the search page; for our purpose, which items got purchased, if any. 
+% \end{itemize}
+% If no item was purchased within the previous query session, the user state stays the same. Otherwise it gets updated with the candidate state vector corresponding to the purchased item.
+
+\subsection{Evaluation Results}
+
+
+\begin{table}[htbp] 
+\centering
+\caption{Offline Metrics}
+\begin{tabular}{c|c|c}
+\hline
+Model name & Session AUC & NDCG \\
+\hline
+DNN & 0.6765 & 0.5104 \\
+DIN-S & 0.6875 & 0.5200 \\
+RNN & 0.6915 & 0.5272 \\
+S3DDPG & 0.6968 & 0.5307 \\
+\hline
+\end{tabular}
+\label{tab:offline_metrics}
+\end{table}
+We present both Session AUC and NDCG for the 4 models listed in Table~\ref{tab:offline_metrics}. The DNN baseline simply aggregates the user sequential features through sum-pooling, all of which are id embeddings. The successive improvements are consistent between the two session-wise metrics: RNN improved upon DIN-S by about $0.4\%$ in Session AUC and $0.7\%$ in NDCG, while S3DDPG further improves upon RNN by another $0.5\%$ in Session AUC and $0.4\%$ in NDCG. The overall gain of S3DDPG is around a full $1\%$ in either metrics from the DIN-S baseline, and $2\%$ from the DNN baseline.
+
+
+Table~\ref{tab:user_group_evaluation} highlights the gain of S3DDPG over the myopic RNN baseline on a variety of user subsets. For instance, along the dimension of users' past session counts, S3DDPG shows a significantly stronger performance for more seasoned users in both validation metrics. Another interesting dimension is whether the current query belongs to a completely new category of shopping intent compared to the users' past search experience. Users who issue such queries in the evaluation set are labeled ``Category New Users". Along that dimension, we see that S3DDPG clearly benefits more than RNN from similar queries searched in the past.
+
+While there are a number of hyperparameters associated with reinforcement learning models in general, the most important one is arguably the discount factor $\gamma$ parameter. We choose $\gamma = 0.8$ for all our S3DDPG experiments, since we found little improvement when switching to other $\gamma$ value. Another important parameter specific to actor-critic style architecture is the relative weight $\mu$ between PG loss and TD loss. Interestingly, as we shift weight from TD to PG loss (increasing $\mu$), there is a noticeable trend of improvement in both AUC and NDCG, as shown in Figure~\ref{fig:hyperparameter}. This suggests the effectiveness of maximizing the long term cumulative reward directly, even at the expense of less strict enforcement of the Bellman equation through the TD loss. When $\mu$ is set to $1$, however, training degenerates, as the Q-value optimized by PG loss is not bound to the actual reward (cross entropy loss) any more.
+
+\begin{figure}
+    \centering
+    %\includegraphics[width=0.9\linewidth]{SessionAUC_µ.png}
+    \includegraphics[width=\linewidth]{mu.png}
+    \caption{influence of hyperparameter $\mu$}
+    \label{fig:hyperparameter}
+\end{figure}
+
+Finally we conduct 3 sets of online A/B tests, each over a timespan of 2 weeks. The overall metric improvements are reported in Table~\ref{tab:online_metrics}. The massive gain from DNN to DIN-S is expected, since the DNN baseline, with sum-pooling of the sequential features, is highly ineffective at using the rich source of sequential data. Nonetheless we also see modest to large improvements between RNN and DIN-S and between S3DDPG and RNN respectively, in all core business metrics. Figures~\ref{fig:daily_ucvr} present the daily UCVR metric comparison for the last 2 sets of A/B tests.  Aside from a single day of traffic variation, both RNN and S3DDPG show consistent improvement over their respective baselines. 
+\begin{figure}
+    \centering
+%    \includegraphics[width=\linewidth]{UCVR-S3DDPG-RNN.png}
+%     \caption{UCVR (conversion rate/unique user) delta in \% from DIN-S and RNN models over 14 days.}
+%     \label{fig:rnn_v_DIN-S}
+% \end{figure}
+% \begin{figure}
+%     \centering
+    \includegraphics[width=\linewidth]{UCVR_ONLINE.png}
+    \caption{Daily UCVR \% improvement for online A/B tests over 14 days.}
+    \label{fig:daily_ucvr}
+\end{figure}
+% The gain from DIN to RNN is relatively easy to understand: by giving the model the full spectrum of input features from previous sessions in the near-term (30 days), RNN is equipped with much more context information about the user than the DIN model, which only gets a few categorical features of the past interacted items. 
+% % The gain from RNN to S3DDPG is much more elusive. After all, they both have the same set of input features, and RNN, with its GRU kernel, is already a time-proven method for dealing with sequential data. Furthermore, the vast majority of users in the evaluation set only have a single session on the last day.
+
+% The offline metrics gain from RNN to S3DDPG mainly comes from the removal of a weighting scheme used in both DIN and RNN, intended to promote items with higher prices, since besides user conversion rate, another important metric is GMV (gross merchandise volume), which measure the the total revenue generated by users' shopping activities on the search platform. While the price weighting scheme was very helpful in boosting GMV per user for the baseline DIN model as well as the RNN model, we found in online experiments that removing it did not cause any negative effect on GMV/user. Quite surprisingly, it in fact led to huge boost of both GMV/user as well as the closely related RPM (revenue-per-mil) metrics, both of which increased by nearly $2\%$ in relative term compared to RNN with price weighting, at a significance level of p-value $\leq 1\%$. 
+
+% In fact, the trick lies in a technical detail mentioned earlier in Section~\ref{sec:method}. Namely, for both DIN and RNN, we introduced a weighting scheme to promote higher priced items within the search results. This was effective in boosting GMV and related revenue metrics, without sacrificing too much on click-through and conversion rate. For S3DDPG, however, this was removed. The hope was that reinforcement learning with its emphasis on long term reward is able to bring in more user conversion that would offset the short-term loss in per item revenue.
+
+% Indeed from the online metrics Table~\ref{tab:online_metrics}, we see highly significant gains in GMV / user 
+
+
+% As mentioned in Section~\ref{subsec:rnn:pairwise}, 
+
+% Experiments to report:
+% 1. DIN
+% 2. RNN
+% 3. DDPG:
+% 3a. no target Q
+% 3b. target Q
+% 4. DQN: not convergent
+% 5. 4 reward experiments
+% 6. Analysis: long/short validation set
+% 7. off-policy TopK
+% 8. gamma grid search
+% 9. TD + PG no tuning
+% 10. target actor 
+
+
+
+% \begin{table}[htbp]
+% \centering
+% \caption{Hyperparameter µ}
+% \begin{tabular}{c|c|c}
+% \hline
+% Parameter & Session AUC & NDCG \\
+% \hline
+% 0 & -- & -- \\
+% \hline
+% 0.1 & 0.6887 & 0.5226 \\
+% \hline
+% 0.2 & 0.6946 & 0.5284 \\
+% \hline
+% 0.3 & 0.6939 & 0.5281 \\
+% \hline
+% 0.4 & 0.6941 & 0.5281 \\
+% \hline
+% 0.5 & 0.6968 & 0.5307 \\
+% \hline
+% 0.6 & 0.6959 & 0.5307 \\
+% \hline
+% 0.7 & 0.6970 & 0.5304 \\
+% \hline
+% 0.8 & 0.6979 & 0.5311 \\
+% \hline
+% 0.9 & 0.6985 & 0.5329 \\
+% \hline
+% 1.0 & -- & -- \\
+% \hline
+% \end{tabular}
+% \end{table}
+
+% \begin{table}[htbp] \label{tab:offline_metrics}
+% \centering
+% \caption{S3DDPG vs RNN for Category New Users}
+% \begin{tabular}{c|c|c|c}
+% \hline
+% Data Type & Model pairs & Session AUC & NDCG \\
+% \hline
+% New User & S3DDPG vs RNN & +0.3195\% & +0.1412\% \\
+% \hline
+% Old User & S3DDPG vs RNN & +0.6584\% & +0.6688\%\\
+% \hline
+% \end{tabular}
+% \end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{S3DDPG vs RNN for different user evaluation groups}
+\begin{tabular}{c|c|c}
+\hline
+User Group  & Session AUC & NDCG \\
+\hline
+Past Session Count < 5  & +0.6534\% & +0.2418\% \\
+Past Session Count >= 5  & +0.9544\% & +0.9092\%\\
+Category New Users & +0.3195\% & +0.1412\% \\
+Category Old Users & +0.6584\% & +0.6688\% \\
+\hline
+\end{tabular}
+ \label{tab:user_group_evaluation}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Online Metrics}
+\begin{tabular}{c|c|c|c}
+\hline
+Model pairs & GMV/user & CVR/user & RPM \\
+\hline
+DIN-S vs DNN & +4.05\%(1e-3) & +3.51\%(1e-3) & +4.08\%(5e-3) \\
+RNN vs DIN-S & +0.60\%(5e-3) & +1.58\%(9e-3) & +0.49\%(8e-3) \\
+S3DDPG vs RNN & +1.91\%(8e-3) & +0.78\%(1e-2) & +1.94\%(9e-3) \\
+\hline
+\end{tabular}
+ \label{tab:online_metrics}
+\end{table}
+\vspace{-10pt}
+% \begin{itemize}
+% \item 离线实验指标
+% \begin{itemize}
+% \item RNN vs. DNN
+% \begin{itemize}
+% \item auc +0.94\%
+% \end{itemize}
+% \item DQN(gamma=0.8) vs. DNN
+% \begin{itemize}
+% \item auc +1.51\%
+% \end{itemize}
+% \end{itemize}
+% \begin{itemize}
+% \item DQN(gamma=0.8) vs. RNN
+% \begin{itemize}
+% \item auc +0.56\%
+% \item results for other gamma 
+% % (see Diagram~\ref{dia:gamma_sweep}
+% \end{itemize}
+% \end{itemize}
+% \end{itemize}
+% 在线实验指标
+% \begin{itemize}
+% \item RNN vs. DNN（线上观察7天）
+% \begin{itemize}
+% \item UV价值(搜索GMV/搜索用户) : +2.40\%
+% \item UCVR(订单行/搜索用户): +3.09\%
+% \item GMV: +1.99\%
+% \item RPM(1000*搜索GMV/搜索量): +2.54\%
+% \end{itemize}
+% \item DDPG vs. RNN（线上观察7天）
+% \begin{itemize}
+% \item UV价值：+1.91\%
+% \item UCVR：+0.78\%
+% \item GMV：+1.77\%
+% \item RPM：+1.94\%
+% \item 流动性：+4.24\%
+% \item 流动性: 使用rbo距离计算每个query今天的昨天TOP20 SKU排序的diff率，多天取平均。
+% \item CID4基尼不纯度：0.95\%
+% \item CID4基尼不纯度：TOP60坑位有曝光的CID4的gini不纯度
+% \end{itemize}
+% \item AB实验指标
+% \end{itemize}
+
+
+\label{sec:industrial}
+
+% \subsection{Public Dataset Experiment}
+% \label{sec:public}
+% We take the Amazon review dataset as our starting point. Each reviewer is identified through his or her reviewer id. Since every review event contains a timestamp, we can naturally form a temporal sequence. Unlike our in-house dataset, however, there is no analogue of a session (with multiple items) in the dataset. Instead, we simply consider the sequence of review events. To take advantage of full recurrence as proposed, we include expensive features such as item titles, past reviews, etc, in addition to asin\_id (item id) and category names.
+
+% \subsection{Case Study}
+\label{sec:case}
+
+

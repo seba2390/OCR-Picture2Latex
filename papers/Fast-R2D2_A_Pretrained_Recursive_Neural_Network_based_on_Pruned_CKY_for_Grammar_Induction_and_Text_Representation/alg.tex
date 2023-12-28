@@ -1,0 +1,202 @@
+\section{Methodology}
+
+\subsection{Global Pruning Strategy}
+We propose a top-down parser based on syntactic distance~\cite{DBLP:conf/acl/BengioSCJLS18} to evaluate scores for all split points in a sentence and generate a merge order according to the scores. 
+
+\begin{figure}[htb!]
+  \centering
+  \includegraphics[width=0.4\textwidth]{data/parse_tree.png}
+  \caption{(a) A parsed tree obtained by sorting split scores ($v_i$). (b) A sampled tree by adding Gumbel noise ($g_i$ in dark vertical bars).}
+  \label{fig:sample_demo}
+\end{figure}
+
+\paragraph{Top-down parser.}
+Given a sentence $\mathbf{S} = \{s_{1}, s_{2},..., s_{n}\}$, there are $n-1$ split points between words. 
+We define a top-down parser by giving confidence scores to all split points as follows:
+\begin{equation}
+\begin{aligned}
+\textbf{v}=[v_{1}, v_{2}, ..., v_{n-1}] = f(\mathbf{S};\theta)
+\end{aligned}
+\end{equation}
+To keep it simple and rigorously maintain linear complexity, we select bidirectional LSTMs as the backbone, though Transformers are also an option.
+As shown in Figure~\ref{fig:sample_demo}, 
+first, a bi-directional LSTM encodes the sentence, 
+and then, for each split point, an MLP over the concatenation of the left and right context representations yields the final split scores. 
+Formally, we have:
+\begin{equation}
+\begin{aligned}
+\label{eq:split_score_eval}
+&\overrightarrow{\textbf{h}},\overleftarrow{\textbf{h}} = \mathrm{BiLSTM}(\mathbf{E};\theta )\\
+&v_{i} = \mathrm{LayerNorm}(\mathrm{MLP}(\overrightarrow{\textbf{h}}_{i}\oplus \overleftarrow{\textbf{h}}_{i+1}))
+\end{aligned}
+\end{equation}
+Here, $\mathbf{E}$ is the embedding of the input sentence $\mathbf{S}$, while
+$\overrightarrow{\textbf{h}}$ and $\overleftarrow{\textbf{h}}$ denote the forward and reverse representation, respectively. 
+$v_{i}$ is the score of the $i$-th split point, whose left and right context representations are $\overrightarrow{\textbf{h}}_{i}$ and $\overleftarrow{\textbf{h}}_{i+1}$. 
+Given scores $[v_1, v_2, ..., v_{n-1}]$, one can easily recover the binary tree shown in Figure~\ref{fig:sample_demo}:
+We recursively split a span (starting with the entire sentence) into two sub-spans by picking the split point with the highest score in the current span.
+Taking the sentence in Figure~\ref{fig:sample_demo} (a) as an 
+example, we split the overall sentence at split point $3$ in the first step, which leads to two sub-trees over $s_{1:3}$ and $s_{4:6}$. 
+Then we split $s_{1:3}$ at $2$ and $s_{4:6}$ at $4$. We can continue this procedure until the complete tree has been recovered. 
+
+\paragraph{Tree sampling.}
+In the training stage, we perform sampling over the computed scores $[v_1, v_2, ..., v_{n-1}]$ in order to increase the robustness and exploration of our model.
+Let $\mathcal{P}^{t}$ denote the list of split points at time $t$ in ascending order, which is $\{1,2,3,...,n\!-\!1\}$ in the first step. 
+Then a particular split point $a_{t}$ is selected from $\mathcal{P}^{t}$ by sampling based on the probabilities estimated by stacking of split points scores. The sampled
+$\{a_{1}, a_{2}, ..., a_{n-1}\}$ together form the final split point sequence $\mathcal{A}$. 
+At each time step, we remove $a_{t}$ from $\mathcal{P}^{t}$ when $a_{t}$ is selected, then sample the next split point until the set of remaining split points is empty. Formally, we have:
+\begin{align}
+&a_{t} \sim \mathrm{softmax}(\textbf{v}^t)\\
+&\mathcal{P}^{t+1}=\mathcal{P}^{t}\setminus \{{a_{t}}\}
+\end{align}
+where $\textbf{v}^t$ is concatenation of $v_{i}$ in $\mathcal{P}^{t}$.
+As the Gumbel-Max trick \cite{GUMBEL,DBLP:conf/nips/MaddisonTM14} provides a simple and efficient way
+to draw samples from a categorical distribution with class probabilities, we can obtain $a_{t}$ via the Gumbel-Max trick as:
+\begin{align}
+&a_{t} = \underset{i}{\mathrm{argmax}}\,[v_{i}+g_{i}], i \in \mathcal{P}^{t},
+\end{align}
+where $g_{i}$ is the Gumbel noise for the $i$-{th} split point. 
+Therefore, the aforementioned process is equivalent to sorting the original sequence of split points scores with added Gumbel noise.
+Figure~\ref{fig:sample_demo} (b) shows a sampled tree with respect to the split point scores.
+The split point sequence $\mathcal{A}$ can hence be obtained simply as:
+\begin{align}
+\mathcal{A} = \underset{i}{\mathrm{argsort}}(\textbf{v} + \textbf{g})
+\end{align}
+Here, $\mathrm{argsort}$ sorts the array in descending order and returns the indices of the original array.
+The sampled $\mathcal{A}$ is $\{2, 4, 3, 5, 1\}$ in Figure~\ref{fig:sample_demo} (b).
+
+\paragraph{Span Constraints.}
+As word-pieces~\cite{wu2016google} and Byte-Pair Encoding (BPE) are commonly used in pretrained language models,
+it is straightforward to incorporate multiple word-piece constraints into the top-down parser to reduce word-level parsing errors.
+We denote a list of span constraints composed of beginning and end positions of non-split-table spans as $\mathcal{C}$, defined as $\mathcal{C}=\{(b_{1}, e_{1}), (b_{2}, e_{2}), ..., (b_{n}, e_{n})\}$. 
+For each $(b_{i}, e_{i})$ in $\mathcal{C}$, there should be a sub-tree for a span covering the sub-string $s_{b_{i}:e_{i}}$. 
+This goal can be achieved by simply adjusting the scores of all splits within the spans in C by $-\delta$. To make them smaller than the scores of span boundaries, $\delta$ could be defined as $(\max(\textbf{v}) - \min(\textbf{v}) + c)$, where $c$ could be any positive number.
+
+\paragraph{Model-based Pruning.}
+We denote the reverse order of the split point sequence $\mathcal{A}$ as $\mathcal{M}$ and
+then treat $\mathcal{M}$ as a bottom-up merge order inferred by the top-down parser based on the global context.
+Subsequently, the complete pruning process is as follows: 
+\begin{enumerate}
+\item Pick the next merge index by invoking Alg~\ref{alg:next_merge_point}. 
+\item Perform Steps 3 and 4 in the heuristic pruning part in Section~\ref{sec:r2d2}
+\end{enumerate}
+As shown in Figure~\ref{fig:pruning}, we still retain the threshold and the pruning logic of R2D2, 
+but we select cells to merge according to $\mathcal{M}$ instead of following heuristic rules. 
+Specifically, given a shrinking chart table, 
+we select the next merge index among the second row by popping and modifying $\mathcal{M}$ in Algorithm~\ref{alg:next_merge_point}.
+
+\begin{algorithm}[!h]
+\small
+    \caption{Next merge index in the second row}
+    \label{alg:next_merge_point}
+    \begin{algorithmic}[1] % The number tells where the line numbering should start
+        \Function{Next-Index}{$\mathcal{M}$}
+        \State{$i = \pop(\mathcal{M})$}\Comment{Index}
+        \For{$j \in 1$ to $\mathcal{M}.\mathrm{len}$}
+        \If {$\mathcal{M}_{j} > i$} \Comment{Merging at left}
+        \State {$\mathcal{M}_{j} = \mathcal{M}_{j} - 1$} \Comment{Shift left}
+        \EndIf
+        \EndFor
+        \State{\Return{$i$}}
+        \EndFunction
+    \end{algorithmic}
+\end{algorithm}
+
+Take the example in Figure~\ref{fig:sample_demo} (b) for instance: 
+$\mathcal{M}$ starts with $\{1, 5, 3, 4, 2\}$.
+Then we merge the first cell in the second row in Figure~\ref{fig:pruning} (b),
+and obtain a new $\mathcal{M} = \{4, 2, 3, 1\}$. 
+In the next round, we treat the 4th cell covering $s_{5:6}$ as a non-splittable cell in Figure~\ref{fig:pruning} (e), 
+and $\mathcal{M}$ becomes $\{2, 3, 1\}$.
+
+\subsection{Optimization}\label{sec:opt}
+
+We denote the tree probabilities estimated by the top-down parser and R2D2 as $p_{\theta}(\textbf{z}|\textbf{S})$, $q_{\phi}(\textbf{z}|\textbf{S})$, respectively. 
+The difficulty here is that while
+$q_{\phi}(\textbf{z}|\textbf{S})$ may be optimized by the objective defined in Equation~\ref{eq:bilm_loss}, 
+there is no gradient feedback for $p_{\theta}(\textbf{z}|\textbf{S})$. 
+To make $p_{\theta}(\textbf{z}|\textbf{S})$ learnable, an intuitive solution is to fit $p_{\theta}(\textbf{z}|\textbf{S})$ to $q_{\phi}(\textbf{z}|\textbf{S})$ by minimizing their Kullback–Leibler distance. 
+While the tree probabilities of both distributions are discrete and not exhaustive,
+inspired by URNNG~\cite{dblp:conf/naacl/kimrykdm19}, a Monte Carlo estimate for the gradient with respect to $\theta$ can be defined as:
+\begin{equation}
+\small
+\begin{aligned}
+&\triangledown_{\theta} \KL[q_{\phi}(\textbf{z}|\textbf{S}) \parallel p_{\theta}(\textbf{z}|\textbf{S}) ] \\
+= &\triangledown_{\theta} \mathbf{E}_{z \sim q_{\phi}(\textbf{z}|\textbf{S})}[\log \frac{q_{\phi}(\textbf{z}|\textbf{S})}{p_{\theta}(\textbf{z}|\textbf{S})}] \\
+\approx &-\triangledown_{\theta} \frac{1}{K}\sum_{k=1}^{K}\log p_{\theta}(\textbf{z}^{(k)}|\textbf{S})
+\end{aligned}
+\vspace{-1.5pt}
+\end{equation}
+with samples $\textbf{z}^{(1)}$, ..., $\textbf{z}^{(K)}$ from $q_{\phi}(\textbf{z}|\textbf{S})$. 
+Algorithm~\ref{alg:sample} shows the complete sampling process from $q_{\phi}(\textbf{z}|\textbf{S})$.
+Specifically, we sample split points with corresponding span boundaries recursively as in previous work \cite{DBLP:journals/corr/cmp-lg-9805007,DBLP:conf/emnlp/FinkelMN06,dblp:conf/naacl/kimrykdm19} 
+with respect to the intermediate tree probabilities calculated during hierarchical encoding.
+
+\begin{algorithm}[!h]
+\small
+    \caption{Top-down tree sampling for R2D2}
+    \label{alg:sample}
+    \begin{algorithmic}[1] % The number tells where the line numbering should start
+        \Function{Sample}{$\mathcal{T}_{1,n}$} \Comment{Root cell}
+        \State {$Q = [\mathcal{T}_{1,n}]$}
+        \State {$K = []$}
+        \While {$Q$ is not empty}
+        \State{$\mathcal{T} = \pop(Q)$}
+        \State {$i,j = \mathcal{T}.i$, $\mathcal{T}.j$} \Comment{Start/end indices}
+        \State{$L = \mathcal{T}.\mathrm{splits}$} \Comment{$m$ splits at most}
+        \State{$\tau=0$}
+        \For {$k \in 1$ to $\len(L)$}
+        \State {$w_{k} = \widetilde{p}_{i,j}^{L[k]}$} \Comment{Using Equation~\ref{eq:tree_prob}}
+        \State {$\tau = \tau + w_{k}$} \Comment {Sum up all $w_{k}$}
+        \EndFor
+%        \State{$\tau = \sum_{k \in \mathcal{S}}^{}w_{k}$}
+        \State{$idx \sim \mathrm{Cat}([w_{1}/\tau, ..., w_{\len(L)}/\tau])$} \\
+        \Comment{Sample a split point}
+        \State{$\push(K, (L[idx], i, j))$} \\
+        \Comment{Keep the split point and span boundary}
+        \If {$L[idx] > i$} \Comment{Add left child}
+            \State{$\push(Q, \mathcal{T}_{i, L[idx]})$}
+        \EndIf
+        \If {$L[idx] + 1 < j$} \Comment{Add right child}
+            \State{$\push(Q, \mathcal{T}_{L[idx]+1, j})$}
+        \EndIf
+        \EndWhile
+        \State{\Return{$K$}}
+        \EndFunction
+    \end{algorithmic}
+\end{algorithm}
+
+A sequence of split points and corresponding spans is returned by the sampler. For the $k$-{th} sample $\textbf{z}^{(k)}$, let $p_{\theta}(a_{t}^{k}|\textbf{S})$ denote the probability of taking $a_{t}^{k}$ as split from span $(i_{t}^{k}, j_{t}^{k})$ at the $t$-{th} step. Formally, we have:
+\begin{equation}
+\small
+\begin{aligned}
+%p_{\theta}(a_{t}^{k}|\textbf{S}) = \softmax ([v_{i_{t}^{k}}, ..., v_{j_{t}^{k}}]) \\
+p_{\theta}(a_{t}^{k}|\textbf{S}) &= \frac{e^{v_{a^{k}_{t}}}}{e^{v_{i^{k}_{t}}} + ... + e^{v_{j^{k}_{t}}}} \\
+\log p_{\theta}(\textbf{z}^{(k)}|\textbf{S}) &= \sum_{t=1}^{n-1} \log p_{\theta}(a_{t}^{k}|\textbf{S}),
+\end{aligned}
+\end{equation}
+where $i_{t}^{k}$ and $j_{t}^{k}$ denote the start and end of the corresponding span. Please note here that the $v_i$ are not adjusted by span constraints. 
+
+\subsection{Downstream Tasks}
+\label{sec:downstream}
+\paragraph{Inference.}
+In this paper, we mainly focus on classification tasks as downstream tasks. We consider the root representation as representing the entire sentence.
+As we have two models pre-trained in our framework -- an R2D2 encoder and a top-down parser -- we have two ways of generating the representations:
+\begin{enumerate}
+    \item[a)] Run forced encoding over the binary tree from the top-down parser with the R2D2 encoder.
+    \item[b)] Use the binary tree to guide the pruning of the R2D2 encoder, and take the root representation $e_{1,n}$.
+\end{enumerate}
+It is obvious that the first approach is much faster than the latter one, as the R2D2 encoder only runs $n-1$ times in forced encoding, 
+and can run in parallel layer by layer, e.g., we may run compositions at $a_5$, $a_3$, and $a_4$ in parallel in Figure~\ref{fig:sample_demo} (b).
+We explore both of these approaches in our experiments.
+
+\paragraph{Training Objectives.}
+As suggested in prior work \cite{radford2018improving,howard-ruder-2018-universal,gururangan-etal-2020-dont}, 
+given a pretrained model, continued pretraining on an in-domain corpus with the same pretraining objective can yield a better generalization ability.
+Thus, we simply combine our pretraining objectives via summation in all downstream tasks. At the same time, as the downstream task may guide R2D2 to more reasonable tree structures, we still maintain the KL loss to enable the parser to continuously update.
+For the two inference methods,
+we uniformly select the root representation $e_{1,n}$ as the representation for a given sentence followed by an MLP, and estimate the cross-entropy loss, denoted as $\mathcal{L}_\mathrm{forced}$ and $\mathcal{L}_\mathrm{cky}$, respectively. Let $\mathcal{L}_\mathrm{KL}$ denote the KL loss described in Section~\ref{sec:opt} and $\mathcal{L}_\mathrm{bilm}$ denote the bidirectional language model loss described in Eq~\ref{eq:bilm_loss}.
+The final loss is:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_\mathrm{forced} + \mathcal{L}_\mathrm{cky} + \mathcal{L}_\mathrm{bilm} + \mathcal{L}_\mathrm{KL}
+\end{equation}

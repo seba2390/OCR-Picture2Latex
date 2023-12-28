@@ -1,0 +1,1394 @@
+\maketitle
+
+% \vspace*{-3mm}
+\begin{abstract}
+Inspired by human conscious planning, we propose \agentshort{}, a model-based reinforcement learning agent that utilizes spatial and temporal abstractions to generalize learned skills in novel situations. It automatically decomposes the task at hand into smaller-scale, more manageable subtasks and hence enables sparse decision-making and focuses its computation on the relevant parts of the environment. This relies on the definition of a high-level proxy problem represented as a directed graph, in which vertices and edges are learned end-to-end using hindsight. Our theoretical analyses provide performance guarantees under appropriate assumptions and establish where our approach is expected to be helpful. Generalization-focused experiments validate \agentshort{}'s significant advantage in zero-shot generalization, compared to existing state-of-the-art hierarchical planning methods.
+\end{abstract}
+% \vspace*{-3mm}
+
+\section{Introduction}
+By making use of imagination and intuition, human conscious planning breaks down long-horizon tasks into more manageable abstract steps, each of which can be narrowed down further. This type of planning attends to important decision points \citep{sutton1999between} and relevant environmental factors linking the decision points \citep{tang2020neuroevolution}, thus operating abstractly both in time and in space \citep{dehane2017consciousness}. %Furthermore, abstract skills based on abstract knowledge representations usually generalize and/or adapt more easily to novel situations.
+In contrast, existing RL agents either operate solely based on intuition (model-free methods) or are limited to reasoning over mostly shortsighted plans (model-based methods). The intrinsic limitations constrain the application of RL in real-world under a glass ceiling formed by challenges of longer-term generalization, below the level of human conscious reasoning. % The inability stems from the difficulty to plan upon the over-detailed modeled trajectories without making use . % , where 1) spatial abstraction corresponds to focusing computation on the salient parts of the environment \citep{tang2020neuroevolution}; and 2) temporal abstraction translates to planning over sparser decision timings \citep{sutton1999between}. 
+% For humans, temporal abstraction decides where to draw the boundaries to decompose the original task, and spatial abstraction helps us focus within each subtask.
+
+%Following the line of model-based methods, we seek to address the difficulties of planning upon and modelling over-detailed longer trajectories with the help of proper abstractions \citep{asadi2019combating,moerland2023model}. 
+In this paper, we leverage these intuitions to develop a planning agent that automatically decomposes the complex task at hand into smaller subtasks, by constructing high-level abstract ``proxy'' problems. A proxy problem is represented as a graph where 1) the vertices consist of states proposed by a generative model, which represent sparse decision points; and 2) the edges, which define temporally-extended transitions, are constructed by focusing on a small amount of relevant information from the states, using an attention mechanism. Once a proxy problem is constructed and the agent solves it to form a plan, each of the edges defines a new sub-problem, on which the agent will focus next. This divide-and-conquer strategy allows constructing partial solutions that generalize better to new situations, while also giving the agent flexibility to construct abstractions necessary for the problem at hand. Our theoretical analysis establishes guarantees on the quality of the solution to the overall problem.
+
+We also examine empirically whether out-of-training-distribution generalization can be achieved through our method after using only a few training tasks. % This setting not only reflects how RL may be applied in real-world scenarios, but also tests the agents' abilities to generalize via \textit{understanding} instead of \textit{memorization}.
+We show through detailed controlled experiments that the proposed agent, which we name \agentshort{}, performs significantly better in terms of zero-shot generalization, compared to the baselines and to state-of-the-art Hierarchical Planning (HP) methods \citep{nasiriany2019planning,hafner2022deep}. %Our experiments indicate that both temporal and spatial abstractions are instrumental to achieve its enhanced generalization capabilities, as they are both needed to reliably extract a series of manageable abstract steps to achieve the original tasks, and robustly solving each of them. % We hope that our study will contribute towards the broader goal of building model-based RL agents that are able to adapt and generalize to novel scenarios.
+
+% NOTE(H): optional, best moved to the impact section
+% Importantly, the understanding of the behaviors and the consequences of agency for AI to discover goals on their own, is one of the most important insights to ensure a safe development in the application of AI. With this paper, we hope to understand better how RL agents would behave given the temporal abstraction abilities inspired from human-planning, and gain deeper understanding of automatic goal-discovery.
+\section{Preliminaries}
+\label{sec:preliminary}
+
+%Now, we present the preliminary materials required to understand the scope, the methodologies as well as the connections to existing research of this paper.
+
+\textbf{Reinforcement Learning \& Problem Setting.} An RL agent interacts with an environment through a sequence of actions to maximize its cumulative reward. The interaction is usually modeled as a Markov decision process (MDP) $\scriptM \equiv \langle \scriptS, \scriptA, P, R, d, \gamma \rangle$, where $\scriptS$ and $\scriptA$ are the set of states and actions, $P: \scriptS \times \scriptA \to \text{Dist}(\scriptS)$ is the state transition function, $R: \scriptS \times \scriptA \times \scriptS \to \mathbb{R}$ is the reward function, $d: \scriptS \to \text{Dist}(\scriptS)$ is the initial state distribution, and $\gamma \in [0, 1]$ is the discount factor. The agent needs to learn a policy $\pi: \scriptS \to \text{Dist}(\scriptA)$ that maximizes the value function, \ie{} the expected discounted cumulative reward $\doubleE_{\pi, P} [\sum_{t=0}^{T_\perp} \gamma^t R(S_t, A_t, S_{t+1}) | S_0 \sim d]$, where $T_\perp$ denotes the time step at which the episode terminates. A value estimator $Q: \scriptS \times {|\scriptA|} \to \mathbb{R}$ can be used to guide the search for a good policy. However, real-world problems are typically partially observable, meaning that at each time step $t$, after taking an action $a_t \in \scriptA$, the agent receives an observation $x_{t+1} \in \scriptX$, where $\scriptX$ is the observation space. The agent then needs to infer the state from its sequence of observations, which is usually done through a state encoder.  %In medium to large domains, Neural Networks (NNs) are often introduced to assist the RL agents, giving rise to the field of deep RL.
+
+One important goal of RL is to achieve high (generalization) performance on evaluation tasks after learning from a limited number of training tasks, where the evaluation and training distributions may differ; For instance, a policy for a robot may need to be trained in a simulated environment for safety reasons, but would need to be deployed on a physical device, a setting called sim2real. Discrepancy between task distributions is often recognized as a major reason why RL agents are yet to be applied pervasively in the real world  \citep{igl2019generalization}. To address this issue, in this paper,  agents are trained on a small set of fixed training tasks, then evaluated in unseen tasks, where there are environmental variations, but the core strategies needed to finish the task remains consistent, for example because of the existence of causal mechanisms. To generalize well, the agents need to build learned skills which capture the consistent knowledge across tasks.
+
+
+% In this study, as we are interested in a generalization setting in which there is a distribution of both training and test tasks, we evaluate the agent's performance by taking the expectation of the agent's performance across both the training and test set distributions separately. 
+
+%A policy could condition on more inputs than only a state, \eg{} a goal-conditioned policy conditions additionally on a certain representation of a "goal".
+
+%There are often termination conditions limiting the length of the agents' trajectories. Let $T_\perp$ denote the time at which a trajectory is terminated, assuming $T_\perp$ is finite on all trajectories, the goal of the agent is to maximize the cumulative \textbf{return} received over its lifetime, expressed as a sum of rewards $\sum{r_{t \to t'}}$, where the first $t=0$ and the last $t'=T_\perp$. To understand the learned capabilities, an agent's performance is evaluated in expectation over instantiations of environment-agent pairs, where the environments are often different from the training tasks, as in the real-world. 
+%This is reflected in the experiments section.
+
+% In an RL problem, an agent seeks to learn to maximize the cumulative sum of rewards within its allowed time (an episode) by interacting with the environment, via the agent' decided actions at each decision time \cite{sutton2018reinforcement}. 
+
+% The agent learns to improve its policy, \ie{} a strategy to take which actions at which decision time. To this end, there are two essential problems to the RL agent: evaluate how it is doing, \aka{} policy evaluation, and learn to do better, \aka{} policy improvement.
+
+%In Markov Decision Processes (MDPs), the agent transition within \textit{states} in the \textit{state space}, the sufficient statistics to describe the system, determine actions, compute rewards, \etc{}. An RL agent needs to infer the current state from the history of interactions with the environment.
+
+%A Markov Reward Process (MRP), an MDP augmented with a Reward function, is a tuple $\langle \scriptS, \scriptA, P, r \rangle$ consisting of: the state space $\scriptS$, the action space $\scriptA$, a state transition function  that describes the distribution of the states the agent would transition to by taking action $a$ from state $s$, as well as a reward function $r(s, a, s')$.
+
+%At the core of each RL agent is a \textbf{policy}. At each time step $t$, the agent starts from a state $S_t$ and takes an action $A_t$ drawn from its policy $\pi$ and lands in $S_{t+1}$. A policy is a conditional distribution over actions given a state. A policy could condition on more inputs than only a state, \eg{} a goal-conditioned policy conditions additionally on a certain representation of a "goal".
+
+%RL agents often optimize a \textit{surrogate} of the expectation of the return, named the cumulative \textit{discounted} return $G \equiv \sum_{t}{\gamma^{t-1} r(s_t, a_t)}$, where $\gamma \in (0, 1]$ is a scalar discount factor and $r(s_t, a_t)\equiv\doubleE[r(S_t, A_t, S_{t+1}) | S_t = s_t, A_t = a_t, S_{t+1} \sim P(s_t, a_t, )]$ is the expectation of reward by taking $a_t$ at $s_t$, since the agent could control only its actions not the stochasticity in the environment. When there are terminal states that force an end of episode in the environment, the sum would be taken up to the possible trajectory length.
+
+\textbf{Deep Model-based RL.}
+%\label{sec:model_basedL_drl}
+% Deep Reinforcement Learning (DRL) is a research field of combining Deep Learning and RL. The expressive power and generalization abilities of NNs grant the RL agents possibilities to learn complicated behaviors from complex environmental observations. 
+%Despite the significant progress in deep model-free methods, they still often suffer from poor sample efficiency, low generalization abilities, etc . 
+Deep model-based RL uses approximations to the transition and reward functions in order to guide the search for a good policy \citep{silver2017mastering,schrittwieser2020mastering}. Intuitively, rich models, expressed by Neural Networks (NNs), have the ability to capture generalizable information and possibly to infer latent causal structure. \textit{Background} planning agents \eg{}, Dreamer \citep{hafner2023mastering} use their model as a data generator to improve their value estimators and policies,  which they execute while interacting with the environment \citep{sutton1991dyna}. Thus, these agents usually do not improve on the trained policy at test time.
+In contrast, \textit{decision-time} planning agents \eg{}, MuZero \citep{schrittwieser2020mastering} actively use their model at decision time to make better decisions. Recent work suggests that this approach may provide better generalization \citep{alver2022understanding}.
+%For example, MuZero performs a tree search with the learned model at every encountered state 
+%to simulate a desirable future state to act towards 
+%\citep{schrittwieser2020mastering}. 
+%To this end, decision-time planning agents are better suited towards generalization\citep{alver2022understanding}.
+
+\textbf{Options \& Goal-Conditioned RL.} Temporal abstraction allows RL agents to use sub-policies, and to model the environment over extended time scales, in order to enable both better generalization and solving larger problems. Options and their models provide a formalism for temporal abstraction in RL~\citep{sutton1999between}. Each option consists of an initiation condition, a policy, and a termination condition. For any set of options defined on an MDP, the decision process that selects only among those options, executing each to termination, is a Semi-MDP (SMDP) \citep{puterman2014markov}, consisting of the set of states $\scriptS$,  the set of options $\mathcal{O}$, and for each state-option pair, an expected return, and  a joint distribution of the next state and transit time. In this paper, we focus on goal-conditioned options, where the initiation set covers the whole state space $\scriptS$. Each such option is a tuple $o = \langle \pi, \beta \rangle$, where $\pi: \scriptS \to \text{Dist}(\scriptA)$ is the (intra-)option policy and $\beta: \scriptS \to \{0, 1\}$ indicates when a goal state is reached. Hindsight Experience Replay (HER) \citep{andrychowicz2017hindsight} is often used to train goal-conditioned options by sampling a transition $\langle x_t, a_t, r_{t+1}, x_{t+1} \rangle$ together with an additional observation $x^{\odot}$ from the same trajectory, which is re-labelled as a ``goal".
+% Goal-conditioned agents are often implemented within the feudal RL framework, a hierarchical RL framework in which a high-level \textit{manager} provides low-level goals to its \textit{workers} \citep{dayan1992feudal,NIPS1997_5ca3e9b1,vezhnevets2017feudal}; 
+% Planning with options requires \textit{option models}, \ie{} the models of the options' consequences \citep{sutton1999between}.
+
+%\textbf{Goal-Conditioned RL.} Notably, goal-conditioned RL seeks to train agents to achieve a goal or a sequence of goals \citep{nasiriany2019planning}, and hence can be viewed as instantiating option learning \citep{sutton2022reward} whose policies are shaped towards achieving certain outcomes. The goal conditioned RL agents are often implemented within the feudal RL, a hierarchical RL framework \citep{NIPS1997_5ca3e9b1}, where a high-level manager directs how the low-level worker operates \citep{dayan1992feudal}.
+
+% \textbf{Semi-MDPs \& Option Models.} 
+% For any set of options defined on any MDP, the decision process that selects only among those options, executing each to termination, is a Semi-MDP \citep[SMDP, ][]{puterman2014markov}. An SMDP consists of 1) a set of states $\scriptS$, 2) a set of options $\mathcal{O}$, 3) for each pair of state and option, an expected cumulative discounted reward, and (4) a well-defined joint distribution of the next state and transit time.
+
+% The most common way of formulating
+% temporally-extended and temporally-variable ways of behaving in a reinforcement learning agent is as options (Sutton, Precup & Singh, 1999), each of
+% which comprises a way of behaving (a policy) and a way of stopping. The
+% appeal of options is that they are in some ways interchangeable with actions.
+% Just as we can learn models of action’s consequences and plan with those
+% models, so we can learn and plan with models of options’ effects.
+% There remains the critical question of where the options come from. A common approach to option discovery is to pose subsidiary tasks such as reaching
+% a bottleneck state or maximizing the cumulative sum of a sensory signal other
+% than reward. Given such subtasks, the agent can develop temporally abstract
+% structure for its cognition by following a standard progression in which each
+% subtask is solved to produce an option, the option’s consequences are learned
+% to produce a model, and the model is used in planning.
+
+% A minimal DRL agent consists of a state representation encoder, a value estimator and a parameterized policy (optional). Often, we would wish that the encoder $\scriptE$ could encode a state representation from the history of observations sufficient enough to make optimal decision, per MDP formulations. However, the theories 
+
+% Notably, DRL is good at handling the RL problem with partial observability.
+
+% %In these RL problems, instead of the agent receiving some lossless representation of the state it situates, it receives an observation $X_{t+1} \equiv f_\scriptX(S_{t+1})$ that is mapped from the next state $S_{t+1}$ by a function $f_\scriptX$ determined by the environment. We call the collection of possible values of $X_t$ the \textit{observation space} $\scriptX$.
+
+% If there exists a function $f^{-1}_{\scriptX}$ \st{} $\forall t \in \{0, 1, \dots\}$, $S_t = f^{-1}_{\scriptX}(S_{t})$, \ie{} there exists a bijection between $S_t$ and $O_t$ for every $t$, the RL problem on top of the MRP is recognized as \textit{fully-observable}, otherwise \textit{partially-observable}. \red{we can talk about POMDP theories here} DL makes it much more feasible to estimate the true state $S_t$ given all the observations collected in the episode until timestep $t$, \ie{} $[O_0, \dots, O_t]$.
+
+% \red{only add this if we are going to talk about reward respecting things}
+% Reward-respecting subtasks contrast with commonly used
+% subtasks, such as shortest path to bottleneck states (e.g.,
+% McGovern & Barto, 2001; Simsek & Barto, 2004; Simsek,
+% Wolfe, & Barto, 2005), pixel maximization (Jaderberg et al.,
+% 2017), and diffusion maximization (c.f. Machado, Barreto,
+% & Precup, 2021), which explicitly maximize the cumulative
+% sum of a signal other than the reward of the original task
+
+% If achieved in RL, this planning behavior could bring forth useful and practical plans without excessive modelling of the pathways to achieve the sub-goals. 
+
+% Mapping to formal language, we acquire "what is the probability of certain condition to be true?", "is achieving certain condition preferable according to certain metrics?", "given that some conditions are met, what is the next condition to fulfill to maximize performance on certain metrics?" and "what are the prerequisite conditions for a desired condition to be met?". 
+
+% Compared to RL agents that are "unconscious" of the "steps" to achieve task objectives, 
+% \vspace*{-2mm}
+
+\section{\agentshort{}: Spatially \& Temporally Abstract Planning}
+
+% This could be translated into the abilities of supposing ourselves in a connected graph whose vertices are imagined possible events, and using our , as edges, to guide our decision making. % The ability of constructing of these graphs is likely enhanced with the increment of our life experience: it is hard for someone who does not really travel to make robust plans but one would improve with more experience.
+
+% Once an abstract plan like this is formed, we humans would try to detail our plans to achieve the sub-goals along the planned abstract trajectories. 
+
+%We explore strategies of spatially- and temporally-abstracted planning that allows for learning generalizable skills and hereby propose
+In this section we describe the main ingredients of \agentshort{} - an agent that formulates a simplified  \textbf{proxy} problem for a given task, solves this problem, and then proceeds to ``fill in" the details of the plan.  
+
+\subsection{Proxy Problems}
+
+Proxy problems are finite graphs constructed at decision-time, whose vertices are states and whose directed edges are estimated possible transitions between the vertices, as shown in Fig. \ref{fig:proxy_problem}. We call the states selected to be vertices of the proxy problems \textit{checkpoints} to differentiate them from other states are not involved in the decision time planning process. The current state is always one of the vertices. The checkpoints are proposed by a generative model and represent a finite subset of states that the agent might experience in the current episode. Each edge is annotated with estimates of the duration and reward associated with the transition between the checkpoints it connects; these estimates are learned over the relevant aspects of the environment and depend on the agent's capability. As the low-level policy that implements checkpoint transitions improves, the edges strengthen, in the sense that shorter or higher-reward paths may be discovered. Planning in a proxy problem is temporally abstract, because the checkpoints represent sparse decision points. Estimating each checkpoint transition is spatially abstract, as an option corresponding to such a task would base its decisions only on some aspects of the environment state~\citep{bengio2017consciousness}, in order to improve generalization as well as computational efficiency \citep{zhao2021consciousness}. % In other words, the proxy problems alleviate the difficulties of long horizon planning by \textit{marginalizing the change of uninteresting aspects} of the space and time within trajectories, and \textit{constraining the options} \st{} the changes that matter to the objective are simpler to predict \citep{bengio2017consciousness}.
+
+\begin{wrapfigure}[24]{r}{0.3\textwidth}
+\centering
+% \vspace*{-3mm}
+\includegraphics[width=0.28\textwidth]{fig_proxy_problem.png}
+\caption{\small \textbf{A \orange{Proxy Problem} on a Grid-World Navigation Task}: the MDP of the \gray{original problem} is in gray; terminal states are marked with squares. An agent needs to get from the (filled \red{red}) position, to the goal (filled \darkgreen{green}). The proxy problem has $12$ checkpoints (enlarged and outlined \orange{orange}). The agent's plan corresponds to reaching a series of distant states to get closer to the goal.}
+\label{fig:proxy_problem}
+\end{wrapfigure}
+
+Note that a proxy problem can be viewed as a deterministic SMDP, where each edge will be implemented as a goal-conditioned option, aiming to reach the end checkpoint of the edge. Thus, it can be fully described by the discount and reward matrices, \blue{$\Gamma^\pi$} and \darkgreen{$V^\pi$}, where \blue{$\gamma^\pi_{ij}$} and \darkgreen{$v^\pi_{ij}$} are defined as:
+\begin{align}
+    \blue{\gamma^\pi_{ij}} &\doteq \mathbb{E}_\pi\left[\gamma^{T_\perp} | S_0=s_i, S_{T_\perp}=s_j\right] \\
+    \darkgreen{v^\pi_{ij}} &\doteq \textstyle\mathbb{E}_\pi\left[\sum_{t=0}^{T_\perp} \gamma^t R_t | S_0=s_i, S_{T_\perp}=s_j\right].
+\end{align}
+By planning with \blue{$\Gamma^\pi$} and \darkgreen{$V^\pi$}, \eg{} using SMDP value iteration~\citep{sutton1999between}, we can solve the proxy problem, and form a jumpy plan to travel between states in the original problem. If the proxy problems can be estimated well, the obtained solution will be of good quality, as established in the following theorem:
+
+\begin{theorem}\label{thm:overall_perf}
+Let $\mu$ be the SMDP policy (high-level) and \red{$\pi$} be the low-level policy. Let \darkgreen{$\hat{V}^\pi$} and \blue{$\hat{\Gamma}^\pi$} denote learned estimates of the SMDP model. If the estimation accuracy satisfies:
+\begin{align}
+    & |\darkgreen{v^\pi_{ij}}-\darkgreen{\hat{v}^\pi_{ij}}|<\epsilon_v  v_{\text{max}} \ll (1-\gamma)  v_{\text{max}} & \text{\textbf{and}}\\
+    & \quad\quad |\blue{\gamma^\pi_{ij}} -\blue{\hat{\gamma}^\pi_{ij}}|<\epsilon_\gamma\ll (1-\gamma)^2 & \forall i,j. \nonumber
+\end{align}
+Then, the estimated value of the composite $\hat{v}_{\mu\circ \pi}(s)$ is accurate up to error terms linear in $\epsilon_v$ and $\epsilon_\gamma$:
+\begin{align}
+    \hat{v}_{\mu\circ \pi}(s) &\doteq \sum_{k=0}^\infty \hat{v}_\pi(s_k^\odot |{s}_{k+1}^\odot ) \prod_{\ell=0}^{k-1}\hat{\gamma}_\pi (s_\ell^\odot | s_{\ell+1}^\odot ) = v_{\mu\circ \pi }(s) \pm \frac{\epsilon_v  v_{\text{max}}}{1-\gamma} \pm \frac{\epsilon_\gamma v_{\text{max}}}{(1-\gamma)^2}  + o(\epsilon_v+\epsilon_\gamma) \nonumber
+\end{align}
+where \darkgreen{$\hat{v}_\pi(s_i | s_j )\equiv \hat{v}^\pi_{ij}$} and \blue{$\hat{\gamma}_\pi(s_i | s_j )\equiv \hat{\gamma}^\pi_{ij}$}, and $v_{\text{max}}$ denotes the maximum value of $v_{\mu \circ \pi }$, the true value of $\mu \circ \pi$.
+\end{theorem}
+
+The theorem indicates that once the agent achieves high accuracy estimation of the model for the proxy problem and a near-optimal lower-level policy $\red{\pi}$, its performance becomes close to the optimal $v_{\mu \circ \pi}$ (proof in Appendix \ref{sec:proof_bound}). Although the theorem is general, in the experiments, we limit ourselves to %the scope where the accuracy assumption can be met non-trivially, \ie{}, while avoiding degenerate proxy problems whose checkpoint transitions involve no rewards, that is, in 
+navigation tasks with sparse rewards for reaching goals, where the goals are included as permanent vertices in the proxy problem. This is a case where the accuracy assumption can be met non-trivially, \ie{}, while avoiding degenerate proxy problems whose edges involve no rewards. The theorem also makes no assumption on \red{$\pi$} because it would likely be difficult to learn a good \red{$\pi$} for far away targets. Following Thm. \ref{thm:overall_perf}'s guidance, we train estimators for \darkgreen{$v_\pi$} and \blue{$\gamma_\pi$} and refer to this task as \textit{edge estimation}.
+
+\subsection{Design Choices}
+To implement planning over proxy problems, our framework embraces the following design choices:
+
+\begin{itemize}[label={},leftmargin=*]
+\item \textbf{Spatio-temporal abstraction}: temporal abstraction allows us to break down the given task into smaller ones, while spatial abstraction over the state features through an attention mechanism is used to improve local learning and generalization;
+
+\item \textbf{Decision-time planning} is employed due to its ability to improve the policy in novel situations;
+
+\item \textbf{Learning end-to-end from hindsight, off-policy}: to maximize sample efficiency and the ease of training, we propose to use auxiliary (off-)policy methods for edge estimation, and learn a context-conditioned checkpoint generation, both from hindsight experience replay;
+
+\item \textbf{Higher quality proxies}: we introduce pruning techniques to improve the sparsity of the proxy problems, which leads to better quality;
+
+\item \textbf{Delusion suppression}: we propose a delusion suppression technique to minimize the behavior of chasing non-existent outcomes. This is done by exposing the edge estimators to targets that would otherwise not exist in experience.
+\end{itemize}
+
+\subsection{Problem 1: Edge Estimation}
+
+First, we discuss how to estimate the edges of the proxy problem, given a set of already generated checkpoints.
+%Edge estimation focuses on partial environmental state factors that are relevant to the sub-problem of checkpoint transition estimation and thus should be spatially abstract. 
+Taking inspiration from conscious information processing in brains, we introduce a local perceptive field selector, $\sigma$, consisting of a learned attention bottleneck that (soft-)selects the top-$k$ local segments of the full state (\eg{} a feature map by a typical convolutional encoder); all segments of the state compete for the $k$ attention slots, \ie{} relevant aspects of states are promoted, and irrelevant ones discarded, to form a partial state representation \citep{mott2019towards,tang2020neuroevolution,zhao2021consciousness,alver2023minimal}. We provide an example in Fig. \ref{fig:overall} (see purple parts). On top of $\sigma$, the auxiliary estimators, to be discussed soon, force the bottleneck mechanism to promote aspects relevant to the local estimation of connections between the checkpoints. The rewards and discounts are then estimated on top of the partial state $\sigma(S)$, based on the agent's behavior. 
+
+\begin{figure*}[htbp]
+\centering
+\vspace*{-3mm}
+\captionsetup{justification = centering}
+\includegraphics[width=1.0\textwidth]{fig_overall.pdf}
+\vspace*{-5mm}
+\caption{\small \textbf{\agentshort{} Framework}: 1) Partial states consist of a few local fields, soft-selected via top-$k$ attention \citep{gupta2021memory}. \agentshort{}'s edge estimations as well as low-level behaviors \red{$\pi$} are solely based on the partial states. 2) The checkpoint generator learns by splitting the full state into context and partial descriptions, and fusing them to reconstruct the input. It generates checkpoints by sampling partial descriptions and combines them with the episodic contexts; 3) We prune the vertices and edges of the denser graphs to extract sparse proxy problems. Once a plan is formed, the immediate checkpoint target is used to condition the policy, which then guides the actions. In the proxy problem example, blue edges are estimated to be bidirectional and red edges are unidirectional (with the other direction pruned).}
+\label{fig:overall}
+\vspace*{-2mm}
+\end{figure*}
+
+\subsubsection{Basis for Connections: Checkpoint-Achieving Policy}
+%Implementing low-level actions for checkpoint transitions, t
+The low-level policy $\red{\pi}$ maximizes an intrinsic reward, \st{} the target checkpoint $S^{\odot}$ can be reached. The choice of intrinsic reward is flexible; for example, one could use a reward of $+1$ when $S_{t+1}$ is within a small radius of $S^{\odot}$
+%, \ie{} when the next state $S_{t+1}$ is close enough to the target $S^{\odot}$, 
+according to some distance metric, or use reward-respecting intrinsic rewards that enable more sophisticated behaviors, as in \citep{sutton2022reward}. In the following, for simplicity, we will denote the checkpoint-achievement condition with equality: $S_{t+1}=S^{\odot}$.
+
+\subsubsection{Estimate Connections}
+%\vspace*{-5mm}
+The following estimates are learned with using distributional RL, where the output of each estimator takes the form of a histogram over scalar support \citep{dabney2018distributional}.
+
+\textbf{Cumulative Reward.} %The first interesting edge estimate to learn is t
+The cumulative discounted task reward \darkgreen{$v_{ij}^\pi$} 
+%along the possible trajectories leading to the target checkpoint $s_j$ under $\red{\pi}$ from a starting state $s_i$. This 
+is learned using policy evaluation on an auxiliary reward that is the same as the original task reward everywhere except when reaching the target. Given a hindsight sample $\langle x_t, a_t, r_{t+1}, x_{t+1}, x^{\odot} \rangle$ and the corresponding encoded sample $\langle s_t, a_t, r_{t+1}, s_{t+1}, s^{\odot} \rangle$, we train $\darkgreen{V_\pi}$ with KL-divergence as follows:
+\vspace*{-2mm}
+\begin{equation}
+\darkgreen{\hat{v}_\pi(\sigma(s_t), a_t | \sigma(s^{\odot}))} \gets \begin{cases}
+R(s_t, a_t, s_{t+1}) + \gamma \darkgreen{\hat{v}_\pi(\sigma(s_{t+1}), a_{t+1} | \sigma(s^{\odot}))} &\text{if } s_{t+1} \neq s^{\odot}\\
+R(s_t, a_t, s_{t+1}) &\text{if } s_{t+1} = s^{\odot}
+\end{cases}
+\vspace*{-2mm}
+\label{eq:smdp_reward}
+\end{equation}
+where $\sigma(s)$ is the spatially abstracted partial state from the full state $s$ and $a_{t+1} \sim \red{\pi(\cdot | \sigma(s_{t+1}), \sigma(s^{\odot}))}$. %Similar methods on estimating the reachability between states also exist in literature. 
+
+\textbf{Cumulative Distances / Discounts.} 
+%Besides $\darkgreen{v_\pi}$, another important estimate for a checkpoint transition is the discounts $\blue{\gamma_\pi}$.
+%, which can be used for dynamic programming to solve the proxy problem. 
+Similarly to $\darkgreen{V_\pi}$, we would want to know the cumulative discount leading to the target $s_\odot$ under $\red{\pi}$. Unfortunately, this quantity is difficult to learn, since the prediction would be heavily skewed towards $1$ if $\gamma \approx 1$. Yet, we can instead effectively estimate cumulative (truncated) distances (or trajectory length) under \red{$\pi$}. Such distances can be learned with policy evaluation, where the auxiliary reward is $+1$ on every transition, except at the targets:
+\vspace*{-1mm}
+\begin{equation*}
+\blue{D_\pi(\sigma(s_t), a_t | \sigma(s^{\odot}))} \gets \begin{cases}
+1 + \blue{D_\pi(\sigma(s_{t+1}), a_{t+1} | \sigma(s^{\odot}))} &\text{if } s_{t+1} \neq s^{\odot}\\
+1 &\text{if } s_{t+1} = s^{\odot}\\
+\infty &\text{if } s_{t+1} \text{ is terminal and } s_{t+1} \neq s^{\odot}\\
+\end{cases}
+\vspace*{-1mm}
+\end{equation*}
+where $a_{t+1} \sim \red{\pi(\cdot | \sigma(s_{t+1}), \sigma(s^{\odot}))}$. The cumulative discount can then be recovered by replacing the support of the quantized distribution of distances with the corresponding discounts. The learned distance is also used to prune unwanted checkpoints in order to simplify the proxy problem, as well as prune far-fetched edges. The details of pruning will be presented shortly.
+
+Please refer to the Appendix \ref{sec:proof_update} for a discussion of the properties of the proposed learning rules for \darkgreen{$\hat{v}_\pi$} and \blue{$\hat{\gamma}_\pi$}. 
+
+\subsection{Problem 2: Vertex Generation}
+
+%Finishing on the edge estimation, 
+%We now focus on the generation of checkpoints during planning, the vertices of the proxy graph. A 
+The checkpoint generator aims to directly model the possible future states \textit{without needing to know how exactly the agent might reach them}. The details of checkpoint transitions will be abstracted by the connection estimates instead. 
+
+% OPTIONAL
+% With hindsight sampling, we may need a careful control over the distribution of the future checkpoints, which we seek to learn with the generator. This distribution, unlike that of $1$-step transition outcome, could more diverse and could be non-stationary given a changing behavior policy, since HER by default directly samples from the past episodes \citep{andrychowicz2017hindsight}.
+
+
+To make the checkpoint generator generalize well across diverse tasks, while still being able to capture the underlying causal mechanisms in the environment (a tall order for  existing model-based methods), we propose that the checkpoint generator learns to split the state representation into two parts: an episodic \underline{context} and a \underline{partial description}. In a navigation problem, for example, as in Fig. \ref{fig:overall}, a context could be a representation of the map of a gridworld, and the partial description be the 2D-coordinates of the agent's location. In different contexts, the same partial description could correspond to very different states. Yet, within the same context, we should be able to recover the same state given the same partial description.
+
+As shown in Fig. \ref{fig:overall}, this information split  is achieved using two functions: the \textit{splitter} $\scriptE_{CZ}$, which maps the input state $S$ into a representation of a context $c(S)$ and a partial description $z(S)$, as well as the \textit{fuser} $\bigoplus$ which, when applied to the input $\langle c, z \rangle$, recovers $S$. In order to achieve consistent context extraction across states in the same episode, at training time, we force the context to be extracted from other states in the same episode, instead of the input.
+
+
+% Crucial for grounding partial descriptions into reality, a reconstruction loss is compatible with the generator working in both the observation-level or a learned state level, depending on the need of the application\footnote{Since we are modelling the aspects of future without considering the process of reaching them, we do not know for sure if taking advantage of the reconstruction of the future states is more preferred than reconstructing the future observations directly. When the observation space is simpler than the state space in terms of reconstruction, we would recommend the reconstruction there, given the environment is fully observable}.
+
+%Making a case for conditional generation, w
+We sample in hindsight a diverse distribution of target encoded (full) states $S^{\odot}$, given any current $S_t$. Hence, we use as generator a conditional Variational AutoEncoder (VAE) \citep{sohn2015learning} which learns a distribution $p(S^{\odot} | C(S_t)) = \sum_z{p(S^{\odot} | C(S_t), z) p(z | C(S_t))}$, where $C(S_t)$ is the extracted context from $S_t$ and $z$s are the partial descriptions. We train the generator by minimizing the evidence lower bound on $\langle S_t, S^{\odot} \rangle$ pairs chosen with HER.
+
+Similarly to \citet{hafner2023mastering}, we constrain the partial description encoding to a bundle of binary variables and train them with the straight-through gradient estimator \citep{bengio2013estimating}. These discrete latents can be easily sampled or composed to generate checkpoints. 
+
+Compared to existing models such as in Director \citep{hafner2022deep}, which generates intermediate goals given the on-policy trajectory, our method generates a diverse distribution of states, which can be used to plan in novel scenarios.
+
+\subsubsection{Pruning}
+In this paper,% we do not cover a learning method to improve the quality of the generated checkpoints as 
+we limit ourselves only to checkpoints from a return-unaware conditional generation model, leaving the question of how to improve the quality of the generated checkpoints for future work. Without learning, the proxy problem can be improved by making it more sparse, and making the proxy problem vertices more evenly spread in state space. To achieve this, we propose a pruning algorithm based on $k$-medoids clustering \citep{kaufman1990medoids}, which requires pairwise distance estimates between states. During proxy problem construction, we first sample a larger number of checkpoints, and then cluster them and select the centers (which are always real states).
+%, while not creating non-existent checkpoints by weighted sums in the representation space. 
+
+% From Thm. \ref{thm:overall_perf}, we know \agentshort{}'s performance depends on how accurate the estimated proxy problems are. For tasks with sparse rewards, \eg{} navigation tasks which reward reaching goals, the inclusion of the goal state in the proxy problem opens up the possibility towards optimality. Thus, we would want the checkpoint generator to be able to capture the rewarding states \st{} the abstract problem would not be "rewardless", which has no hope to achieve the accuracy condition at all.
+
+Notably, for sparse reward tasks, the generator cannot guarantee the presence of the rewarding checkpoints in the proposed proxy problem. We could remedy this by explicitly learning the generation of the rewarding states with another conditional generator. These rewarding states should be kept as vertices (immune from pruning).
+
+In addition to pruning the vertices, we also prune the edges according to a distance threshold, \ie{}, all edges with estimated distance over the threshold are deleted from the complete graph of the pruned vertices. This biases potential plans towards shorter-length, smaller-scale sub-problems, as far-away checkpoints are difficult for \red{$\pi$} to achieve.
+
+\subsubsection{Safety \& Delusion Control}
+
+Model-based HRL agents can be prone to blindly optimizing for objectives without understanding the consequences. We propose a technique to suppress delusions by exposing the edge estimators to  potentially delusional targets that do not exist in the experience replay buffer. Details and examples are provided in the Appendix.
+
+\subsection{Overall Framework \& Training}
+The overall method and its implementation details are presented in Appendix \ref{sec:pseudocode}. The estimators are trained with KL-divergence and equal weighting of all terms, and the generator is trained with a standard VAE loss. The overall training loss is a simple sum of the KL-divergences and the VAE loss. Details of \agentshort{} can be found in the Appendix.
+
+% In model-based RL particularly, there is a significant risk posed by the agents' wanting to achieve some delusional future states that do not exist within the safety constraints. With a use of a learned generative model, it is almost inevitable that the generated target future states go beyond the borders of safety, because of uncontrollable generalization effects. 
+
+% In our framework, checkpoints proposed by the generative model could correspond to delusional non-existent "states" that would lead to delusional edge estimates and therefore confuses planning. For instance, arbitrarily sampling partial descriptions may result in invalid states, where a car drives over pedestrians without harm.
+
+% To address such concerns, we propose an optional auxiliary training procedure that makes the agent stay further away from delusional checkpoints. All we have to do is to replace the hindsight-sampled target states with generated checkpoints, which contain both valid and invalid states. Then, the auxiliary rewards will all converge to the minimum in terms of favorability on the invalid states.
+
+% Director \cite{hafner2022deep} uses world models to generate on-policy future states that the agent would possibly meet in every $8$ steps. A manager policy $\text{mgr}(z | s_t)$ is learned to generate abstract description of future states. Yet the method is decision-time modelfree and does not utilize planning at the manager level, therefore is expected to not being able to generalize well. 
+
+
+% Limitations:
+
+
+
+% For explicitly-labelled goal conditioned tasks\footnote{At the start of the episode, the agent is given a representation of the goal of the corresponding episode.}, a similar was proposed as "modelfree" planning in \cite{nasiriany2019planning}. However, the proposed planning method utilizes a measure of reachability defined over an auxiliary dense temporal difference reward that punishes the agent's distance from the target state without keeping the SMDP consistency. Also, the method builds itself upon state representations from a pretrained VAE that is unaware of the RL task.
+
+
+% Didnt find effective way to guarantee generating rewarding events. 
+
+\section{Experiments}
+As introduced in Sec. \ref{sec:preliminary}, our first goal is to test the zero-shot generalization ability of trained agents. In order to fully understand the results, it is necessary to have precise control of the difficulty of the training and evaluation environments. Also, to validate if the empirical performance of our agents matches the formal analyses (Thm. \ref{thm:overall_perf}), we need to know how close to the (optimal) ground truth our edge estimations and checkpoint policies are. These goals give rise to the need to use environments whose ground truth information (optimal policies, true distances between checkpoints, etc) can be computed. Thus, we base our experimental setting on the MiniGrid-BabyAI framework \cite{chevalierboisvert2018minigrid,chevalier2018babyai,hui2020babyai}. Specifically, we build on the environments and experiment settings used in \citet{zhao2021consciousness,alver2022understanding}: the agent needs to navigate to the goal from its initial state in gridworld environments filled with terminal lava traps generated randomly according to a difficulty parameter, which  controls their density. During evaluation, the agent is always spawned at the opposite side from the goals; During training, the agent's position is uniformly initialized to speed up training. We provide results for non-uniform training initialization in the Appendix. 
+
+These fully observable tasks focus on the challenge of reasoning over causal mechanisms instead of  representation learning from observations, which is not the priority of this work. Across all experiments, we sample training tasks from an environment distribution of difficulty $0.4$: each cell in the field has probability $0.4$ to be filled with lava while guaranteeing a viable path from the initial position to the goal. The evaluation tasks are sampled from increasing OOD difficulties of $0.25$, $0.35$, $0.45$ and $0.55$, where the difficulty of training tasks acts as a median. In order to step up the long(er) term generalization difficulty compared to existing work, we showcase experiments done on large, $12 \times 12$ maze sizes, (see the visualization in Fig \ref{fig:overall}). The agents are trained for $1.5 \times 10^{6}$ agent-environment interactions. 
+
+We compare \agentshort{} against two state-of-the-art Hierarchical Planning (HP) methods: LEAP \citep{nasiriany2019planning} and Director \citep{hafner2022deep}. The comparative results include:
+
+\begin{itemize}[label={},leftmargin=*]
+    \item \textbf{\agentshort{}-once}: A \agentshort{} agent that generates one proxy problem at the start of the episode, and the replanning (choosing a checkpoint target based on the existing proxy problem) only triggers a quick selection of the immediate checkpoint target;
+    \item \textbf{\agentshort{}-regen}: A slower \agentshort{} agent that generates a new proxy problem every time replanning is triggered;
+    \item \textbf{modelfree}: A model-free baseline agent that serves as the basis of the architecture for the \agentshort{} variants, with a prioritized distributional Double DQN \citep{schaul2016prioritized,dabney2018distributional,vanhasselt2015deep};
+    \item \textbf{Director}: A tuned Director agent~\citep{hafner2022deep} fed with simplified visual inputs. Since Director discards trajectories that are not long enough for training purposes, we make sure that the same amount of training data is gathered as for the other agents;
+    \item \textbf{LEAP}: A re-implemented LEAP for discrete action spaces. Due to low performance, we replaced the VAE and the distance learning mechanisms with our own counterparts. We waived the agent-environment interaction costs for its generator pretraining stage, only showing the second stage of RL pretraining.
+\end{itemize}
+Please refer to the Appendix for more details on these agents, and additional experimental insights.
+
+\subsection{Generalization Performance}
+Fig. \ref{fig:50_envs} shows how the agents' generalization performance evolves during the training process. These results are obtained with $50$ fixed and sampled training tasks, a representative configuration of different numbers of training tasks including $\{1, 5, 25, 50, 100, \infty \}$\footnote{$\infty$ training tasks mean that an agent is trained on a different  task for each training episode. In reality, this may lead to prohibitive costs in creating the training environment.}, whose results can be found in the Appendix. In Fig. \ref{fig:50_envs} a), we can observe how well an agent performs on its training tasks. If an agent performs well here but badly in b), c), d) and e), \eg{} the \textbf{modelfree} baseline, then we conclude that it overfitted on training trajectories, likely an indicator of reliance on memorization.
+
+In these experiments, we consistently observe a significant advantage (\ie{} non-overlapping confidence intervals) in the generalization performance of the \agentshort{} agents throughout the training process. The \textbf{regen} variant dominates all the other methods. This is because the frequent reconstruction of the graph makes the agent less prone to errors in the estimation and provides extra adaptability in novel scenarios. The \agentshort{} agents behave less optimally than expected on training tasks, despite the strong generalization on evaluation tasks. As our ablation results and theoretical analyses consistently show, such a phenomenon is a composite outcome of inaccuracies both in the proxy problem and the checkpoint policy. One of the major symptoms of an inaccurate proxy problem is that the agent would chase over delusional checkpoint targets. We address this behavior with the delusion suppression technique, whose results can be found in the Appendix.
+
+\begin{figure*}[htbp]
+\centering
+\vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of Agents During Training}: the $x$-axes correspond to training progress, while the aligned $y$-axes represent the success rate of episodes (optimal is 1.0). Each agent is trained with $50$ tasks. Each data point is the average success rate over $20$ evaluation episodes, and each error bar (95\% confidence interval) is processed from $20$ independent seed runs. Training tasks performance is shown in (a) while OOD performance is shown in (b), (c), (d), (e). }
+% \vspace*{-2mm}
+\label{fig:50_envs}
+\end{figure*}
+
+Better than the \textbf{modelfree} baseline, LEAP obtains reasonable generalization performance, despite the extra budget it needs for pretraining. In the Appendix, we show that LEAP benefits largely from the delusion suppression technique. This indicates that optimizing for a path in the latent space is prone to errors caused by delusional subgoals. Lastly, we see that the Director agents suffer in these experiments despite their good performance in the single environment experimental settings reported by \citet{hafner2022deep}. We present additional experiments in the Appendix to show that Director is ill-suited for our generalization-focused setting:  Director still performs well in single environment configurations, but its performance deteriorates fast with more training tasks. This indicates poor scalability in terms of generalization, a limitation to its application in real-world scenarios. % We observe $2$ of its failure modes: 1) visualizations indicate its RSSM model likely rely on memorization within very few training tasks and cannot generalize well out of those; 2) the background planning induces overfitting value estimators that limit its generalization abilities during OOD evaluation.
+
+
+\subsection{Scalability of Generalization Performance}
+Like \citet{cobbe2020leveraging}, we investigate the scalability of the agents' generalization abilities across different numbers of training tasks. To this end, in Fig. \ref{fig:num_envs_all}, we present the results of the agents' final evaluation performance after training over different numbers of training tasks.
+
+With more training tasks, the \agentshort{} variants and the baseline show consistent improvements in generalization performance (significant advantage with a finite number of training tasks greater than $5$). While both LEAP and Director behave similarly to the previous subsection, notably, the \textbf{modelfree} baseline can reach similar performance as \agentshort{}, but only when trained on a different task in each episode, which is generally not feasible in real-world applications beyond simulation.
+
+\begin{figure*}[htbp]
+\centering
+\vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of Agents on Different Numbers of Training Tasks}: each data point and corresponding error bar (95\% confidence interval) are based on the final performance from $20$ independent seed runs.
+Training task performance is shown in (a) while OOD performance is shown in (b), (c), (d), (e). Notably, the \agentshort{} agents as well as the adapted LEAP behave poorly during training when being trained on only one task, as the split of context and partial information cannot be achieved. Training on one task invalidates the purpose of the proposed generalization-focused checkpoint generator.}
+% \vspace*{-2mm}
+\label{fig:num_envs_all}
+\end{figure*}
+
+\subsection{Ablation \& Sensitivity Studies}
+We present ablation results in the Appendix, where we confirm the effectiveness of delusion suppression, $k$-medoids checkpoint pruning and the local perception field, etc. In the Appendix, we also provide sensitivity study for the number of checkpoints in each proxy problem.
+
+\subsection{Summary of Experiments}
+Within the scope of the experiments, we conclude that:
+\begin{itemize}[leftmargin=*]
+\item{} The proposed \agentshort{} framework provides benefits for generalization;
+\item{} \agentshort{} achieves better generalization when exposed to more training tasks;
+\end{itemize}
+
+From the content presented in the Appendix, we deduce additionally that: 
+\begin{itemize}[leftmargin=*]
+\item{} Spatial abstraction based on the local perception field  is crucial for the scalability of the agents;
+\item{} \agentshort{} performs well by reliably decomposing the given tasks, and achieving the sub-tasks robustly. Its performance is bottlenecked by the accuracy of the estimated proxy problems as well as the checkpoint policies. This matches well with our theory. The proposed delusion suppression technique (in Appendix) is effective in suppressing plans with non-existent checkpoints as targets, thereby increasing the accuracy of the proxy problems;
+\item{} LEAP fails to generalize well within its original form and can generalize better when combined with the ideas proposed in this paper; Director may generalize better only in domains where long and informative trajectory collection is possible;
+
+\item{} We verified empirically that, as expected, \agentshort{} is compatible with stochasticity.
+\end{itemize}
+
+\vspace*{-2mm}
+\section{Related Work}
+
+%To the best of our knowledge, this is the first work that raises the attention of combining spatial and temporal abstraction for enhancing the generation abilities of planning agents. Yet, this paper is not the first work that attempts abstraction by exploring the following ideas:
+
+
+\textbf{Option Modelling.}
+Learning options whose outcome can be reliably predicted has been studied in \citet{gregor2016variational,Modhe_2020}, where the authors use unsupervised pretraining to discover intrinsic options via the empowerment objective. Similarly, our framework utilizes the models to learn the ``outcomes'' of options first, and then learn corresponding options constrained to achieve these outcomes \citep{sutton1999between,nasiriany2019planning}. Thus, it dodges the difficulty of option collapse \citep{bacon2017option}. In fact, we trade difficulties in option modelling to those of generator learning. This is likely beneficial in tasks where states are easy to learn and generate, and / or in stochastic environments where the outcomes of unconstrained options are difficult to learn.
+
+\textbf{HP Frameworks.}
+\citet{nair2018visual} uses generative models to imagine subgoals. In \citet{kim2021landmarkguided}, promising states to explore are generated and plans are formed with shortest-path algorithms. Similar ideas have been attempted for guided exploration \citep{erraqabi2021exploration,kulkarni2016hierarchical}. Similar to \citet{hafner2022deep}, \citet{czechowski2021subgoal} generate $k$-th step ahead subgoals for complex reasoning tasks. In \citet{chanesane2021goalconditioned}, the agent proposes halfway subgoals to the task goals. LEAP explicitly plans a chain of subgoals towards the task goal \citep{nasiriany2019planning}. Checkpoints can be seen as sub-goals that generalize the notion of ``landmarks" from \citet{sutton1999between}, while proxy problems can be seen equivalent to a special case of subMDPs from \citet{NEURIPS2020_4a5cfa92}. A framework of using latent landmark graphs as high-level guidance has been explored by \citet{zhang2021world}. These landmarks are selected via a sparsification procedure that uses a weighted sum in the latent space to compose subgoals. On the other hand, our checkpoint pruning selects a subset of generated states, which is less prone to issues created by weighted sums. 
+
+
+\textbf{HP Estimates.}
+\citet{zhang2021world} propose a distance estimate with an explicit regression. With TDMs \citep{pong2018temporal}, LEAP \citep{nasiriany2019planning} uses a sparse intrinsic reward based on distance information to the goal when the time budget is depleted. Policy-aware estimators are investigated by \citet{nachum2018dataefficient}.
+
+\textbf{Decision-Time / Background HP Methods.}
+Prior to LEAP \citep{nasiriany2019planning}, path planning with evolutionary algorithms was investigated by \citet{nair2019hierarchical}; \citet{hafner2022deep,mendonca2021discovering} propose world models to assist temporally abstract background planning.
+
+\textbf{Spatial Abstraction.} Attention mechanisms have been investigated to construct state representations for model-free agents in \citep{mott2019towards,manchin2019reinforcement,tang2020neuroevolution}. In \citet{zhao2021consciousness}, the first form of spatial abstraction in planning was attempted. The authors proposed an attention-based bottleneck to dynamically select a subset of environmental entities during the atomic-step forward simulation during decision-time planning. \agentshort{} is a step-up from their approach, where we identify that the previously overlooked aspect of spatial abstraction is as crucial for longer-term planning as temporal abstraction.
+
+\section{Conclusion \& Future Work}
+
+We proposed, analyzed and validated our HP framework, \agentshort{}, which provides better generalization compared to other HP methods, because of its spatio-temporal abstraction abilities.
+
+In this work, we generated checkpoints at random by sampling the partial description space. Despite the pruning mechanisms, the generated checkpoints do not prioritize the predictable, important states that matter the most to form a meaningful plan. This is likely why similar existing frameworks have limited applicable scenarios and experience trouble in environments with more complex reward structures. We would like to continue investigating the possibilities along this line. Additionally, we would like to explore other environments where the accuracy assumption (in Thm. \ref{thm:overall_perf}) can meaningfully hold, \ie{} beyond sparse reward cases.
+
+% \section{Ethics Statement}
+% \section{Reproducibility Statement}
+
+\clearpage
+\bibliography{references}
+
+\clearpage
+\appendix
+
+\section{Experimental Results (Cont.)}
+We present the experimental results that the main paper could not hold due to the page limit.
+
+\subsection{\textbf{\agentshort{}-once} Scalability}
+We present the performance of \textbf{\agentshort{}-once} on different numbers of training tasks in Fig. \ref{fig:once_num_envs}.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_once_num_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_once_num_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_once_num_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_once_num_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_once_num_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of \agentshort{}-once on different numbers of training tasks}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:once_num_envs}
+\end{figure*}
+
+\subsection{\textbf{\agentshort{}-regen} Scalability}
+We present the performance of \textbf{\agentshort{}-regen} on different numbers of training tasks in Fig. \ref{fig:regen_num_envs}.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_regen_num_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_regen_num_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_regen_num_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_regen_num_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_regen_num_envs_4.pdf}}
+
+\caption{\small \textbf{Performance of \agentshort{}-regen on different numbers of training tasks}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:regen_num_envs}
+\end{figure*}
+
+
+\subsection{\textbf{modelfree} Baseline Scalability}
+We present the performance of the \textbf{modelfree} baseline on different numbers of training tasks in Fig. \ref{fig:modelfree_num_envs}.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_modelfree_num_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_modelfree_num_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_modelfree_num_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_modelfree_num_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_modelfree_num_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the \textbf{modelfree} baseline on different numbers of training tasks}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:modelfree_num_envs}
+\end{figure*}
+
+\subsection{LEAP Scalability}
+We present the performance of the adapted LEAP baseline on different numbers of training tasks in Fig. \ref{fig:leap_num_envs}.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_leap_num_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_leap_num_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_leap_num_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_leap_num_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_leap_num_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the LEAP baseline on different numbers of training tasks}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:leap_num_envs}
+\end{figure*}
+
+\subsection{Director Scalability}
+We present the performance of the adapted Director baseline on different numbers of training tasks in Fig. \ref{fig:director_num_envs}.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_director_num_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_director_num_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_director_num_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_director_num_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_director_num_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the Director baseline on different numbers of training tasks}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:director_num_envs}
+\end{figure*}
+
+\subsection{Comparative Generalization Performance on Different Numbers of Training Tasks}
+The comparative results of all agents performing on each training configurations, \ie{} different numbers of training tasks, are presented in Fig. \ref{fig:1_envs}, Fig. \ref{fig:5_envs}, Fig. \ref{fig:25_envs}, Fig. \ref{fig:50_envs_app}, Fig. \ref{fig:100_envs} and Fig. \ref{fig:inf_envs}.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_1_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_1_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_1_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_1_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_1_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the Agents when trained with $1$ training task}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:1_envs}
+\end{figure*}
+
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_5_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_5_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_5_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_5_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_5_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the Agents when trained with $5$ training tasks}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:5_envs}
+\end{figure*}
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_25_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_25_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_25_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_25_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_25_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the Agents when trained with $25$ training tasks}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:25_envs}
+\end{figure*}
+
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the Agents when trained with $50$ training tasks (same as in the main paper)}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:50_envs_app}
+\end{figure*}
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_100_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_100_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_100_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_100_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_100_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the Agents when trained with $100$ training tasks}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:100_envs}
+\end{figure*}
+
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_inf_envs_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_inf_envs_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_inf_envs_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_inf_envs_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_inf_envs_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of the Agents when trained with $\infty$ training tasks (a new task each training episode)}: each error bar (95\% confidence interval) is obtained from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:inf_envs}
+\end{figure*}
+
+\section{Ablation \& Sensitivity}
+\subsection{Validation of Effectiveness on Stochastic Environments}
+We present the performance of the agents in stochastic variants of the used environment. Specifically, in these tasks, with probability $0.1$ where each action an agent takes could be changed into a random action. We present the $50$-training tasks performance evolution in Fig. \ref{fig:50_envs_stoch}. The results validate the compatibility of our agents with stochasticity in environmental dynamics. Notably, the performance of the baseline deteriorated to worse than even Director with the injected stochasticity.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_stoch_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_stoch_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_stoch_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_stoch_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_stoch_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of agents in \textbf{stochastic} environments}: $\epsilon$-greedy style randomness is added to each primitive action with $\epsilon=0.1$. Each agent is trained with $50$ environments and each curve is processed from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:50_envs_stoch}
+\end{figure*}
+
+
+
+\subsection{Ablation for Spatial Abstraction}
+We present in Fig. \ref{fig:50_envs_once_local} the ablation results on the spatial abstraction component with \textbf{\agentshort{}-once} agent, trained with $50$ tasks. The alternative component of the attention-based bottleneck, which is without the spatial abstraction, is an MLP on a flattened full state. The results confirm significant advantage in terms of generalization performance as well as learning speed, brought by the introduced spatial abstraction technique.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_local_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_local_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_local_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_local_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_local_4.pdf}}
+
+\caption{\small \textbf{Ablation for Spatial Abstraction on \agentshort{}-once agent}: each agent is trained with $50$ environments and each curve is processed from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:50_envs_once_local}
+\end{figure*}
+
+% \begin{figure*}[htbp]
+% \centering
+% % \vspace*{-5mm}
+% \subfloat[training, diff $0.4$]{
+% \captionsetup{justification = centering}
+% \includegraphics[height=0.22\textwidth]{fig_50_envs_modelfree_local_0.pdf}}
+% \hfill
+% \subfloat[OOD, diff $0.25$]{
+% \captionsetup{justification = centering}
+% \includegraphics[height=0.22\textwidth]{fig_50_envs_modelfree_local_1.pdf}}
+% \hfill
+% \subfloat[OOD, diff $0.35$]{
+% \captionsetup{justification = centering}
+% \includegraphics[height=0.22\textwidth]{fig_50_envs_modelfree_local_2.pdf}}
+% \hfill
+% \subfloat[OOD, diff $0.45$]{
+% \captionsetup{justification = centering}
+% \includegraphics[height=0.22\textwidth]{fig_50_envs_modelfree_local_3.pdf}}
+% \hfill
+% \subfloat[OOD, diff $0.55$]{
+% \captionsetup{justification = centering}
+% \includegraphics[height=0.22\textwidth]{fig_50_envs_modelfree_local_4.pdf}}
+
+% \caption{Ablation for Spatial Abstraction on \textbf{modelfree} baseline. Each agent is trained with $50$ environments and each curve is processed from $20$ independent seed runs. Spatial abstraction assists learning even in the atomic-step based value estimation.}
+% % \vspace*{-2mm}
+% \label{fig:50_envs_modelfree_local}
+% \end{figure*}
+
+\subsection{Accuracy of Proxy Problems \& Checkpoint Policies}
+
+We present in Fig. \ref{fig:50_envs_GT} the ablation test results on the accuracy of proxy problems as well as the checkpoint policies of the \textbf{\agentshort{}-once} agents, trained with $50$ tasks. The ground truths are computed via Dynamic Programming (DP) on the optimal policies, which are also suggested by DP. Concurring with our theoretical analyses, the results indicate that the performance of \agentshort{} is determined (bottlenecked) by the accuracy of the proxy problem estimation on the high-level and the optimality of the checkpoint policy on the lower level. Specifically, the curves for the generalization performance across training tasks, as in (a) of \ref{fig:50_envs_GT}, indicate that the lower than expected performance is a composite outcome of errors in the two levels. In the next part, we address a major mis-behavior of inaccurate proxy problem estimation - chasing delusional targets.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_GT_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_GT_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_GT_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_GT_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_GT_4.pdf}}
+
+\caption{\small \textbf{\agentshort{}-once Empirical Performance \vs{} ground truths}: both the optimal policy and optimal plan variants are calculated via DP on the environment dynamics. The default deterministic setting induces the fact that combining optimal policy and optimal plan results in $1.0$ success rate. The figures suggest that the learned agent is limited by errors both in the proxy problem estimation and the checkpoint policy $\pi$. Each agent is trained with $50$ environments and each curve is processed from $20$ independent seed runs. }
+% \vspace*{-2mm}
+\label{fig:50_envs_GT}
+\end{figure*}
+
+
+
+\subsection{Training Initialization: uniform v.s. same as evaluation}
+We present in Fig. \ref{fig:50_envs_non_uniform} the comparative results on the training setting: whether to use uniform initial state distribution or not. The non-uniform starting state distributions introduce additional difficulties in terms of exploration and therefore globally slow down the learning process. These results are obtained from training on $50$ tasks. We conclude that given similar computational budget, using non-uniform initialization only slows down the learning curves, and thus we use the ones with uniform initialization for presentation in the main paper.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_non_uniform_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_non_uniform_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_non_uniform_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_non_uniform_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_non_uniform_4.pdf}}
+
+\caption{\small \textbf{Comparative Results on $50$ training tasks without uniform initial state distribution}: each curve is processed from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:50_envs_non_uniform}
+\end{figure*}
+
+\subsection{Ablation: Vertex Pruning}
+As mentioned previously, each proxy problem in the experiments are reduced from $32$ vertices to $12$ with such techniques. We present the comparative performance curves of the used configuration against a baseline that generates $12$-vertex proxy problems without pruning. We present in Fig. \ref{fig:50_envs_once_no_prune} these ablation results on the component of $k$-medoids checkpoint pruning. We observe that the pruning not only increases the generalization but also the stability of performance.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_no_prune_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_no_prune_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_no_prune_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_no_prune_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_no_prune_4.pdf}}
+
+\caption{\small \textbf{Ablation Results on $50$ training tasks for $k$-medoids pruning}: each curve is processed from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:50_envs_once_no_prune}
+\end{figure*}
+
+\subsection{Sensitivity: Number of Vertices}
+We provide a sensitivity analysis to the number of checkpoints (number of vertices) in each proxy problem. We present the results of \textbf{\agentshort{}-once} on $50$ training tasks with different numbers of post-pruning checkpoints (all reduced from $32$ by pruning), in Fig. \ref{fig:50_envs_once_ckpts}. From the results, we can see that as long as the number of checkpoints is above $6$, \agentshort{} exhibits good performance. We therefore chose $12$, the one with minimal computation cost, as the default hyperparameter.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_ckpts_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_ckpts_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_ckpts_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_ckpts_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_ckpts_4.pdf}}
+
+\caption{\small \textbf{Sensitivity of \agentshort{}-once on the number of checkpoints in each proxy problem}: each agent is trained with $50$ environments. All curves are processed from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:50_envs_once_ckpts}
+\end{figure*}
+
+\subsection{Ablation: Planning over Proxy Problems}
+We provide additional results to intuitively understand the effectiveness of planning over proxy problems. This is done by comparing the results of \textbf{\agentshort{}-once} with a baseline \agentshort{}-goal that blindly selects the task goal as its target all the time. We present the results based on $50$ training tasks in Fig. \ref{fig:50_envs_once_always_goal}. Concurring with our vision on temporal abstraction, we can see that solving more manageable sub-problems leads to faster convergence. The \agentshort{}-goal variant catches up later when the policy slowly improves to be capable of solving long distance navigation.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_always_goal_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_always_goal_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_always_goal_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_always_goal_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_once_always_goal_4.pdf}}
+
+\caption{\small \textbf{Effectiveness of Proxy Problem based Planning}: each agent is trained with $50$ environments and each curve is processed from $20$ independent seed runs.}
+% \vspace*{-2mm}
+\label{fig:50_envs_once_always_goal}
+\end{figure*}
+
+\begin{algorithm*}[htbp]
+\caption{Delusion Suppression}
+\label{alg:suppress}
+
+\darkgreen{// This whole code block should be injected into the training loop if used}\\
+
+generate using the checkpoint generator, from the sampled batch of encoded states, the target states (to overwrite those relabelled in the HER) \ie{} replace $\langle s_t, a_t, r_{t+1}, s_{t+1}, s^{\odot} \rangle$ with $\langle s_t, a_t, r_{t+1}, s_{t+1}, s^{\odot}_* \rangle$, where $s^{\odot}_*$ are generated from the context of $s_t$\\
+
+train the distance estimator $D$ as if these are sampled from the HER\\
+
+\end{algorithm*}
+
+
+\section{Delusion Suppression}
+
+\begin{SCfigure}%{0.3\textwidth}
+\centering
+\vspace*{-3mm}
+\includegraphics[width=0.4\textwidth]{fig_example_delusion.pdf}
+\caption{\small \textbf{Example of Failure Caused by Delusions}: we illustrate an instance of chasing delusional checkpoint in one of our experimental runs by \agentshort{}. The distance (discount) estimator, probably due to the ill-generalization, estimates that the delusional checkpoint (yellow) is \underline{very close to every other state}. A resulting plan was that the agent thought it could reach any far-away checkpoints by using the delusional state to form a shortcut: the goal that was at least $17$ steps away would be reached in $2.2$.}
+\label{fig:example_delusion}
+\end{SCfigure}
+
+
+RL agents are prone to blindly optimizing for an intrinsic objective without fully understanding the consequences of its actions. Particularly in model-based RL or in Hierarchical RL (HRL), there is a significant risk posed by the agents trying to achieve delusional future states that do not exist within the safety constraints. With a use of a learned generative model, as in the proposed framework, such risk is almost inevitable, because of uncontrollable generalization effects. 
+
+Generalization abilities of the generative models are a double-edged sword. The agent would take advantage of its potentials to propose novel checkpoints to improve its behavior, but is also at risk of wanting to achieve non-existent unknown consequences. In our framework, checkpoints proposed by the generative model could correspond to non-existent ``states'' that would lead to delusional edge estimates and therefore confuse planning. For instance, arbitrarily sampling partial descriptions may result in a delusional state where the agent is in a cell that can never be reached from the initial states. Since such states do not exist in the experience replay, the estimators will have not learned how to handle them appropriately when encountered in the generated proxy problem during decision time. We present a resulting failure mode in Fig. \ref{fig:example_delusion}.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[generalization performance across training tasks]{
+\captionsetup{justification = centering}
+\includegraphics[width=0.24\textwidth]{fig_once_50_envs_suppress_0.pdf}}
+\hfill
+\subfloat[distance estimation error (L1) for delusional edges]{
+\captionsetup{justification = centering}
+\includegraphics[width=0.24\textwidth]{fig_once_50_envs_suppress_1.pdf}}
+\hfill
+\subfloat[frequency of selecting delusional targets]{
+\captionsetup{justification = centering}
+\includegraphics[width=0.24\textwidth]{fig_once_50_envs_suppress_2.pdf}}
+\hfill
+\subfloat[target optimality]{
+\captionsetup{justification = centering}
+\includegraphics[width=0.24\textwidth]{fig_once_50_envs_suppress_3.pdf}}
+
+\caption{\small \textbf{Ablation Results for \agentshort{}-once with the proposed Delusion Suppression Technique}: each curve and corresponding error bar (95\% CI) are processed from $20$ independent seed runs. a) the performance across training tasks is shown. A more optimal performance can be achieved with \agentshort{}-once in training tasks, when delusions are suppressed; b) During training interactions, the error in estimated (truncated) distance from and to delusional targets are significantly reduced with the technique; c) The frequency of selecting a delusional target is reduced to almost negligible during the whole training process; d) The optimality of target checkpoint during training can be improved by the suppression. Each agent is trained with $50$ environments and each curve is processed from $20$ independent seed runs. }
+% \vspace*{-2mm}
+\label{fig:once_50_envs_suppress}
+\end{figure*}
+
+To address such concerns, we propose an optional auxiliary training procedure that makes the agent stay further away from delusional checkpoints. Due to the favorable properties of the update rules of \blue{$D_\pi$} (in fact, \darkgreen{$V_\pi$} as well), all we have to do is to replace the hindsight-sampled target states with generated checkpoints, which contain non-existent states. Then, the auxiliary rewards will all converge to the minimum in terms of favorability on the non-existent states. This is implemented trivially by adding a loss on top of the original training loss for the distance estimator, which we give a $0.25$ scaling for stability.
+
+\begin{wrapfigure}[19]{R}{0.32\textwidth}
+  \begin{center}
+  \includegraphics[width=0.3\textwidth]{fig_support_override.pdf}
+  \end{center}
+  \caption{\small \textbf{Estimating Distributions of Discount and Distance with the Same Histogram}: by transplanting the support with the corresponding discount values, the distribution of the cumulative discount can be inferred.}
+\label{fig:support_override}
+\end{wrapfigure}
+
+
+We provide analytic results and related discussion for \textbf{\agentshort{}-once} agents trained with the proposed delusion suppression technique on $50$ training tasks in Fig. \ref{fig:once_50_envs_suppress}. The delusion suppression technique is not enabled by default because it was not introduced in the main manuscript due to the page limits. 
+
+\section{Recovering Discounts}
+
+We can recover the distribution of the cumulative discount by replacing the support of the discretized truncated distances with the corresponding discounts, as shown in Fig. \ref{fig:support_override}. Specifically, the problem we wanted to dodge was $\doubleE[\gamma^D] \neq \gamma^{\doubleE[D]}$. Luckily, the probability of having a trajectory length of 4 under policy $\pi$ from state $s_t$ to  $s_\odot$ is the same as a trajectory having discount $\gamma ^ 4$. The estimated distribution over distances is used to recover on a different support the corresponding distribution of discounts.
+
+
+
+\section{\agentshort{} Implementation Details}
+\label{sec:details_implement}
+The PyTorch-based source code of experiments is uploaded in the supplementary materials, where reviewers could find the detailed architectures that may be difficult to understand from the following descriptions. The hyperparameters introduced by \agentshort{} can be located in Alg. \ref{alg:JP}.
+
+The agent is based on a distributional prioritized double DQN. All the trainable parameters are optimized with Adam at a rate of $2.5\times10^{-4}$ \citep{kingma2014adam}, with a gradient clipping by value (maximum absolute value $1.0$).
+
+\subsection{Full State Encoder}
+The full-state encoder is a two layered residual block (with kernel size 3 and doubled intermediate channels) on top of the $16$-dimensional bag-of-words embedder of BabyAI \citep{hui2020babyai}.
+
+\subsection{Partial State Selector}
+The selector $\sigma$ is implemented with one-head (not multiheaded, therefore the output linear transformation of the default multihead attention implementation in PyTorch is disabled.) top-$4$ attention, with each local perceptive field of size $8\times8$ cells. Layer normalization \citep{ba2016layer} is inserted before and after the spatial abstraction.
+
+\subsection{Estimators}
+
+The estimators, which operate on top of the partial states, are $3$-layered MLPs with $256$ hidden units. At the output, there are $16$ bins for each histogram estimation (value, reward, distance). An additional estimator for termination is learned, which instead of taking a pair of partial state input, takes only one, and is learned to classify terminal states with cross-entropy loss. The distance from terminal states to other states would be overwritten with $\infty$. The internal $\gamma$ for intrinsic reward of \red{$\pi$} is $0.95$, while the task $\gamma$ is $0.99$
+
+\subsection{Checkpoint Generator}
+The checkpoint generator is implemented as follows:
+\begin{itemize}[leftmargin=*]
+\item The generator operates on observation inputs and outputs, because of its compactness and the equivalence to full states under full observability in our experiments;
+\item The context extractor $\scriptE_c$ is a $32$-dimensional BabyAI embedder. It encodes an input observation into a representation of the episodic context;
+\item The partial description extractor $\scriptE_z$ is made of a $32$-dimensional BabyAI embedder, followed by $3$ aforementioned residual blocks with $3\times3$ convolutions (doubling the feature dimension every time) in between, followed by global maxpool and a final linear projection to the latent weights. The partial descriptions are $6$ binary latents that each could represent $64$ different checkpoints. Similar to VQ-VAE \citep{van2017neural}, we use the argmax of the latent weights as partial descriptions, instead of sampling according to the softmax-ed weights. This enables easy comparison of current state to the checkpoints in the partial description space, because each state deterministically corresponds to one partial description. In our implementation, we identify reaching a target checkpoint if the partial description of the current state matches that of the target.
+
+\item The fusing function first projects linearly the partial descriptions to a $128$-dimensional space and then uses deconvolution to recover an output which shares the same size as the encoded context. Finally, a residual block is used, followed by a final $1x1$ convolution that downscales the concatenation of context together with the deconv'ed partial description into a 2D weight map. The agent's location is taken to be the argmax of this weight map.
+\item The whole checkpoint generator is trained end-to-end with a standard VAE loss. That is the sum of a KL-divergence for the agent's location, and the entropy of partial descriptions, weighted by $2.5 \times 10^{-4}$, as suggested in \url{https://github.com/AntixK/PyTorch-VAE}. Note that the per-sample losses in the batches are not weighted according to priority from the experience replay.
+\end{itemize}
+
+As in our experiments, if one does not want to generate non-goal terminal states as checkpoints, we could also seek to train on reversed $\langle S^\odot, S_t \rangle$ pairs. In this case, the checkpoints to reconstruct will never be terminal.
+
+\subsection{HER}
+Each agent-environment transition is further duplicated into $4$ hindsight transitions at the end of each episode. Each of these transitions is combined with a randomly sampled observation from the same trajectory as the relabelled "goal". The size of the hindsight buffer is extended to $4$ times that of the baseline that does not learn from hindsight accordingly, that is, $4\times 10^{6}$.
+
+\subsection{Planning}
+As introduced, we use value iteration over options \citep{sutton1999between} to plan over the proxy problem represented as an SMDP. We use the matrix form $Q = R_{S \times S} + \Gamma V$, where $R$ and $\Gamma$ are the estimated edge matrices for cumulative rewards, respectively. Note that this notation is different from the ones we used in the manuscript. The checkpoint value $V$, initialized as all-zero, is taken on the maximum of $Q$ along the checkpoint target (the actions for $\mu$) dimension. At decision time, we run each planning for $5$ iterations. The edges from the current state towards other states are always set to be one-directional, and the self-loops are also deleted from the graph. This means the first column as well as the diagonal elements of $R$ and $\Gamma$ are all zeros. Besides pruning edges based on the distance threshold, as introduced in the main paper, the terminal estimator is also used to prune the matrices: the rows corresponding to the terminal states are all zeros.
+
+\section{LEAP Implementation Details}
+\label{sec:leap_exp_details}
+The LEAP baseline has been implemented from scratch for our experiments, since the original open-sourced implementation\footnote{\url{https://github.com/snasiriany/leap}} was not compatible with environments with discrete action spaces. LEAP's training involves two pretraining stages, that are, generator pretraining and distance estimator pretraining, which are named the VAE and RL pretraining originally. Despite our best effort, that is to be covered in details, we found that LEAP was unable to get a reasonable performance in its original form after rebasing on a discrete model-free RL baseline.
+
+We tried to identify the reasons why the generalization performance of the adapted LEAP was unsatisfactory: we found that the original VAE used in LEAP is not capable to handle even few training tasks, let alone generalize well to the evaluation tasks. Even by combining the idea of the context / partial description split (still with continuous latents), during decision time, the planning results given by the evolutionary algorithm (Cross Entropy Method, CEM, \citet{RUBINSTEIN199789}) almost always produce delusional plans that are catastrophic in terms of performance. This was why we switched into LEAP the same conditional generator we proposed in the paper, and adapted the CEM accordingly, due to the change from continuous latents to discrete.
+
+The original distance estimator based on Temporal Difference Models (TDM) also does not show capable performance in estimating the length of trajectories, even with the help of a ground truth distance function (calculated with DP). Therefore, we switched to learning the distance estimates with our proposed method. Our distance estimator is not sensitive to the sub-goal time budget as TDM and is hence more versatile in environments like that was used in the main paper, where the trajectory length of each checkpoint transition could highly vary. Like for \agentshort{}, an additional terminal estimator has been learned to make LEAP planning compatible with the terminal lava states. Note that this LEAP variant was trained on the same sampling scheme with the HER, and was marked as "LEAP" in the main paper.
+
+We also did not find that using the pretrained VAE representation as the state representation during the second stage helped the agent's performance, as the paper claimed. In fact, the adapted LEAP variant could only achieve decent performance after learning a state representation from scratch in the RL pretraining phase.
+
+The introduced distance estimator, as well as the accompanying full-state encoder, are of the same architecture, hyperparameters, and training method as those used in \agentshort{}. The number of intermediate subgoals for LEAP planning is tuned to be $3$, which close to how many intermediate checkpoints \agentshort{} typically needs to reach before finishing the tasks. The CEM is called with $5$ iterations for each plan construction, with a population size of $128$ and an elite population of size $16$. We found no significant improvement in enlarging the search budget other than additional wall time. The new initialization of the new population is by sampling a $\epsilon$-mean of the elite population (the binary partial descriptions), where $\epsilon = 0.01$ to prevent the loss of diversity. Because of the very expensive cost of using CEM at decision time and its low return of investment in terms of generalization performance, during the RL pretraining phase, the agent performs random walks over uniformly random initial states to collect experience.
+
+\section{Director Implementation Details}
+\label{sec:director_exp_details}
+
+\begin{wrapfigure}{R}{0.25\textwidth}
+  \begin{center}
+    \includegraphics[width=0.25\textwidth]{fig_rds_director.png}
+  \end{center}
+  \caption{\small \textbf{An example for simplified observations for Director.}}
+  \label{fig:rds_director}
+\end{wrapfigure}
+
+\textbf{Adaptation.} For our experiments with Director \citep{hafner2022deep}, we have used the publicly available code\footnote{See \url{https://github.com/danijar/director}} provided by the authors. Except for a few changes in the parameters, which are depicted in Table \ref{tab:director_configs}, we have used the default configuration provided for Atari environments. Note that as the Director version in which the worker receives no task rewards performed very badly in our environment, we have used the version in which the worker receives scaled task rewards (referred to as ``Director (worker task reward)'' in \citet{hafner2022deep}). This agent has also been shown to perform better across various domains in \citet{hafner2022deep}.
+
+\textbf{Encoder.} Unlike \agentshort{} and LEAP agents, the Director agent receives as input a simplified RGB image of the current state of the environment (see Fig. \ref{fig:rds_director}). This is because we found that Director performed better with its original architecture, which was designed for image-based observations. To simplify the representation learning of Director as much as possible, we also used a simplified RGB image, instead of a detailed one (where the lava cells have waves on top etc.).
+
+\begin{table}[]
+    \centering
+    \caption{\small The changed parameters and their values in the config file of the Director agent.}
+    
+    \begin{tabular}{|p{3cm}|p{5cm}|}
+    \hline
+    Parameter & Value \\
+    \hline
+    replay\_size & 2M \\
+    replay\_chunk & 12 \\
+    imag\_horizon & 8 \\
+    env\_skill\_duration & 4 \\
+    train\_skill\_duration & 4 \\
+    worker\_rews & \{extr: 0.5, expl: 0.0, goal: 1.0\} \\
+    sticky & False \\ 
+    gray & False \\
+    \hline
+    \end{tabular}
+    \label{tab:director_configs}
+\end{table}
+
+
+\textbf{Training Performance.} We investigated why Director is unable to achieve near optimal training performance in the used environment (Fig.\ \ref{fig:50_envs}). 
+%even with very few training tasks, where generalization difficulties should be relatively low. 
+As Director was trained solely on environments where it is able to collect long trajectories to train a good enough recurrent world model \citep{hafner2022deep}, we hypothesized that Director may perform better in domains where it is able to interact with the environment through longs trajectories to train a good enough recurrent world model (\ie{}, the agent does not immediately die as a result of interacting with specific objects in the environment). To test this, we experimented with variants of the used environments, where the lava cells are replaced with wall cells, so the agent does not die upon trying to move towards them (we refer to this environment as the ``walled'' environment). The corresponding results on $50$ training tasks are depicted in Fig. \ref{fig:50_envs_director_wall}. As can be seen, the Director agent indeed performs better within the training tasks than in the environments with lava. 
+
+\textbf{Generalization Performance.} We also investigated why Director is unable to achieve good generalization performance in the used environment (Fig.\ \ref{fig:50_envs}). As Director trains its policies solely from the imagined trajectories predicted by its learned world model, we believe that the low generalization performance is due to Director being unable to learn a good enough world model that generalizes to the evaluation tasks. The generalization performances in both the ``walled'' and regular environments, depicted in Fig.\ \ref{fig:50_envs_director_wall}, indeed support this argument. Similar to the main paper, we also present experimental results for how the generalization performance changes with the number of training environments that are used. Results in Fig.\ \ref{fig:num_envs_all_director_wall} show that the number of training environments has no effect on the poor generalization performance of Director.
+
+\begin{figure*}[htbp]
+\centering
+% \vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_director_wall_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_director_wall_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_director_wall_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_director_wall_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_50_envs_director_wall_4.pdf}}
+
+\caption{\small \textbf{Comparative Results of Director on Environments with Lavas and on those with Walls}: the results are obtained with $50$ training tasks. The results for Director-lava (same as in the main paper) are obtained from $20$ independent seed runs, while those for Director-wall are obtained from $5$ runs.}
+% \vspace*{-2mm}
+\label{fig:50_envs_director_wall}
+\end{figure*}
+
+
+\begin{figure*}[htbp]
+\centering
+\vspace*{-5mm}
+\subfloat[training, diff $0.4$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_director_wall_0.pdf}}
+\hfill
+\subfloat[OOD, diff $0.25$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_director_wall_1.pdf}}
+\hfill
+\subfloat[OOD, diff $0.35$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_director_wall_2.pdf}}
+\hfill
+\subfloat[OOD, diff $0.45$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_director_wall_3.pdf}}
+\hfill
+\subfloat[OOD, diff $0.55$]{
+\captionsetup{justification = centering}
+\includegraphics[height=0.22\textwidth]{fig_num_envs_all_director_wall_4.pdf}}
+
+\caption{\small \textbf{Generalization Performance of Agents on Different Numbers of Training Tasks (while Director runs on the walled environments)}: besides \textbf{Director}, each data point and corresponding error bar (95\% confidence interval) are processed from the final performance from $20$ independent seed runs. \textbf{Director}-wall's results are obtained from $5$ runs.}
+% \vspace*{-2mm}
+\label{fig:num_envs_all_director_wall}
+\end{figure*}
+
+
+\section{Pseudo Code (with Hyper-Parameters)}
+\label{sec:pseudocode}
+
+\subsection{Overall \agentshort{} Framework}
+The pseudocode of \agentshort{} is provided in Alg. \ref{alg:JP}.
+
+\subsection{\textit{k}-medoids based pruning}
+\begin{algorithm*}[htbp]
+\caption{\agentshort{} with Random Checkpoints \purple{(implementation choice in purple)}}
+\label{alg:JP}
+
+\For{each episode}{
+    \darkgreen{//construct the proxy problem, can be done multiple times in one episode too (as in \textbf{\agentshort{}-regen})} \\
+    
+    generate more than necessary \purple{(32)} checkpoints by sampling from the partial description latent space given the extracted context from the initial state \\
+
+    k-medoid pruning based on the distance estimations among all checkpoints \purple{(down to $12$ vertices)}\\
+
+    use estimators to construct the pruned graph \purple{(including a terminal state estimator to correct the estimates)}\\
+
+    prune edges that are too far-fetched according to distance estimations \purple{(threshold set to be $8$, same as replan interval)}\\
+
+    \For{each agent-environment interaction step}{
+        \If{decided to explore \purple{(DQN-style annealing $\epsilon$-greedy)}}{ 
+            take a random action\\    
+        }
+        \Else{
+            \If{abstract problem just constructed \textbf{or} a checkpoint / timeout reached \purple{($\geq8$ steps since last planned)}}{
+                run value iteration \purple{(for $5$ iterations)} on the proxy problem, select the target checkpoint \\
+            }
+            follow the action suggested by the checkpoint-achieving policy\\ 
+        }
+        \If{time to train \purple{(every $4$ actions)}}{
+            sample hindsight transitions and train checkpoint-achieving policy, estimators \purple{(including a teriminal state estimator)} and checkpoint generator\\
+
+            [optional delusion control]: generate imaginary states and use them to train the estimators\\
+        }
+        save interaction into the trajectory experience replay\\
+    }
+    convert trajectory into hindsight samples in HER \purple{(relabel $4$ random states as additional goals)}\\
+}
+\end{algorithm*}
+
+We present the pseudocode of the modified $k$-medoids algorithm for pruning overcrowded checkpoints in Alg. \ref{alg:k_medoids}. Note that the actual implementation is parallelized, the simplification for presentation is intended for reader's understanding. The changes upon the original $k$-medoids algorithm is marked in \purple{purple}. When $k$-medoids is called after the unpruned graph is constructed, $\scriptS_\vee$ is set to be the set containing the goal state only. This is intended to span more uniformly in the state space with checkpoints, taking consideration into the goal. Let the estimated distance matrix be $D$, where each element $d_ij$ represents the estimated trajectory length it takes for $\pi$ to fulfill the transition from checkpoint $i$ to checkpoint $j$. Since $k$-medoids cannot handle infinite distances (\eg{} from a terminal state to another state), the distance matrix $D$ is truncated, and then we take the elementwise minimum between the truncated $D$ and $D^T$ to preserve the one-way distances. The matrix containing the elementwise minimums would be the input of the pruning algorithm.
+
+\begin{algorithm*}[htbp]
+\caption{Checkpoint Pruning with $k$-medoids}
+\label{alg:k_medoids}
+% \KwIn{$D$ (estimated distance matrix), $\scriptS_{\vee}$ (states that must be kept)}
+% \KwOut{$\scriptS_{\odot}$ (states to keep)}
+
+% $\scriptS_{\odot} \leftarrow \scriptS_{\vee}$ \\
+\SetAlgoNlRelativeSize{-1}
+\KwData{$X = \{x_1, x_2, \ldots, x_n\}$ (state indices), $D$ (estimated distance matrix), $\scriptS_{\vee}$ (states that must be kept), $k$ (\#checkpoints to keep)\\
+}
+\KwResult{$\scriptS_\odot \equiv \{M_1, M_2, \ldots, M_k \}$ (checkpoints kept)}
+\BlankLine
+
+Initialize $\scriptS_\odot \equiv \{M_1, M_2, \ldots, M_k \}$ randomly from $X$\\
+
+\purple{make sure $\scriptS_\vee \subset \scriptS_\odot$}\\
+
+\Repeat{Convergence (no cost improvement)}{
+    Assign each data point $x_i$ to the nearest medoid $M_j$, forming clusters $C_1, C_2, \ldots, C_k$\;
+    \ForEach{medoid $M_j$}{
+        Calculate the cost $J_j$ of $M_j$ as the sum of distances between $M_j$ and the data points in $C_j$\;
+    }
+    Find the medoid $M_j$ with the lowest cost $J_j$\;
+    \If{$M_j$ changes}{
+        \purple{make sure $\scriptS_\vee \subset \scriptS_\odot$}\\
+        Replace $M_j$ with the data point in $C_j$ that minimizes the total cost\;
+    }
+}
+\end{algorithm*}
+
+% \section{Limitations}
+% We would like to discuss the limitations to the current form of the framework, as well as the design choices that we seek to improve in the future:
+
+% \begin{itemize}[leftmargin=*]
+%     \item We generate future checkpoints at random by sampling the partial description space. Despite the post-processing such as pruning, the generated checkpoints do not prioritize on the predictable, important states that matter the most to form a meaningful plan. This is likely why similar existing frameworks have limited applicable scenarios and experience trouble in sparse reward environments. We would like to continue investigating the possibilities along this line. There are some existing work on jumpy prediction of future states, that do not yet target such RL-awareness. Most notable among them may be TD-VAE \citep{gregor2018temporal};
+%     \item The edge estimates of the proxy problem are established on explicitly reconstructed states. While, the tuple $\langle C, Z_t, Z^{\odot} \rangle$ has the same information as the input pair $\langle S_t, S^{\odot} \rangle$. Thus, explicit reconstructions may not be needed;
+%     \item No recurrent mechanism has been implemented, since we did not consider the behavior of this agent in partially-observable environments. These limits the application of the framework to the popular partially-observable benchmark suites;
+%     \item We have yet to extend the experiments to environments with richer visual observations;
+%     % The previous project was mostly conceptualized on navigation tasks. What about tasks with rewards that punishes all the time?
+% \end{itemize}
+
+\section{Theoretical Analyses}
+\subsection{Update Rules for Edge Estimation}
+\label{sec:proof_update}
+First, we show that the update rules proposed in the main paper indeed estimate the desired cumulative discount and reward.
+
+The low-level checkpoint-achieving policy $\pi$ is trained with an intrinsic reward to reach target state $s^{\odot}$.
+The cumulative reward and cumulative discount are estimated by applying policy evaluation given $\pi$, on the two sets of auxiliary reward signals, respectively.
+
+For the cumulative discounted reward random variable:
+\begin{align}
+    V_\pi(s_t,a_t|s^{\odot}) &= R(s_t,a_t,S_{t+1})+\gamma V_\pi(S_{t+1},A_{t+1}|s^{\odot}) \\
+     &= \sum_{\tau=t}^\infty \gamma^{\tau-t} R(S_\tau,A_\tau,S_{\tau+1}),
+\end{align}
+where $S_{t+1}\sim p(\cdot|s_t,a_t)$, $A_{t+1}\sim\pi(\cdot|S_{t+1},s^{\odot})$, and with $V_\pi(S_{t+1},A_{t+1}|s^{\odot})=0$ if $S_{t+1}=s^{\odot}$. We overload the notation as follows: $V_\pi(s|s^{\odot}) \doteq V_\pi(s,A|s^{\odot})$ with $A\sim\pi(\cdot|s,s^{\odot})$.
+ 
+The cumulative discount random variable denotes the event that the trajectory did not terminate before reaching the target $s^{\odot}$:
+\begin{align}
+    \Gamma_\pi(S_t,A_t|s^{\odot}) &= \gamma\cdot\Gamma_\pi(S_{t+1},A_{t+1}|s^{\odot}), \\
+     &= \gamma^{T_\perp-t} \mathbb{I}{\{S_{T_\perp}=s^{\odot}\}},
+\end{align}
+where $T_\perp$ denotes the timestep when the trajectory terminates, and with $\Gamma_\pi(S_{t+1},A_{t+1}|s^{\odot})=1$ if $S_{t+1}=s^{\odot}$ and $\Gamma_\pi(S_{t+1},A_{t+1}|s^{\odot})=0$ if $S_{t+1}\neq s^{\odot}$ is terminal. We overload the notation as follows: $\Gamma_\pi(s_t|s^{\odot}) \doteq \Gamma_\pi(s_t,A_t|s^{\odot})$ with $A_{t+1}\sim\pi(\cdot|S_{t+1},s^{\odot})$.
+
+Note that, for the sake of simplicity, we take here the view that the terminality of states is deterministic, but this is not reductive as any state with a stochastic terminality can be split into two identical states: one that is deterministically non-terminal and the other that is deterministically terminal. Note also that we could adopt the view that the discount factor is the constant probability of the trajectory to not terminate. 
+
+\subsection{Performance Bound}
+\label{sec:proof_bound}
+We are going to denote the expected cumulative discounted reward, \aka{} the state-action value with $q_\pi \doteq \mathbb{E}_\pi[V]$, and let $\hat{q}_\pi$ be our estimate for it. We are also going to consider the state value $v_\pi(s|s^{\odot}) \doteq \sum_a \pi(a|s,s^{\odot})q_\pi(s,a|s^{\odot})$ and its estimate $\hat{v}_\pi$. Similarly, we denote the expected cumulative discount with $\gamma_\pi\doteq \mathbb{E}_\pi[\Gamma]$ and its estimate with $\hat{\gamma}_\pi$.
+
+We are in the presence of a hierarchical policy. The high level policy $\mu$ consists in (potentially) stochastically picking a sequence of checkpoints. The low-level policy is implemented by \red{$\pi$} which is assumed to be given and fixed for the moment. The composite policy $\mu\circ\pi$ is non-Markovian: it depends both on the current state and the current checkpoint goal. So there is no notion of state value, except when we arrive at a checkpoint, \ie{} when a high level action (checkpoint selection) needs to be chosen.
+
+Proceeding further, we adopt the view where the discounts are a way to represent the hazard of the environment: $1 - \gamma$ is the probability of sudden trajectory termination. In this view, $v_\pi$ denotes the (undiscounted: there is no more discounting) expected sum of reward before reaching the next checkpoint, and more interestingly $\gamma_\pi$ denotes the binomial random variable of non-termination during the transition to the selected checkpoint.
+
+Making the following assumption that the trajectory terminates almost surely when reaching the goal, \ie{} $\gamma_\pi(s_i,s_g)=0, \forall s_i$, 
+% \begin{itemize}[leftmargin=*]
+%     \item The trajectory terminates almost surely when reaching the goal, hence $\gamma_\pi(s_i,s_g)=0$ for all $s_i$;
+%     % \item $v_\pi$ and $\gamma_\pi$ are accurate, \ie{} $\hat{v}_\pi=v_\pi$ and $\hat{\gamma}_\pi=\gamma_\pi$.
+% \end{itemize}	
+the gain $V$ can be written:
+\begin{align}
+V_0 = V(S_0^{\odot}|S_1^{\odot})+\Gamma(S_0^{\odot}|S_1^{\odot}) V_1 =  \sum_{k=0}^\infty V(S_k^{\odot}|S_{k+1}^{\odot}) \prod_{i=0}^{k-1}\Gamma(S_i^{\odot}|S_{i+1}^{\odot}),
+\end{align}
+where $S_{k+1}\sim\mu(\cdot|S_k)$, where $V(S_k^{\odot}|S_{k+1}^{\odot})$ is the gain obtained during the path between $S_k^{\odot}$ and where $S_{k+1}^{\odot}$, and $\Gamma(S_k^{\odot}|S_{k+1}^{\odot})$ is either 0 or 1 depending whether the trajectory terminated or reached $S_{k+1}^{\odot}$. If we consider $\mu$ as a deterministic planning routine over the checkpoints, then the action space of $\mu$ boils down to a list of checkpoints $\{s^{\odot}_0=s_0, s^{\odot}_1, \cdots,s^{\odot}_n=s_g\}$. Thanks to the Markovian property in checkpoints, we have independence between $V_\pi$ and $\Gamma_\pi$, therefore for the expected value of $\mu\circ\pi$, we have:
+\begin{align}
+    v_{\mu\circ\pi}(s_0) \doteq \mathbb{E}_{\mu\circ\pi}[V|S_0=s_0]=  \sum_{k=0}^\infty v_\pi(s^{\odot}_k|s^{\odot}_{k+1}) \prod_{i=0}^{k-1}\gamma_\pi (s^{\odot}_i|s^{\odot}_{i+1})  
+\end{align}
+
+
+% \paragraph{Harry's statement} We have ALL states in the abstract problem, which is no longer abstract, by applying our planning method, we could steadily reach the optimal policy.
+% \paragraph{Romain's response}
+% We can reach the optimal $\mu$ given $\pi$, but there is an impossibility to reach the optimal policy with a policy $\mu\circ\pi$ of the form described before, except if $\mu$ degenerates to selecting directly the goal state $s_g$. Indeed, even if $s^{\odot}_i$ is a sensible checkpoint into reaching the goal, there might be unexpected lucky transitions to a state that is closer to $s_g$ than $s^{\odot}_i$. In such a situation, a $\mu\circ\pi$ policy will go back and reach checkpoint $s^{\odot}_i$ before attempting at reaching the goal.
+
+% We actually only relied on the single assumption on the accurateness of the estimates of $v_\pi$ and $\gamma_\pi$ to guarantee accurate policy evaluation of any deterministic $\mu$\footnote{We could easily extend this result to stochastic $\mu$.}.
+Having obtained the ground truth value, in the following, we are going to consider the estimates which may have small error terms:
+\begin{align}
+    |v_\pi(s)-\hat{v}_\pi(s)|<\epsilon_v  v_{\text{max}} \ll (1-\gamma)  v_{\text{max}} \quad\quad\text{and}\quad\quad |\gamma_\pi(s)-\hat{\gamma}_\pi(s)|<\epsilon_\gamma\ll (1-\gamma)^2 \quad\quad\forall s.
+\end{align}
+
+We are looking for a performance bound, and assume without loss of generality that the reward function is non-negative, \st{} the values are guaranteed to be non-negative as well. We provide an upper bound:
+\begin{align}
+    &\ \hat{v}_{\mu\circ\pi}(s) \doteq \sum_{k=0}^\infty \hat{v}_\pi(s^{\odot}_k|s^{\odot}_{k+1}) \prod_{i=0}^{k-1}\hat{\gamma}_\pi (s^{\odot}_i|s^{\odot}_{i+1})  \\
+    &\leq \sum_{k=0}^\infty \left(v_\pi(s^{\odot}_k|s^{\odot}_{k+1})+\epsilon_v  v_{\text{max}}\right) \prod_{i=0}^{k-1}\left(\gamma_\pi(s^{\odot}_i|s^{\odot}_{i+1})+\epsilon_\gamma\right)  \\
+    &\leq v_{\mu\circ\pi}(s) + \sum_{k=0}^\infty \epsilon_v  v_{\text{max}} \prod_{i=0}^{k-1}\left(\gamma_\pi(s^{\odot}_i|s^{\odot}_{i+1})+\epsilon_\gamma\right) + \sum_{k=0}^\infty \left(v_\pi(s^{\odot}_k|s^{\odot}_{k+1})+\epsilon_v v_{\text{max}}\right) k\epsilon_\gamma\gamma^k + o(\epsilon_v+\epsilon_\gamma)  \\
+    &\leq v_{\mu\circ\pi}(s) + \epsilon_v  v_{\text{max}} \sum_{k=0}^\infty  \gamma^k + \epsilon_\gamma v_{\text{max}} \sum_{k=0}^\infty k\gamma^k  + o(\epsilon_v+\epsilon_\gamma) \\
+    &\leq v_{\mu\circ\pi}(s) + \frac{\epsilon_v  v_{\text{max}}}{1-\gamma} + \frac{\epsilon_\gamma v_{\text{max}}}{(1-\gamma)^2}  + o(\epsilon_v+\epsilon_\gamma)
+\end{align}
+
+Similarly, we can derive a lower bound:
+\begin{align}
+    &\ \hat{v}_{\mu\circ\pi}(s) \doteq \sum_{k=0}^\infty \hat{v}_\pi(s^{\odot}_k|s^{\odot}_{k+1}) \prod_{i=0}^{k-1}\hat{\gamma}_\pi (s^{\odot}_i|s^{\odot}_{i+1})  \\
+    &\geq \sum_{k=0}^\infty \left(v_\pi(s^{\odot}_k|s^{\odot}_{k+1})-\epsilon_v  v_{\text{max}}\right) \prod_{i=0}^{k-1}\left(\gamma_\pi(s^{\odot}_i|s^{\odot}_{i+1})-\epsilon_\gamma\right)  \\
+    &\geq v_{\mu\circ\pi}(s) - \sum_{k=0}^\infty \epsilon_v  v_{\text{max}} \prod_{i=0}^{k-1}\left(\gamma_\pi(s^{\odot}_i|s^{\odot}_{i+1})-\epsilon_\gamma\right) - \sum_{k=0}^\infty \left(v_\pi(s^{\odot}_k|s^{\odot}_{k+1})-\epsilon_v v_{\text{max}}\right) k\epsilon_\gamma\gamma^k + o(\epsilon_v+\epsilon_\gamma)  \\
+    &\geq v_{\mu\circ\pi}(s) - \epsilon_v  v_{\text{max}} \sum_{k=0}^\infty  \gamma^k - \epsilon_\gamma v_{\text{max}} \sum_{k=0}^\infty k\gamma^k  + o(\epsilon_v+\epsilon_\gamma) \\
+    &\geq v_{\mu\circ\pi}(s) - \frac{\epsilon_v  v_{\text{max}}}{1-\gamma} - \frac{\epsilon_\gamma v_{\text{max}}}{(1-\gamma)^2}  + o(\epsilon_v+\epsilon_\gamma)
+\end{align}
+
+We may therefore conclude that $\hat{v}_{\mu\circ\pi}$ equals $v_{\mu\circ\pi}$ up to an accuracy of $\frac{\epsilon_v  v_{\text{max}}}{1-\gamma} + \frac{\epsilon_\gamma v_{\text{max}}}{(1-\gamma)^2}  + o(\epsilon_v+\epsilon_\gamma)$. Note that the requirement for the reward function to be positive is only a cheap technical trick to ensure we bound in the right direction of $\epsilon_\gamma$ errors in the discounting, but that the theorem would still stand if it were not the case.
+
+\subsection{No Assumption on Optimality}
+If the low-level policy \red{$\pi$} is perfect, then the best high-level policy $\mu$ is to choose directly the goal as target\footnote{A triangular inequality can be shown that with a perfect $\pi$ and a perfect estimate of $v_\pi$ and $\gamma_\pi$, the performance will always be minimized by selecting $s_1^\odot=s_g$.}. Our approach assumes that it would be difficult to learn effectively a $\pi$ when the target is too far, and that we would rather use a proxy to construct a path with shorter-distance transitions. Therefore, we'll never want to make any optimality assumption on $\pi$, otherwise our approach is pointless. These theories we have initiated makes no assumption on $\pi$.

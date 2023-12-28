@@ -1,0 +1,134 @@
+\chapter{Methods \& Algorithm Development}
+In the traditional framework of federated optimization, the central server will aggregate weights from the client models. This implementation is termed Federated Effective Rank (FedER). This section will first explain some intuition and explain the methodology, then explain the naive implementation that performed poorly and then go into a secondary improved version. 
+% \vspace{-5mm}
+\section{Intuition \& Methodology }
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/er-across-models.png}
+    \caption{Effective Rank Measured Across Models; }
+    \label{fig:er-across-models}
+\end{figure}
+
+Above in \autoref{fig:er-across-models} the general methodology is laid out. Each of the `arrows' with blue-blocks represents a model ($M_i$) where the blue blocks represent convolutional blocks/layers ($C_j$). The Effective Rank is calculated per layer as $er_j^i$ where $j$ refers to the convolutional block $C_j$ (may also be referred to as layer $l$) and $i$ refers to the model $M_i$ (also referred to client $k$). After calculating the effective rank for all the convolutional blocks, the weighted-average of the model's weights need to occur. This is done on a layer-by-layer basis so that every convolutional block's effective rank is weighted in proportion to that layer. As such \autoref{eq:alphweight} shows how the weighting $\alpha$ is calculated according to effective rank. Then $alpha$ will be used when averaging the model weights to aggregate information.
+
+\begin{equation}\label{eq:alphweight}
+    \alpha_l^k \leftarrow \frac{er_l^k}{\sum_{k} er_l^k} 
+\end{equation}
+\\
+Below in Algorithm \autoref{alg:clientupdate} and Algorithm \autoref{alg:effectiverank} shows the two common algorithms that do not change throughout this implementation. In effect Algorithm \autoref{alg:clientupdate} refers to \autoref{eq:grad1} while Algorithm \autoref{alg:effectiverank} refers to \autoref{eqn:er}.
+
+\begin{algorithm}
+\caption{Common Client Update}\label{alg:clientupdate}
+\begin{algorithmic}[1]
+\Function{ClientUpdate}{$w_t^k$}
+    \For {epoch $e = 1 ... E$ }
+        \For {batch $b \in \mathcal{B}$}
+            \State $w_t^k \leftarrow w_t^k - \eta \nabla \ell(w_t^k, b)$
+        \EndFor
+    \EndFor
+    \State \textbf{return} $w_t^k$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Effective Rank}\label{alg:effectiverank}
+\begin{algorithmic}[1]
+\Function{EffectiveRank}{$\tW$}
+    \State $U, S, V \leftarrow$ \texttt{EVBMF}($\tW$) 
+    \State \textbf{return} \texttt{ShannonEntopy}(S)
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\newpage
+\section{Initial Weight Aggregation}\label{sec:initmethod}
+Simple weight aggregation though effective rank calculation can take place by iterating through the layers of a Convolutional Neural Network (CNN) and calculating the effective rank. 
+
+\begin{algorithm}
+\caption{Initial Algorithm development of FedER}\label{alg:init}
+\begin{algorithmic}[1]
+% \Require model on client $i$ $f_{i \in K}$
+\Procedure{Server Execution}{}
+\State Initialize: $w_0$, 
+\For {round $t = 1, 2 ... T$}
+    \For {client $k \in K$ in parallel}
+        \State $w_{t}^{k} \leftarrow$ \texttt{ClientUpdate}$(w_{t}^{k})$ \Comment{Alg \autoref{alg:clientupdate}}
+    \EndFor
+    \State Initialize Effective Rank Aggregator: $A_l$
+    \For {layer $l = 1 ... L$ in $w_{t}^{k} = [\tW_1^{k} ... \tW_l^{k}...\tW_L^{k}]$ }
+        \If {dim($\tW_l^{k}$) = 4} \Comment{if convolutional layer}
+            \State $er_{l}^{k} \leftarrow $ \texttt{EffectiveRank}($\tW_l^{k}$) \Comment{ Alg \autoref{alg:effectiverank}}
+            \State $A_l \leftarrow A_l + er_{l}^{k}$
+        \EndIf
+    \EndFor
+    \State \textit{// Begin Averaging According to Effective Rank}
+    \For {layer $l = 1 ... L$ in $w_{t}^{k} = [\tW_1^{k} ... \tW_l^{k}...\tW_L^{k}]$ }
+        \If {dim($\tW_l^{k}$) = 4} \Comment{if convolutional layer}
+            \State $er_{l}^{k} \leftarrow $ \texttt{EffectiveRank}($\tW_l^{k}$) \Comment{ Alg \autoref{alg:effectiverank}}
+            \State $\alpha_l^k \leftarrow er_{l}^{k}/A_l$
+            \State $\tW_l \leftarrow \sum_{k \in K} \alpha_l^k \cdot \tW_l^{k}$
+        \EndIf
+        \If {dim($\tW_l^{k}$) $\neq$ 4} \Comment{If non convolutional layer - simple averaging}
+            \State $\tW_l \leftarrow \sum_{k \in K} (1/K) \cdot \tW_l^{k}$
+        \EndIf
+    \EndFor
+\EndFor
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+% \vspace{10mm}
+% Lines 8 through 13 iterate through the layers of the trained weights and compute the effective rank for convolutional blocks. It computes a layer-by-layer aggregator across models on clients. Lines 15 through 23 then utilize the aggregated effective rank in order to calculate the `weighted' $\alpha$ for the weighted average-per-layer.
+
+\subsection{Limitations}
+This naive implementation essentially sets the `effective rank' of the non-convolutional weights to 1, thus relying on an implicit `mapping' of one. This hinders the model's ability to utilize the non-convolutional effective rank, or propagate the previous layer's effective rank to the non-convolutional blocks. \\
+
+\section{Improved Effective Rank Weight Aggregation}
+To improve on the approach outlined in \autoref{sec:initmethod}, two key changes are made. Firstly the pure effective rank is not considered, but rather the maximum between 1e-3 and the effective rank. Secondly, for non-convolutional blocks, the previous convolutional layer's effective rank is used.\\
+
+Similar to Algorithm \autoref{alg:init}, the server first trains the clients then comes together to aggregate the results. A few key changes are made, in particular Line 10 where the maximum between 0.001 and the calculated effective rank was taken. When a model begins training, it is effectively a randomized mapping, which provides no value. Seen in \autoref{fig:lowrankdist} where the weights `uncover' (learn) the mapping during training. \\
+% \newpage
+
+\begin{algorithm}[H]
+\caption{Improved Implementation of FedER}
+\begin{algorithmic}[1]
+% \Require model on client $i$ $f_{i \in K}$
+\Procedure{Server Execution}{}
+\State Initialize: $w_0$, 
+\For {round $t = 1, 2 ... T$}
+    \For {client $k \in K$ in parallel}
+        \State $w_{t}^{k} \leftarrow$ \texttt{ClientUpdate}$(w_{t}^{k})$ \Comment{Alg \autoref{alg:clientupdate}}
+    \EndFor
+    \State Initialize Effective Rank Aggregator: $A_l$
+    \For {layer $l = 1 ... L$ in $w_{t}^{k} = [\tW_1^{k} ... \tW_l^{k}...\tW_L^{k}]$ }
+        \If {dim($\tW_l^{k}$) = 4} \Comment{if convolutional layer}
+            \State $er_{l}^{k} \leftarrow $ max(1e-3, \texttt{EffectiveRank}($\tW_l^{k}$)) \Comment{ Alg \autoref{alg:effectiverank}}
+            \State $A_l \leftarrow A_l + er_{l}^{k}$
+        \EndIf
+    \EndFor
+    \State \textit{// Begin Averaging According to Effective Rank}
+    \For {layer $l = 1 ... L$ in $w_{t}^{k} = [\tW_1^{k} ... \tW_l^{k}...\tW_L^{k}]$ }
+        \State Initialize: $\alpha_p^k$ \Comment{The previous $p$ conv layer}
+        \If {dim($\tW_l^{k}$) = 4} \Comment{if convolutional layer}
+            \State $er_{l}^{k} \leftarrow $ \texttt{EffectiveRank}($\tW_l^{k}$) \Comment{ Alg \autoref{alg:effectiverank}}
+            \State $\alpha_l^k \leftarrow er_{l}^{k}/A_l$
+            \State $\alpha_p^k \leftarrow \alpha_l^k$ \Comment{Save the last convolutional block's $\alpha$}
+            \State $\tW_l \leftarrow \sum_{k \in K} \alpha_l^k \cdot \tW_l^{k}$
+        \EndIf
+        \If {dim($\tW_l^{k}$) $\neq$ 4} 
+           \State $\tW_l \leftarrow \sum_{k \in K} \alpha_p^k \cdot \tW_l^{k}$ \Comment{Use last convolutional ER for non-conv}
+        \EndIf
+    \EndFor
+\EndFor
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+% \newpage
+
+
+\subsection{Limitations}
+This implementation suffers from a few key limitations, firstly the effective rank calculation is done entirely through one a single process, and could be done in parallel to improve efficiency. Secondly, the weight aggregation could be vectorized instead of done in consecutive \texttt{for} loops. While technically the asymptotic nature of this implementation is still an $\mathcal{O}$(n) the multiple iterations means lost computational efficiency. Thirdly, this weight aggregation scheme suffers from a few-high level limitations. 
+
+In particular, it would struggle to reconcile multiple different architectures. For example if one client was running the residual network with 18 layers (ResNet 18) and another running with 34 layers (ResNet 34) \cite{he2016deep} the layer-by-layer approach would fail. This could be resolved by calculating the model effective rank in \autoref{eqn:modeler}. Another limitation is around the asynchronous nature of distributed systems, where certain client could drop from training. In these cases, the clients could inhibit training since the central server expects all clients to be together or the client could become a free rider \cite{fraboni2021free}. A free rider is a client that does not contribute to training but receives the finalized trained model at the end, thus getting the model for `free'. In our specific case of cross-silo implementations this concern becomes less severe, but is still present with hostile clients.

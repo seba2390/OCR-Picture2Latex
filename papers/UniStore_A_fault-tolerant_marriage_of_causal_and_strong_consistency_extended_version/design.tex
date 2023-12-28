@@ -1,0 +1,179 @@
+\section{Key Design Decisions in \System}
+\label{sec:overview}
+
+\begin{figure*}[t]
+\begin{tabular}{@{}c c@{}}
+\begin{minipage}[t]{5.7cm}
+\includegraphics[width=\textwidth]{figures/diagram-causal-vCR}
+\caption{Why \System may need to forward remote causal transactions.}
+\label{fig:execution-causal}
+\end{minipage}
+&
+\begin{minipage}[t]{11,5cm}
+\includegraphics[width=\textwidth]{figures/diagram-strong-vCR}
+\caption{Why \System needs to ensure that the dependencies of a strong
+  transaction are uniform before committing it.}
+\label{fig:execution-strong}
+\end{minipage}
+\end{tabular}
+\end{figure*}
+
+
+
+
+
+\paragraph{Baseline causal consistency.} A causal transaction in \System
+first executes at a single data center on a causally consistent snapshot.
+After this it immediately commits, and its updates are replicated to all other
+data centers in the background. This minimizes the latency of causal
+transactions and makes them highly available, i.e., they can be executed even
+when the network connections between data centers fail.
+
+As is common in causally consistent data stores~\cite{cops,gentlerain,cure}, to
+ensure that causal transactions execute on consistent snapshots, a data center
+exposes a remote transaction to clients only after exposing all its
+dependencies. Then to satisfy the \liveness{} property under failures, a data
+center receiving a remote causal transaction may need to forward it to other
+data centers, as in reliable
+broadcast~\cite{isis-reliable} and anti-entropy protocols for replica reconciliation~\cite{anti-entropy}.
+
+Figure~\ref{fig:execution-causal}
+depicts a scenario that demonstrates how \liveness{} could be
+violated in the absence of this mechanism.
+Let {\color{\CausalTxColor}$t_1$} be a causal %
+transaction submitted at a data center $d_1$ (event \circled{1}). Assume that
+$d_1$ replicates {\color{\CausalTxColor}$t_1$} to a correct data center $d_2$
+(event \circled{2}) and then fails (event \circled{3}), so that
+{\color{\CausalTxColor}$t_1$} does not get replicated anywhere else.
+Let {\color{\CausalTxColor}$t_2$} be a %
+transaction submitted at $d_2$ after {\color{\CausalTxColor}$t_1$} becomes
+visible there, so that {\color{\CausalTxColor}$t_2$} depends on
+{\color{\CausalTxColor}$t_1$} (event \circled{4}). Transaction
+{\color{\CausalTxColor}$t_2$} will eventually be replicated to all correct data
+centers (event \circled{5}). But it will never be exposed at any of them,
+because its dependency {\color{\CausalTxColor}$t_1$} is missing. If data
+centers can forward remote causal transactions, then $d_2$ can
+eventually replicate {\color{\CausalTxColor}$t_1$} to all correct data centers,
+preventing this problem.
+
+
+
+
+
+
+
+
+
+\paragraph{On-demand strong consistency.}
+\System uses optimistic concurrency control for strong transactions: they are
+first executed speculatively and the results are then {\em certified} to
+determine whether the transaction can commit, or must abort due to a conflict
+with a concurrent strong transaction~\cite{wv}.
+Certifying a strong transaction requires synchronization between the replicas of
+partitions it accessed, located in different data centers.
+\System implements this using an existing
+fault-tolerant protocol that combines two-phase commit and
+Paxos~\cite{discpaper} while minimizing commit latency.
+However, just using such a protocol is not enough to make the overall system
+fault tolerant: for this, before a strong transaction commits, all its causal
+dependencies must be uniform in the following sense.
+\begin{definition}
+  A transaction is {\em uniform} if both the transaction and its causal
+  dependencies are guaranteed to be eventually replicated at all correct data
+  centers.
+\label{def:uniform}
+\end{definition}
+This adapts the classical notion of uniformity in distributed computing to
+causal consistency~\cite{cachin-book}. \System considers a transaction to be
+uniform once it is visible at $f+1$ data centers, because at least one of these
+must be correct, and
+data centers can forward causal transactions to others.
+
+The following scenario, depicted in Figure~\ref{fig:execution-strong},
+demonstrates why committing a strong transaction before its dependencies become
+uniform can compromise the liveness of the system.
+Assume that a causal transaction {\color{\CausalTxColor}$t_1$} and a strong
+transaction {\color{\StrongTxColor}$t_2$} are submitted at a data center $d_1$
+in such a way that {\color{\CausalTxColor}$t_1$} becomes a dependency of
+{\color{\StrongTxColor}$t_2$} (events \circled{1} and \circled{2}). Assume also
+that {\color{\StrongTxColor}$t_2$} is certified, committed and delivered to all
+relevant replicas (events \circled{3} and \circled{4}) before
+{\color{\CausalTxColor}$t_1$} is replicated to any data center, and thus before
+it is uniform. Now if %
+$d_1$ fails before replicating
+{\color{\CausalTxColor}$t_1$} (event \circled{5}), no remote data center will be
+able to expose {\color{\StrongTxColor}$t_2$}, because its dependency
+{\color{\CausalTxColor}$t_1$} is missing. This violates the \liveness{} property,
+and even worse, %
+no strong transaction conflicting with {\color{\StrongTxColor}$t_2$} can 
+commit from now on. For instance, let {\color{\StrongTxColor}$t_3$} be such a
+transaction, submitted at $d_3$ (event \circled{6}). Because $d_3$ cannot expose
+{\color{\StrongTxColor}$t_2$}, transaction {\color{\StrongTxColor}$t_3$}
+executes on a snapshot excluding {\color{\StrongTxColor}$t_2$}. Hence,
+{\color{\StrongTxColor}$t_3$} will abort during certification (events
+\circled{7} and \circled{8}): committing it would violate the Conflict Ordering
+property, since transactions {\color{\StrongTxColor}$t_2$} and
+{\color{\StrongTxColor}$t_3$} conflict, but neither of them is visible to the
+other. Ensuring that {\color{\CausalTxColor}$t_1$} is uniform before committing
+{\color{\StrongTxColor}$t_2$} prevents this problem, because it guarantees that
+{\color{\CausalTxColor}$t_1$} will eventually be replicated at $d_3$. After this
+{\color{\StrongTxColor}$t_2$} will be exposed to conflicting transactions at
+this data center, which will allow them to commit.
+
+\paragraph{Minimizing the latency of strong transactions.} Ensuring that
+all the causal dependencies of a strong transaction are uniform before
+committing it may significantly increase its latency, since this requires
+additional communication between data centers. \System mitigates this problem by
+executing causal transactions on a snapshot that is slightly in the past, which
+is allowed by causal consistency. Namely, \System makes a remote causal
+  transaction visible to the clients only after it is uniform.
+This minimizes the latency of a strong transaction, since to commit it
+only needs to wait for causal transactions originating at the local data center
+to become uniform. We cannot delay the visibility of the latter transactions due
+to the need to guarantee {\em read your writes} to local clients.
+
+
+
+\paragraph{On-demand durability of causal transactions.} Client applications
+interacting with the external world require hard durability guarantees:
+e.g., a banking application has to ensure that a withdrawal is durably recorded
+before authorizing the operation. \System guarantees that, once a strong
+transaction commits, the transaction and its dependencies are durable. However,
+\System returns from a causal transaction before it is replicated, and thus the
+transaction may be lost if its origin data center fails. Ensuring the durability
+of every single causal transaction would require synchronization between data
+centers on its critical path, defeating the benefits of causal consistency.
+Instead, \System reuses the mechanism for tracking uniformity to let the clients
+pay the cost of durability only when necessary. Even though \System replicates
+causal transactions asynchronously, it allows clients to execute a \emph{uniform
+  barrier}, which ensures that the transactions they have observed so far are
+uniform, and thus durable.
+
+
+
+
+\paragraph{Client migration.} Clients may need to migrate between
+data centers, e.g., because of roaming or for load balancing. \System also uses
+the uniformity mechanism to preserve session guarantees during migration.
+A client wishing to migrate from its local data center $d$ to another data
+center $i$ first invokes a uniform barrier at $d$. This guarantees that the
+transactions the client has observed or issued at $d$ are durable and will
+eventually become visible at $i$, even if $d$ fails. The client then makes an
+{\em attach} call at the destination data center $i$ that waits until $i$ stores
+all the above transactions. After this, the client can operate at $i$ knowing
+that the state of the data center is consistent with the client's previous
+actions. 
+
+Currently \System does not support consistent client migration in response
+to a data center failure: if the data center a client is connected to fails, the
+client will have to restart its session when connecting to a different data
+center. 
+As shown in~\cite{swiftcloud}, this limitation can be lifted without defeating
+the benefits of causal consistency. We leave integrating the corresponding
+mechanisms into \System for future work.
+
+
+
+
+
+

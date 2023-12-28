@@ -1,0 +1,271 @@
+\section{Results}
+\label{sec:results}
+
+\subsection{Experimental results}
+
+Raw performance was not a motivation (\S~\ref{sec:motivation}) or design goal
+(\S~\ref{sec:arch}). However, if cloud native Streams' platform performance was
+significantly worse than legacy Streams', then it would not be an acceptable
+replacement. The primary goal of our experiments is to demonstrate that cloud
+native Streams has acceptable comparable performance, and the secondary goal is
+to identify aspects of Kubernetes which can be improved.
+
+We ran our experiments on a 14 node cluster using Streams v4.3.1.0 as legacy,
+Kubernetes v1.14 and Docker v18.09.6. Each node has two 4-core Intel Xeon X5570
+processors at 2.93 GHz with hyperthreading enabled and 48GB of memory.  One
+node is dedicated to management, leaving 13 nodes and 104 physical cores (208
+logical cores) for applications.
+
+Unless otherwise stated, our test application has a source operator which
+continuously generates tuples and feeds into an $n$-way parallel region. Each
+channel in the parallel region has a pipeline of $n$ operators, and all
+channels eventually converge into a sink operator. We fuse each operator into
+its own PE. We vary $n$ in our experiments, which means that the number of
+operators and PEs grows with $n^2$. As described earlier, each PE is a separate
+process and runs in its own pod. Different experiments need a different number
+of pre- and post-processing operators before and after the parallel region.
+
+\begin{figure}
+\centering
+\begin{subfigure}{1.0\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/submitted-eps-converted-to}
+  \caption{Time taken for jobs to reach the \code{Submitted} state.}
+  \label{fig:submit-cancel-submitted}
+\end{subfigure}
+\begin{subfigure}{1.0\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/healthy-eps-converted-to}
+  \caption{Time taken for jobs to reach full health.}
+  \label{fig:submit-cancel-healthy}
+\end{subfigure}
+\begin{subfigure}{1.0\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/cancel-eps-converted-to}
+  \caption{Time taken for jobs to fully terminate.}
+  \label{fig:submit-cancel-terminate}
+\end{subfigure}
+\caption{Job life cycle times.}
+\label{fig:submit-cancel}
+\end{figure}
+
+\paragraph{Job life cycle:}
+\label{sec:results:job-submission-termination}
+
+The three job life cycle phases exposed to users are submission, full health
+and full termination. The submission time is how long it takes for the
+platform to create all of the PEs and job resources. Such jobs are still
+initializing and are not yet processing data. Only when all PEs are running and
+have established all connections is the application processing data and
+considered fully healthy. Finally, after the user cancels the job, the platform
+considers the job fully terminated after all PEs and associated resources are
+gone.
+
+Figure~\ref{fig:submit-cancel} shows how long it takes to reach each phase of
+the job life cycle for both cloud native and legacy Streams, with each data
+point representing the average of 10 runs.
+Figure~\ref{fig:submit-cancel-submitted} shows that cloud native Streams is
+consistently faster to reach the \code{Submitted} state. Reaching the
+\code{Submitted} state only requires resource creation; for legacy Streams, that
+means registering all resources in ZooKeeper, and for cloud native Streams that
+means all resources are stored in etcd. However, legacy Streams also
+computes PE schedules: it rejects jobs for which it cannot find a valid
+schedule. In cloud native Streams, Kubernetes schedules PE’s pods asynchronously.
+
+The time it takes for cloud native Streams to reach full health,
+Figure~\ref{fig:submit-cancel-healthy}, is dependent on whether the
+cluster is oversubscribed. Each PE is a process in a separate pod, and the
+experiments scale to 1027 PEs. But the cluster will be fully subscribed by at least
+208 PEs; there are more processes than cores. Before the cluster is
+fully subscribed, cloud native Streams performs competitively with legacy
+Streams. Both versions suffer as the cluster becomes more oversubscribed, but
+cloud native Streams eventually takes twice as long.
+
+The job termination experiments, Figure~\ref{fig:submit-cancel-terminate}, have
+results for two different approaches for cloud native Streams: manual resource
+deletion and relying on Kubernetes' garbage collector. In the case of manual
+deletion, the job controller actively cleans up by telling Kubernetes to delete
+resources in bulk by their label. Bulk deletion minimizes the number of API calls
+and therefore reduces the strain on Kubernetes' API server. We originally relied
+on Kubernetes' resource garbage collector to automatically reclaim resources
+owned by deleted jobs. Kubernetes' garbage collector, however, does not scale
+well as the number of resources grows.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/throughput-eps-converted-to}
+    \caption{PE-PE communication throughput.}
+    \label{fig:throughput}
+\end{figure}
+
+\paragraph{PE-to-PE communication throughput:} The experiments in
+Figure~\ref{fig:throughput} use an application designed to test PE-to-PE
+throughput. It consists of two PEs, pinned to two fixed nodes in our
+testbed, while varying the size of the tuple payload from 1 byte to 4 MB.
+Transmissions run for 5 minutes, with throughput measurements every 10 seconds.
+
+Cloud native Streams achieves significantly lower throughput than legacy when
+the tuple size is smaller than 4 KB. This performance degradation is due to the
+deeper networking stack used within Kubernetes. Because of its networking
+architecture, a single packet sent from one container is required to cross
+various virtual interfaces and packet filters before reaching another container.
+Comparatively, a packet sent between two PEs within the legacy Streams platform
+is directly sent to the default interface for the target route. This increased
+complexity has the most pronounced effect with payloads less than 8 KB.  With
+larger payloads, the increased networking cost is mostly amortized.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/pr-width-change-eps-converted-to}
+    \caption{Parallel region width change time.}
+    \label{fig:pr-width-change}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/pe-recovery.pdf}
+    \caption{Application PE failure recovery time.}
+    \label{fig:pe-recovery}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/cr-pe-recovery.pdf}
+    \caption{CR App. PE Failure Recovery.}
+    \label{fig:cr-pe-recovery}
+\end{figure}
+
+\paragraph{Parallel region width change:}
+
+Figure~\ref{fig:pr-width-change} has two sets of experiments: increasing and
+decreasing parallel region width. The $x$-axis is the starting width of the
+parallel region, and we measure how long it takes an application currently at
+full health to either double or halve that parallel region. In general, cloud
+native Streams benefits from the concurrency enabled by the design from
+\S~\ref{sec:parupdates}. Starting new PEs and terminating the old PEs
+happens concurrently, handled by Kubernetes' pod scheduling. In legacy Streams,
+these phases need to happen sequentially. Cloud native Streams also has less
+communication with its metadata backing store (etcd) than legacy Streams
+(ZooKeeper). Starting at a width of 12, the cluster is oversubscribed (the
+number of PEs grows with the square of the width). At that point, when doubling
+the width, we see the same behavior regarding starting new PEs in an oversubscribed
+cluster as in Figure~\ref{fig:submit-cancel-healthy}.
+
+\paragraph{PE failure recovery:}
+\label{sec:results:pe-recovery}
+
+We test PE recovery time in Figure~\ref{fig:pe-recovery}. The $x$-axis is the
+number of PEs in the application, and each dot represents how long it took the
+application to return to full health after we killed a particular PE. This
+process times how long it takes for the platform to detect that the PE is gone,
+start a replacement, and wait for the replacement PE to re-establish all
+connections. The clustered times are due to different PEs being in similar
+places in the application topology. In cloud native Streams, the delay is in
+re-establishing the connections; the PEs are restarted quickly as that is almost
+entirely handled through Kubernetes' pod management.
+
+\paragraph{Consistent region PE failure recovery:}
+
+The experiments in Figure~\ref{fig:cr-pe-recovery} are the same as in the PE
+failure recovery with the addition that the operators are also in a consistent
+region. This addition means that their recovery is managed by the consistent
+region protocol (\S~\ref{sec:consistentregion}) which requires more
+communication and coordination than just restarting the PEs.  The outlier
+latencies tend to be the PEs which have more connections.
+
+\paragraph{Discussion:}
+
+One benefit of a bespoke platform is specialization. Our experimental results
+show that there is currently a cost for some actions when using Kubernetes as
+a generic platform. Improving these parts of Kubernetes will improve
+its ability to handle workloads such as Streams.
+
+\emph{Oversubscription:} Cloud native Streams behaves poorly compared to legacy
+Streams when the cluster is oversubscribed.  We have identified two potential
+culprits.  First, the DNS propagation in Kubernetes seems to be slower than the
+name resolution mechanism in legacy Streams. This latency is likely caused by
+the extra complexity of pod networking. Second, many more subsystems are
+involved in cloud native Streams than legacy Streams when creating new PEs:
+where \code{fork()} is enough for the latter, the former calls upon the Docker
+daemon and various Linux kernel facilities such as \code{cgroups} to start new
+pods.
+
+\emph{Networking latency:} The increased latency is the biggest pain point as
+IBM Streams was designed and engineered as a low latency, high throughput
+streaming solution. This is especially true as the most common tuple size used
+by Streams customers is around 500 bytes, within the size range where the
+latency degradation reaches 50\%. A solution is to use two different planes for
+control and data: Kubernetes networking for the Streams control plane, while a
+separate network for the Streams data plane. Such a separation can be achieved
+through user-space networking, either through a bespoke user-space TCP/IP
+network stack integrated into Streams' runtime or through a Kubernetes plugin
+supporting user-space networking, such as Microsoft FreeFlow\cite{freeflow}.
+
+\emph{Garbage collector:} When handled completely by the Kubernetes garbage
+collector, our resource deletion time experienced significant latency even with
+a modest number of resources on an undersubscribed cluster. The garbage
+collector could likely be tuned to reduce the deletion time, but such tuning
+introduces the danger of overfitting it to one specific workload at the
+detriment of others. Garbage collector plugins similar to scheduler plugins
+could solve this problem.
+
+\emph{PE recovery:} We initially suspected the container runtime added latency,
+but further investigation conducted by stressing container creation and
+deletion did not show any behavior that would explain the increasing recovery
+latency past 100 PEs. Another intuition concerns the networking address
+allocation for PEs: when recovering a failed PE, the legacy Streams platform
+will respawn the process on the same host. By doing so, the name resolution
+stays stable and other PEs communicating with the respawned process will be
+able to reconnect to it immediately. However, on the Kubernetes platform, PEs
+may not end up with the same container IP address, even when allocated on the
+same host. Therefore, all PEs communicating with the respawned process first
+need to get a fresh name translation record, which is dependent on how fast the
+Kubernetes DNS subsystem propagate changes.  Validation requires more
+investigation. However, some workloads may benefit from stable IP addresses
+for pods. Such stable addressing could be implemented by either updating an
+existing network plugin or implementing a network plugin specific to the
+workload.
+
+\subsection{Lines of Code}
+
+Rearchitecting a legacy product to be cloud native should offload significant
+responsibility to the cloud platform. This process should significantly
+reduce the lines of code in the implementation. Table~\ref{tab:sloc} shows
+that reduction.
+
+\begin{table}[h]
+    \centering
+    \footnotesize
+    \begin{tabular}{|l|r|r|}
+        \hline
+                             & \textbf{legacy}   & \textbf{cloud native}  \\
+        \hline
+        \textbf{SPL}         &           429,406 &                415,809 \\
+        \textbf{platform}    &           569,933 &                148,375 \\
+        \textbf{install}     &            14,785 &                      0 \\
+        \hline
+        \hline
+        \textbf{total}       &         1,014,124 &                564,184 \\
+        \hline
+    \end{tabular}
+    \caption{Physical lines of source code across Streams versions.}
+    \label{tab:sloc}
+\end{table}
+
+We use scc~\cite{scc} to count code. It counts physical source lines of code,
+which is defined as lines of code which are not comments or blank. The
+languages included in our count are C++, Java, Perl, XML Schema and YAML.  The
+SPL compiler is primarily C++, with some of the user-exposed code generation
+features in Perl.  The SPL runtime is split between C++ and Java. The legacy
+platform is about 80\% Java, 20\% C++. The install is primarily Java.  We do
+not include code related to the build process or system tests.
+
+Cloud native Streams is about half the size of the legacy version, and the
+platform is about a quarter the size of the old platform. The implementation of
+the architecture presented in this paper is about 26,000 lines of code, which
+means that we reused about 122,000 lines of platform code. Most of that code is
+the job submission pipeline (\S~\ref{sec:jobsubmission}). The cloud native
+version does not have an installer: users apply the YAMLs for the CRDs and make
+the Docker images available which contain the instance operator and the
+application runtime.
+

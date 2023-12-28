@@ -1,0 +1,107 @@
+\input{mergebert_fig}
+
+\section{Merge Conflict Resolution as a Classification Task}
+\label{formulation}
+
+In this work, we demonstrate how to exploit the restricted nature of merge conflict resolutions -- compared to an arbitrary program repair -- to leverage discriminative models to synthesize the merge resolution sequence.
+We have empirically observed that the application of \texttt{diff3} at token granularity enjoys two useful properties over its line-level counterpart: (i) it helps localize the merge conflicts to small program segments, effectively reducing the size of conflicting regions, and (ii) most resolutions of merge conflicts produced by token \texttt{diff3} consist entirely of changes from $a$ or $b$ or $o$ or a sequential composition of $a$ followed by $b$ or vice versa. Here, and throughout the paper we will use lower case notations to refer to attributes of token-level differencing (e.g. $a$, $b$, and $o$ are conflict regions produced by \texttt{diff3} at token granularity).
+On the flip side, a token-level merge can introduce many small conflicts. 
+To balance the trade-off, we start with the line-level conflicts as produced by the standard \texttt{diff3} and perform a token-level merge of only the segments present in the line-level conflict.
+There are several potential outcomes for such a two-level merge at the line-level: 
+\begin{itemize}
+\item {\it A conflict-free token-level merge}: For example, the edit from $A$ about \texttt{let} is merged since $B$ does not edit that slot as shown in Fig.~\ref{fig:word1}(b).  
+\item {\it A single localized token-level merge conflict}: For example, the edit from both $A$ and $B$ for the arguments of \texttt{max} yields a single conflict as shown in Fig.~\ref{fig:word1}(b).
+\item {\it Multiple token-level conflicts}: Such a case (not illustrated above) can result in several token-level conflicts. %which forms 59\%, 36\%, and 5\% of our dataset, respectively.
+\end{itemize}
+
+Token-level diff3 applied to a 4-tuple of programs $(\mathcal{A}, \mathcal{B}, \mathcal{O}, \mathcal{M})$, would usually result in a set of localized merge tuples $\langle a_j, b_j, o_j, m_j\rangle$. 
+We empirically observe that 74\% of such resolutions $m_j$ are comprised of ($i$) exactly the tokens in $a_j$ or ($ii$) exactly the tokens in $b_j$.  Another 0.4\% of the resolutions are ($iii$) just the tokens in $o_j$. In addition, 23\% of the resolutions are the result of concatenating ($iv$) $a_j$ and $b_j$ or ($v$) $b_j$ and $a_j$.  Finally, 1.8\% comprise another four variants, obtained by taking $i$, $ii$, $iv$ and $v$ above and removing the tokens that also occur in the base, $o_j$. In total, this provides \textit{nine} primitive merge resolution patterns (see online Appendix~\cite{FSE22Appendix} for more details about the primitive merge patterns). 
+
+We, therefore, treat the problem of constructing merge conflict resolutions $m_j$ as a classification task to predict between these possibilities. It is important to note that although we are predicting simple resolution strategies at the token-level, they may translate to complex resolutions at the line-level. In addition, not all conflicts are resolved by breaking that conflict into tokens and applying these patterns---some resolutions such as those introducing new tokens or reordering tokens are not expressible as a choice at the token-level.  
+
+% Removing for now...
+%One of the practical advantages of formulating merge conflict resolution as a classification task is a significant reduction in total FLOPS \Shuvendu{describe} required to decode a resolution region, as compared to generative models, making this approach an appealing candidate for deployment in IDEs (see section~\ref{sec:inference}). \sarah{appendix}
+
+
+% Overview of basic mergeBERT
+\section{\thistool{}: Neural Program Merge Framework}
+\label{sec:main_model}
+
+\thistool{} is a textual program merge model based on the bidirectional transformer encoder (BERT) model~\cite{bert}.
+We refer the reader to CodeBERT~\cite{feng-etal-2020-codebert} for a discussion on applying transformers to code. A transformer, like
+a recurrent neural network, maps a sequence of text into a high
+dimensional representation, which can later be decoded to solve
+downstream tasks. While not originally designed for code, transformers have found many applications in software engineering~\cite{clement2020pymt5,kanade2020learning,svyatkovskiy2020intellicode}
+
+\thistool{} approaches merge conflict resolution as a sequence classification task given conflicting regions extracted with token-level differencing and surrounding code as context. 
+%By focusing on token-level merge conflicts, we are able to resolve real-world merges. 
+The key technical innovation in \thistool{} lies in how it breaks program text into an input representation amenable to learning with a transformer encoder and how it aggregates various input encodings for classification. 
+
+In the standard sequence learning setting there is a single input and single output sequence. In the merge conflict resolution task, there are multiple conflicting input programs and one resolution. To facilitate learning in this setting, we construct \thistool{} as a multi-input encoder neural network, which first encodes token sequences of conflicting programs, then aggregates them into a single hidden summarization state. 
+
+An overview of the \thistool{} model architecture is shown in Fig.~\ref{fig:mergebert}. Given conflicting programs $\mathcal{A}$, $\mathcal{B}$ and $\mathcal{O}$ we first perform tokenization and then repeat the three-way differencing at token granularity. If a conflict still exists in this token-level three-way differencing, we collect the token sequences corresponding to conflicting regions $a$, $b$, and $o$, and compute pair-wise alignments of $a$ and $b$ with respect to the base $o$. Finally, for each pair of aligned token sequences we extract an ``edit sequence'' that represents how to turn the second sequence into the first. The resulting aligned token sequences are fed to the multi-input encoder neural network, while the corresponding edit sequences are consumed as type embeddings. Finally, the encoded token sequences are summarized into a hidden state which serves as input to the classification layer. 
+
+Given a 4-tuple of programs $(\mathcal{A}, \mathcal{B}, \mathcal{O}, \mathcal{M})$ which contains token-level merge tuples $(a_{j}, b_{j}, o_{j}, m_{j})$, j=0...N, \thistool{} models the following conditional probability distribution:
+\begin{equation}
+    p(m_{j} | a_{j}, b_{j}, o_{j}),
+\end{equation}
+and consequently, for entire programs:
+\begin{equation}
+    p(\mathcal{M} | \mathcal{A}, \mathcal{B}, \mathcal{O}) = \prod_{j=1}^{N} p(m_{j} | a_{j}, b_{j}, o_{j})
+\end{equation}
+Independence of token-level conflicts is a simplifying assumption. However, we observe that in our data set only 5\% of merge conflicts result in more than 1 token-level conflict per line-level conflict. 
+
+
+
+
+\subsection{Context Encoding}
+
+For a merge tuple $(a, b, o, m)$ \thistool{} calculates two pair-wise alignments between the sequences of tokens of conflicting regions $a$ (respectively $b$) with respect to that of the original program $o$: $a|_o$, $o|_a$, $b|_o$, and $o|_b$. For each pair of aligned token sequences we compute an edit sequence. These edit sequences -- $\Delta_{ao}$ and $\Delta_{bo}$ -- are comprised of the following editing actions (kinds of edits): $\textbf{=}$ represents equivalent tokens, $\textbf{+}$ represents insertions, $\textbf{-}$ represents deletions,
+$\boldsymbol{\leftrightarrow}$ represents a replacement, and
+$\boldsymbol{\emptyset}$ is used as a padding token. Overall, this produces four token sequences and two edit sequences: ($a|_{o}$,
+$o|_{a}$, and $\Delta_{ao}$) and ($b|_{o}$, $o|_{b}$, and $\Delta_{bo}$). Fig.~\ref{fig:embedding} provides an example of an edit sequence. Each token sequence covers the corresponding conflicting region and, potentially, surrounding code tokens. We make use of Byte-Pair Encoding (BPE) unsupervised tokenization to avoid a blowup in the vocabulary size given the sparse nature of code identifiers~\cite{10.1145/3377811.3380342}.
+To help the model learn to recognize editing steps we introduce an edit type embedding. We combine it with the standard token and position embeddings utilized in BERT model architecture via addition. 
+%: $\mathcal{S} = \mathcal{S_{T}} + \mathcal{S_{P}} +\mathcal{S_{E}}$. 
+%\alexey{Chris: I agree with the comment. We can comment out the formula since it is not used anywhere else. Or we can add one more layer of details: to explain how embeddings work in general. Since we use standard implementation here, I think it is not necessary.}
+%\chris{@Alexey, this last paragraph probably needs a bit more explanation.  $\mathcal{S}$ is never defined and never appears anywhere else in the paper.  We should explain where it fits in fig 2 and how it connects to the rest of the model.  How do we arrive at the position and edit type embeddings?}
+\begin{figure}
+\begin{center}
+    \includegraphics[width=.48\textwidth]{images/Embedding.pdf}
+\caption{An example edit sequence extracted between a pair of token sequences.  Top row is $o|_b$, bottom is $b|_o$, and middle is $\Delta_{bo}$. Padding symbols \texttt{[PAD]} are introduced for alignment. In this case, the target token sequence is obtained by swapping a token and inserting two tokens.}
+\label{fig:embedding}
+\end{center}
+\vspace{-12pt}
+\end{figure}
+
+
+\subsection{Merge Tuple Aggregation}
+%\label{sec:mergesumm}
+
+We utilize transformer encoder model $\mathcal{E}$ to independently encode each of the four token sequences of token-level conflicting regions $a|_{o}$, $o|_{a}$, $b|_{o}$, and $o|_{b}$, passing corresponding edit sequences $\Delta_{ao}$ and $\Delta_{bo}$ as type embeddings. Finally, \thistool{} aggregates the resulting encodings into a single hidden summarization state $h$:
+\begin{dmath}
+h = \sum_{x \in (a|_{o}, o|_{a}, b|_{o}, o|_{b})} \theta_{x} \cdot \mathcal{E} (x, \Delta_x)
+\end{dmath}
+where $\mathcal{E} (x, \Delta_x)$ are the encoded tensors for each of the sequences $x \in (a|_{o}, o|_{a}, b|_{o}, o|_{b})$, and $\theta_{x}$ are learnable weights. After aggregation a linear classification layer with \texttt{softmax} is applied:
+\begin{equation}
+      p(m_{j} | a_{j}, b_{j}, o_{j}) = \mathrm{softmax}(W\cdot h + b)
+\end{equation}
+
+The resulting line-level resolution region is obtained by concatenating the prefix, predicted token-level resolution $m_{j}$, and the suffix. Finally, in the case of a one-to-many correspondence between the original line-level and the token-level conflicts (see Appendix for more details and a pseudocode), \thistool{} uses a standard beam-search to decode the most promising predictions. 
+
+%\subsection{Model Training}
+
+%We exploit the traditional two-step pretraining and finetuning training procedure. First, we pretrain a transformer encoder $\mathcal{E}$ on a multilingual source code corpus with unsupervised masked language modeling (MLM) pretraining objective. 
+%We transfer the weights of the pretrained transformer encoder~\cite{feng-etal-2020-codebert} into the \thistool{} multi-input neural network, and attach a randomly initialized linear layer with softmax. We then finetune the resulting neural network in a supervised setting for the sequence classification task. 
+%See section~\ref{sec:implement} in the Appendix for more details about the implementation. 
+
+
+\subsection{Implementation Details}
+\label{sec:implement}
+
+We utilize a pretrained CodeBERT\footnote{\url{https://huggingface.co/huggingface/CodeBERTa-small-v1}} model with 6 encoder layers, 12 attention heads, and a hidden state size of 768. The vocabulary is constructed using byte-pair encoding \citep{sennrich2015neural} and the vocabulary size is 50000. We transfer the weights of the pretrained transformer encoder into the \thistool{} multi-input neural network, and attach a randomly initialized linear layer with softmax. We then finetune the resulting neural network in a supervised setting for the sequence classification task. Input sequences for finetuning training cover conflicting regions and surrounding code (i.e., fragments of prefix and suffix of a conflicting region) up to a maximum length of 512 BPE tokens. The backbone of our implementation is HuggingFace's~\footnote{\url{https://github.com/huggingface/transformers}} \texttt{RobertaModel} and \\
+\texttt{RobertaForSequenceClassification} classes in PyTorch, which are modified to turn the model into a multi-input architecture shown in Fig.~\ref{fig:mergebert}. 
+We finetune \thistool{} with Adam stochastic optimizer with weight decay fix using a
+learning rate of 5e-5, 512 batch size and 8 backward passes per \texttt{allreduce}. 
+The finetuning training was performed on 4 NVIDIA Tesla V100 GPUs with 16GB memory for 6 hours. 
+
+In the inference phase, the model prediction for each line-level conflict consists of one or more token-level predictions. Given the token-level predictions and the contents of the merged file, \thistool{} generates the code corresponding to the resolution region. The contents of the merged file include the conflict in question and its surrounding regions. Afterward, \thistool{} checks the syntax of the generated code with a tree-sitter\footnote{\url{https://tree-sitter.github.io/tree-sitter}} parser and outputs it as the candidate merge conflict resolution only if it is syntactically correct.

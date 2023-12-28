@@ -1,0 +1,357 @@
+\section{Zero-Cost Transition Conditions}
+\label{sec:formal-conditions}
+
+\begin{figure}[t]
+  \begin{small}
+  \begingroup
+  \setlength{\tabcolsep}{1mm}
+  \setlength{\arraycolsep}{1mm}
+  \begin{tabular}{>{$}r<{$} >{$}c<{$} >{$}r<{$} >{$}c<{$} >{$}l<{$}}
+    \vals & \ni & \oc{v} & \bnfdef & \val{n}{p}
+    \\
+
+    \frames & \ni & \oc{\SF} & \bnfdef &
+        \{
+        \mathit{base} \bnftypes \nats;
+        \mathit{ret\mbox{-}addr\mbox{-}loc} \bnftypes \nats;
+        \mathit{csr\mbox{-}vals} \bnftypes \powerset{\regs \times \nats} \}
+    \\
+
+    \functions & \ni & \oc{F} & \bnfdef &
+        \{
+        \mathit{instrs} \bnftypes \nats \rightharpoonup \commands;
+        \mathit{entry} \bnftypes \nats;
+        \mathit{type} \bnftypes \nats \}
+    \\
+
+    \ostates & \ni & \oc{\Phi} & \bnfdef & \oerror \bnfalt
+        \{
+        \Psi \bnftypes \states;
+        \mathit{funcs} \bnftypes \nats \rightharpoonup \functions;
+        \mathit{stack} \bnftypes [\frames] \}
+  \end{tabular}
+  \endgroup
+  \end{small}
+  \caption{\olangname{} Extended Syntax}
+  \label{fig:overlay:syntax}
+\end{figure}
+
+Having laid out the security properties required of an SFI transition
+system, we turn to formally defining the set of zero-cost conditions on sandboxed
+code such that they sufficiently capture when we may securely elide springboards
+or trampolines.
+%
+To this end we define our zero-cost conditions as a safety monitor via the
+language \olangname{} overlaid on top of \langname{}.
+%
+\olangname{} extends \langname{} with additional structure and dynamic type
+checks that ensure the invariants needed for zero-cost transitions are
+maintained upon returning from library functions, providing both an inductive
+structure for proofs of security for zero-cost implementations and providing a
+top-level guarantee that our integrity and confidentiality properties are
+maintained.
+%
+In \sectionref{sec:overlay:secure} we outline the proofs of overlay soundness,
+showing that \olangname{} captures when a system is zero-cost secure.
+
+\para{Syntax of \olangname{}}
+%
+\figref{fig:overlay:syntax} shows the extended syntax of \olangname{}.
+%
+Values ($\oc{v}$) are extended with a security label $p$.
+%
+Overlay state, written $\oc{\Phi}$, wraps the state of \langname{}, extending it
+with two extra pieces of data.
+%
+First, \olangname{} requires the sandboxed code be organized into functions
+($\oc{\Phi}.\mathit{funcs}$).
+%
+$\oc{\Phi}.\mathit{funcs}$ maps each command in the sandboxed library to its
+parent function.
+%
+Functions ($\oc{F}$) also store the code indices of their commands as the field
+$\oc{F}.\mathit{instrs}$, store the entry point ($\oc{F}.\mathit{entry}$),
+and track the number of arguments the function expects ($\oc{F}.\mathit{type}$).
+%
+This partitioning of sandboxed code into functions is static.
+%
+Second, the overlay state dynamically tracks a list of overlay stack frames
+($\oc{\Phi}.\mathit{stack}$).
+%
+These stack frames ($\oc{\SF}$) are solely logical and inaccessible to instructions.
+%
+They instead serve as bookkeeping to implement the dynamic type checks of
+\olangname{} by tracking the base address of each stack frame
+($\oc{\SF}.\mathit{base}$), the stack location of the return address
+($\oc{\SF}.\mathit{ret\mbox{-}addr}$), and the values of the callee
+save registers upon entry to the function ($\oc{\SF}.\mathit{csr\mbox{-}vals}$).
+%
+We are concerned with the behavior of the untrusted library, so the logical
+stack does not finely track application stack frames, but keeps a single large
+``stack frame'' for all nested application stack frames.
+
+When code fails the overlay's dynamic checks it will result in the state
+$\oerror$.
+%
+Our definition of monitor safety, which will ensure that zero-cost transitions
+are secure, is then simply that a program does not step to an $\oerror$.
+
+\subsection{Overlay monitor} \label{subsec:overlay-monitor-def}
+
+\begin{figure}[t]
+  \begin{small}
+  \begin{mathpar}
+    \inferrule[\defredOcall]
+    {
+      \val{n}{\untrusted} = \oimmval{\oc{\Phi}}{e}
+      \\ n' = k(n)
+      \\ sp' = \oc{\Phi}.sp + 1
+      \\\\ M' = \oc{\Phi}.M[sp' \mapsto \oc{\Phi}.pc + 1]
+      \\ \mathit{stack}' = [\oc{\SF}] \concat \oc{\Phi}.\mathit{stack}
+      \\ \oc{\SF} = \oname{new-frame}(\oc{\Phi}, n', sp')
+      \\ \oname{typechecks}(\oc{\Phi}, n', sp')
+      \\ \oc{\Phi'} = \oc{\Phi}[\mathit{stack} \assign \mathit{stack}', pc \assign n', sp \assign sp', M \assign M']
+    }
+    {\currentcom{\oc{\Phi}}{\ccall{k}{e}}{\untrusted} \ostep \oc{\Phi'}}
+
+    \inferrule[\defredOret]
+    {
+      \oname{is-ret-addr}(\oc{\Phi}, \oc{\Phi}.sp)
+      \\ \natval{n} = \oc{\Phi}.M(\oc{\Phi}.sp)
+      \\ n' = k(n)
+      \\\\ \oname{csr-restored}(\oc{\Phi})
+      \\ \oc{\Phi'} = \oname{pop-frame}(\oc{\Phi})
+    }
+    {\currentcom{\oc{\Phi}}{\cret{k}}{\untrusted} \ostep \oc{\Phi'}[pc \assign n', sp \assign \oc{\Phi}.sp - 1]}
+
+    \inferrule[\defredOjmp]
+    {
+      \val{n}{\untrusted} = \oimmval{\oc{\Phi}}{e}
+      \\ n' = k(n)
+      \\\\ \oname{in-same-func}(\oc{\Phi}, \oc{\Phi}.pc, n')
+    }
+    {\currentcom{\oc{\Phi}}{\cjmp{k}{e}}{\untrusted} \ostep \oc{\Phi}[pc \assign n']}
+
+    \inferrule[\defredOstore]
+    {
+      \val{n}{\untrusted} = \oimmval{\oc{\Phi}}{e}
+      \\ \oc{v} = \val{\_}{p_{e'}} = \oimmval{\oc{\Phi}}{e'}
+      \\ M' = \oc{\Phi}.M[n' \mapsto \oc{v}]
+      \\\\ \oname{writeable}(\oc{\Phi}, n')
+      \\ n' = k(n)
+      \\ p_{e'} = \trusted \Longrightarrow n' \notin H_{\untrusted}
+    }
+    {\currentcom{\oc{\Phi}}{\cstore{k}{e}{e'}}{\untrusted} \ostep \pcinc{\oc{\Phi}}[M \assign M']}
+  \end{mathpar}
+  \end{small}
+  \caption{\olangname Operational Semantics Excerpt}
+  \label{fig:overlay:operational-excerpt}
+\end{figure}
+
+\begin{figure}[t]
+  \begin{small}
+  \begin{mathpar}
+    \inferrule
+    {
+      \oc{F} = \oc{\Phi}.\mathit{funcs}(\mathit{target})
+      \\ \oc{F}.\mathit{entry} = \mathit{target}
+      \\ sp \in S_p
+      \\\\ [\oc{\SF}] \concat \_ = \oc{\Phi}.\mathit{stack}
+      \\ sp \geq \oc{\SF}.\mathit{ret\mbox{-}addr} + \oc{F}.\mathit{type}
+    }
+    {\oname{typechecks}(\oc{\Phi}, \mathit{target}, sp)}
+
+    \inferrule
+    {
+      [\oc{\SF}] \concat \_ = \oc{\Phi}.\mathit{stack}
+      \\\\ \mathit{ret\mbox{-}addr} = \oc{\SF}.\mathit{ret\mbox{-}addr}
+    }
+    {\oname{is-ret-addr}(\oc{\Phi}, \mathit{ret\mbox{-}addr})}
+
+    \inferrule
+    {
+      \oc{F} \in \cod{\oc{\Phi}.\mathit{funcs}}
+      \\\\ n, n' \in \oc{F}.\mathit{instrs}
+    }
+    {\oname{in-same-func}(\oc{\Phi}, n, n')}
+
+    \inferrule
+    {
+      [\oc{\SF}] \concat \_ = \oc{\Phi}.\mathit{stack}
+      \\\\ \forall (r, n) \in \oc{\SF}.\mathit{csr\mbox{-}vals}.~ \oc{\Phi}.R(r) = n
+    }
+    {\oname{csr-restored}(\oc{\Phi})}
+
+    \inferrule
+    {
+      [\oc{\SF}] \concat \_ = \oc{\Phi}.\mathit{stack}
+      \\\\ n \in S_p \Longrightarrow
+      n \geq \oc{\SF}.\mathit{base} \wedge n \neq \oc{\SF}.\mathit{ret\mbox{-}addr}
+    }
+    {\oname{writeable}(\oc{\Phi}, n)}
+  \end{mathpar}
+  \end{small}
+  \caption{\olangname Semantics Auxiliary Predicates}
+  \label{fig:overlay:aux-preds}
+\end{figure}
+
+\olangname{} enforces our zero-cost conditions by extending the operational
+semantics of \langname{} with additional checks in the overlay's small
+step operational semantics, written $\oc{\Phi} \ostep \oc{\Phi'}$.
+%
+Each of these steps is a refinement of the underlying \langname{} step, that is
+$\oc{\Phi}.\Psi \step \oc{\Phi'}.\Psi$ whenever $\oc{\Phi'}$ is not $\oerror$.
+%
+\figref{fig:overlay:operational-excerpt} (with auxiliary definitions shown in
+\figref{fig:overlay:aux-preds}) shows an excerpt of the checks, which we
+describe below.
+%
+Full definitions can be found in \iftechreport{\appref{appendix:overlay}}{the
+technical appendix~\cite{kolosick2021isolation}}.
+%
+The checks are similar in nature to the defensive semantics of \citet{sfi-as-ai}
+though they account for confidentiality and define a more flexible notion of
+protecting stack frames.
+
+\para{Call}
+%
+In the overlay, the reduction rule for library $\mathtt{call}$ instructions
+(\explainredOcall{}) checks type-safe execution with $\oname{typechecks}$, a
+predicate over the state ($\oc{\Phi}$), call target ($\mathit{target}$), and
+stack pointer ($sp$) that checks that
+\begin{enumerate*}
+\item the address we are jumping to is the entry instruction of one of the
+functions,
+
+\item the stack pointer remains within the stack ($sp \in S_p$), and
+
+\item the number of arguments expected by the callee have been pushed
+to the stack.
+\end{enumerate*}
+%
+On top of this, $\mathtt{call}$ also creates a new logical stack frame
+recording the base of the new frame, location of the return address, and the
+current callee-save register values, pushing the new frame onto the overlay
+stack.
+%
+To ensure IFC, we require that $i$ has the label $\untrusted$ to ensure that
+control flow is not influenced by confidential values; a similar check is done
+when jumping within library code, obviating the need for a program counter
+label.
+%
+Further, because the overlay captures zero-cost transitions, $\mathtt{gatecall}$
+behaves in the exact same way except for an additional IFC check that the
+arguments are not influenced by confidential values.
+
+\para{Jmp}
+%
+Our zero-cost conditions rely on preventing invariants internal to a function
+from being interfered with by other functions.
+%
+A key protection enabling this is illustrated by the reduction
+for $\mathtt{jmp}$ (\explainredOjmp), which enforces that the
+only inter-function control flow is via $\mathtt{call}$
+and $\mathtt{ret}$: the $\oname{in-same-func}$ predicate
+checks that the current ($n$) and target ($n'$)
+instructions are within the same overlay function.
+%
+The same check is added to the program counter increment operation,
+$\pcinc{\oc{\Phi}}$.
+%
+These checks ensure that the logical call stack corresponds to the actual
+control flow of the program, enabling the overlay stack's use in maintaining
+invariants at the level of function calls.
+
+\para{Store}
+%
+The reduction rule for $\mathtt{store}$ (\explainredOstore) demonstrates the
+other key protection enabling function local reasoning, with the check that the
+address ($n$) is $\oname{writeable}$ given the current state of the overlay stack.
+%
+The predicate $\oname{writeable}$ guarantees that, if the operation is writing
+to the stack, then that write must be within the current frame and cannot be the
+location of the stored return address.
+%
+This allows reasoning to be localized to each function: they do not need to
+worry about their callees tampering with their local variables.
+%
+Protecting the stored return address is crucial for ensuring well-bracketing,
+which guarantees that each function returns to its caller.
+
+To guarantee IFC, \redOstore{} first requires that the pointer have the label
+$\untrusted$, ensuring that the location we write to is not based on confidential
+data.
+%
+Second, the check $p_{i'} = \trusted \Longrightarrow n' \notin H_{\untrusted}$
+enforces that confidential values cannot be written to the library heap.
+%
+Similar checks, based on standard IFC techniques, are implemented for all other
+instructions.
+
+\para{Ret}
+%
+With control flow checks and memory write checks in place, we guarantee that,
+when we reach a $\mathtt{ret}$ instruction, the logical call frame will
+correspond to the ``actual'' call frame.
+%
+$\mathtt{ret}$ is then responsible for guaranteeing well-bracketing and ensuring
+callee-save registers are restored.
+%
+This is handled by two extra conditions on $\mathtt{ret}$ instructions:
+$\oname{is-ret-addr}$ and $\oname{csr-restored}$.
+%
+$\oname{csr-restored}$ checks that callee-save registers have been
+properly restored by comparing against the values that were saved in the
+logical stack frame by $\mathtt{call}$.
+%
+$\oname{is-ret-addr}$ checks that the value pointed to by the stack pointer
+($\mathit{ret\mbox{-}addr}$) corresponds to the location of the return address
+saved in the logical stack frame.
+%
+Memory writes were checked to enforce that the return address cannot be
+overwritten, so this guarantees the function will return to the expected program
+location.
+
+\subsection{Overlay Semantics Enforce Security}
+\label{sec:overlay:secure}
+
+The goal of the overlay semantics and our zero-cost conditions is to capture the
+essential behavior necessary to ensure that individual, well-behaved library
+functions can be composed together into a sandboxed library call that enforces
+SFI integrity and confidentiality properties.
+%
+Thus, library code that is well-behaved under the dynamic overlay type system
+will behave equivalently to library code with springboard and trampoline
+wrappers, and therefore well-behaved library code can safely elide those
+wrappers and their overhead.
+%
+We prove that the overlay semantics is sound with respect to each of our
+security properties:
+%
+\begin{theorem}[Overlay Integrity Soundness] \label{thm:overlay-integrity-soundness}
+  If $\oc{\Phi_0} \in \programs$, $\oc{\Phi_0} \ostepn{n} \oc{\Phi_1}$,
+  $\currentcom{\oc{\Phi_1}}{\_}{\trusted}$, and
+  $\oc{\Phi_1} \ostepstar \oc{\Phi_2}$ such that $\oc{\Phi_1}.\Psi \stepwb
+  \oc{\Phi_2}.\Psi$ with $\pi = \oc{\Phi_0}.\Psi \stepn{n} \oc{\Phi_1}.\Psi$, then
+  \begin{enumerate*}
+  \item $\mathcal{CSR}(\pi, \oc{\Phi_1}.\Psi, \oc{\Phi_2}.\Psi)$ and
+  \item $\mathcal{RA}(\pi, \oc{\Phi_1}.\Psi, \oc{\Phi_2}.\Psi)$.
+  \end{enumerate*}
+\end{theorem}
+
+\begin{theorem}[Overlay Confidentiality Soundness] \label{thm:overlay-confidentiality-soundness}
+  If $\oc{\Phi_0} \in \programs$, $\currentcom{\oc{\Phi_1}}{\_}{\untrusted}$,
+  $\currentcom{\oc{\Phi_3}}{\_}{\trusted}$, $\oc{\Phi_0}.\Psi \stepstar
+  \oc{\Phi_1}.\Psi \steplown{n} \oc{\Phi_2}.\Psi \step \oc{\Phi_3}.\Psi$,
+  $\oc{\Phi_1} \ostepn{n + 1} \oc{\Phi_3}$, and $\oc{\Phi_1} =_{\untrusted}
+  \oc{\Phi_1'}$,
+  %
+  then $\oc{\Phi_1'}.\Psi \steplown{n} \oc{\Phi_2'}.\Psi \step \oc{\Phi_3'}.\Psi$,
+  $\oc{\Phi_1'} \ostepn{n + 1} \oc{\Phi_3'}$
+  $\currentcom{\oc{\Phi_3'}}{\_}{\trusted}$, $\oc{\Phi_3}.pc = \oc{\Phi_3'}.pc$,
+  and
+  \begin{enumerate*}
+  \item $\currentop{\oc{\Phi_2}}{\cgatecall{n'}{e}}$, $\currentop{\oc{\Phi_2'}}{\cgatecall{n'}{e}}$, and $\oc{\Phi_3} =_{\mathtt{call}\ n'} \oc{\Phi_3'}$ or
+  \item $\currentop{\oc{\Phi_2}}{\cgateret}$, $\currentop{\oc{\Phi_2'}}{\cgateret}$, and $\oc{\Phi_3} =_{\mathtt{ret}} \oc{\Phi_3'}$.
+  \end{enumerate*}
+\end{theorem}

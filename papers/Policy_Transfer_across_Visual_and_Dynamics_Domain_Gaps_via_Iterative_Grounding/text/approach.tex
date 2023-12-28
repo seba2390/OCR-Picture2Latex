@@ -1,0 +1,138 @@
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/training3.pdf}
+    \caption{
+        Our approach, IDAPT, alternates between two stages: (1)~source environment grounding and (2)~policy training. We ground the source environment in the target environment by learning visual (purple) and action (yellow) transformations. During the grounding stage, we first train the visual transformation on unpaired images, and then train the action transformation.  During policy training, we fix the grounded environment and optimize the policy using RL.
+    }
+    \label{fig:training}
+\end{figure*}
+
+
+\section{Approach}
+
+In this paper, we aim to address the problem of transferring a policy from a well-instrumented and controlled environment to a target environment with minimal task information (i.e. no reward and state information). However, in many robotics setups, policies trained in the source environment struggle at performing the learned task in the target environment due to the visual and dynamics differences. To overcome such domain gaps, we introduce IDAPT, a novel policy transfer method with iterative environment grounding. The key goal is to learn a grounded source environment that mimics the target domains so that a policy trained in this grounded environment can then directly be executed in the target environment.
+
+
+
+\subsection{Problem Formulation}
+\label{sec:problem_formulation}
+
+We consider an RL framework for policy transfer of a task from a source environment $S$ to target environment $T$.  The task is defined by a shared state space $\mathcal{S}$, action space $\mathcal{A}$, and reward function $\mathcal{R}: \mathcal{S} \times \mathcal{A} \rightarrow \mathbb{R}$.  The source and target environments have different visual observation spaces, $\mathcal{O}^S$ and $\mathcal{O}^T$, and transition functions, $\mathcal{T}^S: \mathcal{S} \times \mathcal{A} \rightarrow \mathcal{S}$ and $\mathcal{T}^T: \mathcal{S} \times \mathcal{A} \rightarrow \mathcal{S}$, respectively.  Note that the source environment provides full access to reward $r^S$, visual observation $o^S$, and state $s^S$, while the target environment only provides visual observations $o^T$.  Given a time horizon $H$ and discount factor $\gamma \in [0,1]$, our objective is to learn the optimal visual policy $\pi^*(a_t|o^T_t)$ that maximizes the expected return in the target environment:  
+\begin{equation}
+    \label{eqn:target_J}
+    J(\pi) = \mathbb{E}_{\tau \sim p(\tau|\pi,\mathcal{T}^T )} \left [\sum_{t=0}^H \gamma^t r_t \right ].
+\end{equation}
+Due to the differences in observations and transition functions, this is not equivalent to maximizing the expected return in the source environment and results in different optimal policies.
+
+In addition, we assume access to task-agnostic datasets of unpaired visual observations in both domains, $\mathcal{D}_o^S = \{(o_t^S, s_t^S), (o_{t+1}^S, s_{t+1}^S), \cdots \}$ and $\mathcal{D}_o^T = \{o_t^T, o_{t+1}^T, \cdots \}$. These task-agnostic datasets do not need to align with the current task, and therefore they can be collected via autonomous exploration, hand-specified calibration sequences, or policies trained for other tasks.  However, we assume the datasets share similar underlying state distributions, \ie they are collected by similar policies.
+
+
+
+\subsection{Iterative Domain Alignment for Policy Transfer}
+\label{sec:iterative_domain_alignment}
+To overcome domain gaps for policy transfer, IDAPT iterates between (1) source environment grounding; and (2) policy training, as illustrated in \myfigref{fig:training}:
+\begin{itemize}
+    \item \textbf{Source environment grounding}: we learn a \textit{visual transformation} and \textit{action transformation} that compensate for the visual and dynamics domain gaps between the two environments from unpaired trajectories.
+    \item \textbf{Policy training}: the grounded environment acts as a proxy for the target environment, providing interactions with reward to train a policy.
+\end{itemize}
+
+We first initialize the grounded environment by training the visual transformation on the unpaired, task-agnostic dataset of images and initializing the action transformation as the identity function. From the following grounding step, we collect task-relevant trajectories using the learned policy to improve both transformations. For every environment grounding iteration, we further train our policy in the improved grounded environment.
+Since we do not have access to paired data or expert task data, the transformations for grounding are trained with the unpaired, sub-optimal data. However, as the learned policy generates still sub-optimal but more task-relevant data, the visual and dynamics transformations become more accurate around the task-relevant state and action spaces. The improved grounding improves policy transfer as the domain gaps between the grounded environment and the target environment shrink. Therefore, we iterate over these two stages to gradually improve the alignment between the grounded and target environments and the performance of the policy. The entire training procedure is outlined in \myalgref{alg:method}.
+
+
+\subsection{Learning Grounded Environment}
+\label{sec:grounded_environment}
+
+The goal of this step is to ground the source environment \textit{both visually and physically} using unpaired source and target environment trajectories. 
+As the grounded environment is closer to the target environment, the policy trained in the grounded environment transfers better than one trained in the original source environment.
+
+As illustrated in \myfigref{fig:training} (right), our grounded source environment is composed of three components: the source environment $S$, visual transformation $G: \mathcal{O}^S \rightarrow \mathcal{O}^T$, and action transformation $F: \mathcal{O}^T \times \mathcal{A} \rightarrow \mathcal{A}$. 
+With these transformations, we ground the source environment by:
+\begin{enumerate}[label=(\arabic*)]
+\item Translating the source observation to the target domain, $\hat{o}_t^T = G(o_t^S)$.
+\item Translating the target action to the source action to compensate dynamics mismatches, $\hat{a}_t^S = F(\hat{o}_t^T, a_t^T)$.
+\item Rolling out the source environment, $o_{t+1}^S = \mathcal{T}^S(o_t^S, \hat{a}_t^S)$. 
+\item Translating the next source observation to the target domain, $\hat{o}_{t+1}^T = G(o_{t+1}^S)$. 
+\end{enumerate}
+Through this process, the grounded environment can simulate the target environment by taking $a_t^T$ and providing $\hat{o}_{t+1}^T$. In addition, this grounded environment can provide the task reward $\hat{r}_t^T = r_t^S$, which is not available in the target environment.
+
+To achieve a transferable policy, it is crucial for the grounded environment to simulate the target environment as closely as possible. In the rest of this section, we explain how to efficiently learn accurate grounding by learning a visual transformation and action transformation from limited target environment data.  For each grounding step, we train the transformations with 1k target environment samples.
+
+
+\subsubsection{\textbf{Learning Visual Transformation}} 
+\label{sec:visual_transformation}
+
+To transfer a visual policy, the visual domains during training and deployment should be similar. To match the domains, we ground the source environment to be visually similar to the target environment by learning a source-to-target visual transformation $G$. 
+
+The visual transformation is first initialized using the task-agnostic datasets $\{\mathcal{D}_o^S, \mathcal{D}_o^T\}$, and then we iteratively improve it with online datasets $\{\mathcal{D}^S_{online}, \mathcal{D}^T_{online}\}$ collected using the current policy.  This serves to improve the transformation in the task-relevant observation spaces which may not be well represented in the initial task-agnostic datasets.
+
+We train our visual transformation using an unsupervised image-to-image translation method, CycleGAN~\citep{zhu2017unpaired}, which optimizes the cycle-consistency loss between two domains. However, due to the lack of paired images, the resulting visual transformation can map semantically incorrect images, \eg change the arrangements of objects in the scene.
+To ensure the state information is preserved across domains (i.e. the domains are semantically aligned), we propose a \textit{state reconstruction regularization}, which encourages the source state and the predicted state from the translated observation to be the same. Note that the state reconstruction can be replaced with any form of self-supervision, such as a robot state or reward.
+
+Since the target environment does not provide the state information, we cannot directly train a target state predictor. Instead, we first train a source state predictor $s = P^{S}(o^{S})$ using the source domain dataset $\mathcal{D}_o^S$ with state labels, and generate pseudo-labeled target domain dataset $\{(G(o^S), s)|(o^S, s) \in \mathcal{D}_o^S \}$ to train the target state predictor $s = P^{T}(o^{T})$. Using this target state predictor, we can compute the state reconstruction regularization loss $\lVert P^{T}(G(o^{S})) - s \rVert_1$. We can jointly train the visual transformation and target state predictor by optimizing the CycleGAN objective with state reconstruction regularization:
+\begin{equation}
+\begin{aligned}
+    \label{eqn:visual_loss}
+    \mathcal{L}_{visual} &= \mathcal{L}_{CycleGAN}(o^{S}, o^{T}) + \lambda \lVert P^{T}(G(o^{S})) - s \rVert_1,
+\end{aligned}
+\end{equation}
+where $\lambda$ is a weighting factor for the regularization. For correct visual alignment, we encourage the state predictors to extract the shared state information: we initialize the target state predictor with the weights of the source state predictor and finetune only the top layer (\texttt{conv1}) in the target domain~\citep{aytar2017crossmodal, jeong2020selfsupervised}, as illustrated in \myfigref{fig:visual_transformation}.  During subsequent iterations, we follow the same procedure of first training $P^{S}$ and copying its weights to $P^{T}$, then jointly training the rest of the model to finetune to task-relevant data.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/visual_transformation.pdf}
+    \caption{
+        To train the visual transformation, we first train the source state predictor (left bottom) with image-state pairs from the source environment, and copy its weights to the target state predictor. Then, we train image translation models (purple) and the first layer (\texttt{conv1}) of the target state predictor jointly using the CycleGAN loss and state reconstruction regularization.
+    }
+    \label{fig:visual_transformation}
+\end{figure}
+
+
+\subsubsection{\textbf{Learning Action Transformation}}
+\label{sec:action_transformation}
+
+In addition to the visual domain gap, physical differences (e.g. friction, mass, robot calibration) hinder policy transfer to the target domain.  To deal with the discrepancy between the dynamics of the source and target environments, we learn an action transformation~\citep{hanna2017grounded, desai2020stochastic, karnan2020reinforced, desai2020imitation} that compensates for the dynamics mismatch.
+We learn the action transformation $F(a^{S}|o^T,a^{T})$ from a target domain observation-action pair to a source domain action such that the resulting transition in the respective environments is the same.  This grounds the source environment in the target environment's dynamics, and thus a policy trained in the grounded environment can generate the same trajectories in the target environment.  
+
+However, prior grounded action transformation approaches require access to a shared, low-dimensional state space across domains and are not suited for visual observations with domain gaps. Since our goal is to solve more realistic cases where the target environment does not provide access to such information, we extend the grounded action transformation to image observations with visual domain differences.  We use the visual features $f_\pi(o^T)$ generated by the policy network (i.e. output of the convolutional layers of the policy network) as a proxy for the state since the policy extracts low-dimensional representations that contain task-relevant information.  Since $f_\pi$ is trained on the target domain we can directly use it to encode target domain observations into proxy states.  In the source domain, we can use the visual transformation $G$ to obtain the corresponding target domain observation, $f_\pi(G(o^S))$. Hence, we can use $f_\pi$ to generate a shared feature space to act like proxy states for both source and target domain observations.
+
+To efficiently learn an action transformation on our proxy state representation, we use the state-of-the-art grounded action transformation method, GARAT~\citep{desai2020imitation} -- which requires only a few target domain trajectories -- by framing our problem as an adversarial imitation learning from observation problem in the source environment.  Specifically, the action transformation, recast as the agent, transforms actions between domains such that the resulting transitions in the source environment resemble the transitions gathered in the target environment, thereby correcting for any dynamics differences.   
+We implement GARAT using GAIfO~\citep{torabi2018generative} and PPO~\citep{PPO}.
+
+
+\begin{algorithm}[t]
+    \caption{\fullmethod}
+    \label{alg:method}
+    \begin{algorithmic}[1]
+        \STATE \textbf{Input:} Task-agnostic dataset $\{\mathcal{D}_o^S,\mathcal{D}_o^T\}$, number of grounding steps $N$
+        \STATE Randomly initialize policy $\pi$ and visual transformation $G$
+        \STATE Initialize action transformation $F$ as identity function
+        \STATE Pretrain source state predictor $P^S$ on $\mathcal{D}^S_o$
+        \STATE Optimize $G$ with $P^T$ to minimize \myeqref{eqn:visual_loss} on $\{ \mathcal{D}^S_o, \mathcal{D}^T_o \}$
+        \FOR {$i = 1,2,\cdots,N$}
+            \STATE Optimize $\pi$ in grounded environment with RL 
+            \STATE Roll out $\pi$ in target environment to obtain $ \mathcal{D}^T_{online}$
+            \STATE Roll out $\pi$ in grounded environment to obtain $ \mathcal{D}^S_{online}$
+            \STATE Finetune $P^S$, $G$, and $P^T$ on $\{\mathcal{D}^S_{online},\mathcal{D}^T_{online}\}$
+            \STATE Optimize $F$ with GARAT on $\mathcal{D}^T_{online}$
+        \ENDFOR
+        \STATE \textbf{Output:} Policy $\pi$ to deploy in target environment
+    \end{algorithmic}
+\end{algorithm}  
+
+
+\subsection{Policy Training}
+\label{sec:policy_training}
+
+With the grounded environment, a policy $\pi(a^T | o^T)$ can be trained using any RL algorithm as if it were trained on the target environment. The policy learns to maximize the expected return  from the grounded environment:
+\begin{equation}
+    \label{eqn:grounded_J}
+    \hat{J}(\pi) = \mathbb{E}_{\tau \sim p(\tau| F(G, \pi \circ G),\mathcal{T}^S )} \left [\sum_{t=0}^H \gamma^t \hat{r}_t \right ].
+\end{equation}
+In this work, we use Asymmetric SAC~\citep{pinto2017asymmetric} for policy training, a variant of SAC~\citep{haarnoja2018sac} that is efficient for learning an image-based policies by using state-conditioned critics.  
+
+Even though the policy only learns from the grounded source environment interactions, we can directly execute this policy on the target environment as our learned transformations effectively close the domain gaps between the source and target environments. This makes IDAPT well suited for cases where task supervision is not available and data collection is expensive or dangerous in the target environment. Instead, IDAPT efficiently learns the visual transformation and action transformation using a few target domain interactions, and then trains a policy by fully utilizing rich, cheaply obtained data from the well instrumented and controlled source environment.
+
+The initial task-agnostic dataset may not be sufficient to train a grounded environment accurate enough to learn a transferable policy. 
+Hence, we improve the grounded environment using the task-relevant data collected by the updated policy, and then train the policy again using the better grounded environment. We iterate between these two stages to gradually improve the grounded environment and the policy. The entire training procedure is outlined in \myalgref{alg:method}.

@@ -1,0 +1,159 @@
+% !TEX root = ../top.tex
+% !TEX spellcheck = en-US
+
+\section{Approach}
+\label{sec:approach}
+
+Our goal is to estimate the 3D rotation and 3D translation of a known rigid object depicted in an RGB image. To this end, 
+%following the recent trend~\cite{xx,Hu19}\WJ{Hm, "following the trend" doesn't sound like the best motivation, would omit. Better to argue NN yields unparalleled accuracy compared to classical vision approaches?}, 
+we design a deep network that regresses the 2D projections of predefined 3D points. However, rather than regressing the 2D projections at a single, fixed scale, which lacks robustness to large depth variations, we use a Feature Pyramid Network (FPN)~\cite{Lin17e}, perform the regression at multiple scales, and fuse the resulting multiple estimates in a robust pose prediction.
+
+In the following sections, we first present the FPN architecture our network builds on and then introduce a sampling-based training strategy to leverage every pyramid level for each training instance. Finally, we discuss our fusion approach to obtaining a single pose estimate during inference.
+
+\subsection{Pyramid Network Architecture}
+% \WJ{High-level impression: I had to look at the original paper at this point, because the
+% discussion below didn't work for me as a self-contained
+% explanation of FPN. While reading that, I was wondering:
+% are you mainly building on the high-level idea, or is it a faithful reimplementation
+% of the various lateral and top-down connections (which aren't mentioned anywhere). 
+% You may want to add a sentence like "Our FPN architecture is identical to the original paper, except ...."
+% The text discussing backbone network, strides etc., is very technical, and the main question should be: why did you make these modifications?
+% "Objectness indicator", "thin branch layer", etc -- all of these changes raise similar questions that aren't explained.
+% It may be helpful to structure the discussion by adding a figure of classic FPN and the modified architecture (perhaps with new blocks in a different color)?
+% The dimensionality of feature vectors seems like a low level detail (perhaps add a detailed network description in the supplemental?).
+% }
+% \YH{rephrased. We do not invent a network architecture and, basically, use the FPN directly. Our point is how to train it to make it work on 6D object pose, as discussed in the following section. ensemble-aware sampling.}
+
+Most 6D pose estimation deep networks rely on an encoder-decoder architecture. Therefore, to handle large scale variations for 6D object pose estimation, instead of relying on an additional object detection network, we use the inherent hierarchical architecture of the encoder network, which extracts features at different scales. Specifically, we use Darknet-53~\cite{Redmon18} as backbone in our framework and employ the same network architecture as in the FPN~\cite{Lin17e} designed for object detection, which consists of $k=5$ levels of feature maps, $\{{\cal F}_1, {\cal F}_2, {\cal F}_3, {\cal F}_4, {\cal F}_5\}$, each with an increasingly large receptive field. 
+% The spatial width and height of the feature maps is then halved in each subsequent pyramid level. 
+    % Following~\cite{RetinaNet, FCOS, ATSS}, the highest-resolution feature map ${\cal F}_1$ is obtained by using a stride of $8$ on the features from the third block of the backbone \yh{Darknet-53} network~\cite{1}. 
+
+% The feature maps ${\cal F}_1, {\cal F}_2, {\cal F}_3, {\cal F}_4$ and ${\cal F}_5$ thus have strides $8, 16, 32, 64$ and $128$, respectively. \MS{I am not sure to understand this statement and why we need it.}
+
+Instead of computing a single pose estimate from the feature map ${\cal F}_5$ only, we regress the 2D locations of the object 3D keypoints from every level of this pyramid. 
+% \MS{How is this done? The different feature maps have different resolutions, so they cannot be processed by the same decoder. This needs some explanations. Check what I wrote thereafter.} \YH{We add a thin branch layer to each pyramid level of the same decoder to perform the final prediction for each level.} 
+To this end, we rely on the segmentation-driven approach of~\cite{Hu19a}, and make the feature vector at every spatial location in each feature map to output the 2D projections of the 3D keypoints, represented as an offset from the center of the corresponding cell, and an objectness score for each object class. The feature vector at each cell therefore is a $C\times (2\times 8+1)$ dimensional vector consisting of $8$ 2D offsets and an objectness indicator for $C$ object classes. To encode a segmentation mask, all feature cells need to be involved in the objectness prediction, including those that contain no target objects. By contrast, as discussed below, only selected cells are involved in training the pose regressor.
+
+%Most practical networks under the encoder-decoder structure, including most 6D object pose estimation networks~\cite{xx}, have a hierarchical architecture which extracts the features of different scalings level by level~\cite{xx}. 
+%We propose to make use of those multiple feature levels that are already there rather than regressing the pose only on the last feature level which suffers from the scaling problem.
+
+\input{fig/sampling_demo.tex}
+
+\subsection{Ensemble-Aware Sampling}
+\label{sec:ea_sampling}
+
+% In the object detection literature, the standard approach to training an FPN is to assign each training sample to a single feature level according to object size. While this process might be sufficient when using a set of pre-defined anchor boxes for detection, it is sub-optimal in our 6D pose estimation context that does not rely on such anchors, because it does not train each level to provide valid predictions for objects of arbitrary sizes, which can be a problem at test time, where the object scale is unknown.  \MS{Does this sound like a credible explanation?} Fig.~\ref{fig:sampling_demo} illustrates this situation. \PF{It really does not.}
+
+% \yh{
+Large-scale variations impose drastic difficulties on the network for accurate prediction for every scale. The standard approach to training an FPN follows a divide-and-conquer strategy, consisting of dividing the whole training set of instances into several non-overlapping groups according to the object size and then assigning different groups to different pyramid levels during training, as illustrated in Fig.~\ref{fig:sampling_demo}(a). This simple strategy may be sufficient for object detection where one can simply choose level producing the best prediction based on the objectness scores during testing. However, for 6D pose estimation, it prevents one from leveraging the predictions of the multiple levels jointly to improve robustness, because, for a given scale, most levels will yield highly noisy estimates as they weren't trained for objects at that scale.
+%but, prevents possible cooperation between different pyramid levels as the nonoverlapped training strategy, which we will show that is critical for accurate 6D object pose estimation.
+% }\YH{Clearer?}
+
+
+
+To address this issue, we design a sampling strategy that allows every feature vector within the object segmentation mask at each level to participate in the prediction with a certain probability, as in Fig.~\ref{fig:sampling_demo}(b). 
+%
+Let $s_{k}, \text{for } 1\leq k \leq 5$, be a reference object size for level $k$ of the pyramid, chosen based on the object size distribution in the target dataset. For example, in our SwissCube dataset,
+% \WJ{first time that CubeSat is mentioned, perhaps just "dataset"?} \YH{Fixed}
+we take $s_k$  to be $16, 32, 64, 128$, and $256$, respectively. Then, for an object of size ${\cal S}$ taken to be the largest of the width and height of its 2D bounding box, we uniformly randomly sample
+\begin{equation}
+    {\cal N}_k=\alpha \frac{e^{-\lambda \Delta_{k}^{2}}}{\sum^{5}_{j=1}{e^{-\lambda \Delta_{j}^{2}}}}\;
+\label{eq:nk}
+\end{equation}
+feature vectors at level $k$ among those within the object segmentation mask, with 
+%
+\begin{equation}
+    \Delta_k= | \log_{2}\frac{{\cal S}}{s_k} | \; \mbox{ and } \; \alpha=10 \; .
+\label{eq:dk}
+\end{equation}
+The hyper-parameter $\alpha$ specifies the maximum number of active feature vectors on any level, and $\lambda \geq 0$ controls the distribution of the number of active cells across levels. When $\lambda = 0$, all ${\cal N}_k$s are equal, thus using the same number of feature cells at each pyramid level, independently of the object size. By contrast, when $\lambda$ is large, that is, $\lambda > 20$, the sampling strategy degenerates to the ``hard assignment" commonly-used by  FPNs. In Fig.~\ref{fig:typical_k_drawings}, we show how each ${\cal N}_k$ varies as a function of ${\cal S}$ for different $\lambda$ values.  Note that, for a given object size, multiple pyramid levels will be involved in training, thus making them  robust to scale variations.
+
+%and with the corresponding set of feature cells located within segmentation mask on each pyramid level as $C_{k}, 1\leq k \leq 5$, we will choose ${\cal N}_k$ positive feature cells randomly from set $C_k$ for each level $1\leq k \leq 5$. Intuitively, the more similar of the object size ${\cal S}$ as the base interesting size $s_{k}$ of level $k$ the more feature cells should be chosen from, and vice versa. We model it by a normalized function:
+
+%where $\alpha$ and $\lambda$ are adjustable parameters and $\Delta_k$ is the logarithmic scale difference between the current sample and the associated base size of the corresponding pyramid level:
+
+
+%In practice, we often set $\alpha=10$ which is the total number of activated feature cells on all levels. As to $\lambda \geq 0$ which is the parameter controlling the distribution of the number of activated cells across multiple levels.
+%When $\lambda = 0$ all ${\cal N}_k$ will be equal and it will activate the same number of feature cells on each pyramid level. On the other hand, when $\lambda$ is large enough (typically $\lambda \geq 20$) the sampling strategy will degenerate to the simple ``hard'' assignment strategy without any interactions between levels as FPN adopts.
+%We show some typical plottings of each ${\cal N}_k$ versus ${\cal S}$ in Fig.~\ref{fig:typical_k_drawings}. Note how the assignment of positive feature cells becomes ``soft'' across multiple pyramid levels, which lays the foundations for our multi-scale fusion presented in the following sections.
+
+\input{fig/typical_n_drawings.tex}
+\subsection{Loss Function in 3D Space}
+
+As mentioned before, every feature vector selected by our sampling procedure is then used to regress the 2D projections of the 8 corners of the 3D object bounding box. %which are obtained offline from the given 3D meshes, where 2D reprojections are represented by the offsets to the center of the corresponding cell~\cite{Hu19a,1,2}. 
+When regressing 2D locations, most existing methods~\cite{Rad17,Hu19a} seek to directly minimize the error in the image plane, that is, the loss function $\sum_{i=1}^{n}{|{\bf u}_i-\hat{{\bf u}}_i|}$, where ${\bf u}_i$ is the ground-truth 2D projection and $\hat{{\bf u}}_i$ the predicted one. However, as illustrated by Fig.~\ref{fig:cube_problem}, this loss function is suboptimal, particularly in the presence of large depth variations, because it puts more emphasis on some keypoints than on others and also depends on the object's relative position.
+% \WJ{In this section, the frequent use of "keypoint" sounds strange to me. Why not just "point"?}\YH{As points maybe confused with other points on the object surface. We only use the 8 corners of the 3D object bounding box of the object. So we say they are ``key'' points.}
+
+To overcome this, we introduce a loss function in 3D space, which is invariant to the depth of 3D keypoints. Under a perspective camera model, the projection of a 3D object keypoint ${\bf p}_i$ in the image is given by
+%
+\begin{equation}
+    \begin{aligned}
+    \lambda_i
+    \begin{bmatrix}
+    {\bf u}_i \\
+    1 \\
+    \end{bmatrix}
+    =\bK(\bR{\bf p}_i+{\bf t}),
+    \end{aligned}
+    \label{eq:perspective}
+\end{equation}
+%
+where ${\bf u}_i$ is the 2D image location, $\lambda_i$ is a scale factor, $\bK$ is the $3\times 3$ matrix of camera intrinsic parameters, and $\bR$ and ${\bf t}$ are the rotation matrix and translation vector representing the 6D object pose. Then, let
+%
+\begin{align}
+    \hat{{\bf v}}_i & = {\bf K}^{-1}[\hat{u}_i,\hat{v}_i,1]^\top \\
+    {\bf p}_i^c      & = {\bf R}{\bf p}_i+{\bf t}
+\end{align}
+%
+be the 3D camera ray passing through the predicted 2D location $\hat{{\bf u}}_i = [\hat{u}_i, \hat{v}_i]$ and the corresponding 3D keypoint ${\bf p}_i$ expressed in the camera coordinate system, respectively, where ${\bf R}$ and ${\bf t}$ are the ground-truth rotation matrix and translation vector.  We can then map the re-projection error into 3D space by computing
+%
+\begin{equation}
+    \begin{split}
+    {\bf e}_i   & = {\bf p}_i^c - \hat{{\bf V}}_i {\bf p}_i^c \\
+                & = ({\bf I}-\hat{{\bf V}}_i) {\bf p}_i^c\;,
+    \end{split}
+\end{equation}
+%
+where 
+%
+\begin{equation}
+    \hat{{\bf V}}_i = \frac{\hat{{\bf v}}_i\hat{{\bf v}}_i^\top}{\hat{{\bf v}}_i^\top\hat{{\bf v}}_i}
+\end{equation}
+is a matrix projecting a 3D point orthogonally to the camera ray $\hat{{\bf v}}_i$~\cite{Lu00}, as illustrated in Fig.~\ref{fig:cube_problem}.
+Finally, we take our pose regression loss to be
+\begin{equation}
+   {\cal L}_{reg} = \sum_{i=1}^{n}{sl_1({\bf e}_i)}.
+\end{equation}
+%
+where $sl_1(\cdot)$ is the smoothed L1 norm~\cite{Girshick15}. As shown in Fig.~\ref{fig:error_vs_positions},
+% \MS{Can you show this in the figure?}\YH{Yes, in a new figure}
+this 3D error is consistent across all 3D keypoints and less influenced by the depth and relative position of the observed object. 
+% \WJ{"As shown by" sounds odd here, I expected a reference to a figure with data showing an empirical proof that it works, rather than the initial motivation.}\YH{Fixed.}
+Furthermore, it can be computed by simple algebraic operations and can thus easily be incorporated in an end-to-end learning formalism.
+%Minimizing the reprojection loss measured in 3D space can solve the problem with minimizing 2D reprojection error on the image plane directly as discussed in Fig.~\ref{fig:cube_problem}, making it consistent across different 3D keypoints and also under different 3D locations. There are no complex computations here, only some simple matrix multiplications, which makes it naturally differentiable and can be embedded into the network to let back-propagated gradients update the network weights with ease.
+
+Ultimately, we combine this loss function with that supervising the predicted objectness score, which yields the overall training loss
+\begin{equation}
+    {\cal L} = \sum_{k=1}^{5}\{{\cal L}_{obj}(k) + {\cal L}_{reg}(k)\},
+\end{equation}
+where ${\cal L}_{obj}(k)$ and ${\cal L}_{reg}(k)$ are the objectness loss and pose regression loss at level $k$, respectively. In this work, we take the loss ${\cal L}_{obj}$ to be the focal loss~\cite{Lin17f}.
+
+\subsection{Inference via Multi-Scale Fusion}
+
+Thanks to our ensemble-aware sampling strategy, our trained network can produce valid pose estimates at every pyramid level for any test image, independently of its scale. These estimates can be selected by thresholding the objectness score predicted for each feature vector at each level, and in practice we use a threshold $\tau = 0.3$. In principle, these estimates could then be fused directly by a RANSAC+PnP strategy~\cite{Lepetit09} or using the learning-based method of~\cite{Hu20a}. 
+For simplicity, we use the RANSAC+PnP approach, but in conjunction with our ensemble-aware sampling scheme.
+
+%Nevertheless, we will show
+% \MS{Will we?} \YH{Do you mean Table~\ref{tab:parameters_study}? Right now all fusion results are based on RASNAC+PnP.} \MS{If so, then why do we say that we can re-use our ensemble-aware sampling at test time? We should simply remove the following paragraph if we don't re-use it.} \YH{We do re-use it during testing. Even for Ransac+PnP, we still need to know which correspondences to pick from all the feature cells. Collecting all correspondences with the objectness score above the threshold will be slow and contribute less to the final pose.}
+%that predictions fusioned even by the simple RANSAC+PnP can be more accurate than predictions from individual pyramid levels.
+%For simplicity, we adopt the RANSAC+PnP way.
+%Equipped with the hierarchical architecture and the proposed sampling strategy, we can obtain a multi-level network with reasonable activations on multiple levels for a single test sample during inference. We show that fusion across these multiple levels can generate more robust results.
+
+%During inference, we have different numbers of valid features cell on different pyramid levels with the objectness score higher than a threshold (typically $\tau \ge 0.3$). We try to re-apply the ensemble-aware sampling strategy in the training process as discussed in Section~\ref{sec:ea_sampling}. 
+
+%\MS{If I understood you correctly the other day, you do not use what is described below at all. If you don't then just comment this out.}
+%\YH{We used. During inference, we still need to choose reasonable cells from each pyramid level. One pyramid level may have a bunch of feature cells with an objectness score larger than 0.3, and we do not want to feed all of them into RANSAC. We only choose alpha=10 best from all the 5 pyramid levels. The predicted object size will tell us how many cells to choose from each pyramid level. After choosing a total of 10 cells, we feed the total 80 3D-to-2D correspondences into RANSAC+PnP.
+%}
+To apply this scheme at test time, we first need to estimate the object size. To this end, we choose the feature vector leading to the highest objectness score, and compute the size ${\cal S}$ from the corresponding predictions of the 8 bounding box corner projections. Given this size, we then select, for each pyramid level $k$, the ${\cal N}_k$  feature cells that give the highest objectness score. This lets us construct a set of 3D-to-2D correspondences $\{{\bf p}_i \leftrightarrow {\bf u}_{ijk}\}$ for every 3D keypoint ${\bf p}_i$, where ${\bf u}_{ijk}$ is the 2D location predicted for ${\bf p}_i$ by cell ${\cal C}_j$ on feature map ${\cal F}_k$, with $1\le i \le 8, 1\le j \le {\cal N}_k $ and $1\le k \le 5$. Finally, we use a RANSAC based PnP algorithm to obtain a robust 6D pose estimate from these correspondences. We will show in our experiments that this outperforms the prediction obtained from any individual pyramid level.
+
+% \input{fig/swisscube_demo.tex}

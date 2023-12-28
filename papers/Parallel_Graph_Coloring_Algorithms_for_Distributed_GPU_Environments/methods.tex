@@ -1,0 +1,303 @@
+%include methods/algorithms here
+\section{Methods}
+
+We present three hybrid MPI+GPU algorithms, called Distance-1 (D1), Distance-1 Two Ghost Layer (D1-2GL) and Distance-2 (D2). D1 and D1-2GL solve the distance-1 coloring problem, and D2 does distance-2 coloring.
+We apply a variation of our D2 coloring to do partial D2-coloring (PD2).
+We leverage Trilinos~\cite{IAB:heroux2005overview} for distributed MPI-based 
+parallelism and Kokkos~\cite{IAB:edwards2014kokkos} for on-node parallelism. KokkosKernels~\cite{kokkoskernels} provides baseline implementations of distance-1 and distance-2 coloring algorithms that we use and modify for our local coloring and recoloring subroutines.
+
+Our three proposed algorithms follow the same basic framework, which builds upon that of Bozda{\u{g}} et al.~\cite{IAB:bozdaug2008framework}.
+Bozda{\u{g}} et al. observe that interior vertices can be properly colored independently on each process without creating conflicts or requiring communication.
+They propose first coloring interior vertices, and then coloring boundary vertices in small batches over multiple rounds involving communication between processes. 
+This approach can reduce the occurrence of conflicts, which in turn reduces the amount of communication necessary to properly color the boundary. 
+In our approach, we color all \emph{local} vertices first.
+Then, after communicating boundary vertices' 
+colors, we fix all conflicts.  Several
+rounds of conflict resolution and communication may be needed to resolve all
+conflicts.
+We found that this approach was generally faster than the batched boundary
+coloring, and it allowed us to use existing parallel coloring routines in KokkosKernels without substantial modification.
+
+\begin{algorithm}[!htb]
+  \caption{Distributed-Memory Speculative Coloring}
+  \label{IAB:alg:overview}
+  \begin{algorithmic}
+    \Procedure{Parallel-Color} {\newline \hspace*{0.5pc} Local Graph $G_l=\{V_l+V_g,E_l+E_g\}$,GID}
+      \State colors $\gets$ Color($G_l$, colors) \Comment{Initially color local graph}
+      \State Communicate colors of boundary vertices
+      \State conflicts $\gets$ Detect-Conflicts($G_l$, colors, GID)
+      \State Allreduce(conflicts, SUM) \Comment{Global sum conflicts}
+      \While{conflicts $>$ 0}
+	\State $\mathit{gc} \gets$ current colors of all ghosts
+	\State colors = Color($G_l$, colors) \Comment{Recolor conflicted}
+        \State \Comment{vertices}
+	\State Replace ghost colors with $\mathit{gc}$
+        \State Communicate updated boundary colors
+        \State conflicts $\gets$ Detect-Conflicts($G_l$, colors, GID)
+        \State Allreduce(conflicts, SUM) \Comment{Global sum conflicts}
+      \EndWhile
+      \State \textbf{return} colors
+    \EndProcedure
+  \end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{IAB:alg:overview} demonstrates the general approach for our three speculative distributed algorithms. 
+First, each process colors all local vertices with a shared-memory algorithm.
+Then, each process communicates its boundary vertices' colors to processes with corresponding ghosts.
+Processes detect conflicts in a globally consistent way and remove the colors of conflicted vertices.
+Finally, processes locally recolor all uncolored vertices, communicate updates, detect conflicts, and repeat until no conflicts are found.
+
+\subsection{Distributed Boundaries}
+
+\begin{figure}
+  \includegraphics[scale=0.2]{boundary-vertex-diagram.png}
+  \caption{Definition of boundary vertex sets for different coloring instances}
+  \label{IAB:boundary-verts}
+\end{figure}
+
+Figure~\ref{IAB:boundary-verts} shows the sets of boundary vertices for distance-1 and distance-2 formulations of graph coloring.
+A process' distance-1 boundary vertices are its owned vertices that have edge neighbors owned by other processes.
+Its distance-2 boundary vertices are its owned vertices whose neighbors have neighbors owned by other processes.
+These sets allow us to optimize our distributed conflict detection, as only vertices in the boundary may conflict with a vertex on another process.
+
+
+\subsection{Distance-1 Coloring (D1)}
+
+Our Distance-1 method begins by independently coloring all owned vertices on each process using the GPU-enabled algorithms by Deveci et al.~\cite{IAB:deveci2016parallel}
+VB\_BIT and EB\_BIT in KokkosKernels~\cite{kokkoskernels}.
+VB\_BIT uses vertex-based parallelism; each vertex is colored by a single thread. VB\_BIT uses compact bit-based representations of colors to make it performant on GPUs.
+EB\_BIT uses edge-based parallelism; a thread colors the endpoints of a single edge. EB\_BIT also uses the compact color representation to reduce memory usage on GPUs.
+For graphs with skewed degree distribution (e.g., social networks), edge-based parallelism typically yields better workload balance between GPU threads.
+We observed that for graphs with a sufficiently large maximum degree, edge-based EB\_BIT outperformed vertex-based VB\_BIT on Tesla V100 GPUs.
+Therefore, we use a simple heuristic based on maximum degree:  we use EB\_BIT for graphs with maximum degree greater than 6000; otherwise, we use VB\_BIT.
+
+\begin{algorithm}[!htb]
+\algrenewcommand\algorithmicindent{1.0em}
+  \caption{Distance-1 conflict detection}
+  \label{IAB:alg:conflictres}
+  \begin{algorithmic}
+    \Procedure{Detect-Conflicts-D1}{\newline \hspace*{0.5pc} Local Graph $G_l=\{V_l+V_g,E_l+E_g\}$, colors, GID} 
+      \State conflicts $\gets$ 0
+      \ForAll{$v \in V_g$} \textbf{in parallel}
+        \ForAll{$\langle v, u\rangle \in (E_g)$}
+          \State conflicts $\gets$ conflicts $+$ Check-Conflicts($v,u,\ldots$)
+	  \If{colors[$v$] $=$ 0}
+	    \State \textbf{break}
+	  \EndIf
+        \EndFor
+      \EndFor
+      \State \textbf{return} conflicts
+    \EndProcedure
+  \end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[!htb]
+  \caption{Algorithm to identify and resolve conflicts}
+  \label{IAB:alg:conflictcheck}
+  \begin{algorithmic}
+    \Procedure{Check-Conflicts}{$v$, $u$, colors, GID, recolorDegrees}
+      \If{colors[$v$] $=$ colors[$u$]}
+	\If{recolorDegrees and degree($v$) $<$ degree($u$)}
+	  \State colors[$v$] $\gets$ 0
+	\ElsIf{recolorDegrees and degree($u$) $<$ degree($v$)}
+	  \State colors[$u$] $\gets$ 0
+        \ElsIf{rand(GID[$v$]) $>$ rand(GID[$u$])}
+	  \State colors[$v$] $\gets$ 0
+	\ElsIf{rand(GID[$u$]) $>$ rand(GID[$v$])}
+	  \State colors[$u$] $\gets$ 0
+	\ElsIf{GID[$v$] $>$ GID[$u$]}
+	  \State colors[$v$] $\gets$ 0
+	\Else
+	  \State colors[$u$] $\gets$ 0
+	\EndIf
+        \State \textbf{return} 1
+      \EndIf
+      \State \textbf{return} 0
+    \EndProcedure
+  \end{algorithmic}
+\end{algorithm}
+
+
+Algorithm~\ref{IAB:alg:conflictres} shows the conflict detection component of Algorithm~\ref{IAB:alg:overview}. 
+This algorithm runs on each process using its local graph $G_l$.
+It detects conflicts across processor boundaries and uncolors vertices to 
+resolve the conflicts before recoloring.
+
+After the initial coloring, only boundary vertices can be in conflict with one another\footnote{As suggested by Bozda{\u{g}} et al., we considered reordering local vertices to group all boundary vertices together for ease of processing. This optimization did not show benefit in our implementation, as reordering tended to be slower than coloring of the entire local graph.}.
+We perform a full exchange of boundary vertices' colors using collective communication functions implemented in the Zoltan2 package of Trilinos~\cite{IAB:heroux2005overview}.
+After the initial all-to-all boundary exchange, we only communicate the colors of boundary vertices that have been recolored.
+After each process receives its ghosts' colors, it detects conflicts by checking each owned vertex's color against the colors of its neighbor.
+The conflict detection is done in parallel over the owned vertices using Kokkos.
+The overall time of conflict detection is small enough that any imbalance resulting from our use of vertex-based parallelism is insignificant relative to end-to-end times for the D1 algorithm. 
+
+
+
+%We also explore using vertex degrees to resolve conflicts.
+%The idea is that recoloring vertices with smaller degrees may reduce the number of overall conflicts that occur in recoloring.
+%In Algorithm~\ref{IAB:alg:conflictcheck}, this functionality is triggered by setting recolorDegrees to true.
+%Importantly, for this to work each process must know the degree of its ghost vertices, which we pre-compute.
+
+Once we have identified all conflicts, we again use VB\_BIT or EB\_BIT to recolor the determined set of conflicting vertices. 
+We modified KokkosKernels' coloring implementations to accept a ``partial'' coloring and the full local graph, including ghosts. 
+(Our initial coloring phase did not need ghost information.)
+We also modified VB\_BIT to accept a list of vertices to be recolored. 
+Such a modification was not feasible for EB\_BIT.
+
+Before we detect conflicts and recolor vertices, we save a copy of the ghosts' colors ($\mathit{gc}$ in Algorithm~\ref{IAB:alg:conflictres}).
+Then we give color zero to all vertices that will be recolored; our coloring functions interpret color zero as uncolored.
+
+To prevent the coloring functions from resolving conflicts without respecting our conflict resolution rules (thus preventing convergence of our parallel coloring), we allow a process to temporarily recolor some ghosts,
+even though the process does not have enough color information to correctly recolor them.  The ghosts' colors are then 
+restored to their original values in order to keep ghosts' colors consistent with their owning process.
+Then, we communicate only recolored owned vertices, ensuring that recoloring changes only owned vertices.
+
+\subsection{Distributed Recoloring Using Vertex Degrees}
+
+When a conflict is found, only one vertex involved in the conflict needs to be recolored. 
+Since conflicts happen on edges between two processes' vertices, both processes must agree on which vertex will be recolored.
+
+We propose a new algorithm for selecting vertices to be recolored in the conflict phase, based on prioritizing by vertex degrees. 
+This idea was inspired by the effectiveness of largest-first and smallest-last ordering in the serial greedy algorithm. 
+To the best of our knowledge, prioritizing the distributed recoloring of lower degree vertices is a novel approach to distributed coloring conflict resolution.
+In this approach, 
+shown in Algorithm~\ref{IAB:alg:conflictcheck}, when recolorDegrees is true, our conflict detection prioritizes recoloring the lower degree vertex involved in a distributed conflict.
+For vertices with equal degree, we adopt the random conflict resolution scheme of Bozda{\u{g}} et al. 
+in which 
+the conflicted vertex with the higher random number generated from its global identifier (GID) is chosen for recoloring.
+
+The idea behind our recolorDegrees heuristic is that recoloring vertices with large degrees will likely result in giving those vertices a higher color, while recoloring vertices with a smaller degree may be able to use a smaller color for that vertex. 
+Additionally, recoloring vertices with fewer neighbors means that it is less likely that we recolor neighboring vertices concurrently which can reduce the number of conflicts that arise during distributed recoloring.
+We show that this approach generally decreases runtime for distance-1 coloring, and reduces the number of colors used.
+In our experiments, recolorDegrees reduces our color usage by 8.9\% and runtime by roughly 7\% for D1 on average. 
+It achieves a maximum speedup of 45\%, and a maximum color reduction of 39\% over using D1 without recolorDegrees.
+
+We compute the vertex degrees only once. Possible variations include using a ``dynamic'' 
+degree based on how many neighbors have been colored or the ``saturation degree'' (how many colors the colored neighbors have been assigned). We do not investigate those variations here.
+
+\subsection{Two Ghost Layers Coloring (D1-2GL)}
+
+Our second algorithm for distance-1 coloring, D1-2GL, follows the D1 method, but adds another ghost vertex ``layer'' to the subgraphs on each process.
+In D1, a process' subgraph does not include neighbors of ghost vertices unless those neighbors are already owned by the process.
+In D1-2GL, we include all neighbors of ghost vertices (the two-hop neighborhood of local vertices) in each process's subgraph, giving us ``two ghost layers.''
+To the best of our knowledge, this approach has not been explored before with respect to graph coloring.
+
+This method can reduce the total amount of communication relative to D1 for certain graphs by reducing the total number of recoloring rounds needed.
+In particular, for mesh or otherwise regular graphs, the second ghost layer is primarily made up of interior vertices on other processes.
+Interior vertices are never recolored, so the colors of the vertices in the second ghost layer are fixed. Each process can then directly resolve more conflicts in a consistent way, thus requiring fewer rounds of recoloring.
+Fewer recoloring rounds results in fewer collective communications.
+
+However, in D1-2GL, each communication is more expensive than in D1, because a larger boundary from each process is communicated.
+Also, in irregular graphs, the second ghost layer often does not have mostly interior vertices.
+The relative proportion of interior vertices in the second layer also gets smaller as the number of processes increases.
+For the extra ghost layer to pay off, it must reduce the number of rounds of communications enough to make up for the increased cost of each communication. 
+
+To construct the second ghost layer on each process, processes exchange the adjacency lists of their boundary vertices; this step is needed only once.
+After the ghosts' connectivity information is added, we use the same coloring approach as in D1.
+
+We optimize our conflict detection for both distance-1 implementations by looking through only the ghost vertices' adjacencies ($E_g$), as they neighbor all local boundary vertices.
+Our local coloring algorithms require our local graphs to have undirected edges to ghost vertices, so this optimization is trivial for both D1 and D1-2GL.
+
+% note -- table here so it shows up at same page where experimental setup starts
+\begin{table*}[!t]
+  \centering
+  \caption{Summary of D1 and D2 input graphs. $\delta_{avg}$ refers to average degree and $\delta_{max}$ refers to maximum degree. Values listed are after preprocessing to remove multi-edges and self-loops. k = thousand, M = million, B = billion.}
+  %\todo{Some of these numbers don't match -- why is livejournal listed as 86M, when it has 69M directed edges? Is this after preprocessing? If so, then all of the edge numbers should be halved -- we don't count both directions of an undirected graph, even if we technically store them that way in memory. So any ``nonzeros'' number listed in SuiteSparse should be halved. Though it looks like others e.g., Friendster are listed correctly, which is why I am confused. Also, I made number of significant figures more consistent for numbers I verified.}\\
+  \begin{tabular}{|r|r|r|r|r|r|r|}
+    \hline
+    Graph   & Class   & \#Vertices  & \#Edges  & $\delta_{avg}$ & $\delta_{max}$ & Memory (GB)\\
+    \hline
+    ldoor           & PDE Problem     & 0.9 M   & 21 M    & 45  & 77  & 0.32 \\
+    Audikw\_1       & PDE Problem     & 0.9 M   & 39 M    & 81  & 345 & 0.59 \\
+    Bump\_2911      & PDE Problem     & 2.9 M   & 63 M    & 43  & 194 & 0.96 \\
+    Queen\_4147     & PDE Problem     & 4.1 M   & 163 M   & 78  & 89  & 2.5 \\
+    soc-LiveJournal1& Social Network  & 4.8 M   & 43 M    & 18  & 20 k & 0.67 \\
+    hollywood-2009  & Social Network  & 1.1 M   & 57 M    & 99  & 12 k & 0.86 \\
+    twitter7        & Social Network  & 42 M    & 1.4 B   & 35  & 2.9 M & 21 \\
+    com-Friendster  & Social Network  & 66 M    & 1.8 B   & 55  & 5.2 k & 27 \\
+    europe\_osm     & Road Network    & 51 M    & 54 M    & 2.1 & 13    & 1.2 \\
+    indochina-2004  & Web Graph       & 7.4 M   & 194 M   & 26  & 256 k & 2.9 \\
+    MOLIERE\_2016 & Document Mining Network & 30 M & 3.3 B & 80 & 2.1 M & 49 \\
+    rgg\_n\_2\_24\_s0 & Synthetic Graph & 17 M    & 133 M   & 15    & 40 & 2.1\\
+    kron\_g500-logn21 & Synthetic Graph & 2.0 M   & 182 M   & 87    & 8.7 & 2.7\\
+    mycielskian19     & Synthetic Graph & 393 k   & 452 M   & 2.3 k & 196 k & 6.7\\
+    mycielskian20     & Synthetic Graph & 786 k   & 1.4 B   & 3.4 k & 393 k & 21\\
+    \hline
+    hexahedral & Weak Scaling Tests & 12.5 M -- 12.8 B & 75 M -- 76.7 B & 6 & 6 & 1.2 GB -- 1.1 TB\\
+    \hline
+  \end{tabular}\\
+  \label{IAB:tab:graphs}
+\end{table*}
+
+\subsection{Distance-2 Coloring (D2)}
+
+Our distance-2 coloring algorithm, D2, builds upon both D1 and D1-2GL.
+As with distance-1 coloring, we use algorithms from Deveci et al. in KokkosKernels for local distance-2 coloring.
+Specifically, we use NB\_BIT, which is a ``net-based'' distance-2 coloring algorithm that uses the approach described by Ta{\c{s}} et al.~\cite{IAB:tacs2017greed}. 
+Instead of checking for distance-2 conflicts only between a single vertex and its two-hop neighborhood, the net-based approach detects distance-2 conflicts among the immediate neighbors of a vertex.
+Our D2 approach also utilizes a second ghost layer to give each process the full two-hop neighborhood of its boundary vertices.
+This enables each process to directly check for distance-2 conflicts with local adjacency information. 
+To find a distance-2 conflict for a given vertex, its entire two-hop neighborhood must be checked for potential conflicting colors.
+
+\begin{algorithm}
+\algrenewcommand\algorithmicindent{1.0em}
+\caption{Distance-2 conflict detection}
+\label{IAB:alg:d2con}
+\begin{algorithmic}
+\Procedure{Detect-D2-Conflicts}{\newline \hspace*{0.5pc} Local Graph $G_l=\{V_l+V_g,E_l+E_g\}$, $V_b$, colors, GID, doPartialColoring} 
+  \State conflicts $\gets$ 0
+  \ForAll{$v \in V_b$} \textbf{in parallel}
+    \ForAll{$\langle v, u\rangle \in (E_l+E_g)$} 
+      \If{not doPartialColoring}
+        \State conflicts $\gets$ conflicts $+$ Check-Conflicts($v,u,\ldots$)
+        \If{colors[$v$] $=$ 0}
+	  \State \textbf{break}
+        \EndIf
+      \EndIf
+      \ForAll{$\langle u, x\rangle \in (E_l+E_g)$} 
+	\State \Comment{$u$ is one hop and $x$ is two hops from $v$}
+	\State conflicts $\gets$ conflicts $+$ Check-Conflicts($v,x,\ldots$)
+	\If{colors[$v$] $=$ 0}
+	  \State \textbf{break}
+	\EndIf
+      \EndFor
+      \If{colors[$v$] $=$ 0}
+	\State \textbf{break}
+      \EndIf
+    \EndFor
+  \EndFor
+\State \textbf{return} conflicts
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+
+Algorithm~\ref{IAB:alg:d2con} shows conflict detection in D2 for each process.
+We again use vertex-based parallelism while detecting conflicts; each thread examines the entire two-hop neighborhood of a vertex $v$.
+The input argument $V_b$ is the set of distance-2 boundary vertices (as in Figure~\ref{IAB:boundary-verts}), which we precompute.
+As with distance-1 conflict detection, we identify all local conflicts and use a random number generator to ensure that vertices to be recolored are chosen consistently across processes.
+The iterative recoloring method of D1 then also works for D2 --- we recolor all conflicts, replace the old ghost colors, and then communicate local changes.
+
+\subsection{Partial Distance-2 Coloring (PD2)}\label{IAB:method:PD2}
+
+We have also implemented an algorithm, PD2, that solves the partial distance-2 coloring problem.
+Partial distance-2 coloring is similar to distance-2 coloring, but it detects and resolves only two-hop conflicts.
+Typically, partial distance-2 coloring is used on non-symmetric graphs.  A bipartite graph 
+$B(V_s, V_t, E_B)$ is constructed from $G(V,E)$ with an undirected edge 
+$\langle v_s \in V_s, v_t \in V_t \rangle$ $\in E_B$ 
+for each directed edge $\langle v_s, v_t \rangle \in E$; colors are needed only for vertices in $V_s$.
+Partial distance-2 coloring colors only one set of the vertices in the bipartite graph, 
+which is why it is a partial coloring.
+In algorithm~\ref{IAB:alg:d2con}, when doPartialColoring is false, the algorithm detects all distance-2 conflicts. 
+When doPartialColoring is true, it only detects two-hop conflicts for the partial coloring.
+Currently, our PD2 implementation must color all vertices in the bipartite representation of the graph;
+applications can ignore colors for vertices in $V_t$.
+Removing this limitation is a subject for future work.
+
+
+\subsection{Partitioning}
+
+We assume that target applications partition and distribute their input graphs in some way before calling these coloring algorithms. In our experiments, we used XtraPuLP v0.3~\cite{slota2017partitioning} to partition our graphs. 
+Determining optimal partitions for coloring is not our goal in this work.
+Rather, we have chosen a partitioning strategy representative of that used in many
+applications.  We partition graphs by balancing the number of edges per-process and minimizing a global edge-cut metric. 
+This approach effectively balances per-process workload and helps minimize global communication requirements.

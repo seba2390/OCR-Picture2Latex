@@ -1,0 +1,697 @@
+\section{Synthesizing Optimizations using \tool}
+\label{sec:rewrite}
+
+\begin{figure*}[tbp]
+    \includegraphics[width=\linewidth]{figures/flowchart.pdf}
+    \caption{Overview of how \tool{} works, and how it fits into the
+      LLVM optimization pipeline}
+    \label{fig:workflow}
+\end{figure*}
+
+\tool{} is invoked by loading it into LLVM's optimization pipeline as
+a plugin.
+%
+For every integer typed, or vector-of-integer typed, SSA value in the
+code being compiled, \tool{} performs a backwards slice following
+dataflow edges, control flow edges, and memory dependence edges to
+extract a loop-free program fragment.
+%
+This fragment is used as the specification for a synthesis problem,
+where the objective is to synthesize a new program fragment that
+refines the old one and is cheaper, using
+LLVM-MCA as a cost model.
+%
+When a cheaper fragment is found, \tool{} rewrites the code just like
+a non-superoptimizing compiler pass would, and it also caches the
+rewrite to avoid repeated synthesis calls.
+%
+Figure~\ref{fig:workflow} provides a high-level view of how \tool{}
+works; the rest of this section explains these steps in detail.
+
+
+\subsection{Representing and Caching Rewrites}
+
+\tool{} stores each potential optimization as a tuple: $(F, V, R)$
+where $F$ is a function in the LLVM intermediate representation (IR),
+$V$ is an SSA value from that function, and $R$ is a rewrite---an
+expression in \tool's own intermediate representation that describes a
+different way to compute $V$ in $F$.
+%
+Rewrites are directed acyclic graphs containing nodes that represent
+operations, and edges representing data flow.
+%
+Although the elements found in \tool{} IR are similar to those found
+in LLVM IR, we could not reuse LLVM IR to represent rewrites since
+LLVM IR does not support incomplete code fragments, and also rewrites
+must contain enough information to support connecting the new code in
+the rewrite to code in the unoptimized function.
+
+
+To support caching, rewrites must be serializable.
+%
+The $F$ and $V$ elements of rewrite tuples can be serialized using
+existing LLVM functionality, and we created a simple S-expression
+syntax for serializing the $R$ part.
+%
+Rewrites are cached in a Redis instance---this implementation choice
+allows the cache to be persistent across multiple \tool{} runs and also
+makes the cache network-accessible.
+
+
+Figure~\ref{fig:syntax} shows the syntax of the IR\@.
+%
+For example, if a 32-bit value is replaced by left shift by one bit
+position, the textual format for the expression is \texttt{(shl (val
+  i32 \%0), (const i32 1), i32)}.
+
+
+\begin{figure}[tbp]
+  \small
+  \begin{tabular}{r c l}
+    \emph{Op} &::=& \emph{Inst} | \emph{Constant} | \emph{Value} \\
+    \emph{Inst}  &::=& (\emph{BinaryOp} \emph{Op}, \emph{Op}, \emph{Type}) | \\
+             && (\emph{UnaryInst} \emph{Op}, \emph{Type}) |\\
+             && (\emph{ConvInst} \emph{Op}, \emph{Type}) | \\
+             && (\emph{Intrinsic} \emph{Op}, \emph{Op}) | \\
+             && (icmp \emph{Cond} \emph{Op} \emph{Op}) | \\
+             && (insertelement \emph{Op}, \emph{Op}, \emph{Op}) | \\
+             && (extractelement \emph{Op}, \emph{Op}) | \\
+             && (shufflevector \emph{Op}, \emph{Op}, \emph{Constant}) \\
+    \emph{Constant} &::=& (const \emph{Type} \texttt{number-literal}) \\
+    \emph{Value} &::=& (val \emph{Type} \texttt{llvm-identifier}) \\
+    \emph{Type} &::=& \textbf{i}sz | <elements $\times$ \textbf{i}sz> \\
+    \emph{BinaryInst} &::=& add | sub | mul | udiv | sdiv | \\
+               && xor | and | or | ashr | lshr | shl\\
+    \emph{UnaryInst} &::=& ctpop | ctlz | cttz | bswap | bitreverse\\
+    \emph{ConvInst} &::=& zext | sext | trunc \\
+    \emph{Cond} &::=& eq | ne | ult | ule | slt | sle \\
+    \emph{Intrinsic} &::=& avx2.pavg.b \dots (165 intrinsics in total) \\
+  \end{tabular}
+  \caption{Syntax for Minotaur rewrites}
+  \label{fig:syntax}
+  %\Description[syntax]{Minotaur syntax}
+\end{figure}
+
+
+\subsection{Correctness for a Peephole Slicer}
+
+Peephole optimizers work because an optimization that is correct for a
+fragment of a program is also correct in the context of the entire
+program.
+%
+Let us look at this in a bit more detail.
+%
+The top-level correctness criterion for an optimizer is that the
+optimized code must refine the unoptimized code.
+%
+The Alive2 paper~\cite{alive2} discusses refinement for LLVM functions
+in detail.
+%
+A peephole optimizer works by finding a program fragment that can be
+rewritten.
+%
+For example, consider a peephole that rewrites $y = x \times 8$ as $y
+= x \ll 3$, where $x$ and $y$ are bitvectors.
+%
+This rewrite is a refinement: $x \times 8 \Rightarrow x \ll 3$.
+%
+The value of $y$ is going to be consumed by subsequent instructions,
+let us call the function computed by those instructions $f$.
+%
+Since refinement is compositional,
+$f(x \times 8) \Rightarrow f(x \ll 3)$.
+%
+Using this kind of argument, we can establish whole-function (and
+whole-program) refinement.
+%
+To be correct, \tool's slice extraction algorithm needs to faithfully
+extract an overapproximation of how a given SSA value is computed.
+%
+As long as it does this, the compositionality of refinement guarantees
+that its rewrites will be correct.
+
+
+\subsection{Extracting Slices}
+
+The state of the art in program synthesis is, at present, not even
+close to being able to synthesize, from scratch, an optimized version
+of an arbitrary LLVM function found in the wild.
+%
+Instead, \tool{} uses a divide-and-conquer approach.
+%
+However, it is fundamentally more aggressive than Bansal and Aiken's
+approach~\cite{Bansal06}, which extracts a small window of sequential instructions,
+and it is also more aggressive than Souper~\cite{souper}, which
+refused to consider memory operations and took a very limited view of
+control flow.
+
+
+\begin{algorithm}[tbp]
+  \small
+  \caption{\small{SSA Slice Extraction Algorithm}}
+  \begin{algorithmic}[1]
+  \Function{ExtractSlice}{F: Function, V: Value}
+  \State {Harvested $\gets \emptyset $}
+  \State {Unknown $\gets \emptyset $}
+  \State {WorkList $\gets$ \{ V \}}
+  \While{WorkList is not empty}
+  \Comment{Value Extraction}
+  \State {I $\gets $ \textrm{WorkList.pop()}}
+  \If {I is visited}
+  \State \textbf{continue}
+  \EndIf
+  \State {Mark I as visited}
+  \If{depth limit exceeded $\lor$ I is unsupported}
+  \State {Insert I into Unknown}
+  \State {\textbf{continue}}
+  \EndIf
+  \If{$V$ is in a loop $\land$ I is not in V's loop }
+  \State {Insert I into Unknown}
+  \State {\textbf{continue}}
+  \EndIf
+  \State {Insert I into Harvested}
+  \If{$I$ is a Load instruction}
+    \State {M $\gets$ I's linked \texttt{MemoryPhi} or \texttt{MemoryDef}}
+    \If {M is a \texttt{MemoryDef} $\wedge$ M is a store}
+    \State {Push M's stored value into WorkList }
+  \EndIf
+
+  \Else
+    \ForAll{operand Op in I}
+    \State {Push Op's definition into WorkList }
+
+    \EndFor
+  \EndIf
+
+  \State {T $ \gets$ terminator of I's basicblock}
+    \If {T is a conditional branch instruction}
+    \State {Push T's condition into WorkList }
+    \EndIf
+
+  \EndWhile
+  \State {Insert every terminator instruction in F to Harvested}
+  % \Comment{Build new function}
+  \State {Remove instrs. in F except those in Harvested}
+  \State {Delete all the backedges in F}
+  \State {Add values in Unknown to F's argument list}
+  \State {Create return instruction for V}
+  \State {\textbf{return} F}
+  \EndFunction
+  \end{algorithmic}
+  \label{alg:slicing}
+\end{algorithm}
+
+Algorithm~\ref{alg:slicing} shows \tool's value extraction algorithm;
+it takes an SSA value $V$ in a source function and produces a well-formed,
+loop-free LLVM function that returns an overapproximation of the
+specified SSA value.
+%
+The value extraction algorithm can be split into two stages.
+%
+In the first stage, \tool{} extracts the SSA values involved in
+the computation, and their uses.
+%
+These values are extracted with a depth-first search; during the
+search, two sets, \emph{Harvest} and \emph{Unknown},
+are propagated which will be used in the second stage
+for constructing the slice.
+%
+To limit the size of the fragment, we set a user-defined depth limitation for
+the search.
+%
+\tool{} uses LLVM's LoopInfo pass~\cite{loopinfo} to identify loops in the
+source function.
+%
+If value $V$ is in a loop, \tool{} will only extract values that are defined
+inside the loop.
+%
+All unsupported operations, operations that are beyond the depth limit, and
+operations that are outside the loop are discarded and replaced with free inputs.
+
+\tool{} extracts the condition of conditional branch instructions,
+since conditions carry control flow information that is useful during
+synthesis.
+%
+Similarly, when it extracts a load from memory, \tool{} consults
+LLVM's MemorySSA pass~\cite{MemorySSA} to get a list of stores that
+potentially influence the loaded value.
+%
+MemorySSA marks memory operations with one of the three memory access tags:
+\texttt{MemoryDef}, \texttt{MemoryUse}, and \texttt{MemoryPhi}.
+Each memory operation is associated with a version of memory state.
+%
+A \texttt{MemoryDef} can be a store, a memory fence, or any operation
+that creates a new version of the memory state.
+%
+A \texttt{MemoryPhi} combines multiple \texttt{MemoryDef}s when
+control flow edges merge.
+%
+A \texttt{MemoryUse} is a memory instruction that does not modify
+memory, it only reads the memory state created by \texttt{MemoryDef}
+or \texttt{MemoryPhi}; a load instruction is always a
+\texttt{MemoryUse}.
+%
+Because it must overapproximate, \tool{} is conservative when finding
+the load-affecting store: it starts from the loads
+\texttt{MemoryUse}'s memory version and walks along the MemorySSA's
+def-use chain,
+%
+and when the associated memory operation is a \texttt{MemoryDef}, it
+checks if the operation is a store and pushes the stored value into
+the worklist.
+%
+\tool{} gives up when the associated memory version is tagged with
+\texttt{MemoryPhi}, or when the version is tagged with
+\texttt{MemoryDef} but the operation is not a store instruction.
+
+In the second stage, \tool{} builds the extracted function, which
+first clones the original function, and then deletes all
+instructions that are not in the extracted fragment.
+%
+\tool{} then deletes all the loop backedges so that the extracted
+function is loop-free.
+%
+Finally, a return instruction is added to return the SSA value that we
+are interested in.
+
+The size of the extracted slice is important, and is controlled by the
+slicer's depth parameter.
+%
+If too few instructions are sliced, the extracted code will be a broad
+overapproximation, making it difficult to find profitable
+optimizations.
+%
+On the other hand, if too many instructions are sliced, the extracted
+code may overwhelm the solver, causing it to timeout during the
+synthesis phase.
+%
+For all experiments reported in this paper, we have used five as the
+slicing depth.
+
+
+
+\renewcommand\algorithmicdo{}
+\begin{algorithm}[tbp]
+  \small
+    \caption{\small semantics of \texttt{\{avx|avx2|avx512\}.pavg.\{b|w\}}}
+    \label{semantic:pavg}
+    \begin{algorithmic}[1]
+    \State{\textsc{pavg<$lanes$, $width$, $masked$>}($S_{a}$, $S_{b}$, PassThrough, Mask)}
+    \For{each i in range [0 to $lanes$ - 1]}
+    \If {$masked$ $\wedge \neg$ Mask[i] }
+        \State {$S_{ret}$[i].val $\gets$ PassThrough[i].val}
+        \State {$S_{ret}$[i].poison $\gets$ PassThrough[i].poison}
+    \Else
+        \State {$S_{ret}$[i].val $\gets$ ($S_{a}$[i].val +$_{width}$ $S_{b}$[i].val $+_{width}$ 1) >>$_{width} 1$}
+        \State {$S_{ret}$[i].poison $\gets S_{a}$[i].poison $\vee$  $S_{b}$[i].poison}
+    \EndIf
+    \EndFor
+%    \EndProcedure
+    \end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[tbp]
+  \small
+    \caption{\small semantics of \texttt{\{sse2|avx2|avx512\}.pmadd.wd} }
+    \label{semantic:pmadd}
+    \begin{algorithmic}[1]
+    \State{\textsc{pmadd.wd<$lanes$, $masked$>}($S_{a}$, $S_{b}$, PassThrough, Mask)}
+    \For{each $j$ in range [0 to $lanes$  - 1]}
+    \If {$masked \wedge \neg$ Mask[i] }
+        \State {$S_{ret}$[i].val $\gets$ PassThrough[i].val}
+        \State {$S_{ret}$[i].poison $\gets$ PassThrough[i].poison}
+    \Else
+	\State {$S_{ret}$[i].val $\gets$ sext($S_{a}$[2$\cdot$i].val $\times_\textsc{16 bit}$ $S_{b}$[2$\cdot$i].val) +$_\textsc{32 bit}$ \newline  \hspace*{8em} sext($S_{a}$[2$\cdot$i$+1$].val $\times_\textsc{16 bit}$ $S_{b}$[2$\cdot$i$+1$].val)}
+	\State {$S_{ret}$[i].poison $\gets$ $S_{a}$[2$\cdot$i].poison $\vee$  $S_{b}$[2$\cdot$i].poison $\vee$
+    \newline  \hspace*{9.8em}$S_{a}$[2$\cdot$i$+1$].poison $\vee$  $S_{b}$[2$\cdot$i$+1$].poison}
+    \EndIf
+    \EndFor
+    % \EndProcedure
+    \end{algorithmic}
+\end{algorithm}
+
+\subsection{Supporting Vector Intrinsics in Alive2}
+
+The version of Alive2 that we started with supports most of the core
+LLVM intermediate representation, including its target-independent
+vector operations.
+%
+However, Alive2 did not have a semantics for any of the numerous
+LLVM-level intrinsic functions that provide predictable, low-level
+access to target-specific vector instructions.
+
+
+We added semantics for 165 x86-64 vector intrinsics to Alive2; these
+come from the SSE, AVX, AVX2, and AVX512 ISA extensions.
+%
+The resulting version of Alive2 supports all x86 vector intrinsics
+except those that use floating point, those that are specifically
+intended to support cryptographic applications, and some memory
+operations that we did not see appearing in programs in practice.
+%
+There is significant overlapping functionality between vector
+instructions; for example, there are eight different variants of the
+\texttt{pavg} instruction that computes a vertical (element-wise)
+average of two input vectors.
+%
+To exploit this overlap, our implementation is parameterized by vector
+width, vector element size, and by the presence of a masking feature
+that, when present, uses a bitvector to suppress the output of vector
+results in some lanes.
+%
+Algorithms~\ref{semantic:pavg} and~\ref{semantic:pmadd} show, for
+example, our implementation of the \texttt{pavg} (packed average) and
+\texttt{pmadd.wd} (packed multiply and add) family of instructions.
+%
+This parameterized implementation enabled a high level of code reuse,
+and our implementation of these semantics is only 660 lines of C++.
+%
+Note in particular that the semantics here differ from the semantics of
+the corresponding processor instruction because at the LLVM level, we
+must account for poison values---a form of deferred undefined
+behavior.
+%
+Our strategy for dealing with poison follows the one used by existing
+LLVM vector instructions: poison propagates lane-wise, but does not
+contaminate non-dependent vector elements.
+%
+LLVM has a second kind of deferred undefined behavior: the
+\emph{undef} value, which we have not supported in our instruction
+semantics.
+%
+We believe this is the correct decision since undef is in the process
+of being deprecated by the LLVM community.
+
+
+\paragraph{Validating the vector instruction semantics}
+
+We found ourselves having difficulty gaining confidence that our
+semantics for vector intrinsics were correct, so we performed some
+randomized differential testing of them.
+%
+Each iteration of our tester creates constant inputs to a single
+vector intrinsic and then:
+\begin{enumerate}
+\item
+  Creates a small LLVM function passing the chosen inputs to the
+  intrinsic.
+\item
+  Evaluates the effect of the function using LLVM's JIT compilation
+  infrastructure~\cite{orc}. The effect is always to produce a concrete value,
+  since the inputs are concrete.
+\item
+  Converts the LLVM function into Alive2 IR and then asks Alive2
+  whether this is refined by the output of the JITted code.
+\end{enumerate}
+%
+Any failure of refinement indicates a bug.
+%
+We choose input values both systematically (for example, values close
+to a power of two) and also randomly, hopefully catching most
+edge-case errors.
+
+
+When we fielded this tester, it rapidly found $11$ cases
+where our semantics produced an incorrect result.
+%
+For example, the semantics for \texttt{pavg} were incorrect when the
+sum overflowed.
+%
+It also found three cases where \tool{} generated SMT queries that
+failed to typecheck.
+%
+For example, we set the wrong lane size when parameterizing the
+semantics for \texttt{psra.w} and \texttt{psra.d}, causing the solver
+to reject our malformed queries.
+%
+After we fixed these $14$ bugs, extensive testing failed to find
+additional defects.
+
+
+% \subsection{Synthesizing Rewrites}
+
+% \begin{algorithm}[tbp]
+%   \caption{Generate Single Instruction}
+%   \label{alg:generate}
+%   \begin{algorithmic}[1]
+%   \Function{GenerateSingleInstruction}{Inputs: set of Values}
+
+%   \State{Incomplete $\gets \emptyset$}
+%   \State{Complete $\gets \emptyset$}
+%   \State {Append ReservedConst and Holes to Inputs}
+
+%   \ForAll {op in \{ BinaryOp, UnaryOp, ConvOp, ICmp, InsertElement, ExtractElement and ShuffleVector \}}
+
+%     \ForAll {Input in Inputs}
+%       \State {I$\gets$ new operation with input as operands}
+%       \If {$I$ have holes}
+%         \State{insert $I$ into Incomplete}
+%       \Else
+%         \State{insert $I$ into Complete}
+%       \EndIf
+%     \EndFor
+%   \EndFor
+%   \State{\textbf{return} \{ Complete, Incomplete \}}
+%   \EndFunction
+%   \end{algorithmic}
+% \end{algorithm}
+
+% \begin{algorithm}[tbp]
+%     \caption{Enumerate Rewrites}
+%     \label{alg:enumerate}
+%     \begin{algorithmic}[1]
+%     \Function{EnumerateRewrites}{$F$: Function}
+%     \State {Results $\gets \emptyset$}
+%     \State {Inputs $\gets$ all the values in $F$}
+%     \State {\{ Complete, Incomplete \} $\gets$ \textsc{GenerateSingleInstruction}(Inputs)}
+%     \State {Results $\gets$ Complete}
+%     \State {WorkList $\gets $ Incomplete}
+
+%     \While {WorkList is not empty}
+%     \State {Inst $\gets$ \textrm{WorkList.pop()}}
+%     \If {ApproximateCost($I$) $\geq$ ApproximateCost($F$)}
+%       \State{\textbf{continue}}
+%     \EndIf
+
+%     \State{\{ Complete, Incomplete \} $\gets$ \textsc{GenerateSingleInstruction}(Inputs)}
+%     \State {WiredInsts $\gets$ Put Complete and Incomplete into the each of holes in Inst}
+%     \ForAll {W in WiredInsts}
+%       \If {W has no holes}
+%       \State {insert W to Results}
+%       \Else
+%       \State {insert W to WorkList }
+%       \EndIf
+%     \EndFor
+%     \EndWhile
+%     \State {\textbf{return} Results}
+%     \EndFunction
+%     \end{algorithmic}
+% \end{algorithm}
+
+
+\subsection{Augmenting Alive2 with Synthesis}
+
+To synthesize an optimization, \tool{} enumerates \emph{partially
+symbolic} candidates: instructions are always represented concretely,
+but literal constants are symbolic and are synthesized during the
+refinement check.
+%
+The overall synthesis problem is bounded by a limit on the number of
+new instructions that are being synthesized.
+%
+\tool{} generates all rewrites that fit into this limit.
+%
+Next, the rewrites are sorted using the cost function
+from the TargetTransformInfo pass~\cite{tti}, which provides an approximate cost
+model that captures the details of the target.
+%
+Then, it uses Alive2 to filter out every rewrite that does not refine
+the specification.
+%
+When a candidate rewrite contains at least one symbolic constant,
+\tool{} issues an exists-forall query instead of the simpler query
+that Alive2 would otherwise have used, effectively asking the
+question: ``Does there exist at least one set of literal constants
+that makes this rewrite work for all values of the inputs?''
+%
+If this query succeeds, the resulting model produced by the SMT solver contains
+the literal values for the symbolic constants, giving a complete,
+sound optimization.
+
+
+Unlike LLVM, \tool{} takes a low-level, untyped view of vector values.
+%
+For example, it internally treats a 16-way vector of 8-bit values the
+same as an 8-way vector of 16-bit values: both of these are simply
+128-bit quantities.
+%
+At the LLVM level, these two types are not interchangeable: a
+``bitcast'' instruction is required to convert between them.
+%
+Bitcasts have no runtime representation on x86 processors and \tool{}
+does not expend synthesis power to create them: it inserts bitcasts as
+needed when converting its own IR into LLVM IR\@.
+%
+A consequence of \tool's untyped view of vectors is that, during
+synthesis, it does not have a fixed idea of how to interpret a value.
+%
+So, for example, when synthesizing addition for 256-bit vector values,
+it will try all of \texttt{<32 x i8>}, \texttt{<16 x i16>},
+\texttt{<8 x i32>}, and \texttt{<4 x i64>} additions.
+
+
+\subsection{Identifying Profitable Rewrites}
+
+Traditional compiler optimizations are sometimes based on an implicit
+cost model.
+%
+For example, eliminating a redundant store to memory is something that
+a compiler can always perform, because it is (presumably) always
+profitable.
+%
+Other traditional optimizations have an explicit cost model.
+%
+For example, we might decide to perform inline substitution of every
+function body that contains seven or fewer instructions.
+%
+This kind of cost model is used not because it is particularly
+accurate, but because it is cheap to evaluate at compile time---the
+execution time of a compiler is an ever-present concern in compiler
+developers' minds---and it usually works well enough.
+
+
+Since a superoptimizer like \tool{} is inherently expensive, and is
+not expected to be run by software developers during their routine
+builds, our cost model does not need to be particularly fast.
+%
+Moreover, in our experience, simple and obvious cost models (such as
+assigning a fixed cost to each instruction in LLVM IR) are difficult
+to make work well in the context of vector computations.
+%
+For one thing, LLVM backends are highly sophisticated and often turn
+one IR instruction into multiple machine instructions, or many IR
+instructions into a single machine instruction.
+%
+For another, estimating the execution cost of machine instructions on
+modern cores is not straightforward.
+%
+Thus, \tool's main cost model is based on compiling the LLVM IR to
+object code and then analyzing its execution on a specific target
+machine using LLVM-MCA: its machine code analyzer component.
+%
+In other words, \tool{} accepts a rewrite when it not only refines the
+specification, but also when it has a lower predicted execution cost
+than the specification and all of the other candidate rewrites.
+
+
+Although LLVM-MCA can estimate the cycle cost of code fragments, we
+instead use the number of uOps (``micro-operations,'' a modern x86
+processor's internal instruction set) as the estimated code.
+%
+We do this because we tried using both cycles and uOps, and uOps work
+better, perhaps because they represent the total pipeline resources
+used by the computation.
+
+
+% \subsection{Pruning Infeasible Rewrites using Dataflow Analysis}
+
+% Mukherjee et al.~\cite{dfa_pruning} showed that a variety of dataflow
+% analyses could be used to prune infeasible branches of the search
+% space during synthesis.
+% %
+% \tool{} implements just one of these, based on LLVM's ``known bits''
+% analysis which tries to prove that individual bits of an SSA value are
+% either zero or one in all executions of the program being compiled.
+% %
+% When there exists a bit that is always one in the specification and
+% always zero in the candidate rewrite (or vice versa), this candidate
+% provably does not refine the specification and it can be discarded.
+% %
+% We ran an experiment showing that pruning eliminates XX\% of the
+% candidates.
+
+
+\iffalse
+\subsection{Soundness of \tool{}'s Rewrites}
+
+Alive2's treatment of loops is unsound, but \tool{} avoids this source
+of unsoundness by never posing queries that contain loops.
+%
+However, there is another source of unsoundness: LLVM's deferred
+undefined behaviors (UBs)~\cite{alive2}.
+%
+Alive2 is perfectly capable of reasoning about these behaviors in a
+sound fashion, but asking it to do so causes a significant slowdown by
+introducing an unfriendly quantifier alternation into its SMT queries.
+%
+Therefore, although it is trivial to make \tool{} operate soundly---by
+asking Alive2 to account for all deferred undefined behaviors---the
+experimental results in this paper are from an unsound mode of \tool{}
+that instructs Alive2 to assume that free inputs to rewrites are not
+those that trigger deferred UB\@.
+%
+To mitigate the risk of miscompilation via deferred UB, we have
+thoroughly tested the executables that we use in
+Section~\ref{sec:evaluation} in all cases where this is practical,
+without finding any problems.
+
+
+To show how deferred UB affects Alive2's performance, we
+conducted a simple experiment.
+%
+For each of the 1,486 rewrites in our loop microbenchmark suite
+(Section~\ref{sec:loops}), we re-verified it while asking Alive2
+to assume that free inputs do not trigger deferred UB\@.
+%
+In this case, none of them reached our 30-minute timeout, and in fact
+99.5\% of the rewrites can be validated within 0.1 seconds.
+%
+On the other hand, with deferred UB enabled, 23\% of the rewrites fail
+to verify within 30 minutes.
+%
+Spread across our experiments, this is simply too much computational
+overhead for us to tolerate.
+%
+Out of the 77\% of our optimizations that could be verified within 30
+minutes, zero were unsound due to poison inputs and 72 were unsound
+due to undef inputs.
+%
+The status of undef in LLVM is currently somewhat murky.
+%
+First, the compiler contains quite a few optimizations that are
+provably unsound (in just the same way that 72 of ours are), that the
+compiler developers have not been willing to remove or fix.
+%
+Second, members of the LLVM community are actively working to entirely
+remove undef from the compiler, since it is so difficult to deal with.
+
+\fi
+
+
+\iffalse
+\begin{figure*}[tbp]
+  \centering
+  \begin{subfigure}[h]{0.45\textwidth}
+    \includegraphics[page=7,width=\columnwidth]{figures/data.pdf}
+    \caption{\footnotesize{with deferred UB, 347 cases exceeded resource limit}}
+    \label{plot:reverify-undef}
+  \end{subfigure}
+  \begin{subfigure}[h]{0.45\textwidth}
+    \includegraphics[page=8,width=\columnwidth]{figures/data.pdf}
+    \caption{\footnotesize{without deferred UB}}
+    \label{plot:reverify-no-undef}
+  \end{subfigure}
+  \caption{Time distribution for reverification}
+\end{figure*}
+\fi
+
+
+\subsection{Integration with LLVM}
+
+\tool{} is loaded into LLVM as a shared library where it runs as an
+optimization pass.
+%
+We arranged for it to run at the end of LLVM's optimization pipeline.
+%
+We call InstCombine and Dead Code Elimination pass after Minotaur to
+clean up the code.

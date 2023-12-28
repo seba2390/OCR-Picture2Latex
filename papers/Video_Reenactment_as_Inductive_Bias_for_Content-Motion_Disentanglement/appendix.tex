@@ -1,0 +1,1356 @@
+\renewcommand{\algorithmiccomment}[1]{\hfill$\triangleright$\,#1}
+
+\ifdef{\boximg}{%
+\renewcommand{\boximg}[3]{\parbox[c]{#1\subfigsz}{\includegraphics[width=#2\subfigsz]{#3}}}%
+}{%
+\newcommand{\boximg}[3]{\parbox[c]{#1\subfigsz}{\includegraphics[width=#2\subfigsz]{#3}}}%
+}
+
+\appendices
+\counterwithin{figure}{section}
+\counterwithin{table}{section}
+
+\section{Derivation of the ELBO}
+\label{sec:elbo}
+
+In this section, we present the derivations of the statements introduced in Section~\ref{sec:experiments} to construct the loss functions of our model based on the Evidence Lower Bound (ELBO) of the expected log-likelihood of our model.
+
+Let  the video~$x$ be a sequence of $K$~chunks, $x = (x_k)_{k=1}^K$.
+Similarly, let $w = \left(w_k\right)_{k=1}^K$ be the sequence of motion representations for all the chunks on the video~$x$. 
+For the $k$-th chunk, we model the content and motion as independent latent variables $z$ and $w_k$.
+
+We are interested in maximizing the expected log-likelihood of the videos \wrt the data empirical distribution~$q(x)$.  
+First, let's consider it based on the sets~$x$ and~$w$ such that
+\begin{align}
+\E_{q(x)} \log p(x) =& \E_{q(x)} \log\iint p(x, w, z) \dif w \dif z, \\
+=& \E_{q(x)} \log\iint \frac{q(w, z \given x)}{q(w, z \given x)}p(x,w,z) \dif w \dif z, \\
+\ge& \E_{q(x)}\E_{q(w, z \given x)} \left[\log\frac{p(x,w,z)}{q(w, z \given x)}\right], \\
+=& \E_{q(x)}\E_{q(w, z \given x)} \left[\log\frac{p(x \given w,z)p(w)p(z)}{q(w \given x)q(z \given x)}\right], \\\nonumber
+=& \E_{q(x)}\E_{q(w, z \given x)} \left[\log p(x \given w,z) + \log\frac{p(w)}{q(w \given x)} \right.\\
+&\left.+ \log\frac{p(z)}{q(z \given x)}\right].
+\end{align}
+However, we are interested in modeling the chunks and their respective latent variables.
+Hence, we need a change in the variable.
+First, let's consider the video distribution based on its chunks as $q(x) = \prod_{k=1}^K q(x_k \given x_{k-1})$, such that $q(x_1 \given x_0) \equiv q(x_1)$, \ie, we consider the video as a Markov chain of chunks.
+Then, by plugging into the sequence representations of the video~$x$ and the motion latent variable~$w$, we get
+\begin{align}
+\E_{q(x)} \log p(x) \geq& \E_{\prod_k q(x_k \given x_{k-1})} \E_{\prod_k q(w_k, z \given x_k)} \Bigg[ \nonumber\\
+& \log  \prod_k p(x_k \given w_k, z) + \nonumber \log\frac{\prod_k p(w_k)}{\prod_k q(w_k \given x_k)} \nonumber\\
+&+ \log\frac{\prod_k p_k(z)}{\prod_k q(z \given x_k)} \Bigg].
+\end{align}
+We denote the content prior distribution over the sequence of chunks as $p(z) = \prod_k p_k(z)$.
+(Abusing notation, we will refer to these priors as $p_k(z) = p(z)$ since they are all the same over the sequence.)
+Then, we can simplify the expected log-likelihood as
+\begin{align}
+\E_{q(x)} \log p(x) & \geq \E_{\prod_k q(x_k \given x_{k-1})} \sum_k \E_{ q(w_k, z \given x_k)} \Bigg[\log  p(x_k \given w_k, z) \nonumber\\
+&+ \log\frac{p(w_k)}{q(w_k \given x_k)} + \log\frac{p(z)}{q(z \given x_k)} \Bigg], \\
+& = \E_{\prod_k q(x_k \given x_{k-1})} \sum_k \Bigg\{ \E_{ q(w_k, z \given x_k) } \left[\log  p(x_k \given w_k, z) \right] \nonumber\\
+&  - \kl{q(w_k \given x_k)}{p(w_k)} \nonumber\\
+&- \kl{q(z \given x_k)}{p(z)} \Bigg\}.
+\end{align}
+
+Notice that the final function corresponds to the expectation over the empirical chain of chunks.
+In our experiments, we simulate this process by sampling throughout the video to obtain the chunks and then compute the summation over the losses.
+
+
+\section{Implementation Details}
+\label{sec:implementation}
+
+\subsection{Architecture}
+
+Our model consists of two encoding streams, corresponding to $q_\phi(z \given x_{k})$ and  $q_\gamma(w_k \given x_{k})$, and one decoding stream, corresponding to $p_\theta(x_{k})$, defined in Section~\ref{sec:method}).
+All the streams have five 3D-convolutional layers, with batchnorm and ReLU activations. 
+The number of filters in the hidden layers of the decoder is double the number of filters in the encoders.
+
+As previous works on DRL from video and VR~\cite{Siarohin2019,Siarohin2019nips,Aberman2019}, we used an appearance-suppressed input to the motion encoding stream. 
+In our case, we added a layer that calculates the optical flow of the chunk with the Lucas-Kanade method~\cite{Lucas1981}.
+
+We use a \textit{Bernoulli observation VAE} where the observed samples of the decoder are used as logits of a Bernoulli distribution, in contrast with the traditional Gaussian observations. 
+We observed a remarkable superiority at reconstruction time of the Bernoulli observations, particularly for videos where the proportion of the object of interest \wrt the background is reasonably low.
+We consider standard Normal priors for both the content and motion latent representations, \ie, $p(z) = \mathcal{N}(0,1)$, and  $p(w_k) = \mathcal{N}(0,1)$ for all $k$.
+
+\begin{algorithm}[tb]
+   \caption{Chunk Sequence Learning training procedure algorithm.}
+   \label{alg:sampling}
+\begin{algorithmic}
+\small
+\STATE {\bf Input:} batch $\mathcal{X}$, video length $T_x$, chunk sequence length $O$, chunk size $c$
+\FOR{\textbf{each} $x \in \mathcal{X}$}
+  \STATE $h \sim U(1, T_x - cO)$ \COMMENT{Random starting position}
+  \STATE Sample $\{x_k\}_{k=1}^O$, $O$ consecutive size $c$ chunks starting at $h$
+  \STATE \COMMENT{Approx. of $x_k \sim q(x_k \given x_{k-1}), \forall\,k$}
+  \FOR{$k=1$ {\bf to} $O$}
+    \STATE $w_k \sim q(w_k \given x_k)$
+    \FOR{$j=1$ {\bf to} $O$}
+      \STATE $z_j \sim q(z \given x_j)$
+      \STATE $\mathcal{L}_r \mathrel{{+}{=}} \log p_\theta(x_k \given w_k, z_j)$
+    \ENDFOR
+    \STATE $\mathcal{L}_a \mathrel{{-}{=}} \kl{q(z \given x_k)}{p(z)}$
+    \STATE $\mathcal{L}_m \mathrel{{-}{=}} \kl{q(w_k \given x_k)}{p(w_k)}$
+  \ENDFOR
+\ENDFOR
+\FOR{\textbf{each} $s,d \in \mathcal{X} \times \mathcal{X}, s \ne d$}
+  \STATE $h_s \sim U(1, T_s - cO)$
+  \STATE $h_d \sim U(1, T_d - cO)$
+  \STATE Sample $\{s_k\}_{k=1}^O$, $O$ consecutive size $c$ chunks starting at $h_s$
+  \STATE Sample $\{d_k\}_{k=1}^O$, $O$ consecutive size $c$ chunks starting at $h_d$
+  \FOR{$l=1$ {\bf to} $O$}
+    \STATE $w_l^d \sim q(w_k \given d_l)$
+    \FOR{$j=1$ {\bf to} $O$}
+      \STATE $z_j \sim q(z \given s_j)$
+      \FOR{$i=1$ {\bf to} $O$}
+        \STATE $z_i \sim q(z \given s_i)$
+        \STATE $\mathcal{L}_b \mathrel{{-}{=}} \skl{p_\theta(x_l \given w_l^d, z_j^s)}{p_\theta(x_l \given w_l^d, z_i^s)}$
+        \STATE \COMMENT{SKL as defined in Equation~\ref{eq:brl}}
+      \ENDFOR
+    \ENDFOR
+  \ENDFOR
+\ENDFOR
+\STATE $\mathcal{L} = \mathcal{L}_r + \lambda\mathcal{L}_b + \beta(\mathcal{L}_a + \mathcal{L}_m)$
+\STATE $(\phi, \gamma, \theta) \mathrel{{-}{=}} \nabla_{(\phi, \gamma, \theta)} \mathcal{L}$ \COMMENT{Backprop the loss over the parameters}
+\end{algorithmic}
+\end{algorithm}
+
+The loss functions $\mathcal{L}_r$, $\mathcal{L}_a$, and $\mathcal{L}_m$ require consecutive chunks of a unique video, while $\mathcal{L}_b$ requires chunks of the source and the driving video.
+In order to train all the losses in the same forward pass, we feed the model with batches of $O$-tuples of consecutive chunks, as shown in the Algorithm~\ref{alg:sampling}, which describes in detail the training procedure of our model.
+For $\mathcal{L}_b$, we create a reversed copy of the batch to be used as the batch of driving videos, while the original batch corresponds to the source videos.
+This gives a sense of completeness for training because it ensures that source videos will also act as driving videos, and vice-versa, in the same forward pass.
+Although Algorithm~\ref{alg:sampling} is expressed so, for each batch, all the possible pairs of videos are used as source and driving, in practice, it is unfeasible because the calculation of $\mathcal{L}_b$ takes cubic time \wrt $O$.
+We can argue that, by means of the stochastic batched training, most of the possible pairs of videos can be covered for our model, if trained for enough time.
+
+\subsection{Model Training}
+
+Making use of labels describing the factors of variation in a video, such as the identity of the object of interest or its motion, we split the datasets in training-test and tested our model in two generalization scenarios.
+We will refer to this as a \emph{soft generalization} scenario, in which the model is requested to reconstruct novel videos from contents and motions seen in training time.
+We included two \emph{hard generalization} scenarios: the \emph{appearance holdout} scenario, in which the model is requested to reconstruct novel videos with appearances that were not seen in training time, and the \emph{motion holdout} scenario, in which the model is requested to reconstruct novel videos with motions that were not seen in training time.
+The quantitative results presented in the main text of this paper (Table~\ref{tab:baselines}, and Figs.~\ref{fig:comparison} and~\ref{fig:cs}) correspond to the soft generalization scenario.
+We show in Appendix~\ref{sec:detailed_results} the quantitative performance of MTC-VAE and the baselines in the three generalization scenarios, as well as detailed results on the ablation studies, corresponding to the soft generalization scenario.
+
+To run the complete set of experiments, including the baselines, the hyper-parameter search, and the ablation study of our model, we used a total of $12$ GPUs Titan X, Titan Xp, RTX 2080 Ti, RTX 5000, GTX 1080 Ti, and Tesla P100.
+However, our model can be executed in a single GPU of 12 GB memory, and the training time varies from $20$ minutes to $12$ hours, depending on the length of the videos, the chunk size, and more importantly, the order of the model.
+Given two videos, the chunk-wise reenactment process takes no more than $2$ seconds.
+
+\subsection{Data}
+\label{sec:data}
+
+\begin{table}[tb]
+\caption{Factors of variation for each multi-factor dataset.}
+\label{tab:factors}
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{>{\ttfamily}l>{\ttfamily}l>{\ttfamily}r}
+\toprule
+\multicolumn{1}{l}{\textbf{Factor (size)}} & \multicolumn{1}{l}{\textbf{Labels}} & \multicolumn{1}{r}{\textbf{S}} \\
+\midrule
+\multicolumn{3}{l}{3dShapes} \\
+\midrule
+floor\_hue (10) & [0-9] & C \\ %
+wall\_hue (10) & [0-9]  \\ %
+object\_hue (10) & [0-9]  \\ %
+shape (4) & [0-3]  \\ \midrule
+init\_size (8) & [0-7] & M \\ %
+final\_size (8) & [0-7] \\ %
+init\_angle (15) & [0-14] \\ %
+final\_angle (15) & [0-14] \\ %
+speed (2) & [1-2] \\
+\midrule
+\multicolumn{3}{l}{dSprites} \\
+\midrule
+R (256) & [0-255] & C \\ %
+G (256) & [0-255] \\ %
+B (256) & [0-255] \\ %
+orientation (40) & [0-39] \\ %
+shape (3) & [0-2] \\ %
+scale (6) & [0-5] \\ \midrule
+x\_init (32) & [0-31] & M \\ %
+y\_init (32) & [0-31] \\ %
+x\_final (32) & [0-31] \\ %
+y\_final (32) & [0-31] \\ %
+speed (3) & [1-3] \\ %
+trajectory (2) & linear arc \\
+\midrule
+\multicolumn{3}{l}{LPC} \\
+\midrule
+Sex (2) & male female & C \\ %
+Body(10) & light dark dark2 darkelf orc redorc \\
+         & darkelf2 tanned tanned2 skeleton \\ %
+Shirt (8) & longsleeve\_maroon sleeveless\_teal \\
+            & sleeveless\_maroon longsleeve\_teal \\
+            & longsleeve\_brown sleeveless\_white \\
+            & longsleeve\_white sleeveless\_brown \\ %
+Pants (4) & magenta red teal white \\ %
+Hat (8)   & none bandana\_red cap\_leather chain \\
+          & helmet\_golden helmet\_metal \\
+          & hood\_chain hood\_cloth \\ %
+Hair (17) & none bangslong2\_brunette bedhead\_brunette \\
+          & bangslong2\_green swoop\_red mohawk\_red \\
+          & shoulderl\_raven plain\_blue loose\_blue \\
+          & shoulderl\_pink messy2\_raven \\
+          & bedhead\_green messy2\_pink swoop\_white \\
+          & mohawk\_white loose\_blonde plain\_blonde \\ \midrule
+Action (6) & spellcast thrust walk slash shoot hurt & M \\ %
+Perspective (4) & back front left right \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\textbf{Cohn-Kanade (CK+) facial expressions dataset.}~\cite{Kanade2000, Lucey2010} $326$ gray-scale videos of $64 \times 64$ pixels of $118$ characters performing six actions: anger, disgust, fear, happy, sad, and surprise.
+This dataset only provides two-factor labels: identity and expression.
+
+\textbf{Multimedia Understanding Group (MUG) facial expressions dataset.}~\cite{Aifanti2010} $931$ RGB videos of $64 \times 64$ pixels of $52$ characters performing six actions: anger, disgust, fear, happy, sad, and surprise.
+This dataset only provides two-factor labels: identity and expression.
+
+\textbf{Liberated Pixel Cup (LPC).}\footnote{\url{https://github.com/jrconway3/Universal-LPC-spritesheet} as as September, 2019. \newline\url{http://lpc.opengameart.org/} as September, 2019.} We generated \num{10000} RGB videos of $64\times 64$ pixels creating $24$ motions classes performed by the characters, which correspond to six actions (walk, spellcast, thrust, shoot, hurt, and slash) times four perspectives (front, back, left, and right).
+For content, we combined different genders, body types, hairstyles, and clothes, creating a large number of different identities.
+In total, we generated \num{10000} videos for training.
+Table~\ref{tab:factors} shows the factors of variation used to evaluate multi-factor disentanglement (Table~\ref{tab:mf}).
+For content-motion disentanglement (Table~\ref{tab:baselines}), we joined these factors in two supersets, as pointed in the \textbf{S} column in Table~\ref{tab:factors}.
+
+\textbf{Moving MNIST (MMNIST).}~\cite{Srivastava2015}
+We generated \num{10000} binary videos of $64\times 64$ pixels with ten identities, corresponding to the digits from $0$ to~$9$.
+All the videos have $32$ frames.
+The digits follow linear trajectories from random starting points. 
+We created $14$ motion classes that distinguish the direction of the trajectory (\eg, down, diagonal up, right-left, left-right).
+This dataset only provides two-factor labels: identity and motion.
+
+\textbf{dSprites.}
+We took the data provided in Deepmind's project\footnote{\url{https://github.com/deepmind/dsprites-dataset} as September, 2019.} and generated \num{10000} videos of $64\times 64$ pixels from the images provided.
+The moving sprites have all possible sizes and shape types, yielding a large number of different identities. 
+We can tweak the starting position, the final position, the velocity, and the type of trajectory (either linear or curved) of the sprite.
+This yields an explosive number of motion classes so, when taking the disentanglement metrics, we decided to label the videos with either linear or curved trajectory.
+Table~\ref{tab:factors} shows the factors of variation used to evaluate multi-factor disentanglement (Table~\ref{tab:mf}).
+For content-motion disentanglement (Table~\ref{tab:baselines}), we joined these factors in two supersets, as pointed in the \textbf{S} column in Table~\ref{tab:factors}.
+
+\textbf{3dShapes.}
+We took the data provided in the Deepmind's project\footnote{\url{https://github.com/deepmind/3d-shapes} as  September, 2019.} and generated \num{10000} videos of $64\times 64$ pixels from the images provided.
+We can take the hue of the floor, the shape, and the walls, as well as the type of shape, yielding different identities.
+Regarding motion, we teak the size of the shape (yielding a heart-beat-like motion) and the perspective (yielding a camera-motion effect), attaining a large (but not explosive) number of motion classes.
+Table~\ref{tab:factors} shows the factors of variation used to evaluate multi-factor disentanglement (Table~\ref{tab:mf}).
+For content-motion disentanglement (Table~\ref{tab:baselines}), we joined these factors in two supersets, as pointed in the \textbf{S} column in Table~\ref{tab:factors}.
+
+\subsection{Baselines}
+
+As said in Section~\ref{sec:experiments}, we compared our method against dis-VAE by \textcite{Li2018}, SVG-LP by \textcite{Denton2018}, and $\beta$-TCVAE by \textcite{Chen2018dr}.
+We executed code already available for the three models. 
+In the case of $\beta$-TCVAE, we extended the code made available by its authors,\footnote{\url{https://github.com/rtqichen/beta-tcvae} as  December, 2019.} so their convolutional streams become 3D ones, in order to support chunks of videos. 
+For SVG-LP, we used the official code provided by the authors\footnote{\url{https://github.com/edenton/svg} as  May, 2020.}
+For dis-VAE, we used a public reproduction of the method\footnote{\url{https://github.com/mazzzystar/Disentangled-Sequential-Autoencoder} as  December, 2019.}
+whose results on the LPC dataset seem to match with the ones presented in the paper. 
+In particular, we used the encoder referred as ``full $q$'' by the authors.
+
+We tuned the hyper-parameters of the three models, by testing a small set of variations, as described below, on all the datasets, in the soft generalization scenario, and extracted the five evaluation metrics (MIG, FVAE, SAP, SSIM, and FID).
+For dis-VAE, we contrasted the ``factored q'' against the ``full q'' in order to determine which model had the best disentanglement and reconstruction performance.
+We determined that the latter had the best performance.
+For $\beta$-TCVAE we tunned $\beta$ and $\lambda$, and the effect of annealing each one of them while training.
+For SVG-LP we tested between the VGG and the DC-GAN architectures, concluding that the latter attained the best results, so we used it for comparison.
+We determined that annealing $\lambda$ while keeping $\beta$ fixed ($1.0$ for MMNIST and dSprites and $5.0$ for the rest of datasets) obtained the best results.
+The best baseline configurations for each dataset were compared against our method, as shown in Table~\ref{tab:detailed_comparison}.
+
+\subsection{Metrics Calculation}
+
+In order to calculate the disentanglement metrics, we took all the videos of the test set ($20\%$, according to the $5$-fold cross-validation setup mentioned in Section~\ref{sec:experiments}), divided them into chunks, and calculated the latent representations of each one of the chunks.
+In the case of dis-VAE, the representations were per frame.
+In total, for CK+, approximately $64$ videos were used to calculate MIG, FVAE, and SAP while, for the rest of datasets, approximately \num{2000} videos were used.
+
+We evaluated content-motion disentanglement for the five datasets (\cf Table~\ref{tab:baselines}), by considering only two factors of variation.
+The 3dShapes, dSprites, and LPC datasets contain more than two factors, so we composed them, as noted in the \textbf{S} column in Table~\ref{tab:factors} to attain only the content-motion factors.
+As stated in Section~\ref{sec:experiments_disentanglement}, when the number of factors is not equal to the number of units (in our case, the number of units is significantly higher than $2$), the MIG and SAP metrics are expected to be low.
+
+Although MIG is a relatively popular metric, it penalizes dispersed representations, by considering the information gap between the first and second units that best represent a factor.
+Thus, when one factor of variation is equally represented by more than one unit, that gap is expected to be low, and so does the metric.
+
+SAP is also thought to be low when there is a mismatch between the number of units and the number of factors since this metric is based on the classification accuracy estimation (using a Linear SVM classifier) when each 1d unit is used to classify examples under each factor.
+
+We consider the FVAE metric to be the most suitable for the objective of motion disentanglement since it only penalizes the undesirable case in which one latent unit represents more than one factor of variation, and we are only considering two factors that we expect to be fully disentangled.
+
+For the reconstructions metrics, in theory, we can generate $n(n-1)$ reenacted videos, where $n$ is the number of videos in the test set.
+It was straightforward to generate \num{10000} reenacted videos for all datasets, except for CK+, which had approximately \num{4000} videos.
+We used all the generated videos to calculate SSIM and FID\@.
+
+\section{Performance of Training with Partial Representations}
+\label{sec:partial}
+
+Aiming at reducing the computational cost of training MYC-VAE when $O$ is high, without reducing its performance, we conducted an experiment to assess the effect of subsampling the number of combinations to calculate the extended log-likelihood (\ref{eq:logp_x}) and the Blind Reenactment Loss (\ref{eq:brl}).
+We set $O=4$, but instead of reconstructing $O$ times the input sequence, we reconstruct only two, by randomly sampling two of the $O$ appearance representations.
+Notice that, if we sampled only one appearance representation, the BRL calculation would not be possible (see Eq.~\ref*{eq:brl}).
+Due to time and computer restrictions, we performed those experiments only in the MUG dataset.
+
+\begin{table*}[tb]
+  \caption{Comparison of the model performances with and without subsampling when $O=4$ in the MUG dataset.}
+  \label{tab:partial}
+  \centering
+  \footnotesize
+  \setlength\tabcolsep{4pt}
+  \begin{tabular}{lSSScSS[table-format=2.2(3)]cSS}
+    \toprule
+    & \multicolumn{3}{c}{Disentanglement} & & \multicolumn{2}{c}{Reconstruction} & & \multicolumn{2}{c}{Accuracy} \\
+    \cmidrule{2-4} \cmidrule{6-7} \cmidrule{9-10}
+    & {FVAE $\uparrow$} & {MIG $\uparrow$} & {SAP $\uparrow$} & & {SSIM $\uparrow$} & {FID $\downarrow$} & & {C $\uparrow$} & {M $\uparrow$} \\
+    \cmidrule{2-4} \cmidrule{6-7} \cmidrule{9-10}
+    Full    & \bf .78(4) & \bf .01(1) &     .82(4) & &     .45(1) &     39.44(355) & & 1.(0) & \bf .40(9) \\
+    Partial &     .77(6) &     .00(0) & \bf .87(2) & & \bf .47(1) & \bf 40.40(205) & & 1.(0) &     .39(4) \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+Table~\ref{tab:partial} shows the results of our experiments.
+These results suggest that a full representation may increase modularity (higher FVAE), while a partial representation seems to deal better with explicitness (higher SAP) and reconstruction quality (SSIM and FID).
+However, the difference between those methods is not big enough to say one is better than the other, reinforcing our hypothesis that higher orders may just add too much redundancy to the training, without improving performance.
+This in part may explain why our experiments showed that optimal values of $O$ are~\num{2} or~\num{3} in terms of cost/benefit, even for long sequences like the ones in MUG\@.
+We also noticed that using the partial representations yielded smaller architectures (about \num{25}\% less trainable parameters), less GPU memory (about \num{50}\%) and a lower execution time (about \num{50}\%).
+
+\section{Experiments on High-Resolution MUG}
+\label{sec:hq}
+
+We tested the effectiveness of MTC-VAE on high-resolution inputs by training it on a $256 \times 256$ version of the MUG dataset, which we will call it as MUG-HQ.
+
+The architecture to process the $256 \times 256$ input contains two more convolutional layers in the encoders and the decoder than the $64 \times 64$ version.
+Also, we doubled the size of the content and motion latent representations, and trained our model for $60$ hours, while the $64 \times 64$ model took $24$ hours to converge.
+
+In table \ref{tab:hq} we compare the performance of MTC-VAE between MUG and MUG-HQ, in order to better analyze how the model was affected with a high-resolution input.
+The SSIM and FID metrics behaved as expected: the larger the input, the harder to reconstruct it, and the harder to yielding samples that belong to the data distribution.
+The performance on the downstream classification task was practically unaffected in content classification, while it had a slight drop in Motion classification.
+
+In general, we expected all the metrics to worsen for high-resolution videos.
+For that reason, the increase on the FVAE and SAP metrics is somehow surprising for us.
+Our conclusion is that the increase in spatial resolution enhanced the quality of the representations, in particular, the content one, by providing mode discriminant information.
+On the other side, the motion representation presented a lower action classification performance, suggesting that it contains less discriminating information.
+
+\begin{table}[tb]
+\caption{Results on MUG-HQ compared with its low-quality version. The lower part indicates the performance on downstream tasks.}
+\label{tab:hq}
+\centering
+\begin{tabular}{lS[table-format=3.2(3)]S[table-format=3.2(3)]}
+\toprule
+Metrics & {Values HQ} & {Values LQ} \\
+\midrule
+FVAE $\uparrow$    & \bf .77(004) &       .72(004) \\
+MIG $\uparrow$     & \bf .02(001) &       .01(001) \\
+SAP $\uparrow$     & \bf .83(003) &       .73(005) \\
+SSIM $\uparrow$    &     .61(001) & \bf   .63(002) \\
+FID $\downarrow$   &   41.12(107) & \bf 28.79(115) \\
+\midrule
+Content $\uparrow$ &     .99(001) & \bf  1.00(000) \\
+Motion $\uparrow$  &     .63(004) & \bf   .79(005) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figures~\ref{fig:hq1} to~\ref{fig:hq8} show some examples of how successful was the reenactment task in yielding realistic videos with accurate poses.
+
+
+\begin{figure*}
+\includegraphics[]{img/MUG_HQ_1_1}
+\includegraphics[]{img/MUG_HQ_1_2}
+
+\vspace{.8mm}
+\includegraphics[]{img/MUG_HQ_1_3}
+\includegraphics[]{img/MUG_HQ_1_4}
+
+\centering
+Driving video
+
+\includegraphics[width=.8\linewidth]{MUG_HQ_1_D}
+
+Reenacted videos
+
+\includegraphics[width=.8\linewidth]{MUG_HQ_1_R1}
+\includegraphics[width=.8\linewidth]{MUG_HQ_1_R3}
+\includegraphics[width=.8\linewidth]{MUG_HQ_1_R4}
+\caption{MUG-HQ: Reenactment examples. Above: selected frames at full resolution. Below: complete sequences.}
+\label{fig:hq1}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[]{img/MUG_HQ_2_1}
+\includegraphics[]{img/MUG_HQ_2_2}
+
+\vspace{.8mm}
+\includegraphics[]{img/MUG_HQ_2_3}
+\includegraphics[]{img/MUG_HQ_2_4}
+
+\centering
+Driving video
+
+\includegraphics[width=.8\linewidth]{MUG_HQ_2_D}
+
+Reenacted videos
+
+\includegraphics[width=.8\linewidth]{MUG_HQ_2_R1}
+\includegraphics[width=.8\linewidth]{MUG_HQ_2_R3}
+\includegraphics[width=.8\linewidth]{MUG_HQ_2_R4}
+\caption{MUG-HQ: Reenactment examples. Above: selected frames at full resolution. Below: complete sequences.}
+\label{fig:hq2}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[]{img/MUG_HQ_3_1}
+\includegraphics[]{img/MUG_HQ_3_2}
+
+\vspace{.8mm}
+\includegraphics[]{img/MUG_HQ_3_3}
+\includegraphics[]{img/MUG_HQ_3_4}
+
+\centering
+Driving video
+
+\includegraphics[width=.8\linewidth]{MUG_HQ_3_D}
+
+Reenacted videos
+
+\includegraphics[width=.8\linewidth]{MUG_HQ_3_R1}
+\includegraphics[width=.8\linewidth]{MUG_HQ_3_R3}
+\includegraphics[width=.8\linewidth]{MUG_HQ_3_R4}
+
+\caption{MUG-HQ: Reenactment examples. Above: selected frames at full resolution. Below: complete sequences.}
+\label{fig:hq3}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[]{img/MUG_HQ_4_1}
+\includegraphics[]{img/MUG_HQ_4_2}
+
+\vspace{.8mm}
+\includegraphics[]{img/MUG_HQ_4_3}
+\includegraphics[]{img/MUG_HQ_4_4}
+
+\centering
+Driving video
+
+\includegraphics[width=.8\linewidth]{MUG_HQ_4_D}
+
+Reenacted videos
+
+\includegraphics[width=.8\linewidth]{MUG_HQ_4_R1}
+\includegraphics[width=.8\linewidth]{MUG_HQ_4_R3}
+\includegraphics[width=.8\linewidth]{MUG_HQ_4_R4}
+
+\caption{MUG-HQ: Reenactment examples. Above: selected frames at full resolution. Below: complete sequences.}
+\label{fig:hq4}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[]{img/MUG_HQ_5_1}
+\includegraphics[]{img/MUG_HQ_5_2}
+
+\vspace{.8mm}
+\includegraphics[]{img/MUG_HQ_5_3}
+\includegraphics[]{img/MUG_HQ_5_4}
+
+\centering
+Driving video
+
+\includegraphics[width=\linewidth]{MUG_HQ_5_D}
+
+Reenacted videos
+
+\includegraphics[width=\linewidth]{MUG_HQ_5_R2}
+\includegraphics[width=\linewidth]{MUG_HQ_5_R3}
+\includegraphics[width=\linewidth]{MUG_HQ_5_R4}
+
+\caption{MUG-HQ: Reenactment examples. Above: selected frames at full resolution. Below: complete sequences.}
+\label{fig:hq5}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[]{img/MUG_HQ_6_1}
+\includegraphics[]{img/MUG_HQ_6_2}
+
+\vspace{.8mm}
+\includegraphics[]{img/MUG_HQ_6_3}
+\includegraphics[]{img/MUG_HQ_6_4}
+
+\centering
+Driving video
+
+\includegraphics[width=\linewidth]{MUG_HQ_6_D}
+
+Reenacted videos
+
+\includegraphics[width=\linewidth]{MUG_HQ_6_R2}
+\includegraphics[width=\linewidth]{MUG_HQ_6_R3}
+\includegraphics[width=\linewidth]{MUG_HQ_6_R4}
+
+\caption{MUG-HQ: Reenactment examples. Above: selected frames at full resolution. Below: complete sequences.}
+\label{fig:hq6}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[]{img/MUG_HQ_7_1}
+\includegraphics[]{img/MUG_HQ_7_2}
+
+\vspace{.8mm}
+\includegraphics[]{img/MUG_HQ_7_3}
+\includegraphics[]{img/MUG_HQ_7_4}
+
+\centering
+Driving video
+
+\includegraphics[width=\linewidth]{MUG_HQ_7_D}
+
+Reenacted videos
+
+\includegraphics[width=\linewidth]{MUG_HQ_7_R1}
+\includegraphics[width=\linewidth]{MUG_HQ_7_R3}
+\includegraphics[width=\linewidth]{MUG_HQ_7_R4}
+
+\caption{MUG-HQ: Reenactment examples. Above: selected frames at full resolution. Below: complete sequences.}
+\label{fig:hq7}
+\end{figure*}
+
+\begin{figure*}
+\includegraphics[]{img/MUG_HQ_8_1}
+\includegraphics[]{img/MUG_HQ_8_2}
+
+\vspace{.8mm}
+\includegraphics[]{img/MUG_HQ_8_3}
+\includegraphics[]{img/MUG_HQ_8_4}
+
+\centering
+Driving video
+
+\includegraphics[width=\linewidth]{MUG_HQ_8_D}
+
+Reenacted videos
+
+\includegraphics[width=\linewidth]{MUG_HQ_8_R1}
+\includegraphics[width=\linewidth]{MUG_HQ_8_R3}
+\includegraphics[width=\linewidth]{MUG_HQ_8_R4}
+
+
+\caption{MUG-HQ: Reenactment examples. Above: selected frames at full resolution. Below: complete sequences.}
+\label{fig:hq8}
+\end{figure*}
+
+\section{Experiments on the Tai Chi Dataset}
+\label{sec:taichi}
+
+The Tai Chi dataset consists of $1191$ sequences downloaded from YouTube of several Tai Chi movements in diverse scenarios.
+The videos are cropped and aligned, in such a way that the character occupies the most of the frame an remains in the center.
+We performed a set of experiments on this dataset, in order to test the limitations of MTC-VAE in reconstructing high-complexity real-world scenes.
+
+That being said, we expect the performance of MTC-VAE to fall behind VR-SotA models~\cite{Chan2019, Liu2019, Zhou2019, Liu2019tg, Aberman2019,Yang2020,Bansal2018,Siarohin2019,Siarohin2019nips,Siarohin2021,Zhao2018,Xie2020,Weng2019}, given that such models rely on high-dimensional structured representations that preserve spatial information, while our model, aiming at providing a meaningful and disentangled low-dimensional representation, has an important disadvantage, as it cannot preserve spatial information so accurately.
+
+Table~\ref{tab:taichi} shows the comparison of the performance of MTC-VAE \wrt the baselines.
+Given that the ground truth of the dataset only provide identity (\ie, content) labels, it is not possible to calculate the disentanglement metrics (FVAE, MIG and SAP).
+Hence, we only report the SSIM and FID metrics, besides the accuracy on content classification.
+Our model outperforms the others in realism (FID) and loses to $\beta$-TCVAE on structural similarity (SSIM).
+Finally, the features yielded by MTC-VAE significantly outperforms the baselines' when used to classify the identity of the character.
+
+\begin{table}[tb]
+  \caption{Performance for content-motion disentanglement and data realism in the Tai Chai dataset}
+  \label{tab:taichi}
+  \scriptsize
+  \centering
+  \begin{tabular}{lSS[table-format=3.2(4)]S}
+    \toprule
+    & {SSIM $\uparrow$} & {FID $\downarrow$} & {Content Class. Acc. $\uparrow$} \\
+    \midrule
+    $\beta$-TCVAE & \bf .81(4) &     244.77(385) &     .93(2) \\
+    dis-VAE       &     .73(5) &     215.51(241) &     .88(4) \\
+    SVG-LP        &     .69(7) &     201.82(091) &     .48(4) \\
+    MTC-VAE       &     .78(2) & \bf 183.24(117) & \bf .98(2) \\
+    \bottomrule
+  \end{tabular}
+
+\end{table}
+
+Figures~\ref{fig:taichi1} to~\ref{fig:taichi12} show examples of VR by MTC-VAE, and confirm our expectation of our model not being competitive when compared to SotA methods, due to the reasons presented above.
+It is important to mention that, besides the complexity of the motions in the video, the highly heterogeneous backgrounds significantly hinders the reconstruction task.
+
+However, Figures~\ref{fig:taichi1} to~\ref{fig:taichi12} allow us to qualitatively assess the disentanglement performance of our model.
+Notice how the appearance is preserved in each row of the matrices of images, while the only trait that changes is the instantaneous pose (\ie, motion).
+Although blurry, it is possible to see that the overall deformation of the body to yield a pose is, at some extent, correctly transferred \wrt the driving video, and that the identity of the character as well as the background (\ie, content) is preserved, meaning that both the content and motion representations have the correct meaningful information to reconstruct the video, and the bottleneck in the reconstruction process is in the decoder.
+
+Solutions to handle this problem include explicitly modeling the background (\ie, having identity, motion, and background representations), and using deformations modules based on Spatial Transformer Networks~\cite{Jaderberg2015}.
+Such solutions are considered as promising future work, but outside of the scope of our proposal in this manuscript.
+
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_1}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi1}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_2}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi2}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_3}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi3}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_4}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi4}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_5}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi5}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_6}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi6}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_7}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi7}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_8}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi8}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_9}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi9}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_10}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi10}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_11}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi11}
+\end{figure}
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{img/TaiChi_12}
+\caption{Tai Chi: Reenactment Examples.}
+\label{fig:taichi12}
+\end{figure}
+
+
+\section{Detailed Quantitative Results}
+\label{sec:detailed_results}
+
+We present the performance of MTC-VAE and the baselines for each the soft generalization and the two hard generalization scenarios, \wrt the three disentanglement metrics introduced in Section~\ref{sec:experiments_disentanglement} and the two reconstruction metrics introduced in Section~\ref{sec:reenactment}.
+
+\begin{table}[tb]
+\caption{Ablation on the chunk size.}
+\label{tab:cs}
+\centering
+\tiny
+\begin{tabular}{lrSSSSS[table-format=3.2(3)]}
+\toprule
+& $c$ & {FVAE $\uparrow$} & {MIG $\uparrow$} & {SAP $\uparrow$} & {SSIM $\uparrow$} & {FID $\downarrow$} \\
+\midrule
+\multirow{5}{*}{3dShapes}
+& 1 &     .50(1) &     .01(00) &     .39(11) & \bf .73(2) & \bf 100.80(4682) \\
+& 3 & \bf .51(1) &     .01(00) & \bf .41(10) & \bf .73(3) &     114.23(4763) \\
+& 5 &     .50(2) &     .01(00) & \bf .41(10) &     .67(6) &     119.47(5100) \\
+& 7 &     .48(0) &     .01(00) &     .32(09) &     .62(7) &     117.88(5690) \\
+& 9 & \bf .51(0) &     .01(00) &     .33(07) &     .58(8) &     124.43(5712) \\
+\midrule
+\multirow{5}{*}{CK+}
+& 1 &     .85(2) & \bf .03(01) &     .05(02) & \bf .68(13) &     76.16(1937) \\
+& 3 & \bf .87(3) & \bf .03(01) &     .11(03) &     .67(12) &     70.56(1992) \\
+& 5 &     .86(4) &     .02(01) & \bf .13(04) &     .66(12) &     63.13(2250) \\
+& 7 &     .85(4) &     .02(01) &     .12(05) &     .62(10) & \bf 63.03(1815) \\
+& 9 &     .81(5) & \bf .03(01) &     .11(03) &     .61(10) &     60.56(1775) \\
+\midrule
+\multirow{5}{*}{dSprites}
+& 1 & \bf .92(1) &     .02(2) &     .01(00) &     .77(1) &    105.79(586) \\
+& 3 &     .89(3) &     .02(2) & \bf .06(05) & \bf .80(4) &     78.40(2319) \\
+& 5 &     .82(1) & \bf .03(1) & \bf .06(01) &     .78(0) & \bf 68.48(378) \\
+& 7 &     .79(3) &     .02(1) &     .05(01) &     .78(0) &     71.17(345) \\
+& 9 &     .76(1) & \bf .03(1) &     .10(01) &     .78(0) &     72.77(282) \\
+\midrule
+\multirow{5}{*}{LPC}
+& 1 &     .86(1) &     .00(0) &     .11(03) & \bf .67(1) & \bf 42.59(409) \\
+& 3 &     .88(4) & \bf .02(6) & \bf .24(23) & \bf .67(1) &     47.40(802) \\
+& 5 &     .87(1) &     .00(0) &     .17(01) &     .66(1) &     84.87(781) \\
+& 7 &     .87(1) &     .00(0) &     .16(02) & \bf .67(1) &     76.92(812) \\
+& 9 & \bf .89(1) &     .01(1) &     .19(03) & \bf .67(1) &     53.57(501) \\
+\midrule
+\multirow{5}{*}{MMNIST}
+& 1 &     .91(4) &     .09(05) &     .09(04) & \bf .69(1) &    186.25(2355) \\
+& 3 & \bf .95(2) &     .08(04) &     .09(05) &     .68(1) &     96.04(1128) \\
+& 5 & \bf .95(4) &     .07(02) &     .10(04) &     .68(1) &    102.11(989) \\
+& 7 &     .92(6) &     .06(02) &     .09(03) &     .68(1) & \bf 95.69(1354) \\
+& 9 &     .91(5) & \bf .10(06) & \bf .12(06) &     .68(1) &    116.05(1338) \\
+\midrule
+\multirow{5}{*}{MUG}
+& 1 &     .70(9) & \bf .04(2) &     .75(08) & \bf .66(6) &     43.86(1315) \\
+& 3 & \bf .73(2) &     .03(2) &     .70(04) &     .62(2) &     37.62(131) \\
+& 5 &     .72(3) &     .02(1) & \bf .76(10) &     .63(2) & \bf 31.18(307) \\
+& 7 &     .72(5) &     .01(1) &     .72(03) &     .62(2) &     37.36(074) \\
+& 9 &     .72(5) &     .02(1) &     .70(04) &     .61(2) &     37.56(106) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[tb]
+\caption{Ablation on Blind Reenactment Loss.}
+\label{tab:brl}
+\centering
+\tiny
+\begin{tabular}{lrSSSSS[table-format=3.2(3)]}
+\toprule
+& $\lambda$ & {FVAE $\uparrow$} & {MIG $\uparrow$} & {SAP $\uparrow$} & {SSIM $\uparrow$} & {FID $\downarrow$} \\
+\midrule
+\multirow{6}{*}{3dShapes}
+& 0    & .50(2) & .01(1) &     .35(15) & .67(6) &     120.08(5340) \\
+& 0.25 & .50(2) & .01(1) &     .36(09) & .67(6) &     120.32(5234) \\
+& 0.5  & .50(2) & .01(1) &     .39(18) & .67(6) & \bf 119.84(5563) \\
+& 1    & .50(2) & .01(0) & \bf .41(14) & .67(6) & \bf 119.47(5100) \\
+& 2    & .50(2) & .01(1) & \bf .41(02) & .67(6) & \bf 119.34(5423) \\
+& 5    & .50(2) & .01(1) &     .40(11) & .67(6) &     120.15(5194) \\
+\midrule
+\multirow{6}{*}{CK+}
+& 0    &     .80(3) & .02(1) &     .11(6)  &     .63(11) &     71.33(2235) \\
+& 0.25 &     .81(3) & .02(1) &     .11(6)  &     .64(14) &     67.73(2237)\\
+& 0.5  &     .78(9) & .02(1) &     .12(8)  &     .64(03) &     64.49(2276)\\
+& 1    & \bf .86(4) & .02(1) &     .13(5)  & \bf .66(12) &     63.13(2250) \\
+& 2    &     .84(7) & .02(1) &     .15(4)  & \bf .66(10) & \bf 60.26(2242)\\
+& 5    &     .80(4) & .02(1) & \bf .17(2)  &     .64(37) &     65.57(2284)\\
+\midrule
+\multirow{6}{*}{dSprites}
+& 0    &     .82(9) &     .02(2) & .01(0) &     .81(0) & \bf 65.83(782) \\
+& 0.25 &     .82(6) &     .02(2) & .01(0) &     .81(0) &     69.85(632) \\
+& 0.5  &     .84(2) &     .02(2) & .01(0) &     .81(0) &     82.23(684) \\
+& 1    & \bf .85(4) & \bf .04(2) & .01(0) & \bf .82(0) &     85.43(926) \\
+& 2    & \bf .85(5) &     .04(2) & .01(0) & \bf .82(0) &     87.85(841) \\
+& 5    &     .83(2) &     .01(1) & .01(0) & \bf .82(0) &     90.15(756) \\
+\midrule
+\multirow{6}{*}{LPC}
+& 0    &     .88(3) &     .01(1) & \bf .22(04) & .67(1) &     55.81(1559)  \\
+& 0.25 &     .86(3) &     .01(1) &     .22(02) & .67(1) &     50.56(373) \\
+& 0.5  &     .85(8) & \bf .02(5) &     .22(01) & .67(1) &     45.27(954) \\
+& 1    &     .89(1) & \bf .02(5) &     .21(19) & .67(1) & \bf 40.05(426) \\
+& 2    &     .87(1) &     .01(1) &     .22(04) & .67(1) &     39.51(542) \\
+& 5    & \bf .90(2) &     .01(1) &     .22(04) & .67(1) &     38.29(725) \\
+\midrule
+\multirow{6}{*}{MMNIST}
+& 0    &     .89(4) &     .05(3) &     .08(4)  & .68(1) & \bf 100.61(1303) \\
+& 0.25 &     .92(7) &     .05(5) &     .09(7)  & .68(1) &     101.11(963) \\
+& 0.5  &     .93(5) & \bf .07(2) &     .09(2)  & .68(1) &     100.97(992) \\
+& 1    & \bf .95(4) & \bf .07(2) & \bf .10(5)  & .68(1) &     102.11(989) \\
+& 2    &     .94(2) & \bf .07(1) &     .09(1)  & .68(1) &     102.34(975) \\
+& 5    &     .94(1) & \bf .07(2) &     .09(1)  & .68(1) &     102.82(951) \\
+\midrule
+\multirow{6}{*}{MUG}
+& 0    &     .72(5) &     .01(1) &     .74(4) &     .62(2) &     34.86(632) \\
+& 0.25 &     .72(5) &     .01(1) & \bf .76(2) &     .62(2) &     27.03(055) \\
+& 0.5  &     .72(4) &     .01(1) & \bf .76(5) &     .62(1) & \bf 24.14(072) \\
+& 1    &     .72(4) & \bf .02(2) &     .74(7) & \bf .63(3) &     29.68(076) \\
+& 2    & \bf .75(7) & \bf .02(1) &     .73(5) &     .62(2) &     30.46(113) \\
+& 5    &     .74(4) & \bf .02(1) &     .72(2) &     .62(1) &     32.21(098) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[tb]
+\caption{Ablation on the order of the model.}
+\label{tab:o}
+\centering
+\tiny
+\begin{tabular}{lrSSSSS[table-format=3.2(3)]}
+\toprule
+& $O$ & {FVAE $\uparrow$} & {MIG $\uparrow$} & {SAP $\uparrow$} & {SSIM $\uparrow$} & {FID $\downarrow$} \\
+\midrule
+\multirow{4}{*}{3dShapes}
+& 1 &     .50(2) &     .01(0) &     .30(014) &     .64(5) & \bf 104.14(3820) \\
+& 2 &     .50(2) &     .01(0) &     .41(014) & \bf .67(6) &     119.47(5100) \\
+& 3 &     .50(2) &     .01(0) & \bf .46(012) & \bf .67(6) &     123.91(5284) \\
+& 4 &     .50(2) &     .01(0) &     .37(012) & \bf .67(6) &     127.32(5150) \\
+\midrule
+\multirow{4}{*}{CK+}
+& 1 &     .80(4) &     .02(01) &     .05(03) & \bf .69(12) &     65.79(2473) \\
+& 2 &     .86(4) &     .02(01) &     .13(05) &     .66(12) & \bf 63.13(2250) \\
+& 3 & \bf .87(3) &     .02(01) &     .13(04) &     .64(12) &     67.57(1931) \\
+& 4 &     .86(4) &     .02(01) &     .06(03) &     .68(13) &     65.02(2444) \\
+\midrule
+\multirow{4}{*}{dSprites}
+& 1 &     .86(2) &     .00(0) & \bf .12(02) & \bf .87(1) & \bf 66.29(300) \\
+& 2 &     .85(6) & \bf .03(1) &     .06(03) &     .78(1) &     74.30(1584) \\
+& 3 &     .89(1) &     .02(1) &     .02(01) &     .78(0) &     81.29(884) \\
+& 4 & \bf .91(4) & \bf .03(3) &     .00(01) &     .78(1) &    116.81(1972) \\
+\midrule
+\multirow{4}{*}{LPC}
+& 1 &     .87(1) &     .00(0) &     .19(03) &     .67(1) & \bf 44.70(400) \\
+& 2 & \bf .88(3) & \bf .02(5) & \bf .21(22) &     .67(1) &     54.85(1806) \\
+& 3 &     .86(1) &     .00(0) &     .20(01) &     .67(1) &     56.50(510) \\
+& 4 &     .86(2) &     .01(0) &     .19(01) & \bf .68(1) &     57.14(470) \\
+\midrule
+\multirow{4}{*}{MMNIST}
+& 1 &     .80(2) &     .02(02) &     .03(03) & \bf .72(3) & \bf 96.10(2398) \\
+& 2 &     .95(4) &     .07(02) &     .10(05) &     .68(1) &    102.11(989) \\
+& 3 & \bf .98(2) &     .07(03) &     .10(06) &     .68(1) &    100.41(1168) \\
+& 4 &     .96(2) & \bf .10(05) & \bf .11(07) &     .68(1) &    103.31(965) \\
+\midrule
+\multirow{4}{*}{MUG}
+& 1 &     .71(3) & .02(2) &     .73(08) &     .62(2) & \bf 29.30(067) \\
+& 2 &     .72(5) & .02(2) &     .72(06) &     .62(3) &     38.69(605) \\
+& 3 & \bf .73(4) & .02(2) &     .77(08) & \bf .64(3) &     30.34(186) \\
+& 4 &     .70(2) & .02(1) & \bf .75(07) &     .63(2) & \bf 29.67(065) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[tb]
+\caption{Ablation on $\beta$.}
+\label{tab:beta}
+\centering
+\tiny
+\begin{tabular}{lrSSSSS[table-format=3.2(3)]}
+\toprule
+& $\lambda$ & {FVAE $\uparrow$} & {MIG $\uparrow$} & {SAP $\uparrow$} & {SSIM $\uparrow$} & {FID $\downarrow$} \\
+\midrule
+\multirow{2}{*}{3dShapes}
+& 1 &     .50(03) &     .03(02) &     .20(02) &     .59(0) &     68.57(1095) \\
+& 5 &     .50(03) &     .03(01) & \bf .25(02) & \bf .60(0) & \bf 58.01(458) \\
+\midrule
+\multirow{2}{*}{CK+}
+& 1 &     .76(03) &     .17(03) &     .74(04) &     .64(2) &     85.62(2089) \\
+& 5 & \bf .84(05) & \bf .23(03) & \bf .84(09) & \bf .71(2) & \bf 59.13(1025) \\
+\midrule
+\multirow{2}{*}{dSprites}
+& 1 & \bf .91(02) & \bf .04(01) & \bf .10(01) &     .78(0) & \bf 57.18(643) \\
+& 5 &     .87(02) &     .02(01) &     .06(01) &     .78(0) &     70.41(521) \\
+\midrule
+\multirow{2}{*}{LPC}
+& 1 & \bf .93(06) & \bf .11(11) & \bf .60(40) &     .67(1) & \bf 41.72(331) \\
+& 5 &     .87(01) &     .01(01) &     .03(01) &     .67(1) &     44.27(461) \\
+\midrule
+\multirow{2}{*}{MMNIST}
+& 1 & \bf .96(05) & \bf .28(05) & \bf .86(01) & \bf .68(1) & \bf 103.59(557) \\
+& 5 &     .56(03) &     .04(03) &     .17(11) &     .67(1) &     150.93(436) \\
+\midrule
+\multirow{2}{*}{MUG}
+& 1 &     .72(04) &     .01(01) &     .73(05) &     .63(2) & \bf 28.79(115) \\
+& 5 & \bf .74(03) & \bf .03(02) & \bf .85(05) & \bf .66(2) &     32.55(071) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Tables~\ref{tab:cs}, \ref{tab:brl}, and~\ref{tab:o} shows the performance in the soft generalization scenario for our ablation studies presented in the main text.
+In particular, Tables~\ref{tab:cs} and~\ref{tab:brl} have the same data as, respectively, in Figs.~\ref{fig:cs} and~\ref{fig:brl}.
+The discussion on these results is provided in Section~\ref{sec:ablation}.
+
+\begin{table}[tb]
+\caption{Detailed results for the hard generalization scenarios in multiple factor disentanglement. Comparison between MTC-VAE (ours) and the baselines. (* $c=1$)}
+\label{tab:detailed_comparison_mf}
+\centering
+\tiny
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrSSScSSS}
+\toprule
+& & {FVAE $\uparrow$} & {MIG $\uparrow$} & {SAP $\uparrow$} & & {FVAE $\uparrow$} & {MIG $\uparrow$} & {SAP $\uparrow$} \\
+\cmidrule{3-5} \cmidrule{7-9}
+& & \multicolumn{3}{c}{Appearance Holdout} & & \multicolumn{3}{c}{Motion Holdout} \\
+\cmidrule{3-5} \cmidrule{7-9}
+\multirow{5}{*}{3dShapes}
+& $\beta$-TCVAE &     .23(04) &     .08(5) &     .03(02) & &     .20(2) &     .07(5) &     .03(2) \\
+& dis-VAE       &     .19(01) &     .03(2) &     .01(01) & &     .19(0) &     .03(1) &     .01(0) \\
+& SVG           &     .18(00) &     .01(0) &     .01(00) & &     .19(1) &     .01(0) &     .01(0) \\
+& MTC-VAE       &     .26(02) & \bf .22(7) & \bf .09(02) & &     .27(6) & \bf .16(4) & \bf .07(1) \\
+& MTC-VAE*      & \bf .30(02) &     .14(6) &     .05(03) & & \bf .30(3) &     .14(4) &     .06(2) \\
+\cmidrule{3-5} \cmidrule{7-9}
+\multirow{5}{*}{dSprites}
+& $\beta$-TCVAE &     .33(04) &     .03(2) &     .02(02) & &     .29(2) &     .02(2) &     .01(0) \\
+& dis-VAE       &     .36(03) &     .02(1) &     .01(00) & &     .39(2) &     .03(0) &     .02(0) \\
+& SVG           &     .25(01) &     .00(0) &     .01(01) & &     .25(0) &     .00(0) &     .00(0) \\
+& MTC-VAE       & \bf .52(01) & \bf .10(1) & \bf .08(01) & &     .38(1) &     .04(3) &     .02(1) \\
+& MTC-VAE*      &     .50(05) &     .07(3) &     .05(02) & & \bf .40(2) & \bf .06(1) & \bf .05(2) \\
+\cmidrule{3-5} \cmidrule{7-9}
+\multirow{5}{*}{LPC}
+& $\beta$-TCVAE &     .49(05) &     .11(3) &     .06(03) & &     .46(8) &     .10(4) &     .05(2) \\
+& dis-VAE       &     .31(01) &     .05(1) &     .03(01) & &     .33(6) &     .05(3) &     .03(2) \\
+& SVG           &     .24(01) &     .01(1) &     .01(01) & &     .23(1) &     .01(1) &     .01(1) \\
+& MTC-VAE       &     .54(19) &     .15(2) &     .08(03) & &     .53(9) & \bf .20(4) &     .10(2) \\
+& MTC-VAE*      & \bf .63(04) & \bf .19(2) & \bf .10(02) & & \bf .65(1) & \bf .20(5) & \bf .12(4) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:o} shows that performance on disentanglement depends on the dataset, and it can be related to the length of the videos.
+\Eg, MMNIST, the dataset with the longest videos, presented better disentanglement performance at the higher orders ($O=4$), while the rest showed better performance in middle-sized orders ($O=2,3$).
+On the other hand, for reconstruction, it seems that the best performance was obtained, in general, for $O=1$.
+It is important to point that the memory and time required to train the model significantly increase as $O$ grows. 
+We consider that having high-order models is not optimal in terms of cost-benefit.
+Also, order 1 may achieve better reconstruction results, but present poorer disentanglement results. 
+Optimal values of $O$ can be~$2$ or~$3$.
+
+\begin{table}[tb]
+\caption{Detailed results for the hard generalization scenarios. Comparison between MTC-VAE (ours) and the baselines, evaluating disentanglement and reconstruction. (* $c=1$)}
+\label{tab:detailed_comparison}
+\centering
+\tiny
+\setlength\tabcolsep{5pt}
+\begin{tabular}{lrSSSSS[table-format=3.2(3)]}
+\toprule
+& & {FVAE $\uparrow$} & {MIG $\uparrow$} & {SAP $\uparrow$} & {SSIM $\uparrow$} & {FID $\downarrow$} \\
+\cmidrule{3-7}
+& & \multicolumn{5}{c}{Appearance Holdout} \\
+\cmidrule{3-7}
+\multirow{5}{*}{3dShapes}
+& $\beta$-TCVAE & \bf .51(2) & \bf .01(1) &     .11(12) &     .54(14) &     183.40(3513) \\
+& dis-VAE       &     .50(0) &     .00(0) &     .08(07) &     .38(4)  & \bf  83.38(1211) \\
+& SVG           &     .50(1) & \bf .01(0) &     .03(04) &     .57(4)  &     219.82(2297) \\
+& MTC-VAE       & \bf .51(2) & \bf .01(1) & \bf .42(15) &     .70(4)  &     174.30(2313) \\
+& MTC-VAE*      &     .49(1) & \bf .01(0) &     .32(10) & \bf .75(1)  &     141.65(1833) \\
+\cmidrule{3-7}
+\multirow{5}{*}{CK}
+& $\beta$-TCVAE &     .83(5) & \bf .03(2) &     .09(04) &     .44(1)  &     122.20(2280) \\
+& dis-VAE       &     .72(1) &     .01(0) &     .05(01) & \bf .54(2)  &      74.08(405)  \\
+& SVG           &     .69(6) &     .02(1) &     .04(03) &     .02(0)  & \bf  61.26(358)  \\
+& MTC-VAE       & \bf .86(3) &     .02(1) & \bf .16(06) &     .50(1)  &      89.22(1263) \\
+& MTC-VAE*      &     .85(3) & \bf .03(1) &     .07(03) &     .50(1)  &     100.44(598)  \\
+\cmidrule{3-7}
+\multirow{5}{*}{dSprites}
+& $\beta$-TCVAE &     .63(5) &     .04(4) &     .00(00) & \bf .84(2)  &      96.93(974)  \\
+& dis-VAE       &     .72(4) &     .01(0) &     .00(00) &     .80(1)  &     123.95(82)   \\
+& SVG           &     .52(1) &     .00(0) &     .00(00) &     .78(1)  &      96.97(541)  \\
+& MTC-VAE       & \bf .87(1) & \bf .06(1) & \bf .01(01) &     .81(0)  & \bf  93.47(366)  \\
+& MTC-VAE*      &     .78(2) &     .03(1) &     .01(00) &     .80(1)  &     117.57(505)  \\
+\cmidrule{3-7}
+\multirow{5}{*}{LPC}
+& $\beta$-TCVAE &     .96(2) & \bf .04(3) & \bf .05(07) &     .59(3)  &     106.71(1006) \\
+& dis-VAE       &     .89(4) &     .02(1) &     .01(01) &     .47(0)  &     109.21(534)  \\
+& SVG           &     .69(4) &     .01(1) &     .02(02) &     .21(0)  &     118.80(1147) \\
+& MTC-VAE       & \bf .99(0) &     .02(1) &     .04(02) & \bf .70(1)  &     151.00(925)  \\
+& MTC-VAE*      &     .98(2) &     .02(0) &     .04(03) &     .55(1)  & \bf  54.66(359)  \\
+\cmidrule{3-7}
+\multirow{5}{*}{MMNIST}
+& $\beta$-TCVAE &     .63(5) &     .03(3) &     .04(04) & \bf .69(2)  &     163.29(1178) \\
+& dis-VAE       &     .63(3) &     .03(1) &     .04(01) &     .68(1)  &     143.25(1362) \\
+& SVG           &     .52(1) &     .01(0) &     .03(01) &     .57(1)  &     195.32(5331) \\
+& MTC-VAE       & \bf .94(5) &     .08(3) & \bf .11(07) &     .68(1)  & \bf  99.18(1473) \\
+& MTC-VAE*      &     .85(9) & \bf .12(5) &     .11(06) &     .65(5)  &     212.73(2281) \\
+\cmidrule{3-7}
+
+& & \multicolumn{5}{c}{Motion Holdout} \\
+\cmidrule{3-7}
+\multirow{5}{*}{3dShapes}
+& $\beta$-TCVAE &     .50(2) & \bf .01(1) &     .11(08) &     .52(12) &    148.64(4391) \\
+& dis-VAE       &     .50(0) &     .00(0) &     .06(01) &     .40(1)  & \bf 71.36(363)  \\
+& SVG           &     .50(0) & \bf .01(1) &     .03(02) &     .58(1)  &    155.14(1155) \\
+& MTC-VAE       &     .50(2) & \bf .01(1) &     .36(18) &     .72(0)  &    126.11(350)  \\
+& MTC-VAE*      &     .50(1) & \bf .01(1) & \bf .44(15) & \bf .75(1)  &    120.44(1319) \\
+\cmidrule{3-7}
+\multirow{5}{*}{CK}
+& $\beta$-TCVAE &     .78(6) &     .03(1) &     .04(02) &     .57(6)  &    100.63(1765) \\
+& dis-VAE       &     .71(3) &     .01(1) &     .02(01) &     .65(1)  &     69.43(119)  \\
+& SVG           &     .71(8) &     .02(1) &     .04(03) &     .02(1)  & \bf 22.08(669)  \\
+& MTC-VAE       & \bf .89(2) &     .02(2) & \bf .08(01) &     .77(1)  &     41.03(507)  \\
+& MTC-VAE*      &     .87(3) & \bf .04(1) &     .05(02) & \bf .78(2)  &     57.02(548)  \\
+\cmidrule{3-7}
+\multirow{5}{*}{dSprites}
+& $\beta$-TCVAE &     .57(7) &     .00(0) &     .00(00) &     .80(3)  &    111.35(213)  \\
+& dis-VAE       & \bf .80(6) &     .02(0) &     .00(00) &     .79(4)  &    129.26(1856) \\
+& SVG           &     .52(1) &     .00(0) &     .00(00) &     .78(0)  & \bf 83.04(1778) \\
+& MTC-VAE       &     .77(1) & \bf .06(2) &     .00(00) & \bf .82(0)  &    107.17(509)  \\
+& MTC-VAE*      &     .75(1) &     .03(0) &     .00(00) &     .81(1)  &    161.05(3461) \\
+\cmidrule{3-7}
+\multirow{5}{*}{LPC}
+& $\beta$-TCVAE &     .94(6) &     .04(1) &     .07(03) &     .65(4)  &    115.16(706)  \\
+& dis-VAE       &     .90(3) &     .04(2) &     .02(01) &     .55(16) &    116.17(530)  \\
+& SVG           &     .72(4) &     .02(1) &     .03(01) &     .23(3)  & \bf 51.82(1417) \\
+& MTC-VAE       & \bf .99(0) & \bf .05(2) & \bf .09(04) & \bf .67(4)  &    150.49(1311) \\
+& MTC-VAE*      &     .98(1) &     .03(2) &     .08(05) &     .59(3)  &    137.85(1014) \\
+\cmidrule{3-7}
+\multirow{5}{*}{MMNIST}
+& $\beta$-TCVAE &     .68(7) &     .08(6) &     .06(06) & \bf .73(3)  &     134.94(1545) \\
+& dis-VAE       &     .66(6) &     .03(2) &     .02(02) &     .71(1)  &     151.44(724)  \\
+& SVG           &     .52(1) &     .01(0) &     .01(01) &     .59(2)  &     164.17(6363) \\
+& MTC-VAE       & \bf .96(2) & \bf .16(9) & \bf .11(04) &     .68(1)  & \bf 103.55(884)  \\
+& MTC-VAE*      &     .92(6) &     .10(9) &     .07(04) &     .68(2)  &     225.99(1280) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:detailed_comparison} presents the comparison of MTC-VAE and the baselines on the two hard generalization scenarios.
+In general, the dominance of MTC-VAE over the baselines persists in both scenarios.
+
+Finally, Table~\ref{tab:detailed_comparison_mf} complements Table~\ref{tab:mf}, by showing the multi-factor disentanglement performance for the hard generalization scenarios. The superiority of MTC-VAE, either in its frame and chunk version, is easily spotted.
+
+\section{Detailed Qualitative Results}
+\label{sec:detailed_pictures}
+
+In this section, we present traversal examples for LPC (Figs.~\ref{fig:traverse_full}, \ref{fig:traverse_full_a}, \ref{fig:traverse_full_m}, \ref{fig:traverse_hair_color}, \ref{fig:traverse_hair_style}, \ref{fig:traverse_pants_color_13}, \ref{fig:traverse_shirt_color11} and~\ref{fig:traverse_perspective_14_18_20}), reenactment examples for LPC (Figs.~\ref{fig:lpc_partial}), 3dShapes (Figs.~\ref{fig:3dShapes_appearance}, \ref{fig:3dShapes_motion}, and~\ref{fig:3dShapes_partial}), dSprites (Figs.~\ref{fig:dSprites_partial}), CK+ (Figs.~\ref{fig:CK_appearance}, \ref{fig:CK_motion}, and~\ref{fig:CK_partial}), and MMNIST (Figs.~\ref{fig:MMNIST_appearance}, \ref{fig:MMNIST_motion}, and~\ref{fig:MMNIST_partial}).
+Besides the comparison with the baselines, we included examples for the ablation studies on the chunk size ($c$), impact of the Blind Reenactment Loss ($\lambda$), and the order of the model ($O$).
+Recall that the default configuration for MTC-VAE (fifth line in each figure) is $c=5$, $\lambda=1$, and $O=2$.
+
+\newcommand{\boximgc}[2]{\boximg{}{#1}{uncrop/#2}}
+
+\begin{figure}[tb]
+  \includegraphics[width=\columnwidth]{uncrop/traverse_full}
+   \caption{LPC: Latent-space traversal. Whole latent space.}
+   \label{fig:traverse_full}
+\end{figure}
+
+\begin{figure}[tb]
+  \includegraphics[width=\columnwidth]{uncrop/traverse_full_a}
+   \caption{LPC: Latent-space traversal. Appearance latent space.}
+   \label{fig:traverse_full_a}
+\end{figure}
+
+\begin{figure}[tb]
+  \includegraphics[width=\columnwidth]{uncrop/traverse_full_m}
+   \caption{LPC: Latent-space traversal. Motion latent space.}
+   \label{fig:traverse_full_m}
+\end{figure}
+
+\begin{figure}[tb]
+  \includegraphics[width=\columnwidth]{img/uncrop/traverse_hair_color}
+   \caption{LPC: Latent-space traversal. Hair color controlled by unit $z_5$.}
+   \label{fig:traverse_hair_color}
+\end{figure}
+
+\begin{figure}[tb]
+  \includegraphics[width=\columnwidth]{img/uncrop/traverse_hair_style}
+   \caption{LPC: Latent-space traversal. Hairstyle controlled by unit $z_7$.}
+   \label{fig:traverse_hair_style}
+\end{figure}
+
+\begin{figure}[tb]
+  \includegraphics[width=\columnwidth]{img/uncrop/traverse_pants_color_13}
+   \caption{LPC: Latent-space traversal. Pants colors controlled by unit $z_{13}$.}
+   \label{fig:traverse_pants_color_13}
+\end{figure}
+
+\begin{figure}[tb]
+  \includegraphics[width=\columnwidth]{img/uncrop/traverse_shirt_color11}
+   \caption{LPC: Latent-space traversal. Shirt color controlled by unit $z_{11}$.}
+   \label{fig:traverse_shirt_color11}
+\end{figure}
+
+\begin{figure}[tb]
+  \includegraphics[width=\columnwidth]{img/uncrop/traverse_perspective_14_18_20}
+   \caption{LPC: Latent-space traversal. Perspective controlled by units $w_0,w_4,w_6$.}
+   \label{fig:traverse_perspective_14_18_20}
+\end{figure}
+
+\begin{figure*}[tb]
+\centering
+  \tiny
+  \setlength{\subfigsz}{.89\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rc}
+    Source & \boximgc{.08}{LPC_s} \\
+    Driving & \boximgc{}{LPC_d} \\
+    $\beta$-TCVAE & \boximgc{}{LPC_betaTC_p10000084} \\
+    dis-VAE & \boximgc{}{LPC_dis_p10000084} \\
+    SVG & \boximgc{}{LPC_SVG_p10000084} \\
+    MTC-VAE & \boximgc{}{LPC_MTC_p10000084} \\
+    $\lambda=0$ & \boximgc{}{LPC_lambda0_p10000084} \\
+    $O=1$ & \boximgc{}{LPC_o1_p10000084} \\
+    $O=3$ & \boximgc{}{LPC_o3_p10000084} \\
+    $O=4$ & \boximgc{}{LPC_o4_p10000084} \\
+    $c=1$ & \boximgc{}{LPC_c1_p10000084} \\
+    $c=5$ & \boximgc{}{LPC_c5_p10000084} \\
+    $c=7$ & \boximgc{}{LPC_c7_p10000084} \\
+    $c=9$ & \boximgc{}{LPC_c9_p10000084}
+  \end{tabular}
+   \caption{LPC: examples of reenactment for the soft generalization scenario. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:lpc_partial}
+\end{figure*}
+
+
+\begin{figure}[tb]
+\centering
+  \tiny
+  \setlength{\subfigsz}{.88\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rcc}
+    Source  & \boximgc{.857}{3dShapes_a_s_0_0_3_1_6_1_2_2_1} \\
+    Driving & \boximgc{}{3dShapes_a_d_7_0_0_1_1_0_4_10_1} \\
+    $\beta$-TCVAE & \boximgc{}{3dShapes_a3_betaTC_0008232} \\
+    dis-VAE & \boximgc{}{3dShapes_a3_dis_0008232} \\
+    SVG & \boximgc{}{3dShapes_a3_SVG_0008232} \\
+    MTC-VAE & \boximgc{}{3dShapes_a3_MTC_0008232} \\
+    $\lambda=0$ & \boximgc{}{3dShapes_a3_lambda0_0008232} \\
+    $O=1$ & \boximgc{}{3dShapes_a3_o1_0008232} \\
+    $O=3$ & \boximgc{}{3dShapes_a3_o3_0008232} \\
+    $O=4$ & \boximgc{}{3dShapes_a3_o4_0008232} \\
+    $c=1$ & \boximgc{}{3dShapes_a3_c1_0008232} \\
+    $c=3$ & \boximgc{}{3dShapes_a3_c3_0008232} \\
+    $c=7$ & \boximgc{}{3dShapes_a3_c7_0008232} \\
+    $c=9$ & \boximgc{}{3dShapes_a3_c9_0008232}
+  \end{tabular}
+   \caption{3dShapes: examples of reenactment for appearance holdout. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:3dShapes_appearance}
+\end{figure}
+
+\begin{figure}[tb]
+\centering
+  \tiny
+  \setlength{\subfigsz}{.88\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rcc}
+    Source  & \boximgc{.25}{3dShapes_m_s_0_0_1_5_3_1_5_5_2} \\
+    Driving & \boximgc{}{3dShapes_m_d_6_5_5_5_7_3_13_6_1} \\
+    $\beta$-TCVAE & \boximgc{}{3dShapes_m3_betaTC_0008235} \\
+    dis-VAE & \boximgc{}{3dShapes_m3_dis_0008235} \\
+    SVG & \boximgc{}{3dShapes_m3_SVG_0008235} \\
+    MTC-VAE & \boximgc{}{3dShapes_m3_MTC_0008235} \\
+    $\lambda=0$ & \boximgc{}{3dShapes_m3_lambda0_0008235} \\
+    $O=1$ & \boximgc{}{3dShapes_m3_o1_0008235} \\
+    $O=3$ & \boximgc{}{3dShapes_m3_o3_0008235} \\
+    $O=4$ & \boximgc{}{3dShapes_m3_o4_0008235} \\
+    $c=1$ & \boximgc{}{3dShapes_m3_c1_0008235} \\
+    $c=3$ & \boximgc{}{3dShapes_m3_c3_0008235} \\
+    $c=7$ & \boximgc{}{3dShapes_m3_c7_0008235} \\
+    $c=9$ & \boximgc{}{3dShapes_m3_c9_0008235}
+  \end{tabular}
+   \caption{3dShapes: examples of reenactment for motion holdout. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:3dShapes_motion}
+\end{figure}
+
+\begin{figure}[tb]
+\centering
+  \tiny
+  \setlength{\subfigsz}{.88\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rcc}
+    Source  & \boximgc{.667}{3dShapes_p_s_6_5_8_3_1_3_7_13_2} \\
+    Driving & \boximgc{}{3dShapes_p_d_4_8_6_4_7_3_3_8_1} \\
+    $\beta$-TCVAE & \boximgc{}{3dShapes_p4_betaTC_0000431} \\
+    dis-VAE & \boximgc{}{3dShapes_p4_dis_0000431} \\
+    SVG & \boximgc{}{3dShapes_p4_SVG_0000431} \\
+    MTC-VAE & \boximgc{}{3dShapes_p4_MTC_0000431} \\
+    $\lambda=0$ & \boximgc{}{3dShapes_p4_lambda0_0000431} \\
+    $O=1$ & \boximgc{}{3dShapes_p4_o1_0000431} \\
+    $O=3$ & \boximgc{}{3dShapes_p4_o3_0000431} \\
+    $O=4$ & \boximgc{}{3dShapes_p4_o4_0000431} \\
+    $c=1$ & \boximgc{}{3dShapes_p4_c1_0000431} \\
+    $c=3$ & \boximgc{}{3dShapes_p4_c3_0000431} \\
+    $c=7$ & \boximgc{}{3dShapes_p4_c7_0000431} \\
+    $c=9$ & \boximgc{}{3dShapes_p4_c9_0000431}
+  \end{tabular}
+   \caption{3dShapes: examples of reenactment for the soft generalization scenario. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:3dShapes_partial}
+\end{figure}
+
+\begin{figure*}
+\centering
+  \tiny
+  \setlength{\subfigsz}{.97\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rccc}
+    Source & \boximgc{.04}{dSprites_s} \\
+    Driving & \boximgc{}{dSprites_d} \\
+    $\beta$-TCVAE & \boximgc{}{dSprites_betaTC_p10000046} \\
+    dis-VAE & \boximgc{}{dSprites_dis_p10000046} \\
+    SVG & \boximgc{}{dSprites_SVG_p10000046} \\
+    MTC-VAE & \boximgc{}{dSprites_MTC_p10000046} \\
+    $O=1$ & \boximgc{}{dSprites_o1_p10000046} \\
+    $O=3$ & \boximgc{}{dSprites_o3_p10000046} \\
+    $O=4$ & \boximgc{}{dSprites_o4_p10000046} \\
+    $c=1$ & \boximgc{}{dSprites_c1_p10000046} \\
+    $c=5$ & \boximgc{}{dSprites_c5_p10000046} \\
+    $c=7$ & \boximgc{}{dSprites_c7_p10000046} \\
+    $c=9$ & \boximgc{}{dSprites_c9_p10000046}
+  \end{tabular}
+   \caption{dSprites: examples of reenactment for the soft generalization scenario. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:dSprites_partial}
+\end{figure*}
+
+
+\begin{figure*}
+\centering
+  \tiny
+  \setlength{\subfigsz}{.95\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rc}
+    Source  & \boximgc{.667}{CK_a_s_S055-001} \\
+    Driving & \boximgc{}{CK_a_d_S124-007} \\
+    $\beta$-TCVAE & \boximgc{}{CK_a1_betaTC_0002384} \\
+    dis-VAE & \boximgc{}{CK_a1_dis_0002384} \\
+    SVG & \boximgc{}{CK_a1_SVG_0002384} \\
+    MTC-VAE & \boximgc{}{CK_a1_MTC_0002384} \\
+    $\lambda=0$ & \boximgc{}{CK_a1_lambda0_0002384} \\
+    $O=1$ & \boximgc{}{CK_a1_o1_0002384} \\
+    $O=3$ & \boximgc{}{CK_a1_o3_0002384} \\
+    $O=4$ & \boximgc{}{CK_a1_o4_0002384} \\
+    $c=1$ & \boximgc{}{CK_a1_c1_0002384} \\
+    $c=3$ & \boximgc{}{CK_a1_c3_0002384} \\
+    $c=7$ & \boximgc{}{CK_a1_c7_0002384} \\
+    $c=9$ & \boximgc{}{CK_a1_c9_0002384}
+  \end{tabular}
+   \caption{CK+: examples of reenactment for appearance holdout. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:CK_appearance}
+\end{figure*}
+
+\begin{figure*}
+\centering
+  \tiny
+  \setlength{\subfigsz}{.95\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rc}
+    Source  & \boximgc{.372}{CK_m_s_S125-001} \\
+    Driving & \boximgc{}{CK_m_d_S074-005} \\
+    $\beta$-TCVAE & \boximgc{}{CK_m1_betaTC_0007015} \\
+    dis-VAE & \boximgc{}{CK_m1_dis_0007015} \\
+    SVG & \boximgc{}{CK_m1_SVG_0007015} \\
+    MTC-VAE & \boximgc{}{CK_m1_MTC_0007015} \\
+    $\lambda=0$ & \boximgc{}{CK_m1_lambda0_0007015} \\
+    $O=1$ & \boximgc{}{CK_m1_o1_0007015} \\
+    $O=3$ & \boximgc{}{CK_m1_o3_0007015} \\
+    $O=4$ & \boximgc{}{CK_m1_o4_0007015} \\
+    $c=1$ & \boximgc{}{CK_m1_c1_0007015} \\
+    $c=3$ & \boximgc{}{CK_m1_c3_0007015} \\
+    $c=7$ & \boximgc{}{CK_m1_c7_0007015} \\
+    $c=9$ & \boximgc{}{CK_m1_c9_0007015}
+  \end{tabular}
+   \caption{CK+: examples of reenactment for motion holdout. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:CK_motion}
+\end{figure*}
+
+\begin{figure*}
+\centering
+  \tiny
+  \setlength{\subfigsz}{.95\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rc}
+    Source  & \boximgc{}{CK_p_s_S130_001} \\
+    Driving & \boximgc{.889}{CK_p_d_S133_005} \\
+    $\beta$-TCVAE & \boximgc{.889}{CK_p4_betaTC_0000429} \\
+    dis-VAE & \boximgc{.889}{CK_p4_dis_0000429} \\
+    SVG & \boximgc{.889}{CK_p4_SVG_0000429} \\
+    MTC-VAE & \boximgc{.889}{CK_p4_MTC_0000429} \\
+    $\lambda=0$ & \boximgc{.889}{CK_p4_lambda0_0000429} \\
+    $O=1$ & \boximgc{.889}{CK_p4_o1_0000429} \\
+    $O=3$ & \boximgc{.889}{CK_p4_o3_0000429} \\
+    $O=4$ & \boximgc{.889}{CK_p4_o4_0000429} \\
+    $c=1$ & \boximgc{.889}{CK_p4_c1_0000429} \\
+    $c=3$ & \boximgc{.889}{CK_p4_c3_0000429} \\
+    $c=7$ & \boximgc{.889}{CK_p4_c7_0000429} \\
+    $c=9$ & \boximgc{.889}{CK_p4_c9_0000429}
+  \end{tabular}
+   \caption{CK+: examples of reenactment for the soft generalization scenario. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:CK_partial}
+\end{figure*}
+
+\begin{figure*}
+\centering
+  \tiny
+  \setlength{\subfigsz}{.99\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rc}
+    Source & \boximgc{.015}{MUG_s} \\
+    Driving & \boximgc{.96}{MUG_d} \\
+    $\beta$-TCVAE & \boximgc{.96}{MUG_betaTC_p10000060} \\
+    dis-VAE & \boximgc{.96}{MUG_dis_p10000060} \\
+    SVG & \boximgc{.96}{MUG_SVG_p10000060} \\
+    MTC-VAE & \boximgc{.96}{MUG_MTC_p10000060} \\
+    $\lambda=0$ & \boximgc{.96}{MUG_lambda0_p10000060} \\
+    $O=1$ & \boximgc{.96}{MUG_o1_p10000060} \\
+    $O=2$ & \boximgc{.96}{MUG_o2_p10000060} \\
+    $O=4$ & \boximgc{.96}{MUG_o4_p10000060} \\
+    $c=1$ & \boximgc{.96}{MUG_c1_p10000060} \\
+    $c=3$ & \boximgc{.96}{MUG_c3_p10000060} \\
+    $c=7$ & \boximgc{.96}{MUG_c7_p10000060} \\
+    $c=9$ & \boximgc{.96}{MUG_c9_p10000060}
+  \end{tabular}
+   \caption{MUG: examples of reenactment for the soft generalization scenario. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:MUG_partial}
+\end{figure*}
+
+\begin{figure*}
+\centering
+  \tiny
+  \setlength{\subfigsz}{.95\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rcc}
+    Source  & \boximgc{}{MMNIST_a_s_1_diag_1_0} \\
+    Driving & \boximgc{}{MMNIST_a_d_9_left_right_18} \\
+    $\beta$-TCVAE & \boximgc{}{MMNIST_a4_betaTC_0001509} \\
+    dis-VAE & \boximgc{}{MMNIST_a4_dis_0001509} \\
+    SVG & \boximgc{}{MMNIST_a4_SVG_0001509} \\
+    MTC-VAE & \boximgc{}{MMNIST_a4_MTC_0001509} \\
+    $\lambda=0$ & \boximgc{}{MMNIST_a4_lambda0_0001509} \\
+    $O=1$ & \boximgc{}{MMNIST_a4_o1_0001509} \\
+    $O=3$ & \boximgc{}{MMNIST_a4_o3_0001509} \\
+    $O=4$ & \boximgc{}{MMNIST_a4_o4_0001509} \\
+    $c=1$ & \boximgc{}{MMNIST_a4_c1_0001509} \\
+    $c=3$ & \boximgc{}{MMNIST_a4_c3_0001509} \\
+    $c=7$ & \boximgc{}{MMNIST_a4_c7_0001509} \\
+    $c=9$ & \boximgc{}{MMNIST_a4_c9_0001509}
+  \end{tabular}
+   \caption{MMNIST: examples of reenactment for appearance holdout. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:MMNIST_appearance}
+\end{figure*}
+
+\begin{figure*}
+\centering
+  \tiny
+  \setlength{\subfigsz}{.95\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rcc}
+    Source  & \boximgc{}{MMNIST_m_s_3_diag_3_18} \\
+    Driving & \boximgc{}{MMNIST_m_d_4_diag_1_0} \\
+    $\beta$-TCVAE & \boximgc{}{MMNIST_m4_betaTC_0001509} \\
+    dis-VAE & \boximgc{}{MMNIST_m4_dis_0001509} \\
+    SVG & \boximgc{}{MMNIST_m4_SVG_0001509} \\
+    MTC-VAE & \boximgc{}{MMNIST_m4_MTC_0001509} \\
+    $\lambda=0$ & \boximgc{}{MMNIST_m4_lambda0_0001509} \\
+    $O=1$ & \boximgc{}{MMNIST_m4_o1_0001509} \\
+    $O=3$ & \boximgc{}{MMNIST_m4_o3_0001509} \\
+    $O=4$ & \boximgc{}{MMNIST_m4_o4_0001509} \\
+    $c=1$ & \boximgc{}{MMNIST_m4_c1_0001509} \\
+    $c=3$ & \boximgc{}{MMNIST_m4_c3_0001509} \\
+    $c=7$ & \boximgc{}{MMNIST_m4_c7_0001509} \\
+    $c=9$ & \boximgc{}{MMNIST_m4_c9_0001509}
+  \end{tabular}
+   \caption{MMNIST: examples of reenactment for motion holdout. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:MMNIST_motion}
+\end{figure*}
+
+\begin{figure*}
+\centering
+  \tiny
+  \setlength{\subfigsz}{.95\linewidth}
+  \setlength\tabcolsep{1.5pt}
+  \begin{tabular}{rcc}
+    Source  & \boximgc{}{MMNIST_p_s_4_left_right_0} \\
+    Driving & \boximgc{}{MMNIST_p_d_5_up_down_10} \\
+    $\beta$-TCVAE & \boximgc{}{MMNIST_p4_betaTC_0001509} \\
+    dis-VAE & \boximgc{}{MMNIST_p4_dis_0001509} \\
+    SVG & \boximgc{}{MMNIST_p4_SVG_0001509} \\
+    MTC-VAE & \boximgc{}{MMNIST_p4_MTC_0001509} \\
+    $\lambda=0$ & \boximgc{}{MMNIST_p4_lambda0_0001509} \\
+    $O=1$ & \boximgc{}{MMNIST_p4_o1_0001509} \\
+    $O=3$ & \boximgc{}{MMNIST_p4_o3_0001509} \\
+    $O=4$ & \boximgc{}{MMNIST_p4_o4_0001509} \\
+    $c=1$ & \boximgc{}{MMNIST_p4_c1_0001509} \\
+    $c=3$ & \boximgc{}{MMNIST_p4_c3_0001509} \\
+    $c=7$ & \boximgc{}{MMNIST_p4_c7_0001509} \\
+    $c=9$ & \boximgc{}{MMNIST_p4_c9_0001509}
+  \end{tabular}
+   \caption{MMNIST: examples of reenactment for the soft generalization scenario. Comparison with the baselines ($\beta$-TCVAE and dis-VAE), and ablation study on the chunk size ($c$), Blind Reenactment Loss ($\lambda$), and order of the model ($O$).}
+   \label{fig:MMNIST_partial}
+\end{figure*}

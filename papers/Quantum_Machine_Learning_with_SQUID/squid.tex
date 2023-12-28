@@ -1,0 +1,221 @@
+
+\section{The squid framework}
+\label{sec:squid}
+Our main goal when designing SQUID is to propose a framework within which both classical and quantum machine learning can work in concert to solve a classification problem.
+Properly utilizing classical computing, when possible, is of great importance because quantum and classical models for data will often have different advantages and disadvantages.
+From an architectural perspective, the key innovation that SQUID allows is for classical neural networks to be globally trained in conjunction with a quantum neural network to build optimal encoders and decoders for the classical inputs or quantum outputs from the hybrid neural network.
+This ability allows us to, in effect, learn a feature map that not only allows us to represent large quantum datasets in near term devices but also allows us to incorporate classical information that may be known a priori into the quantum model.
+
+Before proceeding with the detailed description of the model, it is important for work like this that hybridizes between quantum and classical models to discuss the correspondence between the quantum and classical machine learning models that we implicitly assume.
+In all these cases we assume that in general our training dataset contains both classical vector and quantum states and the following form
+\begin{equation}
+S_{\rm train} = \{(v_{\rm class}[j],\ket{v_{\rm quant}[j]}), j\in 0,\ldots,N_{\rm train} \}
+\end{equation}
+Here we assume a classical bit-encoding, meaning that we assume that each $v_{\rm class}[j] \in \mathbb{R}^D$.
+This is the typical setting in machine learning, however, it is also possible to envision that the actual training vectors are distributions over $D$ symbols and the classical values $v_{\rm class}$ are given by the probabilities of drawing each symbol from the distribution.
+We further implicitly assume that the quantum data $\ket{v_{\rm quant}[j]}$ is provided using an amplitude encoding.  By this we mean that the values of the training vectors are stored in the amplitudes of the $\ket{v_{\rm quant}[j]}$ state.
+We make this choice because it is the most general setting that we can assume as it also subsumes the case where the quantum training vectors correspond to distinct quantum bit strings (otherwise known as a bit-encoding).
+
+The SQUID framework was designed with extensibility and simplicity as its core principles.
+It generally follows design principles set by PyTorch~\cite{PyTorch}.
+Currently there are many competing Quantum SDKs~\cite{smith2016practical, Qiskit, Cirq}, most of which include Python interfaces.
+Hence a successful QML package should allow, a simple extensible solution, which can be adjusted to any specific SDK.
+SQUID enables that by providing general classes, similar to \texttt{nn.Module} in PyTorch, one each for Quantum and Classical Models.
+These satisfy minimal requirements of functions used by the backend \texttt{MainModel} to properly propagate the gradient through combinations of the models.
+
+\subsection{Framework Design}
+Main component of SQUID is the \texttt{MainModel}, which itself accepts three smaller models.
+The first and last models are currently enforced to be classical, while the middle can be either quantum or classical. In case all three models are classical, \texttt{MainModel} is equivalent to PyTorch's \texttt{nn.Sequential} with three sub-components.
+
+The complete framework is shown graphically on Fig.~\ref{fig:model-arch}, and the detailed relations between models within the ensemble are described in the following subsections.
+
+	\begin{figure}
+	\centering
+	\includegraphics[width=0.475\textwidth]{plots/squid_arch.png}
+	\caption{
+		SQUID Model Architecture. A shows a current implementation, which is a simplified version of B, ($\ket{\psi}_{in} = 0$).
+		In A the nodes can be thought of as neurons in classical machine learning, or quantum state vectors.
+		The edges represent transformations applied to these states.
+		These typically involve trainable weights, but they might, as often in case of Quantum Model perform a set of transformations defined by incoming data.
+		"Inputs to the Quantum Model" ($\vec{v}_{class}$) in particular can define both the input state to a quantum system ($W_E$) along with the rotations that should be applied to that input state ($W_V(\theta)$).
+		Quantum Model should also perform a measurement of the state ($M_D$) and return classical amplitude estimates ($\vec{v}_{out}$).
+		Part B contains also planned future extension in which quantum features are also allowed to be passed in.
+	}
+	\label{fig:model-arch}
+\end{figure}
+
+
+\subsection{Propagating through the Main Model}
+\label{subsec:squid-main-model}
+
+Calling the model, or calling the \texttt{forward} function is exactly the same to PyTorch's forward pass.
+The only difference, is when middle model is Quantum, and the conversion between Tensors and numpy arrays~\cite{numpy} is required.
+The reason for choosing numpy arrays to be passed into Quantum model is due to the fact that many QML packages accept them as the input and in fact prefer them even over standard Pythonic lists.
+
+The \texttt{backward} function offers the only major modification for the user in comparison to PyTorch, and it is required to be called explicitly by the user.
+For classical models standard PyTorch back-propagation (\texttt{autograd}) is used, and exact gradients are calculated.
+In the case there is a Quantum model in the middle, the automatic gradient propagation stops at the end of the second (quantum) model.
+This is because there was a conversion to/from numpy in the forward pass.
+SQUID uses the \texttt{backward} function provided by implementation of the Quantum Model.
+This both updates any parameters stored within the model, and provides the gradient with respect to the output of the encoder.
+
+The conversion from numpy array to PyTorch tensor in backward call requires us to create a \textit{fake} loss, which we then use to propagate the gradients backward using back-propagation.
+Given encoder forward output $o_{12}$, gradient of global loss with respect to that output $g_{12}$ (provided by the Quantum Model as described above),
+we define a \textit{fake loss} $L'$:
+\begin{align}
+    L'(o_{12}, g_{12}) &= \sum_i\sum_j {o_{12}}_{ij}{g_{12}}_{ij} \\
+    \frac{\partial L'(o_{12}, g_{12})}{\partial {o_{12}}_{ij}} &= {g_{12}}_{ij}
+\end{align}
+After the above calculation a PyTorch \texttt{backward} call is made on $L'$, which propagates the gradient using \texttt{autograd}.
+Hence, gradients with respect to all of the Main Models parameters are calculated.
+For clarity the process is shown in Algorithm~\ref{alg:main-backprop}.
+
+\begin{footnotesize}
+\begin{algorithm}[h]
+	\SetAlgoLined
+	\KwIn{Main Model $\mathcal{M}$, Loss $L$ (Torch Tensor)}
+
+	Let $\mathcal{M}_1$, $\mathcal{M}_2$, $\mathcal{M}_3$ refer respectively to Encoder, Quantum Model, Decoder of $\mathcal{M}$\;
+
+	L.backward()\;
+	\If{$\mathcal{M}_2$ is Quantum}{
+		Let be $g_{23}$ the gradient of $L$ with respect to input to $\mathcal{M}_3$ (PyTorch-provided)\;
+		Let $g_{12}$ be the gradient of $L$ with respect to input to $\mathcal{M}_2$, this is achieved by passing $g_{23}$ through user-provided \texttt{backward} function of the $\mathcal{M}_2$ model\;
+		Let $o_{12}$ be the output of $\mathcal{M}_1$ and input of $\mathcal{M}_2$ (Saved from forward iteration)\;
+		Let $L'$ be sum of all elements of $g_{12} \odot o_{12}$\;
+		$L'$.backward()\;
+	}
+
+	\caption{Back-propagation through the Main Model}
+	\label{alg:main-backprop}
+\end{algorithm}
+\end{footnotesize}
+
+\begin{footnotesize}
+\begin{algorithm}[h]
+	\SetAlgoLined
+	\KwIn{Number of qubits $N$, vector of $M$ quantum parameters $\vec{\theta}$, desired number of outputs $Q_1\in[1,2^{N}]$}
+	Construct unitary operation corresponding to quantum circuit\;
+	Measure $Q_1$ output probabilities $p_k$ from circuit\;
+	Use parameter shift rule and a total of $N_C=\min\left[2^{N}M,2Q_1(M+1)\right]$ circuits to estimate the $Q_1$ $M$-dimensional gradients $g_{kw}$\;
+	\KwOut{Returns {\it result}=$\vec{p}$ and {\it grad}=$g_{kw}$}
+	\caption{Quantum Model}
+	\label{alg:quantum-backprop}
+\end{algorithm}
+\end{footnotesize}
+
+It is worth mentioning that by using PyTorch built-in \texttt{autograd} procedure any PyTorch loss can be used.
+For example, in the Section~\ref{sec:results} Cross Entropy loss is used.
+Similarly any optimizer can be used.
+The main caveat to using various optimizers is that if any parameters are defined within the Quantum Model the user has absolute control over updating them,
+and the overhead of optimizer implementation falls onto the user.
+
+\subsection{Complexity of Gradient Evaluation}
+\label{sec:complexity}
+
+A crucial question that needs to be evaluated to assess the practicality of any QML algorithm is the quantum complexity of the gradient calculation.  This is especially relevant since the gradients propagated through the quantum model require statistical sampling or a quantum technique such as amplitude estimation to evaluate~\cite{Brassard_2002,Suzuki_2020,Grinko_2021}.  Here we provide such a complexity analysis with the aim of bounding the scaling of the number of quantum operations needed to ensure that the gradients yielded by Algorithm~\ref{alg:quantum-backprop} are accurate within bounded error $\epsilon$.  Here in ensuring that the error is $\epsilon$ we mean that the gradient computation detailed in Algorithm~\ref{alg:quantum-backprop} outputs an estimate of the gradient $\widetilde{g}$ such that $|g-\widetilde{g}|_2 \le \epsilon$.
+
+Let us consider a Monte-Carlo estimate of the gradient.  The algorithm for generating such an estimate involves measuring the expectation value of the gradient.  This expectation value can be evaluated using Hadamard tests to estimate each component of the gradient (see Appendix~\ref{app:gradients}).  Using the empirical frequency of measurements as an unbiased estimate of the probability, we have that if $\widetilde{g}$ is the estimate that returns from our protocol
+\begin{equation}
+| g - \mathbb{E}(\widetilde{g})|_2 =0. 
+\end{equation}
+As there are $M$ different parameters and $Q_1$ outputs yielded by the quantum model, we further have that
+\begin{equation}
+\mathbb{E}(|g - \widetilde{g}|_2^2) = \sum_{k=1}^{Q_1 M} \mathbb{E}(g_k^2 - 2 g\widetilde{g_k} +\widetilde{g_k}^2) =\sum_{k=1}^{Q_1 M} \mathbb{V}(\widetilde{g}_k).
+\end{equation}
+Since the variance of the sum is the sum of the variances and we are using the sample mean for our estimates of the probability.  This means that if $N$ samples are used per point then
+\begin{equation}
+\sum_{k=1}^{Q_1 M} \mathbb{V}(\widetilde{g}_k) \le \sum_{k=1}^{Q_1 M} \frac{\mathbb{V}(g_k)}{N} 
+\end{equation} 
+Therefore we have that the mean square error of $\widetilde{g}$ is at most $\epsilon^2$ if
+\begin{equation}
+N \geq \frac{Q_1M}{\epsilon^2} \max_{k}\mathbb{V}[g_{k}]\in O\left(\frac{Q_1M}{\epsilon^2}\right)\;,\label{eq:nsamp}
+\end{equation}
+note that if the variances are small then the number of samples required will be further reduced.
+Then from Markov's inequality, the number of samples needed to estimate the gradient within error $\epsilon$ with probability greater than $2/3$ will be simply given by $3$ times the estimate in Eq.~\eqref{eq:nsamp} above. 
+
+If a learning rate of $\lambda$ is used for the gradient ascent then the error in the quantum parameters (as quantified by the Euclidean distance) is, with probability greater than $2/3$, at most $\epsilon\lambda$.  We denote by $\Delta$ the error introduced by using the noisy estimator $\widetilde{g}$ for the parameter update
+\begin{equation}
+\Delta = \left\|\prod_j e^{-i \theta_{j=1}^M H_j} - \prod_j e^{-i \widetilde{\theta}_{j=1}^M H_j}\right\|_2\;,
+\end{equation}
+with $\|\cdot \|_2$ the induced Euclidean norm.
+The generators $H_j$ used in SQUID (see Sec.~\ref{sec:qmodels}) have unit norm, this allows us to bound the error as
+\begin{equation}
+\Delta \le | \vec{\theta} - \vec{\widetilde{\theta}}|_1 \le \sqrt{M} | \vec{\theta} - \vec{\widetilde{\theta}}|_2 \in O\left({ \sqrt{M} \lambda \epsilon}\right)\;.
+\end{equation}
+Therefore it follows from the fact that the error in the output probabilities $\vec{p}$ satisfies $|p_k(\vec{\theta}) - p_k(\widetilde{\vec{\theta}})| \in O(\Delta)$, that the value of $N$ needed to ensure that the maximum error $\delta$ in $p_k$ after a single step of gradient ascent, with probability at least $2/3$, obeys
+\begin{equation}
+N \in O\left(\frac{Q_1 M^2 \lambda^2}{\delta^2} \right).
+\end{equation}
+
+Finally, an application of the Chernoff bound shows that if we wish the error to be $\delta$ with probability at least $1-\eta$ then we can repeat the experiment a logarithmic number of times and use majority voting to estimate the updated parameters.  This results in
+\begin{equation}
+N \in O\left(\frac{Q_1 M^2 \lambda^2}{\delta^2}\log\left(\frac{1}{\eta} \right) \right) \in \widetilde{O}\left(\frac{Q_1 M^2 \lambda^2}{\delta^2} \right),
+\end{equation}
+where $\widetilde{O}(\cdot)$ denotes an asymptotic upper bound with polylogarithmic multiplicative factors suppressed.
+On a future fault-tolerant quantum device it would also be possible to obtain a quadratic speedup in both $\epsilon$ and $M$ at the cost of a longer circuit depth (see eg.~\cite{Brassard_2002,gilyen2019optimizing}).
+
+\subsection{Available classical models}
+There are two built-in classical models: Linear and Convolutional. Both accept arguments which specify numbers of neurons per layer, and activation functions between them.
+
+However, since \texttt{ClassicalModel} is a sub-class of \texttt{nn.Module} from PyTorch, it is straightforward for a user to implement their own model.
+This is recommended, unless configuration files from SQUID helpers are utilized (see Sec.~\ref{sec:squid_hlp}).
+
+\subsection{Available quantum models}
+\label{sec:qmodels}
+
+In this section we provide details on the implementation of quantum models within SQUID. The approach we follow in this preliminary study is to construct the most general models on a given set of qubits by expressing the quantum circuits as layers of structured operations acting in nearest-neighbors only. This allows for both generality and a direct connection with real-world implementations on near-term devices with limited connectivity. Despite this choice, the framework is general and can be easily extended to accommodate quantum models with a different structure.
+
+The common construction for a variational quantum classifier (see eg.~\cite{Havl_ek_2019,Schuld_2019b,Schuld2020}) is to start by considering the encoding of an input $D$-dimensional feature vector $\vec{v}\in[0,1]^{D}$  into the quantum state of a register containing $N\geq\lceil\log_2(D)\rceil$ qubit by introducing an encoding unitary operation $W_E$ as
+\begin{equation}
+\ket{\Psi\left(\vec{v}\right)} = W_E(\vec{v})\ket{0}\;,
+\end{equation}
+with $\ket{0}$ a reference state in the computational basis. The encoded state $\ket{\Psi}$ is then modified by acting with a second unitary $W_V$ defined in terms of a set of $N_v$ variational parameters $\vec{\theta}\in[0,\pi)^{N_v}$. The final state of the quantum register right before measurement is then
+\begin{equation}
+\label{eq:qfeat}
+ \ket{\Phi\left(\vec{v},\vec{\theta}\right)} = W_V(\vec{\theta}) \ket{\Psi\left(\vec{v}\right)} = W_V(\vec{\theta})W_E(\vec{v})\ket{0}\;.
+\end{equation}
+
+The output of the quantum models we consider here are the probabilities of measuring each one of the computational basis states in the state $\ket{\Phi}$, which can be estimated by collecting statistics over a large number of circuit executions. Given that the number of possible outcomes scales exponentially in the register size, a small subset of probabilities is typically selected in order for the overall scheme to be scalable.
+
+The decomposition of the total unitary operation mapping $\ket{0}$ to $\ket{\Phi}$ as a function an the {\it encoding} unitary $W_E$ and a {\it variational} unitary  $W_V$ is however artificial and does not necessarily lead to the most efficient scheme. This is especially true in the SQUID framework where a classical network is devoted to optimally determine an encoding of the classical data into a quantum state. The approach we take in SQUID is to consider instead the $M$-dimensional output from the classical encoder as the parameters describing a global unitary $W$ in the quantum register, without artificially distinguishing between ``encoding'' parameters and ``variational'' parameters. This hybridization of the standard approach described above is still completely general and the global network can adjust to effectively reproduce a factorized form $W=W_VW_E$ if there is a measurable advantage for the data under analysis.
+
+We note that a generic unitary operation on $N$ qubits can depend on at most $(4^N-1)$ parameters, which implies that we need to choose $M<(4^N-1)$ for the output of the classical encoder. In practice this is not a limitation since unitary operations which can be decomposed efficiently into a polynomial number of one and two qubit operations will depend at most on a polynomially large number of parameters.
+
+In this first exploratory study we use a simple, but general, parametrization of $W$ in terms of a one qubit unitary $U^1_{k}(\alpha,\beta,\gamma)$ and a two qubit unitary $U^2_{jk}(\theta,\phi,\eta)$ both parametrized by 3 real parameters taking values in $[0,\pi)$.
+The unitary $U_1$ can be written as
+\begin{equation}
+\label{eq:u1_unitary}
+U^1_k(\alpha,\beta,\gamma) = \exp\left(i\alpha Y_k\right)\exp\left(i\beta Z_k\right)\exp\left(i\gamma Y_k\right)\;,
+\end{equation}
+and we recognize the parameters $(\alpha,\beta,\gamma)$ to be the Euler angles in the $YZY$ decomposition.
+In the expression above $Z_k$($Y_k$) denote the Pauli Z matrix (Y matrix) for qubit $k$, and we will denote $X_k$ similarly in the following.
+The two-qubit unitary $U^2_{jk}$ acting on the qubit pair $\{j,k\}$ is instead defined as
+\begin{equation}
+\label{eq:u2_unitary}
+U^2_{jk}(\theta,\phi,\eta) =e^{i\theta X_j\otimes X_k + i\phi Y_j\otimes Y_k + i\eta Z_j\otimes Z_k}\;.
+\end{equation}
+
+The usefulness of these choices comes from the possibility to represent a generic unitary by applying appropriately layers of $U^1_k$ and $U^2_k$ operations.
+For instance, a general $SU(4)$ transformation for 2 qubits can be exactly represented with the following circuit (see~\cite{vidal2004,vatan2004})
+\begin{equation*}
+\label{circ:two_qubits}
+\Qcircuit @C=1em @R=.7em {
+& \gate{U^1_0(\alpha_0,\beta_0,\gamma_0)} & \multigate{1}{U^2_{01}(\theta,\phi,\eta)}&\gate{U^1_0(\alpha_2,\beta_2,\gamma_2)} & \qw\\
+& \gate{U^1_1(\alpha_1,\beta_1,\gamma_1)} & \ghost{U^2_{01}(\theta,\phi,\eta)}&\gate{U^1_1(\alpha_3,\beta_3,\gamma_3)} & \qw\\
+}
+\end{equation*}
+requiring $1$ application of $U^2_{01}$ and $4$ applications of $U^1_k$ (on qubit 0 and 1) for a total of $15$ parameters.
+This construction can be readily extended to larger systems by interleaving layers of $U^1_k$ with layers of $U^2_{jk}$ applied alternatively on even or odd partitions.
+For instance with $4$ qubits we consider circuits of the following form
+\begin{equation*}
+\label{circ:four_qubits}
+\Qcircuit @C=1em @R=.7em {
+& \gate{U^1_0} & \multigate{1}{U^2_{01}}&\gate{U^1_0} & \qw                                       &\qw& \multigate{1}{U^2_{01}}&\gate{U^1_0}& \qw\\
+& \gate{U^1_1} & \ghost{U^2_{01}}              &\gate{U^1_1} & \multigate{1}{U^2_{12}}&\gate{U^1_1} & \ghost{U^2_{01}}&\gate{U^1_1}& \qw\\
+& \gate{U^1_2} & \multigate{1}{U^2_{23}}&\gate{U^1_2} & \ghost{U^2_{12}}             &\gate{U^1_2}&\multigate{1}{U^2_{23}}&\gate{U^1_2}& \qw\\
+& \gate{U^1_3} & \ghost{U^2_{23}}             &\gate{U^1_3} & \qw                                        &\qw&\ghost{U^2_{23}}&\gate{U^1_3}& \qw\\
+}\;.
+\end{equation*}
+
+Note that in the construction above we didn't include the first and last single-qubit operations in the third $U^1$ layer. This allows to remove redundancy in the parameters since we replace the product of two $U^1$ operations with a single $U^1$, this simplification results in enhanced stability in the training.

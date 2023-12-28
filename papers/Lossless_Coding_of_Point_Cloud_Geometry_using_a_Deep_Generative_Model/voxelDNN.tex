@@ -1,0 +1,165 @@
+
+%\par Point cloud data structure, voxel domain, octree domain
+\subsection{VoxelDNN}\label{ssec:voxelDNN}
+
+\begin{figure}
+\captionsetup{justification=raggedright}
+%\captionsetup{singlelinecheck = false, format= hang, justification=raggedright, font=small, labelsep=space}
+\begin{minipage}[b]{.45\linewidth}
+  \centering
+  \centerline{\includegraphics[width=0.85\linewidth]{figures_pcc/3Dcontext.png}}
+%  \vspace{1.5cm}
+  \centerline{(a) 3D voxel context}\medskip
+\end{minipage}
+\hfill
+\begin{minipage}[b]{0.45\linewidth}
+\label{sfig:typeA}
+  \centering
+  \centerline{\includegraphics[width=0.95\linewidth]{figures_pcc/3DmaskA.png}}
+%  \vspace{1.5cm}
+  \centerline{(b) 3D type A mask }\medskip
+\end{minipage}
+\caption{(a): Example 3D context in a $5 \times 5 \times 5$ block. Previously scanned elements are in blue. (b): $3 \times 3 \times 3$ 3D type A mask. Type B mask is obtained by changing center position (marked red) to 1. }
+\label{fig:context}
+\end{figure}
+%
+\begin{figure}[b]
+\captionsetup{justification=raggedright}
+\includegraphics[width=0.9\linewidth]{figures_pcc/networkarchitect.png}
+\caption{VoxelDNN architecture, $d$ is the dimension of the input block, masked layers are colored in yellow and blue. A type A mask is applied to the first layer (dashed borders) and type B masks afterwards. `f64,k7,s1' stands for 64 filters, kernel size 7 and stride 1. }
+\label{fig:Networkarchitecture}
+\end{figure}
+%\setlength{\textfloatsep}{20pt}% Remove \textfloatsep
+
+\input{encoder_algorithm}
+
+% \subsubsection{Voxel context model}
+\par Our method losslessly encodes the voxelized point cloud  using context-adaptive binary arithmetic coding. Specifically, we focus on estimating accurately a probability model $p(v)$  for the occupancy of a block $v$ composed by $d \times d \times d$ voxels. We factorize the joint distribution $p(v)$ as a product of conditional distributions $p(v_i|v_{i-1}, \ldots, v_1)$ over the voxel volume: 
+\begin{equation}
+    p(v)= \underset{i=1 }{\overset{d^3}{\Pi}}p(v_i|v_{i-1},v_{i-2},\ldots,v_{1}).
+    \label{eq:p(v)}
+\end{equation}
+Each term $p(v_i|v_{i-1}, \ldots, v_1)$ above is the probability of the voxel $v_{i}$ being occupied given the occupancy of all previous voxels,  referred to as a context. Figure \ref{fig:context}(a) illustrates such a 3D context. We estimate $p(v_i|v_{i-1}, \ldots, v_1)$ using a neural network which we dub \textbf{VoxelDNN}.  
+
+\par The conditional distributions in~\eqref{eq:p(v)} depend on previously decoded voxels. This requires a \textit{causality} constraint on the VoxelDNN network. To enforce causality, we extend to 3D the idea of masked convolutional filters, initially proposed in PixelCNN~\cite{oord2016pixel}. Specifically, two kinds of masks (A or B) are employed. Type A mask is filled by zeros from the center position to the last position in raster scan order as shown in Figure \ref{fig:context}(b). Type B mask differs from type A in that the value in the center location is 1 (colored in red). Type A masks are used in the first convolutional filter to remove the connections between all future voxels and the voxel currently being predicted. From the second layer, the value of the current voxel is not used in its spatial position and is replaced by the result of the convolution over previous voxels.  As a result, from the second convolutional layer, type B masks are applied which relaxes the restrictions of mask A by allowing the connection from the current spatial location to itself. 
+
+\par In order to learn good estimates $\hat{p}(v_i|v_{i-1}, \ldots, v_1)$ of the underlying voxel occupancy distribution $p(v_i|v_{i-1}, \ldots, v_1)$, and thus minimize the coding bitrate, we train VoxelDNN using cross-entropy loss. That is, for a block $v$ of resolution $d$, we minimize :
+\begin{equation}\label{eq:CEloss}
+    H(p,\hat{p}) = \mathbb{E}_{v\sim p(v)}\left[\sum_{i=1}^{d^3} -\log \hat{p}(v_i)\right].
+\end{equation}
+It is well known that cross entropy represents the extra bitrate cost to be paid when the approximate distribution $\hat{p}$ is used instead of the true $p$. More precisely, $H(p,\hat{p}) = H(p) + D_{KL}(p\| \hat{p})$, where $D_{KL}$ denotes the Kullback-Leibler divergence and $H(p)$ is Shannon entropy. Hence, by minimizing~\eqref{eq:CEloss}, we indirectly minimize the distance between the estimated conditional distributions and the real data distribution, yielding accurate contexts for arithmetic coding. Note that this is different from what is typically done in learning-based \textit{lossy} PC geometry compression, where the focal loss is used~\cite{quach2019learning, quach2020improved}. In this lossy context, the motivation behind using focal loss is to cope with the high spatial unbalance between occupied and non-occupied voxels. The reconstructed PC is then obtained by hard thresholding $\hat{p}(v)$, and the target is thus the final classification accuracy. Conversely, here we aim at estimating accurate soft probabilities to be fed into an arithmetic coder.
+
+
+
+\par Figure \ref{fig:Networkarchitecture} shows our VoxelDNN network architecture for a block  of dimension $d$. Given the $d \times d \times d$ input block, VoxelDNN outputs the predicted occupancy probabilities of all input voxels. Our first 3D convolutional layer uses $7 \times 7 \times 7$ kernels with a type A mask. Type B masks are used in the subsequent layers. To avoid vanishing gradients and speed up the convergence, we implement two residual blocks \cite{he2016deep} with $5 \times 5 \times 5$ kernels. Since type A masks are applied at the first layer, identity skip connection of residual block does not violate the causality constraint. Throughout VoxelDNN, the ReLu activation function is applied after each convolutional layer, except in the last layer where we use softmax activation. Using more filters generally increases the performance of 
+ VoxelDNN, at the expense of an increase in the number of parameters and computational complexity. After experimenting with various number of filters, we concluded that for input voxel block ($d \times d \times d \times 1$) which only has a single feature, 64 convolutional filters give a good trade-off between complexity and model performance.
+\subsection{Multi-resolution encoder and adaptive partitioning}\label{ssec:multires}
+
+We use an arithmetic coder to encode the voxels sequentially from the first voxel to the last voxel of each block in a generative manner. Specifically, every time a voxel is encoded, it is fed back into VoxelDNN to predict the probability of the next voxel. Then, we pass the probability to the arithmetic coder to encode the next symbol. 
+
+However, applying this coding process at a fixed resolution $d$ (in particular, on larger blocks) can be inefficient when blocks are sparse, i.e.,  they contain only a few occupied voxels. 
+% encoding the whole block as a single block is not always the best solution, especially when blocks are sparse. 
+This is due to the fact that in this case, there is little or no information available in the receptive fields of the convolutional filters. To overcome this problem, we propose to optimize the block size based on a rate-optimized multi-resolution splitting algorithm as follows.
+We partition a block into 8 sub-blocks recursively and signal the occupancy of sub-blocks as well as the partitioning decision (0: empty, 1: encode as a single block, 2: further partition). The partitioning decision depends on the bit rate after arithmetic coding. If the total bitstream of partitioning flags and occupied sub-blocks is larger than encoding the parent block as a single block, we do not perform partitioning. The details of this process are shown in Algorithm \ref{algo:proposed_method}. The maximum partitioning level or the maximum number of block sizes is controlled by $maxLv$ and partitioning is performed up to $maxLv=5$ corresponding to a smallest block size of 4. Depending on the output bits of each partitioning solution, a block of size 64 can contain a combination of blocks with different sizes. Figure \ref{fig:4levelpartiitoning} shows 4 partitioning examples for an encoder with $maxLv=4$. Note that VoxelDNN learns to predict the distribution of the current voxel based on previously encoded voxels. As a result, we can use a bigger model size to predict the probabilities for smaller input block size. 
+
+
+
+\begin{figure}
+%
+\captionsetup{justification=raggedright}
+\begin{minipage}[b]{.24\linewidth}
+  \centering
+  \centerline{\includegraphics[width=0.90\linewidth]{figures_pcc/1levelpartition.png}}
+%  \vspace{1.5cm}
+  \centerline{(a)}\medskip
+\end{minipage}
+\hfill
+\begin{minipage}[b]{0.24\linewidth}
+  \centering
+  \centerline{\includegraphics[width=0.90\linewidth]{figures_pcc/2levelpartition.png}}
+%  \vspace{1.5cm}
+  \centerline{(b) }\medskip
+\end{minipage}
+%
+\hfill
+\begin{minipage}[b]{0.24\linewidth}
+  \centering
+  \centerline{\includegraphics[width=0.90\linewidth]{figures_pcc/3levelpartition.png}}
+%  \vspace{1.5cm}
+  \centerline{(c) }\medskip
+\end{minipage}
+%
+\hfill
+\begin{minipage}[b]{0.24\linewidth}
+  \centering
+  \centerline{\includegraphics[width=0.90\linewidth]{figures_pcc/4levelpartition.png}}
+%  \vspace{1.5cm}
+  \centerline{(d)}\medskip
+\end{minipage}
+%
+\caption{Partitioning a block of size 64 into: (a) a single block of size 64, (b): blocks of size 32, (c): 32 and 16, (d): 32, 16 and 8. Non-empty blocks are indicated by blue cubes.}
+\label{fig:4levelpartiitoning}
+%
+\end{figure}
+%\setlength{\textfloatsep}{20}
+
+\subsection{Context extension}\label{ssec:extendcontext}
+We have discussed our multi-resolution encoder with multiple block sizes to adapt to the point cloud structure. However, with smaller block sizes, an implicit context model (using the content of the block) will be less efficient because the context may be too small. Therefore, we extend the context of each block to the encoded voxels that are above and on the left of the current voxel (causality constraint). Figure \ref{fig:context extension} illustrates the context before and after extension. Before extending the context, to encode voxel $v_c$, only voxels from $v_1$ to $v_{i-1}$ in Figure \ref{fig:context extension}(a)  are considered as contexts. After extending the context to the bigger block, the context is now composed of all voxels in the blue area in Figure \ref{fig:context extension}(b). The white area represent inactive voxels, i.e., not used in Eq.~\eqref{eq:p(v)}. Extending the context does not change the partitioning algorithm discussed above, although it might change the optimal selected partitions. Also, the causality is still enforced as long as we use masked filters in our network. 
+
+However, extending to a larger context is not always efficient when the extension area is sparse or contains noise, therefore we employ a rate-optimized block extension decision. To limit the computational complexity, we only allow certain combinations of block sizes and extension sizes, as shown in  Table \ref{table:extending block size}. To encode a block with context extension, in Algorithm \ref{algo:proposed_method}, we encode a block with all the possible extension sizes and select the best one in terms of bpov. In total, we build 5 models for 5 input sizes which are $\{ 128,64,32,16,8\}$ in the context extension mode.
+
+
+\begin{figure}[tb]
+%
+\captionsetup{justification=raggedright}
+\begin{minipage}[b]{.45\linewidth}
+  \centering
+  \centerline{\includegraphics[width=0.90\linewidth]{figures_pcc/before_extend2.png}}
+%  \vspace{1.5cm}
+  \centerline{(a)}\medskip
+\end{minipage}
+\hfill
+\begin{minipage}[b]{0.45\linewidth}
+  \centering
+  \centerline{\includegraphics[width=0.90\linewidth]{figures_pcc/after_extend2.png}}
+%  \vspace{1.5cm}
+  \centerline{(b) }\medskip
+\end{minipage}
+%
+\caption{2D illustration of context extension from block $4 \times 4$ to block $8 \times 8$. (a): Before extension, (b): after extension. Blue squares are active voxels in the context, voxels in the white area are ignored by masks or from the bigger block.  }
+\label{fig:context extension}
+%
+\end{figure}
+
+
+
+\newcolumntype{L}[1]{>{\centering\arraybackslash}p{#1}}
+
+\begin{table}[b]
+\caption{Extending block size}
+\centering
+\begin{tabular}{M{2cm}|L{3cm}}
+\hline
+\begin{bf} Block size \end{bf}&\begin{bf} Extending block size \end{bf}  \\
+\hline
+ 64 & 128,64\\
+ 32 & 64,32\\
+ 16 & 64,32,16\\
+ 8 & 64,32,16,8\\
+\hline
+\end{tabular}
+\label{table:extending block size}
+\end{table}
+
+\subsection{Data augmentation} 
+In order to train more robust probability estimation models and to increase the generalization capabilities of our model, we employ data augmentation techniques specifically suited for PCC.
+In particular, we observed that methods based on convolutional neural networks are especially sensitive to changes in PC density and acquisition noise. Therefore, in addition to typical rotation and shifting data augmentation used for other PC analysis tasks \cite{alonso20203dmininet, wang2020multiscale}, we also consider here alternative techniques, such as downsampling. Note that even though our VoxelDNN operates on voxel domain, to reduce the complexity, all input pipelines process point clouds in the form of $x,y,z$ coordinates before converting into dense block in the final step.
+Specifically, for each generated block from the training datasets, we rotate them by an angle $\theta$ around each $x,y,z$ axis. In addition, to adapt to varying density levels of the test point clouds, we randomly remove points from the original block as well as rotated blocks with the sampling rate $f_{s}$ ($f_s \in \left[ 0, 1\right]$) over the total points. Figure \ref{fig:dataaugment} shows our data augmentation methods applying on Longdress point cloud from MPEG. \\
+\begin{figure}[tb]
+\captionsetup{justification=raggedright}
+%\captionsetup{singlelinecheck = false, format= hang, justification=raggedright, font=small, labelsep=space}
+\centering
+\includegraphics[width=0.9\linewidth]{figures_pcc/dataaug.png}
+\caption{Example of data augmentation applied on the Longdress point cloud. (a) Original; (b) After removing color attributes; (c),(d),(e) Rotation with $\theta=45^{\circ}$ on $x,y$ and $z$ axis; (f),(g) Sampling rate  $f_{s}=0.7$ and $f_{s}=0.4$ }
+\label{fig:dataaugment}
+\end{figure}

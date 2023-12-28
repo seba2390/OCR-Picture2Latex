@@ -1,0 +1,175 @@
+\section{Instantiating Zero-Cost}
+\label{sec:implementation-security}
+
+We describe two isolation systems that securely support zero-cost transitions:
+they meet the overlay monitor zero-cost conditions.
+%
+The first (\secref{sec:web-assembly-secure}) is an SFI system using
+WebAssembly as an IR before compiling to native code using the Lucet
+toolchain~\cite{lucet}.
+%
+Here we rely on the language-level invariants of Wasm to satisfy our
+zero-cost requirements.
+%
+To ensure that these invariants are maintained, in
+\sectionref{sec:wasm-verifier} we describe a verifier, \verifname, that checks
+that compiled binaries meet the zero-cost conditions.
+%
+In \sectionref{sec:wasm-proof} we outline our proof that the verifier guarantees
+that compiled Wasm can safely elide springboards and trampolines.
+
+The second system, \trsegmentsfi, is our novel SFI system combining
+the x86 segmented memory model for memory isolation with several
+security-hardening LLVM compiler passes to enforce our zero-cost conditions.
+%
+While WebAssembly meets the zero-cost conditions, it imposes additional
+restrictions that lead to unrelated slowdowns.
+%
+\trsegmentsfi thus serves as a platform for evaluating the potential cost of
+enforcing the zero-cost conditions directly as well as a proof-of-concept
+SFI implementation designed using the zero-cost framework.
+
+\subsection{WebAssembly}
+\label{sec:web-assembly-secure}
+
+WebAssembly (Wasm) is a low-level bytecode with a sound, static type system.
+%
+Wasm's abstract state includes global variables 
+and heap memory, which are zero-initialized at start-up.
+%
+All heap accesses are explicitly bounds checked, 
+meaning that compiled Wasm programs inherently 
+implement heap isolation.
+%
+Beyond this, Wasm programs enjoy several language-level properties, which ensure
+compiled binaries satisfying the zero-cost conditions.
+%
+We describe these below.
+
+\para{Control flow}
+%
+There are no arbitrary jump instructions in Wasm, only structured intra-function
+control flow.
+%
+Functions may only be entered through a call instruction, and may only be exited
+by executing a return instruction.
+%
+Functions also have an associated type; direct calls are type-checked at
+compile time while indirect calls are subject to a runtime type check.
+%
+This ensures that compiled Wasm meets our type-directed forward-edge CFI condition.
+
+\para{Protecting the stack}
+%
+A Wasm function's type precisely describes the space required to allocate the
+function's stack frame (including spilled registers).
+%
+All accesses to local variables and arguments are performed through statically
+known offsets from the current stack base.
+%
+It is therefore impossible for a Wasm 
+operation to access other stack frames or alter the 
+saved return address.
+%
+This ensures that compiled Wasm meets our local state encapsulation condition,
+and, in combination with type-checking function calls, guarantees that Wasm's
+control-flow is well-bracketed.
+%
+We therefore know that compiled Wasm functions will
+always execute the register-saving preamble and, upon
+termination, will execute the register-restoring epilogue.
+%
+Further, the function body will not alter the values of any registers saved to
+the stack, thereby ensuring restoration of callee-save registers.
+
+\para{Confidentiality}
+%
+Wasm code may store values into function-local variables or a function-local
+``value stack'' similar to that of the Java Virtual Machine~\cite{jvm}.
+%
+The Wasm spec requires that compilers initialize function-local variables either
+with a function argument or with a default value.
+%
+Further, accesses to the Wasm value stack are governed by a coarse-grained
+data-flow type system, with explicit annotations at control flow joins.
+%
+These are used to check at compile-time that an instruction cannot pop a value
+from the stack unless a corresponding value was pushed earlier in the same
+function.
+%
+This guarantees that local variable and value stack accesses can be compiled to
+register accesses or accesses to a statically-known offset in the stack frame.
+
+When executing a compiled Wasm function without heavyweight transitions,
+confidential values from prior computations may linger in these spilled registers or
+parts of the stack.
+%
+However, the above checks ensure that these locations will only be read if they
+have been previously overwritten during execution of the same function by a
+low-confidentiality Wasm library value.
+
+
+\subsection{SegmentZero32}
+\label{sec:segments-secure}
+
+To demonstrate that zero-cost conditions can be applied outside of highly structured languages such as Wasm, we demonstrate their enforcement in our novel SFI system for C code called \trsegmentsfi.
+%
+As we mention in \secref{subsec:overview-zero}, our zero-cost conditions amalgamate a number of individual conditions which separately have well-studied enforcement mechanisms, and so we are able to compose a series of off-the-shelf Clang/LLVM security-hardening passes to form the core of \trsegmentsfi.
+%
+The memory bounds checks are performed using the x86 segmented memory model~\cite{intel-manual} (Similar to NaCl~\cite{yee_native_2009}, however we use an additional segment to separate the sandboxed heap and stack).
+
+Since \trsegmentsfi directly enforces the structure required for zero-cost transitions on C code (rather than relying on Wasm as an IR), it allows us to investigate the intrinsic cost of enforcing zero-cost (See Section \ref{subsec:eval-zerocostsfi}), without suffering from irrelevant Wasm overheads.
+%
+We additionally compare \trsegmentsfi against NaCl's 32-bit SFI scheme for the
+x86 architecture, which we believe is the fastest production-quality SFI
+toolchain currently available.
+%
+Below we discuss specific details \trsegmentsfi zero-cost condition enforcement.
+
+\para{Protecting the stack}
+%
+We apply the SafeStack~\cite{kuznetsov_code-pointer_2014, safestack-llvm} compiler pass to further split the sandboxed stack into a safe and unsafe stack.
+%
+The safe stack contains only data that the compiler can statically verify is
+always accessed safely, e.g., return addresses, spilled registers, and
+allocations that are only accessed locally using verifiably safe offsets within
+the function that allocates them.\footnote{We also use LLVM's
+stack-heap clash detection (\textsf{-fstack-clash-protection}) to prevent
+the stack growing into the heap.}
+%
+All other stack values are moved to the heap segment.
+%
+This ensures that pointer manipulation of unsafe stack references cannot be used to corrupt the return address and saved context of the current call.
+%
+We write a small LLVM pass to add additional support for tracking whether an access must be made through the heap segment or the stack segment, ensuring correct code generation.
+
+These transformations ensure that malicious code cannot programmatically access
+anything stored in the stack segment, except through offsets statically
+determined to be safe by the SafeStack pass.
+%
+This protects the stored callee-save registers and return address, guaranteeing
+the restoration of callee-save registers and well-bracketing \emph{iff forward
+control flow is enforced}.
+
+\para{Control flow}
+%
+Fortunately, enforcing forward-edge CFI has been widely studied~\cite{burow_control-flow_2017}.
+%
+We use a CFI pass as implemented in Clang/LLVM~\cite{cfi-llvm,
+DBLP:conf/uss/TiceRCCELP14} including flags to dynamically protect indirect
+function calls, ensuring forward control flow integrity.
+%
+Further, \trsegmentsfi conservatively bans non-local
+control flow (e.g. \texttt{setjmp/longjmp}) in the C source code.
+%
+A more permissive approach is possible, but we leave this for future work.
+
+\para{Confidentiality}
+%
+To guarantee confidentiality we implement a small change in Clang to zero initialize all stack variables.\footnote{We can't use Clang's existing pass
+for variable initialization~\cite{stack-var-init-llvm} as it zero initializes data on the unsafe stack leading to poor performance}
+%
+This ensures that scratch registers cannot leak secrets as all sandbox values
+are semantically written before use.
+%
+In practice, many of these writes are statically known to be dead and therefore optimised away.

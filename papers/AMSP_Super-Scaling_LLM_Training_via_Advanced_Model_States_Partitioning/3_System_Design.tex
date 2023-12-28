@@ -1,0 +1,448 @@
+%-------------------------------------------------------------------------------
+\section{$\SysName$ Design}
+\label{sec_design}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{System.pdf}
+    \caption{Overview of the \SysName System.}
+    \label{SystemOverview}
+\end{figure}
+
+To deliver a linear-scaling LLM training framework, we introduce \SysName. It leverages an expanded model state partitioning space and possesses the capability to pinpoint the most communication-efficient partition combinations. In the following sections, we will outline its architectural design and delve into the specifics of each module.
+
+\subsection{Overview}
+\noindent\textbf{Architecture $\&$ Workflow.}
+Figure \ref{SystemOverview} illustrates the architecture overview and workflow of the \SysName system. 
+% Initially, based on the model size input through the program and the computational resources represented by the 'world-size', a versatile and comprehensive partitioning space is established for the model states. 
+Initially, \SysName built a unified partition space based on the program configuration inputs (model size and world size).
+Subsequently, \SysName leverages its scale-aware partitioner to produce an optimal combination of model state partitions, 
+% ensuring adherence to GPU memory constraints while minimizing communication overheads. 
+minimizing the communication overheads subject to the GPU memory constraints. 
+% Within this partitioner, there are two pivotal elements: the first is the data dependency rules, aimed at preemptively filtering out strategies that could potentially lead to significant data transfer costs, and the second is a cost model tailored for communication and GPU memory related to combination strategies. 
+This partitioner consists of two vital elements: the data dependency rules and a cost model. The rules can preemptively filter out strategies that could potentially lead to significant data transfer costs. The cost model is designed for communication and GPU memory related to combination strategies. 
+Once this model is established, an off-the-shelf ILP algorithm is employed to pinpoint the optimal partitioning strategy. Considering the data movement resulting from various data placements post-slicing, a unified communication protocol is incorporated to further minimize inter-node communication.
+
+% After finalizing this strategy, based on its intrinsic characteristics, a generic communication protocol is integrated to further reduce inter-node communications. 
+% Through this intricate yet streamlined workflow, the \SysName system ensures a judicious balance between efficient resource utilization and communication overhead optimization.
+Table \ref{tab:notation} defines the notations used in \SysName.
+
+\vspace{10pt}
+\begin{table}
+    \centering
+    \resizebox{\linewidth}{!}{ 
+    \begin{tabular}{|c|l|}
+         \hline
+         \textbf{Notation} & \multicolumn{1}{|c|}{\textbf{Meaning}} \\ \hline
+         \emph{M}& Model size of the given model. \\ \hline
+         \emph{N} & World size of compute nodes. \\ \hline
+         \emph{R} & Number of GPUs on each compute node. \\ \hline
+         \emph{$G_n$} & Number of gradient accumulation steps. \\ \hline
+         \emph{Shard\_P} & Number of GPUs that a \textit{parameter} is partitioned.\\ \hline
+         \emph{Shard\_G} & Number of GPUs that a \textit{gradient} is partitioned. \\ \hline
+         \emph{Shard\_OS} & Number of GPUs that \textit{optimizer states} are partitioned. \\ \hline
+    \end{tabular}}
+     \caption{Notations used in \SysName}
+    \label{tab:notation}
+\end{table}
+
+\subsection{Flexible Partitioning Space}
+\label{partitionSpace}
+% Please add the following required packages to your document preamble:
+% \usepackage{booktabs}
+
+\begin{table*}[]
+   \centering
+    \vspace{-15pt}
+    \renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+
+Spec    & Device0                  & Device1                   & Device2                     & Device3                   \\ \hline
+$P^0G^0OS^0$ & {[}P,G,OS{]}             & {[}P,G,OS{]}              & {[}P,G,OS{]}                & {[}P,G,OS{]}              \\
+$P^0G^0OS^1$ & {[}P,G,0:$\frac{OS}{2}${]}         & {[}P,G,$\frac{OS}{2}$:OS{]}         & {[}P,G,0:$\frac{OS}{2}${]}            & {[}P,G,$\frac{OS}{2}$:OS{]}         \\
+$P^0G^0OS^2$ & {[}P,G,0:$\frac{OS}{4}${]}         & {[}P,G,$\frac{OS}{4}$:$\frac{OS}{2}${]}       & {[}P,G,$\frac{OS}{2}$:3$\frac{OS}{4}${]}        & {[}P,G,3$\frac{OS}{4}$:OS{]}        \\
+$P^0G^1OS^1$ & {[}P,0:$\frac{G}{2}$,0:$\frac{OS}{2}${]}     & {[}P,$\frac{G}{2}$:G,$\frac{OS}{2}$:OS{]}     & {[}P,0:$\frac{G}{2}$,0:$\frac{OS}{2}${]}        & {[}P,$\frac{G}{2}$:G,$\frac{OS}{2}$:OS{]}     \\
+$P^0G^1OS^2$ & {[}P,0:$\frac{G}{2}$,0:$\frac{OS}{4}${]}     & {[}P,$\frac{G}{2}$:G,$\frac{OS}{4}$:$\frac{OS}{2}${]}   & {[}P,0:$\frac{G}{2}$,$\frac{OS}{2}$:3$\frac{OS}{4}${]}    & {[}P,$\frac{G}{2}$:G,3$\frac{OS}{4}$:OS{]}    \\
+$P^0G^2OS^2$ & {[}P,0:$\frac{G}{4}$,0:$\frac{OS}{4}${]}     & {[}P,$\frac{G}{4}$:$\frac{G}{2}$,$\frac{OS}{4}$:$\frac{OS}{2}${]} & {[}P,$\frac{G}{2}$:$\frac{3G}{4}$,$\frac{OS}{2}$:3$\frac{OS}{4}${]} & {[}P,$\frac{3G}{4}$:G,3$\frac{OS}{4}$:OS{]}   \\
+$P^1G^1OS^1$ & {[}0:$\frac{P}{2}$,0:$\frac{G}{2}$,0:$\frac{OS}{2}${]} & {[}$\frac{P}{2}$:P,$\frac{G}{2}$:G,$\frac{OS}{2}$:OS{]} & {[}0:$\frac{P}{2}$,0:$\frac{G}{2}$,0:$\frac{OS}{2}${]}    & {[}$\frac{P}{2}$:P,$\frac{G}{2}$:G,$\frac{OS}{2}$:OS{]} \\
+$P^1G^1OS^2$ & {[}0:$\frac{P}{2}$,0:$\frac{G}{2}$,0:$\frac{OS}{4}${]} & {[}$\frac{P}{2}$:P,$\frac{G}{2}$:G,$\frac{OS}{4}$:$\frac{OS}{2}${]}     & {[}0:$\frac{P}{2}$,0:$\frac{G}{2}$,$\frac{OS}{2}$:3$\frac{OS}{4}${]}       & {[}$\frac{P}{2}$:P,$\frac{G}{2}$:G,3$\frac{OS}{4}$:OS{]}   \\
+$P^1G^2OS^2$ & {[}0:$\frac{P}{2}$,0:$\frac{G}{4}$,0:$\frac{OS}{4}${]} & {[}$\frac{P}{2}$:P,$\frac{G}{4}$:$\frac{G}{2}$,$\frac{OS}{4}$:$\frac{OS}{2}${]}   & {[}0:$\frac{P}{2}$,$\frac{G}{2}$:$\frac{3G}{4}$,$\frac{OS}{2}$:3$\frac{OS}{4}${]}    & {[}$\frac{P}{2}$:P,$\frac{3G}{4}$:G,3$\frac{OS}{4}$:OS{]}  \\
+$P^2G^2OS^2$ & {[}0:$\frac{G}{4}$,0:$\frac{G}{4}$,0:$\frac{OS}{4}${]} & {[}$\frac{P}{4}$:$\frac{P}{2}$,$\frac{G}{4}$:$\frac{G}{2}$,$\frac{OS}{4}$:$\frac{OS}{2}${]} & {[}$\frac{P}{2}$:3$\frac{P}{4}$,$\frac{G}{2}$:$\frac{3G}{4}$,$\frac{OS}{2}$:3$\frac{OS}{4}${]} & {[}3$\frac{P}{4}$:P,$\frac{3G}{4}$:G,3$\frac{OS}{4}$:OS{]} \\ \hline
+\end{tabular}
+\caption{Partition specs of a 2-dimensional tensor on a 2 × 2 device mesh. [P, G, OS] shows a complete model state. The device mesh is [[Device 0, Device 1], [Device 2, Device 3]]. Each device stores a partition of [P, G, OS]. The first column is the conbination of the Partition spec. The latter columns use Numpy syntax to describe the partitions stored on each device.}
+\label{tab:spec}
+\end{table*}
+
+
+ZeRO partitioning all model states across all devices can result in substantial communication overhead, especially at large scales. 
+% MiCS, while reducing this overhead by redundantly storing all model parameters within smaller sub-groups, unfortunately, does not take memory consumption into account. 
+MiCS reduces this overhead by redundantly storing all model parameters within smaller sub-groups.
+It is worth noting that both ZeRO and MiCS treat the three components within the model state as an entire entity. This perspective restricts the possible strategies users could apply.
+
+
+% Even though ZeRO incorporates various stages to reduce memory, it still operates holistically. 
+In our approach, we consider decoupling the model state into its individual constituents. This allows users to specify unique partitioning strategies for each component. 
+Given the different communication patterns and memory footprints of these three model state components, our method facilitates more fine-grained control over communication and memory overheads. Next, we present the enhanced and more flexible partition space within the \SysName.
+
+\noindent\textbf{Partitioning stage.} In \SysName, there are two primary components in the partition space: the model state and partition strategy. The partitioning strategy can be categorized into three main types, ordered by their memory reduction capabilities: \emph{world-size partition}, \emph{intra-partition \& inter-replica}, and \emph{whole replica}. 
+\SysName allows each of the three members within the model state to select a partition strategy independently. Here are the details of the three partition stages:
+% Subsequently, based on specific data dependence rules, these members with their respective partition strategies will be combined by Partitioner (\S\ref{partitioner}).
+
+\emph{World-size Partition}. This strategy revolves around the concept of partitioning data across all available GPUs named \emph{world-size}. 
+% In essence, when employing the 'world-size partition' strategy, each rank, or computational unit, retains a fraction, precisely 1/N, of the member's state. As a consequence, any synchronization or communication tasks linked with this particular member will span across the entire set of computational units or the full world size. 
+% The member's data spreads across all ranks evenly when employing the 'world-size partition' strategy. 
+Therefore, each GPU retains 1/N of data and the synchronization should span across the entire world size. 
+% The primary advantage of this approach is its proficiency in memory reduction. 
+
+% \emph{Whole Replica}. As the name suggests, the 'Whole Replica' strategy is rooted in the principle of maintaining a full replica of a member's state within each rank. This stands in stark contrast to the 'World-size partition' method. Here, while the memory usage is maximized because each rank retains a complete copy, the communication aspect sees significant optimization. The strategy is particularly beneficial for members who do not require much memory but frequently call for communication or synchronization.
+\emph{Whole Replica}. This strategy maintains a full replica of a component's data within each GPU, thus resulting in maximum memory usage and significant optimization of communication synchronization.
+% This strategy is particularly beneficial for members who do not require much memory but frequently call for communication or synchronization.
+
+\emph{Intra-Partition $\&$ Inter-Replica}. This strategy involves data segmentation within $n$ nodes, with the same data redundantly stored across $N/n$ nodes. 
+This method leverages the imbalanced intra- and inter-node bandwidths. 
+% The primary objective is to exploit the fast intra-node bandwidth by redundantly storing data across nodes, thereby aiming to reduce communication overhead. 
+Our main goal is to maximize the usage of the rapid intra-node bandwidth while minimizing high-overhead inter-node communication. To achieve this, the framework partitions model states inside nodes and maintains redundant data replicas across multiple nodes. With this strategy, there are \( {log2^\frac{N}{R}} \) available options, each denoting a distinct degree of redundancy.
+
+% Specifically, 'n=0' refers to the "whole replica" strategy. Conversely, when 'N=n', it transitions to the "world-size partition" strategy. Including these two extremities, there are  \( {log2^\frac{N}{R}+2} \) choices available under this strategy. 
+
+Concurrently, we represent the chosen partitioning strategies for these three components as $Shard\_P$, $Shard\_G$, and $Shard\_OS$, respectively. When the value is equal to 1 and N, means using \emph{World-size partition} and {Whole Replica} partition, while the value from 2 to $N-1$ means one of the subsets of {Intra-Partition $\&$ Inter-Replica} partition strategy.
+
+\noindent\textbf{Device Mesh}. To better express the $intra-partition$\&$inter-replica$ policy and the communication cost associated with it, we express a set of computational resources with bandwidth imbalance using a device mesh.  The \emph{Intra-Partition} refers to the first dimension within the mesh, while \emph{Inter-Replica} pertains to the second dimension of the device mesh. The bandwidths of the first and second dimensions differ.
+
+% A device mesh is a two-dimensional logical view of a set of physical devices. Each device in the grid has the same computational power. Devices can communicate with different bandwidths along the first and second grid dimensions. We assume that different groups of devices along the same grid dimension have the same communication performance.
+
+
+% A noteworthy observation is that both the 'whole replica' and 'world size partition' strategies can be positioned within the framework of the 'intra-partition $\&$ inter-replica' approach. Specifically, they can be characterized as the extreme cases of this strategy, with the former being equivalent to Shard1 and the latter aligning with ShardN.
+
+
+% \emph{World-size Partition}. When a member adopts the 'world-size partition' strategy, each rank retains a 1/N of the member's state, and any synchronization communication associated with this member will encompass the entire world size. This approach optimizes memory utilization at the expense of communication efficiency. 
+% % As such, it's best suited for members with substantial memory demands but minimal communication frequency and overhead.
+% % it implies that the member is divided across the entire data parallel (DP) scope. In this scenario, 
+
+% \emph{Whole Replica} strategy entails retaining a complete copy of the member state within each rank. Contrary to the 'World-size partition' approach, this represents a strategy where memory utilization is at its peak, but communication is optimized. 
+% % It's ideally suited for members with modest memory requirements but demand frequent communication.
+
+% \emph{Intra-Partition \& Inter-Replica} strategy doesn't merely refer to the approach of sharding within a node and replicating across nodes. More broadly, it encapsulates the concept of redundant storage, where members can be partitioned directly in nR ranks (n=1,2..., nR<N), and we denote this strategy as ShardnR. 
+
+% The 'whole replica' and 'world size partition' approaches can be seen as subsets of the 'intra-partition \& inter-replica' strategy and specifically can be viewed as Shard1 and ShardN.
+
+% We refer to these partitioning schemes as Ours-shard8, Ours-shard16, through to Ours-shard512, and so forth
+
+% To illustrate, when the world size is set to 1024, members have the flexibility to partition across multiple ranks such as 8, 16, 32, 64, 128, 256, 512, and so forth.
+
+
+% Depending on the input model size and required training ranks for the task, we'll retain only those partitioning combinations that fall below a specified memory threshold, feeding them into the system's subsequent binder.
+% The three members of the model state P, G, and OS can be uniformly represented as shard-P, shard-G, and shard-OS. Each of these has a value range from 1 to \(log2N+1\). Given this, the memory cost of the model state can be expressed as \[memory\_cost = \frac{2M}{shard-P}+ \frac{2M}{shard-G} + \frac{12M}{shard-OS} \] Depending on the input model size and required training ranks for the task, we'll retain only those partitioning combinations that fall below a specified memory threshold, feeding them into the system's subsequent binder.
+
+
+% Following this, we present a general framework for partitioning model states within our system and subsequently analyze its advantages.
+
+% For instance, consider a 6.7B LLama model being trained using mixed precision on 1024 A100 GPUs. The model state of this setup occupies 107GB, distributed as 13.4GB for parameters, 13.4GB for gradient, and a significant 80.2GB for optimizer state. By partitioning the optimizer state across 8 A100 GPUs(80GB), each GPU is tasked with accommodating a model state memory footprint of 36.8GB, the remaining 43GB is amply sufficient to manage the memory requirements of activations and temporary variables needed for the model's training. These 8 A100 GPUs handle in-place updates for their respective 1/8 share of the optimizer state. Subsequent to this, they utilize the fast intra-node NVlink communication to perform an all-gather operation, ensuring a synchronized, updated set of parameters across all ranks. Importantly, our strategy eliminates the need for the 1024 cross-node all-gather communications required by zero1, bringing that count down to 0.
+
+% os gradient and parameters can be partitioned into different subgroups instead of binding them together like zero and MiCS.
+% \label{subsec_profiler}
+
+% \noindent\textbf{Space-aware Profiling}.
+
+\vspace{-8pt}
+\subsection{Scale-aware Partitioner}
+\label{scale_aware_partition}
+
+Based on the partition space built by \ref{partitionSpace}, we leverage Partitioner to search for a communication optimal combination of strategies from $P$, $G$, and $OS$. In this section, we detail the two components of a partitioner, including a pre-filter based on data dependence, and solving an ILP formulation built by the communication and memory cost model.
+
+\label{partitioner}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{dependencebased.pdf}
+    \caption{Sharding on 16 GPUs utilizing the Dependence-based rule. A larger (1/8) data chunk of gradient ensures enough gradient data to update the optimizer (1/16) without extra aggregating data from other GPUs.}
+    \label{fig:dependencebased}
+\end{figure}
+
+\noindent\textbf{Dependence-based rules}.
+\label{dependenceBased}
+% During the model training process, a foundational sequence is observed: parameters are utilized to compute their corresponding gradients. Subsequently, these gradients are then employed to update the optimizer states. The updated optimizer state then replaces the parameters for the training in the next step. This flow underscores a stringent data dependency that exists among the three principal members of the model state: parameters, gradients, and optimizer states.
+The model training process includes a data dependency flow of all three model states, consisting of several steps: utilizing \textit{parameters} to compute \textit{gradients}, updating \textit{optimizer states} with \textit{gradients}, and updating \textit{parameters} with \textit{optimizer states}. 
+
+
+\emph{Extra Data Transfer}.  
+% When members utilize varying partitioning strategies, it leads to complexities and potential inconsistencies. 
+Utilizing varying partitioning strategies leads to complexities and potential inconsistencies. To maintain result accuracy and integrity, additional data movements are required, introducing communication overhead. 
+% This uptick can have implications for the efficiency and speed of the training process, especially in distributed environments where communication costs can be significant.  
+% Consider an illustrative example to elucidate this scenario: 
+% Consider a scenario where partitioning P is at 1024 GPUs, while G is at 1 GPU. To save G, we need to gather an extra 1/1024 G slice generated by 1/1024 P from 1024 GPUs. This extra G data transfer is the case we try to avoid.
+
+
+
+% Suppose the P of the model opts for the 'world-size partition' strategy, where they are spread across all computational units or ranks. In contrast, the G chooses the 'whole replica' strategy, maintaining a complete copy within each rank. In such a configuration, every time the gradient is partitioned, it becomes imperative to aggregate the gradient contributions from every \( \frac{1}{N} \) partition of the parameters. This aggregation, typically achieved through an 'all-gather' operation within the world-size communication group, aims to reconstruct the complete gradient, which is then employed in accordance with the G 'whole replica' partitioning strategy. Such a frequent data transfer and synchronization overhead can considerably hamper the training process's efficiency and speed. This inefficiency becomes particularly pronounced in distributed environments where communication costs are non-trivial. In recognition of these challenges, we have taken proactive measures. 
+
+% , potentially impacting the training process's efficiency.
+
+% When these members adopt different partitioning strategies, complexities arise. Different partitioning not only introduces potential inconsistencies but, more critically, to ensure the accuracy and integrity of the results, it may necessitate additional data movements. These extra data transfers, while crucial for maintaining result precision, could inadvertently inflate overhead costs, thereby possibly affecting the overall efficiency of the training process.
+% This forward-thinking method seeks to ensure an optimized and streamlined training process. We employ a systematic approach governed by specific dependence rules, which stem from the intrinsic data dependencies among the model state members, and serve as guidelines to ensure consistent and efficient partitioning. 
+
+\emph{Dependence Rules}. To avoid these extra data transmissions, we institute a set of combination rules that are firmly grounded in data dependencies. Before combining the strategies for the members, we filter out and eliminate strategies that are predisposed to incurring substantial data transfer costs. Mathematically, this relationship is represented as: 
+\[ Shard\_{OS} = R\times2^i \times Shard\_{G} = R\times2^j \times Shard\_{P} \]
+Here, \( i \) and \( j \) are exponents such that \( i \leq j \). Noting that the value \( 2^i \) is always less than the world size. At its essence, this rule signifies a hierarchical relationship: the partition number for the $OS$ is a multiple of the number used for both $G$ and $P$, and $G$'s partition number is a multiple of $P$'s nu. Adhering to this pattern ensures that any data dependency in the training flow from the upstream can fully access its proportionally allocated downstream data, facilitating the computation of $G$ and updates of $OS$. Take the optimizer update as an example shown in Figure \ref{fig:dependencebased}. A larger (1/8) data chunk of gradient ensures enough gradient data to update the optimizer, which has a smaller data chunk (1/16). The process of gradient generation follows the same pattern. However, the \emph{optimizer step} is an example in the training flow where the most downstream $OS$ accesses the most upstream parameters. As a result, we design a prefetching mechanism (\S\ref{subsec_prefetch}) to minimize the data movement brought by this partitioning.
+
+% Adhering to this schema ensures that any data dependency at a subordinate level has complete access to its proportionate upstream data within its partition, facilitating G computations and OS updates. 
+
+\noindent\textbf{Partition Specs}. We utilize the "partition spec" to represent the partitioning choices when $P$, $G$, and $OS$ are combined. The partitioning strategies for $P$, $G$, $OS$ can be articulated as \( P^a \), \( G^b \), and \( OS^c \), where \(a\), \(b\), and \(c\) can be formulated as:
+
+\vspace{-5pt}
+\[a, b, c = \frac{\text{shard\_P}}{R}, \frac{\text{shard\_G}}{R}, \frac{\text{shard\_OS}}{R}\]
+
+
+Table \ref{tab:spec} displays all potential partition spec combinations for a 2-dimensional tensor operating on a 2 × 2 mesh with 4 devices.\\
+
+
+% For a model of size M being trained across N nodes (each node containing eight 80GB A100 GPUs), the members of the model state have log2N + 1 potential partitioning schemes. However, due to memory constraints, not all partitioning options for the members can be utilized.
+% When considering combinations of all three members, there are \( {log2^\frac{N}{R}+2} \) possible partitioning strategies for each member of the model state, and the total number of potential strategies amounts to \( {(log2^\frac{N}{R}+2} )^3 \). However, 
+\noindent\textbf{Memory Cost}.
+Due to the inherent memory constraints, not all of the combined strategies that filter by rules \S\ref{dependenceBased} can fit within the available memory. Moreover, certain partitioning strategies for individual members might already breach these constraints. For example, in a 50B LLaMA model, if Shard\_OS equals 1 or 8, the memory consumption for the optimizer state alone on a single GPU would skyrocket to 600GB and 75GB, respectively, 
+% both surpassing the A100's 80GB threshold. 
+exceeding the hardware capacities.
+Given these constraints, we must prune some partitioning strategies based on the memory bounds before consolidating the partition stages for the three members. 
+
+In mixed-precision training, the memory consumption ratio of $P$, $G$, and $OS$, generally stands at $2:2:12$ when using the Adam \cite{Adam} optimizer. The memory cost of the model state and activation memory cost can be expressed as:
+
+\[memory\_cost = \frac{2M}{shard\_P}+ \frac{2M}{shard\_G} + \frac{12M}{shard\_OS} \] 
+
+Depending on the size of the input model and the GPU resources required for the task, we only retain those partition combinations with memory consumption costs below a specified memory threshold. 
+For simplicity, we model the activation \cite{ZeRO} as $(34bsh + 5bs^2a) \times l$ and add it to $memory\_cost$, where b, s, h, a, l represent batch-size, sequence-length,hidden-size,number-of-attention-head and the number of layers.
+
+\noindent\textbf{Communication Cost}. When deploying thousands of GPUs, cross-node communication often becomes a pronounced limitation for collective communication. Aware of this obstacle, our refined model to calculate communication costs narrows its attention solely to cross-node exchanges, sidelining other possible communication routes. In the sections that follow, we elucidate the process of estimating the communication expenses for each component of the model state:
+
+% Cross-node communication emerges as a significant bottleneck for collective communication when using thousands of GPUs. Recognizing this challenge, our subsequent model for estimating communication cost focuses exclusively on cross-node interactions, rather than considering every potential communication pathway. Below we give details of modeling the communication cost for each model state member:
+
+\emph{Parameters}: Each parameter must aggregate shards from other partitions during both the forward and backward passes. Thus the communication cost for P, is expressed as:
+
+
+\[ Comm\_P = 2 \times M \times \frac{Shard\_P}{R} \]
+
+\emph{Gradient}: In scenarios where gradient accumulation techniques are employed, every micro-step of gradient accumulation necessitates aggregation with shards from other partitions. Additionally, at the boundary of gradient accumulation, a world-size 'All-Reduce' operation (a feature specific to DDP, and is not considered part of the gradient's communication cost) is executed. 
+Therefore, the communication cost for the gradient can be described as:
+
+
+\[Comm\_G = G_n \times M \times \frac{shard\_P}{R}\]
+
+
+\emph{Optimizer state}: The communication requirements for this are quite direct. Once updated, it merely sends its shard to the relevant partition housing its associated parameters.
+
+\[ Comm\_OS = M \times \frac{shard\_OS}{R} \]
+
+Table \ref{exampleComm} lists some examples of the communication costs for different partition specs.
+
+\begin{table}[]
+    \centering
+    \vspace{-15pt}
+    \renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{}ll@{}}
+\toprule
+
+Spec    & Comm Cost                                                   \\ \midrule
+$P^0G^0OS^2$ & {[}0, 0, (AG,4){]}                                            \\
+$P^0G^1OS^1$ & {[}0, {[}$G_n\times M$(RS,2), (AR,2){]}, M(AG,2){]} \\
+$P^1G^1OS^1$ & {[}{$2\times M$(AG,2)}, {[}$G_n\times$(RS,2),(AR,2){]}, M(AG,2){]} \\ \bottomrule
+\end{tabular}
+
+\caption{Several cases of the communication cost. Only cross-node communication is included. AG denotes All-Gather, RS denotes Reduce-Scatter, and AR denotes All-Reduce. [0,0($AG$, $i$)] denotes allgather in $i$ ranks for complete OS communication. [$a$,$b$,$c$] represent a complete $P$, $G$, and $OS$, respectively.}
+\label{exampleComm}
+\end{table}
+
+% We assigned each of the three members of the 'model state' to distinct communication groups. Upon this partitioning, an important observation emerged: 
+% The communication cost associated with maintaining synchronization varied significantly among the three members. This discrepancy in communication costs can profoundly impact the overall efficiency and performance of the system. Therefore, to address this, we introduced a ranking mechanism based on the incurred communication cost, leading to a 'communication cost-based priority' for each member. This prioritization is pivotal for the binder's operation. Instead of treating each member equally or randomly when determining a strategy, the binder leverages this priority ranking and searches for the optimal strategy based on the communication cost priority. 
+
+% Its communication cost can be delineated as:
+
+
+
+% \emph{Biased Higher Shard-OS}. An essential aspect to note is the rule based on dependency, which inherently dictates the size relationships among shard-OS, shard-P, and shard-G. Given these constraints and the communication cost modeling of P, G, and OS, we derive a definitive relationship for communication:
+% \[ Comm-OS < Comm-G, Comm-P \]
+% However, the precise relationship between Comm-G and Comm-P is contingent on several user-defined parameters. Specifically, the model size, global batch size, and micro-batch size play crucial roles in determining the relative magnitudes of these communication costs. Consequently, our strategy will ignore dynamically varying Comm-G and Comm-P, focusing on the smallest Comm-OS and inherently biased towards combinations with a more substantial Shard-OS. This deliberate choice ensures that we tap into the maximum potential benefits derived from efficient communication and synchronization of the Optimizer State across nodes.
+
+% \noindent\textbf{Dynamic Strategy}.
+
+\noindent\textbf{ILP Formulation}.
+We frame the minimization of communication costs as an Integer Linear Programming problem and utilize an off-the-shelf solver to find its optimal solution. For three model state members, each has \( {log2^\frac{N}{R}+2} \) strategies. We denote the communication cost and memory cost for the $i^{th}$ member using the $j^{th}$ strategy as \( C_{ij} \), and \( A_{ij} \) respectively. Then we define our decision variable as \( X_{ij} \) to indicate whether the $i^{th}$ member uses the $j^{th}$ strategy. The specified $memory\_threshold$ is usually set to the GPU memory threshold. The objective is to minimize the following
+\[ \text{min} \left( \sum_{i=1}^{3} \sum_{j=1}^{log2^\frac{N}{R}+2} C_{ij} \times X_{ij} \right) \]
+Where the decision variable \( X_{ij} \) must satisfy the dependencies mentioned above and: \[ \sum_{i=1}^{3} \sum_{j=1}^{log2^\frac{N}{R}+2} A_{ij} < memory\_threshold. \] 
+
+% Once the ILP has determined the combination of partitions in the model state, we will also apply a series of post-ILP communication optimizations that further cross-node communication-based on the characteristics of the partitions.
+% We also introduce a series of communication optimizations in \SysName on cross-node communication, which will be discussed later. 
+% Additionally, in \SysName, we've implemented a range of communication enhancements specifically targeting cross-node interactions. We will delve into these optimizations in subsequent discussions.
+
+\subsection{Communication Optimization}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{Stratified.pdf}
+    \caption{An example of all-gather parameters within one partition when employing a Tree-based stratified sync strategy for parameters. The data slice of $P$ is first aggregated locally within nodes to specific ranks, which then combine their data inter-node, before distributing the complete data slice to other ranks in their respective nodes.}
+    \label{sync}
+\end{figure}
+
+
+\begin{algorithm}[t]
+    \caption{\SysName algorithm}
+    \small
+    \label{Lins_alg}
+    \begin{algorithmic}[1]
+        \Input \textbf{model,world size}
+        \Output \textbf{model}
+        \While {model not converged}
+        \State \emph{- AllGather(\textbf{P},world size);}
+        \State \emph{+ Stratified\_AllGather(\textbf{P}, $Shard\_P$);}
+
+        \State \emph{model.forward();}
+ 
+        \State \emph{- partition(\textbf{P},world size);}
+        \State \emph{+ partition(\textbf{P},$Shard\_P$);}
+        \State \emph{- AllGather(\textbf{P},world size);}
+        \State \emph{+ Stratified\_AllGather(\textbf{P}, $Shard\_P$);}
+
+        \State \emph{model.backward();}
+
+        \State \emph{- partition(\textbf{P},world size);}
+        \State \emph{+ partition(\textbf{P},$Shard\_P$);}
+        \State \emph{- ReduceScatter(\textbf{G},world size);}
+        \While {gradient not reach boundary}
+            \State \emph{+ Stratified\_ReduceScatter(\textbf{G},$Shard\_G$);}
+            \EndWhile
+        \State \emph{+ Stratified\_ReduceScatter(\textbf{G},world size);}
+        \If {$Shard\_OS$ < $Shard\_P$}
+            \State \emph{+ Prefetching\_AllGather(OS,$Shard\_OS$);}
+            \EndIf
+        \State \emph{optimizer.step();}
+
+        \EndWhile
+    \end{algorithmic}
+\end{algorithm}
+
+\vspace{10pt}
+
+% At the scale-aware partitioner, we have avoided some extra data movement that may introduced by \SysName and searched for a much lower cost of communication than previous works, because of the difference in our data placement from traditional techniques.  
+% However, based on the changed data placement, we can not only synchronize data within a smaller communication group but can do more optimization within this group. For this, we abstract a tree-based stratified communication optimization and also consider one special case in the training process.
+The unique model states sharding lowers the communication costs compared to existing works. Besides, we also make communication optimizations to further reduce the overhead, including a tree-based stratified communication optimization and parameter update-based prefetching strategy. Algorithm \ref{Lins_alg} exhibits a different communication optimization strategy for \SysName compared to ZeRO-3.
+
+
+
+
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\linewidth]{TreeSync.pdf}
+%     \caption{Tree-based Stratified Sync. Upon receiving a data slice, the tree discerns whether it's a P or G. Depending on the classification, it manages gradient accumulation and synchronization processes across nodes, utilizing either intra-partition methods or a hierarchical communication strategy.}
+%     \label{SyncTree}                                                                                                                     
+% \end{figure}
+\noindent\textbf{Tree-based Stratified Synchronization}.
+\label{treeSync}
+When the splitting strategy for some members of the model state is set to shard-X > R, it will introduce cross-node communication. 
+However, considering the disparity between intra-node and inter-node bandwidths, it is desirable to reduce the frequency of inter-node communications. Furthermore, when shard-X > 1 and the gradient-accumulation technique \cite{GradAccumulate} is applied, a global reduction in each micro-step will introduce multiple times of cross-node communication. 
+The key solution is to reduce the inter-node communication volume as much as possible. 
+Therefore, we introduce a three-tiered conditional step-wise algorithm to diminish communication instances and ensure the sequential integrity of data. It is a tree-based hierarchical approach designed to supersede the traditional singular global synchronization methods. 
+
+% Figure \ref{SyncTree} depicts this algorithm. 
+% By examining this tree, it becomes evident how our method strategically chooses different communication optimization steps based on the characteristics of individual members. 
+Our optimization consists of different communication patterns based on the networking topology. 
+% Here are the detailed steps of the algorithm: \emph{1. Intra-(node/Partition)}: Each device uses the intra-node high bandwidth to gather for P and reduce-scatter for G, as shown in Algorithm Upon its completion, specific ranks obtain aggregated or reduced data amounting to \( R/X \). \emph{2. Inter-(node/Partition)}: For $P$ and $OS$, this involves communication between specific ranks across nodes. The interaction occurs only in the data shard stored by a particular rank 'rank\_i' on each node. At the end of this step, 'rank\_i' should have complete data for that shard. For $G$, we will bypass this step until the gradient accumulation boundary is reached, subsequently triggering inter-par. \emph{3. Reverse Intra}: For P and G, the subsequent operations necessitate each rank having full data. We need to do a reverse intra-communication from the specific 'rank\_i\', which has already gained the full data in step 2. Figure \ref{sync} illustrates the all-gather algorithm when the parameters are partitioned across two nodes, one of which contains 2 ranks. Here is a breakdown of this strategy:
+
+% Furthermore, when shard-X > 1, the gradient accumulation technique introduces additional synchronization overheads for gradients. Specifically, a global reduction is mandated at each micro-step. The inter-node communication induced by this global reduction in each micro-step is significant and cannot be overlooked. In response to this challenge, we have abstracted a hierarchical communication strategy for the Partitioner component, diverging from the erstwhile singular global communication paradigm. We postulate that, under scenarios where communication acts as the bottleneck, sub-communication groups necessitating cross-node communication can be abstracted into a three-step process. This not only diminishes communication instances but also ensures the sequential integrity of data. Intriguingly, this triadic abstraction witnesses variations only in its invocation sequence due to differing objects.
+
+% To address this concern, we have introduced a stratified communication strategy for the Partitioner component, distinct from the previous global singular communication approach. 
+% multiple ranks across various nodes will possess a full copy of the state of that particular member. In scenarios that necessitate global synchronization or updates of member states, inter-node communication becomes inevitable
+% Specifically, this strategy 1) facilitates the all-gather parameters within the same group during both forward and backward passes and 2) enables computations and synchronization of gradients before parameter updates.
+
+
+
+% Our approach introduces a three-tiered conditional stepwise algorithm, which is a tree-based hierarchical approach designed to supersede the traditional singular global synchronization methods. Figure \ref{SyncTree} depicts this algorithm. By examining this tree, it becomes evident how our method strategically chooses different communication optimization steps based on the characteristics of individual members. Here are the detailed steps of the algorithm:
+
+
+
+
+% The third phase's execution depends on whether the subsequent operations necessitate each rank having full data. It gets activated under circumstances such as during the forward and backward passes when the entirety of the parameters is essential for computations, or at the gradient accumulation boundary. It remains inactive during parameter updates. In this scenario, each rank solely requires the gradient of the parameters stored locally, rather than the complete gradient data.
+
+
+
+
+% Step 1: Intra-node Reduction.
+% The initial phase focuses on the intra-node reduce operation. Here, data from `rank0` and `rank3` are directed towards `rank1` and `rank2` respectively. After that, both `rank1` and `rank2` possess a consolidated dataset from within their node. Moreover, it is crucial to note that the data residing in `rank1` and `rank2` are contiguous.
+
+% Step 2: Inter-node Allgather.
+% Following the intra-node reduction, the next move entails an inter-node `allgather` between `rank1` and `rank2`. Upon the culmination of this phase, both `rank1` and `rank2` have a comprehensive set of data from within the partition. A salient feature of this operation is its efficiency, manifesting in a singular inter-node communication.
+
+% Step 3: Intra-node Broadcast.
+% In this stage, `rank1` and `rank2` commence broadcasting their holistic parameters data to the other ranks within their respective nodes. By the end of these orchestrated steps, every rank within the partition is armed with all the parameters required for computations in the subsequent step.
+
+Compared to the global sync. approach with latency \( (x-1) \times M/x \), our method streamlines the cross-node communication. In our design, such communication is chiefly confined to the second stage and occurs with a frequency of \( x/\text{R} \), leading to a reduced latency of:
+\vspace{-5pt}
+\[ \left( \frac{x}{\text{R}} - 1 \right)\times \left( \frac{\text{R}}{x} \right)  \times M  \]
+The latency ratio between \SysName and the global one is:
+
+\[ \frac{x - \text{R}}{x - 1} \]
+The benefit of \SysName decreases as the value of \( x \) increases.
+
+% Compared to the traditional approach, where the latency for cross-node communication is proportional to the model parameter size \( M \) and is represented by \( (x-1) \times M/x \), our method significantly refines this mechanism. Specifically, in our method, cross-node communication predominantly occurs in the second stage, the latency for cross-node communication is reduced to \[ \left( \frac{x}{\text{R}} - 1 \right)\times \left( \frac{\text{R}}{x} \right)  \times M  \]Given the provided information, the ratio \( R \) of the latency of our method to the original method can be expressed as: \[ R = \frac{x - \text{R}}{x - 1} \] Considering real-world scenarios, for GPUs like A100, the value of \( \text{R} \) is typically either 4 or 8,as the splitting strategy for members of model states, denoted by shardX, increases its \( x \) value, the benefits offered by our method tend to diminish.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{Prefetching.pdf}
+    \caption{Prefetching mechanism. A naive approach for the optimizer step leads to the consequence of misalignment in the data sequence and requires extra data copy and replacement. \SysName prefetch the data chunk of $OS$ before the optimizer step begins.}
+    \label{prefetching}
+\end{figure}
+
+\noindent\textbf{Prefetching from OS.}
+\label{subsec_prefetch}
+When updating parameters based on the rules defined in \S\ref{dependenceBased}, $OS$ only possesses a portion of $P$, preventing local exchanges. As shown in Figure \ref{prefetching}(a), a naive approach involves a global scatter reduction, potentially causing data sequence misalignment and necessitating additional data copy and replacement. 
+% To address this challenge, we devised an efficient prefetching communication strategy that pre-transmits the required data chunk for each portion of P needing an update through a newly established communication channel prior to executing the parameter update as shown in Figure \ref{prefetching}(b).
+To address this issue, we devise an efficient prefetching communication strategy. It pre-transmits the required data chunk for each portion of $P$ that needs an update prior to executing the parameter update via a separate channel, as shown in Figure \ref{prefetching}(b).
+
+
+% When we exchange the data of updated OS and old P for the next forward, according to rules defined in Figure \ref{fig:dependencebased}, OS only has a fraction of P, unable to exchange locally due to the lack of global gather from other devices. One naive approach, as depicted in Figure \ref{prefetching}(a), is to execute a globally reduced scatter, which could lead to the consequence of misalignment in the data sequence, and require extra data copy and replacement. In light of this particular challenge, we architect an efficient prefetching communication strategy, intended to mitigate the inevitable overhead introduced by data transfers due to partitioning. To elucidate, prior to embarking on the subsequent forward and backward computations, we construct a novel communication group. This group encompasses specific 'n' downstream data shards identified within each replica group of the upstream data. Within this freshly minted communication group, we aggregate these 'n' downstream data fragments, thereby ensuring that the downstream data is sufficiently equipped with the complete dataset required to seamlessly replace the upstream data, as shown \ref{prefetching}(c).
+
+% As mentioned in \S\ref{dependenceBased}, during the training process, there exists an instance where downstream data accesses upstream data -- the updated OS replaces the P to facilitate the training in the subsequent step. According to the rules defined in \S\ref{subsec_binder}, the downstream training possesses only a fraction of the corresponding upstream data. Consequently, during replacement instances, the downstream updated OS can merely replace a fraction of the `P`, as illustrated in Figure \ref{prefetching}(a). This predicament eludes resolution via hierarchical methodologies.
+% Were one to adopt a naive approach, as depicted in Figure \ref{prefetching}(b), and execute a global reduce scatter, the consequence would be a misalignment in the data sequence.  In light of this particular challenge, we've architected an efficient prefetching communication strategy, intended to mitigate the inevitable overhead introduced by data transfers due to partitioning. To elucidate, prior to embarking on the subsequent forward and backward computations, we construct a novel communication group. This group encompasses specific 'n' downstream data shards identified within each replica group of the upstream data. Within this freshly minted communication group, we aggregate these 'n' downstream data fragments, thereby ensuring that the downstream data is sufficiently equipped with the complete dataset required to seamlessly replace the upstream data,as shown \ref{prefetching}(c).
+
+% \subsection{2D gradient synchronization}
+% \label{subsec_models}
+
+
+% \subsubsection{}
+% \label{subsubsec_packing}
+
+
+% \subsubsection{Throughput Predict Model.}
+% \label{subsubsec_throughput}
+
+
+
+% \subsubsection{Workload Estimate Model.}
+% \label{subsubsec_workload}
+%  to make the corresponding adjustment.
+% Note that we omit local interpretation for \textsl{Throughput Predict Model} and global interpretation for \textsl{Workload Estimate Model} due to the space limit.
+
+
+
+
+
+% \subsection{System Optimizer}
+% \label{subsec_optimizers}
+% \subsubsection{System Tuner.}
+
+
+
+% \subsubsection{Update Engine.}
+
+% \subsection{Properties of Lucid}
+% \label{subsec_properties}
+% In addition to advantages introduced in \S\ref{sec_intro}, \SysName has the following properties as well.
+
+% \noindent\textbf{Sharing Incentive.}
+% For a multi-tenant cluster with $N$ users, \SysName guarantees each user’s performance should be no worse than using a private cluster of size $1/N$ \cite{Themis, ASTRAEA}, which encourages users to share resources instead of monopolizing.
+
+% \noindent\textbf{Packing Incentive.}
+% For \SysName, job packing enabled policies are always at least as good as without packing versions \cite{Gavel}.
+
+% \noindent\textbf{Envy-Freeness.}
+% \SysName satisfies strategy proofness that users violating truth-telling will fail to obtain better performance. Since our system relies on the profiled features instead of information given by users, the manipulation of their job to avoid packing will incur performance degradation.
+
+% Currently, due to the non-intrusive scheduling paradigm of \SysName, the allocation may not satisfy Pareto efficiency. It would be a promising future work.

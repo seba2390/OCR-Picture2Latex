@@ -1,0 +1,131 @@
+
+\section{The Full \unistore{} Protocol for LWW Registers} \label{section:unistore-protocol}
+
+Algorithms~\ref{alg:unistore-client} -- \ref{alg:unistore-recovery} given in
+this section define the full \unistore{} protocol, including parts omitted from
+the main text. This version of the protocol is specialized to the case when the
+data store manages last-writer-wins (LWW) registers.
+
+Algorithm~\ref{alg:unistore-client} shows the pseudocode of clients.
+We assume that each client is associated with a unique client identifier.
+Each client maintains the following variables:
+\begin{itemize}
+  \item $\lc$: The Lamport clock at this client.
+  \item $\clientdc$: The data center to which this client is currently connected.
+  \item $\clientcoord$: The coordinator partition of the current ongoing transaction.
+  \item $\ctid$: The identifier of the current ongoing transaction.
+  \item $\pastVC$: The client's causal past.
+\end{itemize}
+
+A client interacts with \unistore{} via the following procedures:
+\begin{itemize}
+  \item $\tidvar \gets \Call{\start}{\null}$:
+    Start a transaction and obtain an identifier $\tidvar$.
+  \item $v \gets \Call{\read}{k}$:
+    Invoke a read operation on key $k$ in the ongoing transaction and obtain a
+    return value $v$.
+  \item $\ok \gets \Call{\updateproc}{k, v}$:
+    Invoke an update operation on key $k$ and value $v$
+    in the ongoing transaction.
+  \item $\ok \gets \Call{\commitcausaltx}{\null}$:
+    Commit a causal transaction.
+  \item $\decvar \gets \Call{\commitstrongtx}{\null}$:
+    Try to commit a strong transaction
+    and obtain a decision $\decvar \in \set{\commit, \abort}$.
+  \item $\ok \gets \Call{\fence}{\null}$:
+    Execute a uniform barrier.
+  \item $\ok \gets \Call{\clattach}{j}$:
+    Attach to data center $j$.
+\end{itemize}
+
+
+Algorithms~\ref{alg:unistore-coord} -- \ref{alg:unistore-strong-commit} show the
+pseudocode of replicas. The code needed for strong transactions in
+Algorithms~\ref{alg:unistore-coord}, \ref{alg:unistore-replica}, and
+\ref{alg:unistore-clock} is highlighted in red.  Each replica $p^{m}_{d}$
+maintains a set of variables as follows.
+\begin{itemize}
+  \item{$\clockVar$:} The current time at $p^{m}_{d}$.
+  \item{$\rset$:} The read sets of transactions coordinated by $p^{m}_{d}$,
+    indexed by transaction identifier $\tidvar$.
+  \item{$\wbuff$:} The write buffers of transactions coordinated by $p^{m}_{d}$,
+    indexed by transaction identifier $\tidvar$, partition $l$, and key $k$.
+  \item{$\snapVC$:} The snapshot vectors of transactions coordinated by $p^{m}_{d}$,
+    indexed by transaction identifier $\tidvar$.
+  \item{$\oplog$:} The log of updates performed on keys managed by $p^{m}_{d}$,
+    indexed by key $k$.
+  \item{$\knownVC, \stableVC, \uniformVC$:}
+    The vectors used by $p^{m}_{d}$ to track what is replicated where.
+  \item{$\preparedcausal$:} The set of causal transactions
+    local to $p^{m}_{d}$ that are prepared to commit.
+  \item{$\committedcausal$:} For each data center $i$,
+    $\committedcausal[i]$ stores transactions waiting to be
+    replicated by $p^{m}_{d}$ to sibling replicas at other data centers than $i$.
+  \item{$\localmatrix$:} The set of $\knownVC$ received by $p^{m}_{d}$
+    from other partitions in data center $d$.
+    It is used to compute $\stableVC$.
+  \item{$\stablematrix$:} The set of $\stableVC$ received by $p^{m}_{d}$
+    from sibling replicas.
+    It is used to compute $\uniformVC$.
+  \item{$\globalmatrix$:} The set of $\knownVC$ received by $p^{m}_{d}$
+    from sibling replicas.
+    It is used to track what has been replicated at sibling replicas.
+\end{itemize}
+
+We specialize the \unistore{} protocol to LWW registers in several ways.
+First, we add code for managing Lamport clocks, highlighted in blue.
+In particular, each (committed) transaction is associated with a Lamport
+timestamp, equal to the value of $\lc$ at its client when the transaction completes
+(lines~\code{\ref{alg:unistore-client}}{\ref{line:commitcausaltx-lc}}
+and \code{\ref{alg:unistore-client}}{\ref{line:commitstrongtx-lc}}).
+Lamport timestamps are totally ordered, with client identifiers used for tie-breaking
+(see also Definition~\ref{def:lco}).
+
+Second, in Algorithm~\ref{alg:unistore-coord}
+we replace \doop{} by the following two procedures:
+
+\begin{itemize}
+  \item $v \gets \Call{\doread}{\tidvar, k}$:
+    Execute a read operation on key $k$
+    in a transaction with identifier $\tidvar$ and obtain a value $v$.
+  \item $\Call{\doupdate}{\tidvar, k, v}$:
+    Execute an update operation on key $k$ and value $v$
+    in a transaction with identifier $\tidvar$.
+\end{itemize}
+
+Finally, in Algorithm~\ref{alg:unistore-replica}
+we modify the handler of message \getversion{}:
+\begin{itemize}
+  \item $\Call{\readkey}{\snapvc, k}$:
+    Read the latest value from key $k$
+    based on the snapshot vector $\snapvc$.
+    Specifically, it returns the last update to key $k$ of the transaction
+    with the latest $\commitvc$ in terms of their Lamport clock order
+    such that $\commitvc \leq \snapvc$
+    (line~\code{\ref{alg:unistore-replica}}{\ref{line:readkey-read}}).
+\end{itemize}
+
+Algorithms~\ref{alg:unistore-certify} -- \ref{alg:unistore-recovery} contain the
+implementation of the transaction certification service (see also
+\S\ref{section:tcs}). The certification service uses an instance of the leader
+election failure detector $\Omega_m$ for each partition $m$\footnote{Tushar
+  Deepak Chandra, Vassos Hadzilacos, and Sam Toueg. The weakest failure detector
+  for solving consensus. J. ACM, 1996.}. This primitive ensures that from some
+point on, all correct processes nominate the same correct process as the leader.
+For the case when the data store manages only registers, we assume that any two
+writes to the same object conflict. Other data types and conflict relations can
+be easily supported by modifying the certification check in
+Algorithm~\ref{alg:unistore-certification}.
+
+\setcounter{algorithm}{0}
+\input{appendix_fixed/algs/unistore-client}
+\input{appendix_fixed/algs/unistore-coord}
+\input{appendix_fixed/algs/unistore-replica}
+\input{appendix_fixed/algs/unistore-replication}
+\clearpage
+\input{appendix_fixed/algs/unistore-clock}
+\input{appendix_fixed/algs/unistore-strong-commit}
+\input{appendix_fixed/algs/unistore-certification}
+\input{appendix_fixed/algs/unistore-certification-check}
+\input{appendix_fixed/algs/unistore-atomic-commit}
+\input{appendix_fixed/algs/unistore-recovery}

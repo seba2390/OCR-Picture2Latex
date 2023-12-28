@@ -1,0 +1,89 @@
+\section{Building blocks for approximate inference algorithms} \label{sec:inference}
+
+This section first describes a set of building blocks for approximate inference algorithms
+that are based on the generative model of Section~\ref{sec:model}.
+We then describe how to combine these components into a scene graph inference algorithm
+that we evaluate in Section~\ref{sec:experiments}.
+
+\paragraph{Trained object detectors}
+It is possible to infer the types of objects in the scene ($\mathbf{c}$) via Bayesian inference in the generative model
+(see supplement for an example that infers $\mathbf{c}$ as well as $N$ in a scene with a fully occluded object, via Bayesian inference).
+However, for scenes where objects are not fully or nearly-fully occluded,
+and where object types have dissimilar appearance,
+it is possible to train fast object detectors
+that produce an accurate point estimate of $\mathbf{c}$ given an RGB image.
+
+\paragraph{Trained pose estimators}
+In scenes without full or nearly-full occlusion, it is also possible to employ trained pose estimation methods~\citep{wang2019densefusion} to give independent estimates of the 6DoF pose of each object instance in the image.
+However, inferring pose is more challenging than inferring $\mathbf{c}$,
+and occlusion, self-occlusion, and symmetries can introduce significant pose uncertainty.
+Therefore, we only use trained pose estimators (e.g. \citep{wang2019densefusion}) to (optionally) \emph{initialize} the poses of objects before Bayesian inference in the generative model, using the building blocks below.
+
+\paragraph{Data-driven Metropolis-Hastings kernels on object pose}
+We employ Metropolis-Hastings (MH) kernels, parametrized by choice of object $i \in \{1, \ldots, N\}$, that
+take as input a scene graph $\mathcal{G}$,
+propose new values ($\theta_{v_i}'$) for the scene graph parameters of object $i$,
+construct a new proposed scene graph $\mathcal{G'}$,
+and then accept or reject the move from $\mathcal{G}$ to $\mathcal{G'}$ based on 
+the MH rule.
+For objects $v$ whose parent is the world frame ($(r, v) \in E$), we use a data-driven proposal distribution centered on an estimate ($\hat{\mathbf{x}}_v$) of the 6DoF object pose obtained with ICP 
+(a spherical normal distribution concentrated around the estimated position,
+and a vMF distribution concentrated around the estimated orientation).
+We also use kernels with random-walk proposals centered on the current pose.
+For objects whose parent is another object ($(u, v) \in E$ for $u \ne r$),
+we use a random-walk proposal on parameters $(a_{v_i}$, $b_{v_i}$, $z_{v_i})$.
+Note that when the pose of an object is changed in the proposed graph $\mathcal{G'}$,
+the pose of any descendant objects is also changed.\footnote{%
+It is possible to construct an involutive MCMC kernel that does not change the poses of descendant objects.}
+Each of these MH kernels is invariant with respect to $p(G, \bm\theta | \mathbf{c}, \mathbf{Y})$.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.8\textwidth]{imgs/scene-graphs-structure-transition.pdf}
+	\caption{A reversible transition between scene graph structure $G$ and scene graph structure $G'$.}
+	\label{fig:scene-graph-structure-change}
+\end{figure}
+
+
+\paragraph{Involutive MCMC kernel on scene graph structure}
+To infer the scene graph structure $G$, we employ a family of involutive MCMC kernels~\citep{cusumano2020automating} that
+propose a new graph structure $G'$ while keeping the poses ($\mathbf{x}_v$) of all objects fixed.
+The kernel takes a graph structure $G$ and proposes a new graph structure $G'$ (Figure~\ref{fig:scene-graph-structure-change}) by:
+(i) randomly sampling a node $v \in V \setminus \{r\}$ to `sever' from the tree,
+(ii) randomly choosing a node $u \in V \setminus \{v\}$ that is not a descendant of the severed node on which to graft $v$,
+(iii) forming a new directed graph $G'$ over vertices $V$ by grafting $v$ to $u$; by Lemma~O.7.1 the resulting graph $G'$ is also a tree.
+Note that there is an involution $g$ on the set of all pairs $(G, v, u)$ satisfying the above constraints.
+That is, if
+$(G', v', u') = g(G, v, u)$
+then
+$(G, v, u) = g(G', v', u')$.
+(This implies, for example, that $u'$ is the parent of $v$ in $G$.)
+Note that this set of transitions is capable of changing the parent vertex of an object to a different parent object,
+changing the parent vertex of an object from the root (world frame) to any other object,
+or changing the parent vertex from another object to the root, depending on the random choice of $v$ and $u$.
+We compute new values for parameters ($\theta_v$) for the severed node $v$ and possibly other vertices such that the poses of all vertices are unchanged.
+See supplement for the full kernel and a proof that it is invariant w.r.t. $p(G, \bm\theta | \mathbf{c}, \mathbf{Y})$.
+
+\paragraph{Approximately Rao--Blackwellizing object shape via pseudo-marginal MCMC}
+The acceptance probability expressions for our involutive MCMC and MH kernels targeting $p(G, \bm\theta | \mathbf{c}, \mathbf{Y})$ include factors of the form $p(\mathbf{Y} | \mathbf{c}, G, \bm{\theta})$, which is an intractable sum over the latent object models:
+$p(\mathbf{Y} | \mathbf{c}, G, \bm{\theta}) = \sum_{\mathbf{O}^{(1:M)}} p(\mathbf{O}^{(1:M)}) p(\mathbf{Y} | \mathbf{O}^{(1:M)}, \mathbf{c}, G, \bm{\theta})$.
+To overcome this challenge, we employ a pseudo-marginal MCMC approach \citep{andrieu2009pseudo} that uses unbiased estimates of
+$p(\mathbf{Y} | \mathbf{c}, G, \bm{\theta})$
+obtained via likelihood weighting (that is, sampling several times from $p(\mathbf{O}^{(1:M)})$ and averaging the resulting $p(\mathbf{Y} | \mathbf{O}^{(1:M)}, \mathbf{c}, G, \bm\theta$)).
+The resulting MCMC kernels are invariant with respect to an extended target distribution of which $p(G, \bm\theta | \mathbf{c}, \mathbf{Y})$ is a marginal (see supplement for details). % \ref{sec:pseudo-marginal} 
+We implemented an optimization where we sampled 5 values for $\mathbf{O}^{(1:M)}$ and used these samples within every estimate of $p(\mathbf{Y} | \mathbf{c}, G, \bm\theta)$ instead of sampling new values for each estimate.
+Because our learned shape priors did not have significant exterior shape uncertainty,
+this optimization did not negatively impact the results.
+
+\paragraph{Scene graph inference and implementation}
+The end-to-end scene graph inference algorithm has three stages.
+First, we obtain $\mathbf{c}$ from either an object detector or because it is given as part of the task (this is the case in our experiments; see Section~\ref{sec:experiments} for details).
+Second, we obtain initial estimates $\hat{\mathbf{x}}_v$ of 6DoF object poses $\mathbf{x}_v$ for all object vertices $v$ via maximum-a-posteriori (MAP) inference in a restricted variant of the generative model with graph structure $G$ fixed to $G_0$ (so there are no edges between object vertices).
+This MAP inference stage uses the data-driven Metropolis-Hastings kernels on poses, and (optionally) trained pose estimators (see Section~\ref{sec:experiments} for the details, which differ between experiments).
+Third, we use the estimated poses to initialize an MCMC algorithm targeting $p(G, \bm{\theta} | \mathbf{c}, \mathbf{Y})$ with state $G \gets G_0$ and $\theta_v \gets \hat{\mathbf{x}}_v$ for each $v \in V \setminus \{r\}$.
+The Markov chain is a cycle of the involutive MCMC kernel described above with a mixture of the Metropolis-Hastings kernels described above, uniformly mixed over objects.
+We wrote the probabilistic program of Figure~\ref{fig:model} in Gen's built-in modeling language.
+We implemented the data-driven and involutive MCMC kernels, and pseudo-marginal likelihood,
+and integrated all components together, using Gen's programmable inference support.
+Our code is available at \url{https://github.com/probcomp/ThreeDP3}.
+

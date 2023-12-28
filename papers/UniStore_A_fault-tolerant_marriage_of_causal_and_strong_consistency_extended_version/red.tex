@@ -1,0 +1,179 @@
+\section{Adding Strong Transactions}
+\label{sec:redtransactions}
+
+We now describe the full \System protocol with both causal and strong
+transactions. It is obtained by adding the highlighted lines to
+Algorithms~\ref{alg:txncoord1}-\ref{alg:clock} and a new
+Algorithm~\ref{alg:txncoord2}.
+
+
+\subsection{Metadata}
+
+
+The Conflict Ordering property of our consistency model requires any two
+conflicting strong transactions to be related one way or another by the causal
+order $\prec$ (\S\ref{sec:consistency}). To ensure this, the protocol assigns to
+each strong transaction a scalar {\em strong timestamp}, analogous to those used
+in optimistic concurrency control for serializability~\cite{wv}.  Several
+vectors used as metadata in the causal consistency protocol
+(\S\ref{sec:metadata}) are then extended with an extra $\red$ entry.
+
+First, we extend commit vectors and those representing causally consistent
+snapshots. Commit vectors are compared using the previous order $<$, but
+considering all entries; as before, this order is consistent with the causal
+order $\prec$. Furthermore, conflicting strong transactions are causally ordered
+according to their strong timestamps.
+\begin{property}
+  For any conflicting strong transactions $t_1$ and $t_2$ with commit vectors
+  $\commitvector_1$ and $\commitvector_2$, we have:
+  $t_1 \prec t_2 \Longleftrightarrow \commitvector_1[\red] < \commitvector_2[\red]$.
+\end{property}
+
+A consistent snapshot vector $V$ now defines the set of transactions with a
+commit vector $\le V$, according to the new $<$. The vectors
+$\replicavectorclock$ and $\stablesnapshot$ maintained by a replica
+$\partition^m_d$ are also extended with a $\red$ entry. The entries
+$\replicavectorclock[\red]$ and $\stablesnapshot[\red]$ define the prefix of
+strong transactions that have been replicated at $\partition^m_d$ and the local
+data center $d$, respectively:
+\begin{property}
+\label{prop:knownvcred}
+Replica $\partition^m_d$ stores the updates to $m$ by all strong
+transactions with $\commitvector[\red]\leq \replicavectorclock[\red]$.
+\end{property}
+\begin{property}
+\label{prop:stablevcred}
+Data center $d$ stores the updates by all strong transactions with
+$\commitvector[\red]\leq \stablesnapshot[\red]$.
+\end{property}
+To ensure Property~\ref{prop:stablevcred}, the $\red$ entry of $\stablesnapshot$
+is updated at \algline{alg:clock}{line:stablered} similarly to its other
+entries. We do not extend $\uniformsnapshot$, because our commit protocol for
+strong transactions automatically guarantees their uniformity.
+
+
+
+
+
+
+\subsection{Transaction Execution}
+\label{sec:redexecution}
+
+\System uses optimistic concurrency control for strong transactions, with the
+same protocol for executing causal and speculatively executing strong
+transactions. To this end, Algorithm~\ref{alg:txncoord1} is modified as
+follows. First, the computation of the snapshot vector $\vecsnapshottime[\tx]$
+is extended to compute the $\red$ entry
+(\algline{alg:txncoord1}{alg:coord:starttx:end-red}), which is now taken into
+account when checking that a replica state is up to date
+(\algline{alg:txnpartition}{line:waitexecute}).  The $\red$ entry of the
+snapshot vector is computed so as to include all strong transactions known to be
+fully replicated in the local data center, as defined by
+$\stablesnapshot[\red]$. To ensure {\em read your writes}, the snapshot
+additionally includes strong transactions from the client's causal past, as
+defined by $\avc[\red]$. Finally, the coordinator of a transaction now maintains
+not only its write set, but also its read set $\readset$ that records all
+operations by the transaction, including read-only ones
+(\algline{alg:txncoord1}{line:readset}). The latter is used to certify strong
+transactions.
+
+After speculatively executing a strong transaction, the client tries to commit
+it by calling $\COMMITRED$ at its coordinator
+(\algline{alg:txncoord2}{line:commitred}). The coordinator first waits until the
+snapshot on which the transaction operated becomes uniform by calling
+$\MAKEUNIFORM$ (\algline{alg:txncoord2}{line:uniformred}): as we argued in
+\S\ref{sec:overview}, this is crucial for liveness.
+The coordinator next submits the transaction to a \emph{certification service},
+which determines whether the transaction commits or aborts
+(\algline{alg:txncoord2}{line:certifyred}, see \S\ref{sec:certification}).
+In the former case, the service also determines its commit vector,
+which the coordinator returns to the client. If the transaction commits,
+the client sets its causal past $\past$ to the commit vector; otherwise, 
+it re-executes the transaction. 
+
+The certification service also notifies replicas in all data centers about
+updates by strong transactions affecting them via $\DELIVERUPD$ upcalls, invoked
+in an order consistent with strong timestamps of the transactions
+(\algline{alg:txncoord2}{line:deliverred}). A replica receiving an upcall adds
+the new operations to its log and refreshes $\replicavectorclock[\red]$ to
+preserve Property~\ref{prop:knownvcred}.
+
+Finally, a replica $\partition^m_d$ that has not seen any strong transactions
+updating its partition $m$ for a long time submits a dummy strong transaction
+that acts as a heartbeat (\algline{alg:txncoord2}{line:stronghb}). Similarly to
+heartbeats for causal transactions, this allows coping with skewed load
+distributions.
+
+
+\begin{algorithm}[t]
+  \begin{algorithmic}[1]
+    \small
+    \Function{\COMMITRED}{\tx}\label{line:commitred}
+      \State $\MAKEUNIFORM(\vecsnapshottime[\tx])$\label{line:uniformred}
+      \State \Return
+        \CERTIFY(\tx, $\writeset[\tx]$, $\readset[\tx]$, $\vecsnapshottime[\tx]$) \label{line:certifyred}
+    \EndFunction
+
+    \SpaceHandler
+
+    \Upon[\DELIVERUPD($W$)]\label{line:deliverred}
+    \ForAll{\hspace{-1pt}$\langle \aws, \commitvector\rangle {\in} \hspace{1pt} W$\hspace{1pt}in\hspace{1pt}$\commitvector[\red]$\hspace{1pt}order}
+      \ForAll{$\langle k, \op \rangle \in \aws$}
+      \State $\store[k] \gets \store[k] \cdot \langle \op, \commitvector \rangle$\label{line:addred}
+      \EndFor
+      \State $\replicavectorclock[\red] \gets \commitvector[\red]$\label{line:setred}
+      \EndFor
+    \EndUpon
+      
+
+    \SpaceHandler
+
+    \Function{\RHEARTBEAT}{$ $} \Comment{Run periodically}\label{line:stronghb}
+      \State \Return \CERTIFY($\bot$, $\emptyset$, $\emptyset$, $\vec{0}$)
+    \EndFunction
+
+  \end{algorithmic}
+  \caption{Committing strong transactions at $\partition^m_d$.}
+  \label{alg:txncoord2}
+\end{algorithm}
+
+\subsection{Certification Service}
+\label{sec:certification}
+
+
+
+We implement the certification service using an existing fault-tolerant protocol
+from~\cite{discpaper}, with transaction commit vectors computed using the
+techniques from~\cite{multicast-dsn19}. The protocol integrates two-phase commit
+across partitions accessed by the transaction and Paxos among the replicas of
+each partition. It furthermore uses white-box optimizations between the two
+protocols to minimize the commit latency.  The use of Paxos ensures that a
+committed strong transaction is durable and its updates will eventually be
+delivered at all correct data centers
+(\algline{alg:txncoord2}{line:deliverred}). For each partition, a single replica
+functions as the Paxos leader. The protocol is described and formally specified
+elsewhere~\cite{discpaper}, and here we discuss it only briefly. Its pseudocode
+and formal specification are given 
+in~\tr{\ref{section:unistore-protocol}}{\nappfull}
+and~\tr{\ref{section:tcs}}{\napptcs}, respectively.
+
+The certification service accepts the read and write sets of a transaction and
+its snapshot vector (\algline{alg:txncoord2}{line:certifyred}). Even though the
+service is distributed, it guarantees that commit/abort decisions are computed
+like in a centralized database with optimistic concurrency control -- in a total
+{\em certification order}. To ensure Conflict Ordering,
+the decisions are computed using a concurrency-control policy similar to that
+for serializability~\cite{wv}: a transaction commits if its snapshot includes
+all conflicting transactions that precede it in the certification order. The
+certification service also computes a commit vector for each committed
+transaction by copying its per-data center entries from the transaction's
+snapshot vector and assigning a strong timestamp consistent with the
+certification order.
+
+
+
+
+
+
+
+

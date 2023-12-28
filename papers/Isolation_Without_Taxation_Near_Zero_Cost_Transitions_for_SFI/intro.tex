@@ -1,0 +1,352 @@
+\section{Introduction}
+\label{sec:intro}
+
+Memory safety bugs are the single largest source of critical vulnerabilities 
+in modern software. Recent studies found that roughly 70\% of all critical 
+vulnerabilities were caused by memory safety bugs \cite{msf-bugs,chr-bugs} and 
+that malicious attackers are exploiting these bugs before they can be 
+patched~\cite{p0:in-the-wild:21, fireeye-study}.
+%
+Software sandboxing\dash---or software-based fault isolation
+(SFI)\dash---promises to reduce the impact of such memory safety
+bugs~\cite{gang-sfi, wahbe_efficient_1993}.
+%
+SFI toolkits like Native Client (NaCl)~\cite{yee_native_2009} and WebAssembly (Wasm) allow
+developers to restrict untrusted components to their own \emph{sandboxed}
+regions of memory thereby isolating the damage that can be caused by bugs in
+these components.
+%
+Mozilla, for example, uses Wasm to sandbox third-party C libraries in
+Firefox~\cite{rlbox, rlbox-blog}; SFI allows the browser to use libraries
+like \libgraphite (font rendering), \libexpat (XML parsing), \libsoundtouch
+(audio processing), and \hunspell (spell checking) without risking
+whole-browser compromise due to library vulnerabilities.
+%
+Others have used SFI to isolate code in 
+OS kernels~\cite{xfi, bgi,herder2009fault, vino}, 
+databases~\cite{vx32, vxa, wahbe_efficient_1993}, 
+browsers~\cite{omniware,yee_native_2009,haas_bringing_2017}, 
+language runtimes~\cite{robusta, rockjit}, and 
+serverless clouds~\cite{lucet-talk, cloudflare, sledge}.
+
+SFI toolkits enforce memory isolation by placing untrusted 
+code into a sandboxed environment within which every memory access 
+is dynamically checked to be safe.
+%
+For example, NaCl and Wasm toolkits (e.g., Lucet~\cite{lucet} and
+WAMR~\cite{wamr}) instrument memory accesses to ensure they are 
+within the sandbox region and add runtime checks to ensure that 
+all control flow is confined to the sandboxed paths with 
+instrumented memory accesses.
+%
+There is a large body of work that ensures 
+the runtime checks are \emph{fast} on different 
+architectures, e.g., x86~\cite{mccamant_evaluating_2006, yee_native_2009, vx32, payer2011fine}, 
+x86-64~\cite{sehr_adapting_2010}, \SPARC~\cite{omniware-pldi},
+and \ARM~\cite{armor, armlock, sehr_adapting_2010}, as otherwise 
+they incur unacceptable overheads on the code executing in the sandbox.
+%
+Similarly, there is a considerable literature 
+that establishes that the checks are \emph{correct}~\cite{rocksalt, compcert-sfi, veriwasm, sfi-as-ai,besson2019compiling},
+as even a single missing check can let 
+the attacker escape the sandbox.
+
+However, the security and overhead of software sandboxing also
+crucially depends on the correctness and cost of context switching 
+\dash---the \emph{trampolines} and \emph{springboards} used 
+to transition into and out of sandboxes.
+%
+Almost all SFI systems, from \cite{wahbe_efficient_1993}'s original
+SFI implementation to recent Wasm SFI toolkits~\cite{lucet,
+wamr}, use \emph{heavyweight transitions} for context switching.\footnote{The
+one exception is WasmBoxC~\cite{wasmboxc}, discussed in
+Section~\ref{sec:related}.}
+%
+These transitions (1)~switch protection domains 
+by tying into the underlying memory isolation mechanism 
+(e.g., by setting segment registers~\cite{yee_native_2009}, 
+memory protection keys~\cite{vahldiek-oberwagner_erim_2019, hodor}, 
+or sandbox context registers~\cite{lucet, wamr}), and 
+%
+(2)~save, scrub, and restore machine state (e.g. 
+the stack pointer, program counter, and callee-save registers) 
+across the boundary.
+%
+This code is complicated and hard to get right, as it has to 
+account for the particular quirks of different architectures 
+and operating system platforms~\cite{alder2020faulty}.
+%
+Consequently, bugs in transition code have led to
+vulnerabilities in both NaCl and Wasm\dash---from sandbox
+breakouts~\cite{nacl-bug-1607, nacl-bug-1633}, to information
+leaks~\cite{nacl-bug-775, nacl-bug-2919}, and application state
+corruption~\cite{cranelift-bug-1177}.
+%
+Furthermore, in applications with high application-sandbox 
+context switching rates, the cost of transitions
+dominates the overall sandboxing overhead.
+%
+For example, heavyweight transitions prohibitively slowed 
+down font rendering in Firefox, preventing Mozilla from 
+shipping a sandboxed \libgraphite~\cite{rlbox}.
+
+
+% in-sandbox cost
+%    |
+%    | o <---- wasm[lucet,wasm,....]
+%    |         nacl
+%    | SZ32
+%    |
+%    |         Hodor/ERIM
+%    |------------
+%        context-switch cost
+%
+% - trading-off expressiveness
+%    - We need well-bracked control flow. Not structured control flow (like Wasm
+%      does). Structured control flow makes it easier to verify no-use-of-uninit,
+%      but not the only way to do it.
+%
+% - limitations
+%     - we do allow gotos [in wasm this is more costly because of the structure]
+%     - setjmp/longjmp (same)
+% 
+%
+% 
+% System     |  memory isolation | Structure imposed on sandboxed code
+% -----------|-------------------|--------------------------------------------------
+% NaCl32     | x86 segmentation  | Coarse-grained forward-edge CFI (32-byte bundles).
+% NaCl64     | x64 guard pages   | Coarse-grained backward-edge CFI.
+% -----------|-------------------|--------------------------------------------------
+% Hodor      | MPK               | None.* Bytecode scanner ensures no unsafe
+%            |                   | instructions. 
+% -----------|-------------------|--------------------------------------------------
+% Wasm       | x64 guard pages   | Strongly typed. Type-based CFI. Separate (abstract) control stack.
+%            |                   | Structured control flow. Stack variable pre-initialization.
+% -----------|-------------------|--------------------------------------------------
+% Segment0   | x86 segmantation  | Zero-cost conditions: Type-based CFI.
+%            |                   | Well-bracketted control flow.
+% -----------|-------------------|--------------------------------------------------
+% 
+%                                  Callee-save register restoration (everybody
+%                                  does this (even though it's not
+%                                  checked/impseod) for correctness.)
+%                                  Safe stack (local state encapsulation).
+% 
+% * Some additional cost (either due to structure or kernel modifications) is
+% necessary to enforce system call policies.
+
+%%OLD:Software-based fault isolation (SFI) is a lightweight alternative to
+%%OLD:process-based isolation, which isolates untrusted code with runtime 
+%%OLD:checks that restrict (sandbox) the code to a specific region of the 
+%%OLD:address space~\cite{wahbe_efficient_1993,mccamant_evaluating_2006}.
+%%OLD:%
+%%OLD:Though SFI runtime checks typically slow down the code running 
+%%OLD:in the sandbox, in application domains where sandboxed 
+%%OLD:``components are tightly coupled and require frequent domain crossings,'' 
+%%OLD:the low overhead of SFI transitions more than makes up 
+%%OLD:for the added cost~\cite{gang-sfi}.
+%%OLD:%
+%%OLD:For example, SFI has been used to isolate code in 
+%%OLD:OS kernels~\cite{xfi, bgi,herder2009fault, vino}, 
+%%OLD:browsers~\cite{omniware, yee_native_2009,haas_bringing_2017}, 
+%%OLD:runtime systems~\cite{robusta, rockjit, sledge}, and
+%%OLD:storage systems~\cite{vx32, vxa, wahbe_efficient_1993}.
+%%OLD:
+%%OLD:More recently, Mozilla started using WebAssembly (Wasm) based SFI to sandbox
+%%OLD:third-party C libraries in Firefox~\cite{rlbox, rlbox-upstream}, and companies
+%%OLD:like Fastly are using Wasm to isolate tenant code on their edge
+%%OLD:clouds~\cite{lucet-announce}.
+%%OLD:% 
+%%OLD:SFI allows Mozilla to isolate libraries like \libgraphite (font shaping),
+%%OLD:\libexpat (XML parsing), and \hunspell (spell checking) that are tightly
+%%OLD:coupled and process content in a streaming fashion\dash---and thus require frequent
+%%OLD:domain crossings.
+%%OLD:%
+%%OLD:Similarly, SFI allows Fastly to service thousands of tenants per
+%%OLD:second (per core), each of which calls into the runtime multiple times when
+%%OLD:handling a request\dash---all within fractions of a millisecond~\cite{lucet-talk}.
+
+% While there have been significant strides on 
+% SFI enforcement (e.g., on x86~\cite{mccamant_evaluating_2006, yee_native_2009, vx32, payer2011fine},
+% x86-64~\cite{sehr_adapting_2010}, SPARC®~\cite{omniware-pldi}, and
+% ARM®~\cite{armor, armlock, sehr_adapting_2010}), context switching
+% in SFI systems remains largely unexplored.
+% %
+% Since Wahbe et al.'s original work~\cite{wahbe_efficient_1993}, almost all SFI
+% systems have used \emph{heavyweight transitions} for context switching.
+% %
+% These transitions switch domains by tying into 
+% the underlying SFI enforcement mechanism. 
+% For example, when transitioning into a sandbox 
+% they might set segment registers~\cite{yee_native_2009} 
+% or memory protection keys~\cite{vahldiek-oberwagner_erim_2019, hodor} 
+% to ensure the sandbox code is memory isolated.
+% % 
+% They also save, scrub, and restore machine state (e.g., the stack pointer,
+% program counter, and callee-save registers) to ensure confidentiality and
+% integrity.
+% %
+% This code is not only hard to get right (e.g., it must account for different
+% architectures, platforms, and their quirks~\cite{alder2020faulty}) 
+% but also has significant overheads (\secref{sec:eval}).
+
+In this paper, we develop the principles and pragmatics needed to implement
+SFI systems with near-zero-cost transitions, thereby realizing the
+three-decade-old vision of reducing the cost of SFI context switches to
+(almost) that of a function call.
+%
+% This takes the form of the following contributions:
+We do this via five contributions:
+
+\para{1. Formal model of secure transitions (\secref{sec:model})}
+% 
+Simply eliminating heavyweight transitions is unsafe, potentially allowing an
+attacker to escape the SFI sandbox.
+%
+To understand this threat, our first contribution is the first formal,
+declarative, and high-level model that elucidates the role of transitions in
+making SFI secure.
+%
+Intuitively, our model shows how secure transitions 
+protect the integrity and confidentiality of machine 
+state across the domain transition by providing 
+\emph{well-bracketed} control flow, i.e., ensuring 
+that returns actually return to their call sites.
+ 
+\para{2. Zero-cost conditions for isolation (\secref{sec:formal-conditions})}
+%
+Heavyweight transitions provide security by wrapping 
+cross-domain calls and returns to ensure that sandboxed code cannot, 
+for example, read secret registers or tamper with the 
+stack pointer.
+%
+While this wrapping is necessary when sandboxing arbitrary code, our insight is
+these wrappers can be made redundant when the code enjoys additional structure,
+not dissimilar to the additional structure typically imposed by most
+SFI systems to ensure memory isolation.
+%
+For example, NaCl uses \emph{coarse-grained} control-flow integrity
+(CFI) to restrict the sandbox's control flow to its own code
+region~\cite{gang-sfi, yee_native_2009, haas_bringing_2017}.
+
+We concretize this insight via our second contribution, a precise definition of
+\emph{zero-cost conditions} that guarantee that sandboxed code can safely use
+zero-cost transitions.
+%
+In particular, we show that transitions can be eliminated 
+when sandboxed code follows a \emph{type-directed} CFI discipline, 
+has well-bracketed control flow, enforces local state 
+(stack and register) encapsulation, and ensures registers 
+and stack slots are initialized before use.
+%
+Our notion of zero-cost conditions is inspired, in part, by techniques that use
+type- and memory-safe languages to isolate code via language-level enforcement
+of well-bracketed control flow and local state encapsulation~\cite{ocap, joe,
+trufflec, caja, hunt2007singularity, morrisett_talx86_1999}.
+%
+However, instead of requiring developers to rewrite millions of lines of code
+in high-level languages~\cite{gang-sfi}, our zero-cost conditions distill the
+semantic guarantees provided by high-level languages to allow retrofitting
+zero-cost transitions in the SFI setting.
+%
+In other part, our work is inspired by \citet{sfi-as-ai}, who define a
+defensive semantics for SFI that captures a notion of sandboxing via simple
+function calls with a stack shared between the sandbox and host application.
+%
+Our work builds on this work by addressing two shortcomings:
+%
+First, their definition does not account for confidentiality of application
+data, and implementations based on their system would thus need heavyweight
+transitions to prevent such attacks.
+%
+Second, their defensive semantics makes fundamental use of guard zones, which
+limits the flexibility of the framework.
+%
+Our definitions of zero-cost transitions have no such limitations and fully
+realize their goal of defining flexible, secure SFI with zero-cost transitions
+between application and sandbox.
+
+\para{3. Instantiating the zero-cost model (\secref{sec:implementation-security})}
+%
+We demonstrate the retrofitting of zero-cost transitions via our third
+contribution, an instantiation of our zero-cost model to two SFI systems: Wasm
+and \trsegmentsfi.
+%
+Previous work has shown how Wasm can provide SFI by compiling untrusted C/C++
+libraries to native code using Wasm as an IR~\cite{wasm-il,wasmboxc,gobi,rlbox}.
+%
+We show that Wasm satisfies our zero-cost conditions, and replace the
+heavyweight transitions used by the industrial Lucet Wasm SFI toolkit with
+zero-cost transitions.
+% 
+Wasm imposes more structure than required by our zero-cost conditions (and
+Wasm compilers are still relatively new and slow~\cite{not-so-fast}), so, in order to
+compare the overhead of our zero-cost model to the still fastest SFI
+implementation\dash---NaCl~\cite{yee_native_2009}\dash---we design a new
+prototype SFI system (\trsegmentsfi) that: (1) enforces our zero-cost conditions
+through LLVM-level transformations, and (2) enforces memory isolation in
+hardware, using 32-bit x86 segmentation.\footnote{While the prevalence of 32-bit
+x86 systems is declining, it nevertheless still constitutes over 20\% of the
+Firefox web browser's user base (over forty million users)~\cite{ff-stats};
+\trsegmentsfi would allow for high performance library sandboxing on these
+machines.}
+
+\para{4. Verifying security at the binary level (\secref{sec:wasm-verifier})}
+%
+Our fourth contribution is a \emph{static verifier}, \verifname, that checks
+whether a potentially malicious binary produced by the Lucet toolkit
+satisfies our zero-cost conditions.
+%
+This removes the need to trust the Lucet compiler when, for example,
+compiling third-party Firefox libraries~\cite{rlbox} or untrusted tenant code
+running on Fastly's serverless cloud~\cite{lucet-talk}.
+%
+To prove the soundness of \verifname, we develop a logical relation that
+captures when a compiled Wasm function is well-behaved with respect
+to our zero-cost conditions and use it to prove that the checks of
+\verifname{} guarantee that the zero-cost conditions are met.
+%
+We implement \verifname by extending VeriWasm~\cite{veriwasm} 
+and show that in just a few seconds, it can
+%
+(1)~verify sandboxed libraries that ship 
+    (or are in the process of being shipped) with Firefox, 
+    Wasm-compiled \SPECOhSix benchmarks, and 100,000 programs
+    randomly generated by Csmith~\cite{csmith}, and 
+%
+(2)~catch previous NaCl and Wasm vulnerabilities (\secref{subsec:verifier-eval}).
+%
+\verifname is being integrated into the Lucet industrial Wasm
+compiler~\cite{verizero-integration}.
+
+\para{5. Implementation and evaluation (\secref{sec:eval})}
+%
+Our last contribution is an implementation of our zero-cost 
+sandboxing toolkits, and an evaluation of how they improve 
+the performance of a transition micro-benchmark and two 
+macro-benchmarks\dash---image decoding (\libjpeg) 
+and font rendering (\libgraphite) in Firefox.
+%
+First, we demonstrate the potential performance 
+of a purpose-built zero-cost SFI system, by evaluating 
+\trsegmentsfi on \SPECOhSix and our macro-benchmarks.
+%
+We find that \trsegmentsfi imposes at most 25\%
+overhead on \SPECOhSix (nc), and at most \ffMaxImgOverheadSegzeroNative 
+on image decoding and \ffMaxFontOverheadSegzeroNative on font rendering.
+%
+These overheads are lower than the state-of-art NaCl SFI system.
+%
+On the macro-benchmarks, \trsegmentsfi even outperforms an idealized SFI system
+that enforces memory isolation for free but requires heavyweight transitions.
+%
+Second, we find that zero-cost transitions speed up 
+Wasm-sandboxed image decoding by (up to) \ffMaxImgSpeedupWasmZeroHeavy 
+and font rendering by \ffMaxFontSpeedupWasmZeroHeavy.
+%
+The speedup resulting from our zero-cost transitions allowed 
+Mozilla to ship the Wasm-sandboxed \libgraphite library 
+in production.
+
+\para{Open source and data}
+Our code and data will be made available under an open source license.

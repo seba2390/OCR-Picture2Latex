@@ -1,0 +1,158 @@
+\section{Approach}
+\begin{figure}[t]
+\centering
+\resizebox{0.48\textwidth}{!}{ 
+  \includegraphics[width=\textwidth]{figures/workflow.PNG}
+}
+  \caption{Workflow of \system}
+  \label{fig:workflow}
+\end{figure}
+
+Figure ~\ref{fig:workflow} shows the overall workflow of \system. The triggers for using \system are usually alert(s) from automated anomaly detection, or sometimes an SRE engineer's suspicion. There are three major steps: constructing the service  dependency graph, constructing the event causality graph,  and root cause ranking. The outputs are the root causes ranked by the likelihood. To support fast human investigation experience, we build an interactive UI as shown in  Figure~\ref{fig:UI}: the service dependency, events with causal links and additional details such as raw metrics or the developer contact (of a code deployment event) are presented to the user for next steps. As an  offline part of human investigation, we label/collect a data set, perform validation, and summarize the knowledge for further improvement on all incidents on a daily basis. %as validations and heterogeneous graph learning (HGL)~\cite{qiao2020heterogeneous} to synthesize the knowledge from existing cases in order to further improve the system.
+
+\subsection{Constructing Service Dependency Graph}
+\label{sec:appgraph}
+
+The construction of the service dependency graph starts with the initial alerted or suspicious service(s), denoted as $I$. For example, in Figure ~\ref{fig:ex1_dep}, $I=\{\textit{Checkout}\}$. $I$ can contain multiple services based on the range of the trigger alerts or suspicions. We maintain domain service lists where domain-level alerts can be triggered because there is no clear service-level indication.
+
+At the back end, \system maintains a global service dependency graph $G_{global}$ via distributed tracing and log analysis. The directed edge from nodes $A$ to $B$ (two services or system components) in the dependency graph indicates a service invocation or other forms of dependency. In Figure~\ref{fig:ex1_dep}, the black arrows indicate such edges. Bi-directional edges and cycles between the services can be possible and exist. In this work, the global dependency graph is updated daily.%by extracting from one day's total site traffic.
+
+The service dependency (sub)graph $G$ is constructed using $G_{global}$ and $I$. An extended service list $L$ is first constructed by traversing each service in $I$ over $G_{global}$ for a radius range $r$. Each service $u \in L$ can be traversed by at least one service $v \in I$ within $r$ steps: $L=\{u|\exists v\in I, \ dist(u,v)\le r\ or\ dist(v,u)\le r\}$. Then, the service dependency subgraph $G$ is constructed by the nodes in $L$ and the edges between them in $G_{global}$. In our current implementation, $r$ is set to $2$, since this dependency graph may be dynamically extended in the next steps based on events' detail for longer issue chains or additional dependencies.
+
+\subsection{Constructing Event Causality Graph}
+\label{sec:causality}
+
+In the second step, \system collects all supported events for each service in $G$ and constructs the causal links between events. 
+
+\subsubsection{Collecting Events}
+
+Table~\ref{tab:events} presents some example event types and detection techniques for \system's production implementation. For detection techniques, ``De Facto'' indicates that the event can be directly collected via a specific API or storage. %The detection can be done passively at the back end continuously then store anomaly events in different databases; or done actively by pulling data and run detection on the fly to save compute resources. 
+The detection either runs passively in the back end to reduce delay and improve accuracy, or runs actively for only the services within the dependency graph range to save resources. %For example, low-level error signals or logs are detected actively since they are too many to scale. 
+
+There are three major categories of events: performance metrics, status logs, and developer activities:
+\begin{itemize}
+    \item \emph{Performance metrics} represent an anomaly of monitored time series metrics. For example, high CPU usage indicates that the service is causing high CPU usage on a certain machine. In this category, most events are continuously and passively detected and stored. %For high CPU usage, threshold indicates the event is created when CPU usage is higher than certain predefined value. TPS spike indicates a spike in transaction per second, since TPS is a moving average value, we use some statistical model learned from historical data to detect such events.
+    \item \emph{Status logs} are caused by abnormal system status, such as spike of HTTP error code metrics while accessing other services' endpoints. Different types of error metrics are important and supported in \system, including third-party APIs. For example, Bad Host indicates abnormal patterns on some machines running the service, and can be detected by a  clustering-based ML approach.%Markdown indicates that the whole service is down. 
+    \item \emph{Developer activities} are the events generated when a certain activity of developers is triggered, such as code deployment and config change.
+\end{itemize}
+
+\begin{table}[t]
+\centering
+\caption{List of example event types used in \system}
+\resizebox{0.4\textwidth}{!}{ 
+\begin{tabular}{|c|c|c|}
+\hline
+Type                                & Event Type                  & Detection Technique  \\ \hline
+\multirow{6}{*}{Performance Metrics} & High GC (Overhead)      & Rule-based        \\ \cline{2-3} 
+                                    & High CPU Usage          & Rule-based        \\ \cline{2-3} 
+%                                    & Out of Memory           & Rule-based        \\ \cline{2-3} 
+%                                    & LB Connection Stacking  & Statistical Model \\ \cline{2-3} 
+                                    & Latency Spike           & Statistical Model \\ \cline{2-3} 
+                                    & TPS Spike               & Statistical Model \\ \cline{2-3} 
+                                    & Database Anomaly        & ML Model          \\ \cline{2-3} 
+                                    & Business Metric Anomaly & ML Model          \\ \hline
+\multirow{4}{*}{Status Logs}        & WebAPI Error            & Statistical Model \\ \cline{2-3} 
+                                    & Internal Error          & Statistical Model \\ \cline{2-3} 
+                                    & ServiceClient Error     & Statistical Model \\ \cline{2-3} 
+                                    & Bad Host                & ML Model          \\ \hline %\cline{2-3} 
+%                                    & Hystrix Circuit Break   & De Facto          \\ \hline
+\multirow{3}{*}{Developer Activities} & Code Deployment         & De Facto          \\ \cline{2-3} 
+                                    & Configuration Change    & De Facto          \\ \cline{2-3} 
+                                    & Execute URL             & De Facto          \\ \hline
+\end{tabular}
+}
+\label{tab:events}
+\end{table}
+
+In Groot, there are more than a dozen event types such as \emph{Latency Spike} as listed in the column 2 of Table~\ref{tab:events}. 
+Each event type is characterized by three aspects: $Name$ indicates the name of this event type; $Lookback Period$ %\footnote{In Figure~\ref{fig:ex2_n1}, there are two periods, 1 day indicates the look-back range if the model has already finished deployment, 4 days indicates the range if the model deployment is still ongoing(incremental deployment).} 
+indicates the time range to look back (from the time when the use of \system is triggered) for collecting events of this event type;  $PropertyType$ indicates the types of the properties that an event of this event type should hold. 
+$PropertType$  is characterized by a vector of pairs, each of which indicates the string type for a property's name and the primitive type for the property's value such as string, integer, and float. 
+Formally, an event type is defined as a tuple: 
+$ET = <Name, Lookback Period, PropertyType>$ 
+where 
+$PropertyType = <(string, \textit{type}_1), ..., (string, \textit{type}_{n})>$ ($n$ is the number of properties that an event of this event type holds). 
+%
+
+Each event of a certain event type $ET$ is characterized by four aspects:
+$\textit{Service}$ indicates the service name that the event belongs to; $\textit{Type}$ indicates $ET$'s $\textit{Name}$;  $\textit{StartTime}$ indicates the time when the event happens; $\textit{Properties}$ indicates the properties that the event  holds.
+Formally, an event is defined as a tuple: 
+$e = <Service, Type, StartTime, Properties>$ 
+where $Properties$ is an instantiation of $ET$'s  $PropertyType$. 
+
+
+%and each event is defined as $e = \{<\textit{Property}_i, \textit{value}_i>\}$. Each event type serves as a template for the event instantiation. such as a string, an integer, a float or a set of primitive types while $\textit{value}$ is limited to primitive data types. 
+%
+%Each event is defined as a sequence of property-value pairs where the set size is $n$.
+
+For example, in Figure~\ref{fig:example1}, the generated event for \emph{Latency Spike in DataCenter-A} in \emph{Service-C} would be $<``\textit{Service-C}'', ``\textit{Latency\ Spike}'', \textit{2021/08/01-12:36:04}, <(``\textit{DataCenter}'',``\textit{DC-1}''),  ...>>$. %So for each service in $G$, we detect/collect and filter the events within specified time range of the alert.
+
+\subsubsection{Constructing Causal Link}
+
+After collecting all events on all services in $G$, in this step, causal links between these events are constructed for RCA ranking. The causal links (red arrows) in Figure~\ref{fig:ex1_cas} are such examples. A causal link represents that the source event can possibly be caused by the target event. SRE knowledge is engineered into rules and used to create causal links between the pairs of events. %As shown in Figure~\ref{fig:example2}, there are two categories of rules: basic rules and conditional rules. 
+
+A rule for constructing a causal link is defined as a tuple:  $Rule = <Target\mbox{-}Type,  Source\mbox{-}Events, Target\mbox{-}Events, Direction,\\ Target\mbox{-}Service,  Condition>$  ($Condition$ can be optionally specified). $Target\mbox{-}Type$ indicates the type of the rule, being either $Static$ or $Dynamic$ (explained further later). $Source\mbox{-}Events$ indicates the type of the causal link's source event ($Source\mbox{-}Events$ are listed in the names of the rules shown in Figures~\ref{fig:ex2_n1},~\ref{fig:ex2_n2} and~\ref{fig:dynamic_example}).   $Target\mbox{-}Events$ indicates the type of the causal link's target event. $Direction$ indicates the direction of the casual link between the target event and source event. $Target\mbox{-}Service$ indicates the service that the target event should belong to. Note that $Target\mbox{-}Service$ in $Static$ rules can be  $Self$, which indicates that the target event would be within the same service as the source event, or $Outgoing$/$Incoming$, which indicates that the target event would belong to the downstream/upstream services of the service that the source event belongs to in $G$.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.56\columnwidth]{figures/example3.png}
+\caption{Example of dynamic rule}
+\label{fig:dynamic_example}
+\end{figure}
+
+There are two categories of special rules. The first category is \emph{dynamic} rules (i.e., rules whose $Target\mbox{-}Type$  is set to $Dynamic$) to support dynamic dependencies. Here $Target\mbox{-}Service$ does not indicate any of the three possible options listed earlier but indicates the name of the target service that \system would need to create. For example, live DB dependencies are not available due to different tech stacks and high volume. In Figure~\ref{fig:dynamic_example}, a DB issue (DB Markdown) is shown in \emph{Service-A}. Based on the listed \emph{dynamic} rule, \system creates a new ``service'' \emph{DB-1} in $G$, a new event ``Issues'' that belongs to \emph{DB-1}, and a causal link between the two events.  In practice, the SRE teams use dynamic rules to cover a lot of third-party services and database issues since the live dependencies are not easy to maintain.  %However through the internal error messages and dynamic rules, \system is still able to handle these dependencies. %we can still support external inferences. 
+
+The second category of special rules is \emph{conditional} rules. \emph{Conditional} rules are used when some prerequisite conditions should be satisfied before a certain causal link is created. In these rules, $Condition$ is specified with a boolean predicate. As shown in Figure~\ref{fig:ex2_n2}, the SRE teams believe \emph{Latency Spike} events from different services are related only when both events happen within the same data center. Based on this observation, \system would first evaluate the predicate in $Condition$ and build only the causal link when the predicate is true. A conditional rule overwrites the basic rule on the same source-target event pair.
+
+When constructing causal links, \system first applies the \emph{dynamic} rules so that dynamic dependencies and events are first created at once. Then for every event in the initial services (denoted as $I$), if the rule conditions are satisfied, one or many causal links are created from this event to other events from the same or upstream/downstream services. When a causal link is created, the step is repeated recursively for the target event (as a new origin) to create new causal links. After no new causal links are created, the construction of the event causality graph is finished.
+
+% When \system constructs the causal links, \system first processes all dynamic rules as they may create new event nodes in the graph. %\system enumerates the dynamic rules on each existing event node and also on the newly added nodes (There could also be rules applicable to the newly added nodes) until no new event nodes can be created. 
+
+
+%Each rule is defined as a predicate containing both events' property-value pair. If the predicate evaluates to be true between two events, then we would add the edge in the causality graph. For example, in Figure~\ref{fig:example1}, the rule used to establish the edge between \emph{GC overhead in RNO} and \emph{Latency increase in LVS, RNO, SLC} would be like this: Suppose we are now determining whether there should be a link from event $u$ to event $v$, then this rule would be $u.\text{pool} = v.\text{pool}\ and\ u.\text{type} = ``\text{High GC Overhead}"\ and\ v.\text{type} = ``\text{Latency increase}"\ and\ u.\text{center} \cap v.\text{center} \ne \emptyset$ which holds true for these two events. Each causality link is also associated with a weight which represents the likelihood of causality - we set all initial values as $1.0$. Overtime these value are updated by the statistical analysis result of the collected data set.
+
+
+\subsection{Root Cause Ranking}
+Finally, \system ranks and recommends the most probable root causes from the event causality graph. Similar to how search engines infer the importance of pages by page links, we customize the PageRank \cite{manning2010introduction} algorithm to calculate the root cause ranking; the customized algorithm is named as GrootRank. The input is the event causality graph from the previous step. Each edge is associated with a weighted score for weighted propagation. The default value is set as $1$, and is set lower for alerts with high false-positive rates. 
+
+Based on the observation that dangling nodes are more likely to be the root cause, we customize the personalization vector as $P_n = f_n $ or $P_d = 1$, where $P_d$ is the personalization score for dangling nodes, and $P_n$ is for the remaining nodes; and $f_n$ is a value smaller than 1 to enhance the propagation between dangling nodes. In our work, the parameter setting is $f_n = 0.5$, $\alpha = 0.85$, $max_{iter} = 100$ (which are parameters for the PageRank algorithm). Figure \ref{fig:person} illustrates an example. The grey circles are the events collected from three services and one database. The grey arrows are the dependency links and the red ones are the causal links with the weight of $1$. Both of the PageRank and GrootRank algorithms detect $event 5$ (DB issue) as the root cause, which is expected and correct. However, the PageRank algorithm ranks $event 4$ higher than $event 3$. But $event 3$ of $\textit{Service-C}$ is more likely to be the second most possible root cause (besides $event 5$), because the scores on dangling nodes are propagated to all others equally in each iteration. We can see that $event 3$ is correctly ranked as second using the GrootRank algorithm.
+
+The second step of GrootRank is to break the tied results from the previous step. The tied results are due to the fact that the event graph can contain multiple disconnected sub-graphs with the same shape. We design two techniques to untie the ranking: 
+\begin{figure}[t]
+\centering
+  \includegraphics[width=0.8\columnwidth]{figures/personalvector.png}
+  \caption{Example of personalization vector customization}
+  \label{fig:person}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+  \includegraphics[width=0.8\columnwidth]{figures/accessdistance.png}
+  \caption{Example of using access distance to untie the ranking results}
+  \label{fig:untie}
+\end{figure}
+\begin{enumerate}
+\item For each joint event, the access distance (sum) is calculated from the initial anomaly service(s) to the service where the event belongs to. If any ``access'' is not reachable, the distance is set as $d_m+1$ where $d_m$ is the maximum possible distance. The one with shorter access distance (sum) would be ranked higher and vice versa. Figure \ref{fig:untie} presents an example, where \emph{Service-A} and \emph{Service-B} are both initial anomaly services. Since \system suspects that $event 2$ is caused by either $event 3$ or $event 1$ with the same weight. The scores of $event 3$ and $event 1$ are tied. Then, $event 3$ has a score of $1$ (i.e., $0+1$) and $event 1$ has a score of 2 (i.e., $0+2$), since it is not reachable by \emph{Service-B}). Therefore, $event 3$ is ranked first and logical. 
+\item For the remaining joint results with the same access distances, \system continues to untie by using the historical root cause frequency of the event types under the same trigger conditions (e.g., checkout domain alerts). This frequency information is generated from the manually labeled dataset. A more frequently occurred root cause type is ranked higher.% than the less frequent ones.
+\end{enumerate}
+
+
+\subsection{Rule Customization Management}
+
+While \system users create or update the rules,  there could be overlaps, inconsistencies, or even conflicts being introduced such as the example in Figure~\ref{fig:ex2_n2}. \system uses two graphs to manage the rule relationships and avoid conflicts for users. One graph is to represent the link rules between events in the same service (\emph{Same-Graph}) while the other is to represent links between different services (\emph{Diff-Graph}). The nodes in these two graphs are the event types defined in Section~\ref{sec:causality}. There are three statuses between each (directional) pair of event types: (1) no rule, (2) only basic rule, and (3) conditional rule (since it overwrites the basic rule). In \emph{Same-Graph}, \system does not allow self-loop as it does not build links between an event and itself.
+% but it is possible that we build links between different services with the same event type.
+
+When rule change happens, existing rules are enumerated to build edges in \emph{Same-Graph} and \emph{Diff-Graph} based on $Target\mbox{-}Events$ and $Target\mbox{-}Service$. Based on the users' operation of 
+% \begin{itemize}
+%     \item 
+    (1) ``remove a rule'',  \system removes the corresponding edge on the graphs;
+    % \item 
+    (2) ``add/update a rule'',  \system checks whether there are existing edges between the given event types, and then warns the users for possible overwrites. 
+    % The users can also combine the conditional rules.   % while users are adding basic rules between event types if there are existing conditional rules between them.
+    If there are no conflicts, \system just adds/updates edges between the event types.
+    % \item Add conditional rules. We would first alert the possible overwrite. Then if users are about to add new conditional rules on the top of existing conditional rules, we would ask the users to combine these two conditions to add a new one. We then build or change all corresponding edges to status 3.
+% \end{itemize} 
+
+After all changes, \system extracts the rules from the graphs by converting each edge to a single rule. These rules are automatically implemented, and then tested against our labeled data set. The \system users need to review the changes with validation reports before the changes go online.
+
+% Note that currently we don't check the consistencies between dynamic rules as we cannot process the dynamic event types, but this could be solved in the future by using nodes with symbolic values to represent such event types. 

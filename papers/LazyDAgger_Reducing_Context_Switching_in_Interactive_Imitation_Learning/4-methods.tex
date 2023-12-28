@@ -1,0 +1,74 @@
+\section{\algname}
+\label{sec:alg}
+%\algabbr is a new interactive IL algorithm which learns to request informative interventions to enable efficient policy learning while reducing context switches. Similar to SafeDAgger, \algabbr trains a classifier $\ffilt$ to determine when to request supervisor interventions. However, while SafeDAgger thresholds the output of this classifier to determine whether the learner ($\pi$) or supervisor ($\pisup$) is in control at each timestep, \algabbr explicitly reasons about whether it is in supervisor or autonomous mode, which makes it possible to encourage lengthy interventions (Section~\ref{subsec:ac-disc}) which expose the supervisor to a diverse set of states (Section~\ref{subsec:noise-inj}).
+
+\begin{figure*}[htb!]
+\center
+\includegraphics[width=0.92\textwidth]{figures/mujocov6.png}
+\caption{
+\textbf{MuJoCo Simulation Results: }We study task performance (A), ablations (B), online supervisor burden (C), and total bidirectional context switches (D) for \algname and baselines over 3 random seeds. For Columns (A)-(D), the x-axis for all plots shows the number of epochs over the training dataset, while the y-axes indicate normalized reward (A, B), counts of supervisor actions (C, log scale), and context switches (D) with shading for 1 standard deviation. We find that \algname outperforms all baselines and ablations, indicating that encouraging lengthy, noisy interventions improves performance. Additionally, \algname uses far fewer context switches than other baselines while requesting far fewer supervisor actions than DAgger.}
+\label{fig:mujoco}
+\end{figure*}
+
+\begin{algorithm}[t]
+\caption{\algname}
+\label{alg:main}
+\footnotesize
+\begin{algorithmic}[1]
+\Require Number of epochs $N$, time steps per epoch $T$, intervention thresholds $\tausup$, $\tauauto$, supervisor policy $\pisup$, noise $\sigma^2$ %\ryan{add control flow for Execution Time?}
+\State Collect ${\mathcal{D}}, \dsafe$ offline with supervisor policy $\pisup$
+\State $\pirob \leftarrow \arg\min_{\pirob} \mathbb{E}_{(s_t, \pisup(s_t))\sim\mathcal{D}}\left[\cloningloss\right]$ \Comment{Eq.~\eqref{eq:IL-objective}}
+\State $\ffilt \leftarrow \arg\min_{\ffilt} \mathbb{E}_{(s_t, \pisup(s_t))\sim\mathcal{D}\cup\dsafe} \left[\lsafe(\pirob(s_t),\pisup(s_t),\ffilt)\right]$ \Comment{Eq.~\eqref{eq:safe-loss}}
+% \State Pretrain $\pirec$ and $\qsafehat$ on $\demos$ \Comment{Section~\ref{subsec:offline-pretraining}}
+% \State $\mathcal{D}_{\mathrm{task}} \leftarrow \emptyset$, $\mathcal{D}_{\mathrm{rec}} \leftarrow \demos$
+% \State $s_0 \leftarrow \texttt{env.reset()}$
+\For{$i \in \{1,\ldots N\}$}
+    \State Initialize $s_0$, Mode $\gets$ Autonomous
+    \For{$t \in \{1,\ldots T\}$}
+        \State $a_t \sim \pirob(s_t)$
+        \If{Mode = Supervisor or $\ffilt(s_t) \geq 0.5$}
+            \State $a^H_t = \pisup(s_t)$
+            \State $\mathcal{D} \leftarrow \mathcal{D} \cup \{(s_t, a_t^H)\}$
+            \State Execute $\tilde{a}^H_t \sim \mathcal{N}(a^H_t,\sigma^2I)$ \label{lin:noise}
+            \If {$\mathcal{L}(a_t, a^H_t) < \tauauto$}
+                \State Mode $\gets$ Autonomous
+            \Else
+                \State Mode $\gets$ Supervisor
+            \EndIf
+        \Else
+            \State Execute $a_{t}$
+        \EndIf
+    \EndFor
+    \State $\pirob \leftarrow \arg\min_{\pirob} \mathbb{E}_{(s_t, \pisup(s_t))\sim\mathcal{D}}\left[\cloningloss\right]$
+    \State $\ffilt \leftarrow \arg\min_{\ffilt} \mathbb{E}_{(s_t, \pisup(s_t))\sim \mathcal{D}\cup \dsafe}\left[\lsafe(\pirob(s_t),\pisup(s_t),\ffilt)\right]$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+% \end{minipage}
+% \vspace{-0.2in}
+% \end{wrapfigure}
+
+We summarize \algabbr in Algorithm~\ref{alg:main}. In the initial phase (Lines 1-3), we train $\pirob$ and safety classifier $\ffilt$ on offline datasets collected from the supervisor policy $\pisup$. In the interactive learning phase (Lines 4-19), we evaluate and update the robot policy for $N$ epochs, ceding control to the supervisor when the robot predicts a high action discrepancy.
+
+\subsection{Action Discrepancy Prediction}
+\label{subsec:ac-disc}
+SafeDAgger uses the classifier $\ffilt$ to select between $\pirob$ and $\pisup$ (Equation~\eqref{eq:safe_dagger_policy}). However, in practice, this often leads to frequent context switching (Figure~\ref{fig:mujoco}). %A key design goal in \algabbr is to reduce context switches to inflict lower supervisor burden while also ensuring that each intervention is lengthy enough to be informative. 
+To mitigate this, we make two observations. First, we can leverage that in supervisor mode, we directly observe the supervisor's actions. Thus, there is no need to use $\ffilt$, which may have approximation errors, to determine whether to remain in supervisor mode; instead, we can compute the ground-truth action discrepancy $\cloningloss$ exactly for any state $s_t$ visited in supervisor mode by comparing the supplied supervisor action $\pisup(s_t)$ with the action proposed by the robot policy $\pirob(s_t)$. In contrast, SafeDAgger uses $\ffilt$ to determine when to switch modes both in autonomous and supervisor mode, which can lead to very short interventions when $\ffilt$ prematurely predicts that the agent can match the supervisor's actions. Second, to ensure the robot has returned to the supervisor's distribution, the robot should only switch back to autonomous mode when the action discrepancy falls below a threshold $\tauauto$, where $\tauauto < \tausup$. %Thus, as in SafeDAgger, we solicit supervisor interventions when $\ffilt(s_t)$ predicts an action discrepancy greater than $\tausup$ (i.e. $\ffilt(s_t) \geq 0.5$), but the supervisor continues acting in the environment until the action discrepancy is sufficiently low (i.e. ${\cloningloss < \tauauto}$). 
+As illustrated in Figure~\ref{fig:hyst}, \algname's asymmetric switching criteria create a hysteresis band, as is often utilized in control theory~\cite{hysteresis}. Motivated by Eq.~\eqref{eq:LazyDAgger-objective}, we adjust $\tausup$ to reduce context switches $C(\pimeta)$ and adjust $\tauauto$ as a function of $\tausup$ to increase intervention length. We hypothesize that redistributing the supervisor actions into fewer but longer sequences in this fashion both reduces burden on the supervisor and improves the quality of the online feedback for the robot. Details on setting these hyperparameter values in practice, the settings used in our experiments, and a hyperparameter sensitivity analysis are provided in the Appendix.% keeping the expected number of intervention actions $D(\pimeta)$ low. %The relative settings of $\tausup$ and $\tauauto$ are a function of the latency $L$. The larger $L$ is, the smaller $\tauauto$ should be set relative to $\tausup$ to encourage lengthier interventions which avoid frequent context switches. %While $\tausup$ and $\tauauto$ are tunable hyperparameters that vary with the task (see the Appendix), we can initialize $\tausup = \tauauto$ to the value that classifies approximately 25\% of the initial dataset $\mathcal{D} \cup \dsafe$ as unsafe, as in~\citet{safe_dagger}.
+
+% \begin{figure}[t]
+% \center
+% \includegraphics[width=0.45\textwidth]{figures/mujocohistv4.png}
+% \caption{
+% \textbf{Intervention Length Distribution: } We compare the lengths of interventions between \algname and SafeDAgger on the MuJoCo environments using box and whisker plots. While almost all of SafeDAgger's interventions are very short, \algname takes longer interventions while still using a similar number of supervisor actions (see Figure~\ref{fig:mujoco}). Most of SafeDAgger's interventions are a single time step.}
+% \label{fig:interventionhist}
+% \end{figure}
+
+%\vspace{0.2in}
+\subsection{Noise Injection}
+\label{subsec:noise-inj}
+If the safety classifier is querying for interventions at state $s_t$, then the robot either does not have much experience in the neighborhood of $s_t$ or has trouble matching the demonstrations at $s_t$. This motivates exploring novel states near $s_t$ so that the robot can receive maximal feedback on the correct behavior in areas of the state space where it predicts a large action discrepancy from the supervisor. Inspired by prior work that has identified noise injection as a useful tool for improving the performance of imitation learning algorithms (e.g.~\citet{DART} and~\citet{brown2019drex}), we diversify the set of states visited in supervisor mode by injecting isotropic Gaussian noise into the supervisor's actions, where the variance $\sigma^2$ is a scalar hyperparameter (Line \ref{lin:noise} in Algorithm~\ref{alg:main}).
+% \vspace{-0.13in}
+
+%\subsection{Algorithm Overview}
+%We provide an overview of \algabbr in Algorithm~\ref{alg:main}. As in SafeDAgger, \algname first uses $\pisup$ to collect offline datasets $\mathcal{D}$ and $\dsafe$, where the former is used to train the initial learner ($\pirob$) and both are used to train the initial action discrepancy classifier $\ffilt$.

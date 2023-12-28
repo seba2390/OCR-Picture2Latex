@@ -1,0 +1,233 @@
+\section{Numerical experiments}
+\label{sec:results}
+In this section we  provide extensive benchmarking results that investigate
+whether the computation of the reduced Hessian $\nabla^2 f$ with \refalg{algo:batchreduction}
+is well suited for SIMD on GPU architectures.
+As a comparison, we use a CPU implementation based on the sparse LU solver UMFPACK,
+with iterative refinement disabled\footnote{We set the parameter {\tt UMFPACK\_IRSTEP} to 0.} (it yields no numerical
+improvement, however, considerably speeds up the computation).
+We show that on the largest instances our GPU implementation is 30 times faster than
+its sequential CPU equivalent and provide a path forward to further improve our implementation.
+Then, we illustrate that the reduced Hessian computed is effective to track a suboptimal in a real-time
+setting.
+
+\subsection{Experimental Setup}
+\subsubsection{Hardware.}
+
+Our workstation {\it Moonshot} is provided by Argonne National Laboratory.
+All the experiments run on a NVIDIA V100 GPU (with 32GB of memory)
+and {\tt CUDA 11.3}. The system is equipped with a Xeon Gold 6140, used to run the experiments on the CPU (for comparison).
+For the software, the workstation works with Ubuntu 18.04,
+and we use Julia 1.6 for our implementation.
+We rely on our package \KA\ and \lstinline{GPUArrays.jl} to generate parallel GPU code.
+
+All the implementation is open-sourced, and an artifact is provided to reproduce
+the numerical results\footnote{available on \url{https://github.com/exanauts/Argos.jl/tree/master/papers/pp2022}}.
+
+\subsubsection{Benchmark library.}
+The test data represents various case instances (see
+\reftab{tab:test_instances}) in the power grid community obtained
+from the open-source benchmark library PGLIB~\cite{babaeinejadsarookolaee2019power}.
+The number in the case name
+indicates the number of buses (graph nodes) $n_v$ and the number of lines (graph edges) $n_e$ in the power grid: $n_x$ is
+the number of variables, while $n_p$ is the number of parameters (which
+is also equal to the dimension of the reduced Hessian and the parameter space $\REAL^{n_p}$).
+
+\begin{table}[!ht]
+  \centering
+  \resizebox{.35\textwidth}{!}{
+\begin{tabular}{l|cc|cc}
+{\bf Case} & {\bf $n_v$} & {\bf $n_e$}& {\bf $n_x$} & {\bf $n_p$} \\
+\hline
+IEEE118 & 118 & 186 & 181 & 107 \\
+IEEE300 & 300 & 411 & 530 & 137 \\
+PEGASE1354 & 1,354 & 1,991 & 2,447 & 519 \\
+PEGASE2869 & 2,869 & 4,582 & 5,227 & 1,019 \\
+PEGASE9241 & 9,241 & 16,049 & 17,036 & 2,889 \\
+GO30000 & 30,000 & 35,393 & 57,721 & 4,555
+\end{tabular}
+}
+\caption{Case instances obtained from PGLIB}
+\label{tab:test_instances}
+\end{table}
+
+\subsection{Numerical Results}
+
+\subsubsection{Benchmark reduced Hessian evaluation.}
+\begin{table}[!ht]
+  \centering
+  \resizebox{.44\textwidth}{!}{
+    \begin{tabular}{l|rrl}
+      \multirow{2}{*}{\bf Cases}& \multicolumn{3}{c}{{\bf Dimensions}}\\
+                                & $W \in \mathbb{R}^{n_p \times N}$ & $B\in \mathbb{R}^{n_x \times N}$ & $\nabla^2 f \in \mathbb{R}^{n_p \times n_p}$\\
+                                \hline
+      IEEE118 & $107 \times N $ & $181 \times N$ & $107 \times 107$\\
+      IEEE300 & $137 \times N $ & $530 \times N$ & $137 \times 137$\\
+      PEGASE1354 & $519 \times N $ & $2,447 \times N$ & $519 \times 519$\\
+      PEGASE2869 & $1,019 \times N $ & $5,227 \times N$ & $1,019 \times 1,019$\\
+      PEGASE9241 & $17,036 \times N $ & $17,036 \times N$ & $2,889 \times 2,889$\\
+      GO30000 & $30,000 \times N$ & $35,393 \times N$ & $4,555 \times 4,555$
+    \end{tabular}
+  }
+  \caption{Size of key matrices (seed matrix $W$, multiple right-hand sides
+    $B$, and final reduced Hessian $\nabla^2 F$) for a batch size of $N$.
+    On GO30000, instantiating the three
+    matrices $W, B, \nabla^2 F$ for $N=256$ already takes 286MB in the GPU memory.
+  }
+  \label{tab:test_instances_size}.
+\end{table}
+
+For the various problems described in \reftab{tab:test_instances}, we
+benchmarked the computation of the reduced Hessian $\nabla^2 F$ for different
+batch sizes $N$. Each batch computes $N$ columns of the reduced Hessian (which
+has a fixed size of $n_p \times n_p$).
+Hence, the algorithm requires $N_b = div( n_p, N) +1$
+number of batches to evaluate the full Hessian.
+
+In Figure~\ref{fig:batch_scaling}, we compare on various instances (see
+\reftab{tab:test_instances_size}) the reference CPU implementation together
+with the full reduced Hessian computation $\nabla^2 F$ on the GPU
+(with various batch sizes $N$). The figure is displayed in log-log scale, to better illustrate the linear scaling of the algorithm.
+In addition, we scale the time taken by
+the algorithm on the GPU by the time taken
+to compute the full reduced Hessian on the CPU: a value below 1 means that the GPU is faster than the CPU.
+
+We observe that the larger the number of batches $N$, the faster the GPU implementation is. This proves that the GPU is effective at parallelizing the reduction algorithm, with a scaling almost linear
+when the number of batches is small ($N < 32 = 2^5$).  However, we reach the scalability limit of the GPU as we increase the number of batches $N$ (generally, when $N \geq 256= 2^8$).
+Comparing to the CPU implementation, the speed-up is not large on small instances ($\approx$ 2 for IEEE118 and
+IEEE300), but we get up to a 30 times speed-up on the largest instance GO30000, when using a
+large number of batches.
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=\linewidth]{figures/batch_hessian.pdf}
+    \caption{
+      Parallel scaling of the total reduced Hessian accumulation $\nabla^2 F$
+      with batch size $N$: A ratio value $< 1$ indicates a faster runtime
+      compared with that of UMFPACK and AutoDiff on the CPU in absolute time. The
+      dotted lines indicate the linear scaling reference. Lower values imply a
+      higher computational intensity.
+    }
+    \label{fig:batch_scaling}
+\end{figure}
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=\linewidth]{figures/time_decomposed_batch_hessprod_2.pdf}
+    \caption{
+      Decomposition of the runtime against the number of
+      batch $N$, on case PEGASE 9241. $N=1$ corresponds to the CPU implementation.
+      The derivative
+      computation is the dominant kernel.}
+    \label{fig:batch_time_decomposed}
+\end{figure}
+
+\reffig{fig:batch_time_decomposed} shows the relative time spent in the linear algebra and the automatic differentiation backend.
+On the CPU, we observe that UMFPACK is very efficient to perform the linear solves (once the iterative
+refinement is deactivated). However, a significant amount of the total running time is spent inside the AutoDiff
+kernel. We get a similar behavior on the GPU: the batched automatic differentiation backend leads
+to a smaller speed-up than the linear solves, increasing the fraction of the total runtime
+spent in the block {\tt BatchAutoDiff}.
+
+\subsubsection{Discussion.}
+
+Our analysis shows that the reduced Hessian scales with the batch size, while
+hitting an utilization limit for larger test cases. Our kernels may still have potential for improvement, thus further improving utilization scaling as long as we do not hit the memory capacity limit.
+However, the sparsity of the power flow problems represents a worst-case problem for SIMD architectures, common
+in graph-structured applications. Indeed, in contrast to PDE-structured
+problems, graphs are difficult to handle in SIMD architectures because
+of their unstructured sparsity patterns.
+
+% The second bottleneck is the sparse linear algebra:
+% As \reffig{fig:batch_time_decomposed} shows, the time spent in \cusolverrf\
+% amounts to more than two-thirds of the total computation time on the GPU.
+% We hope that future improvements in \cusolverrf\ will help decrease that
+% time further.
+% An alternative is to implement multiple right-hand sides,
+% block preconditioned, iterative linear solvers. They represent a promising
+% portable alternative for other GPU architectures such as AMD or Intel Xe that
+% may not provide an optimized direct linear solver like \cusolverrf.
+
+\subsection{Real-time tracking algorithm.}
+Finally, we illustrate the benefits of our reduced Hessian algorithm by embedding it in a real-time
+tracking algorithm.
+
+Let $\bm{w}_t = (\bm{P}^d_t, \bm{Q}_t^d)$ be the loads
+in~\eqref{eq:powerflowvec}, indexed by time $t$ and updated every minute.
+In that setting, the reduced space problem is parameterized by the loads~$\bm{w}_t$:
+\begin{equation}
+  \label{eq:nonlinearoptreduced_time}
+  \min_{\bm{p}_t} \; F(\bm p_t; \bm w_t) := f\big(x(\bm{p}_t), \bm{p}_t; \bm{w}_t\big) \; .
+\end{equation}
+For all time $t$, the real-time algorithm aims at tracking the optimal solutions $\bm{p}_t^\star$
+associated with the sequence of problems \eqref{eq:nonlinearoptreduced_time}. To achieve this,
+we update the tracking point $\bm{p}_t$
+at every minute, by exploiting the curvature information provided by the reduced Hessian. The procedure is the following:
+\begin{itemize}
+  \item \textbf{Step 1:} For new loads $\bm{w}_t = (\bm{P}_t^d, \bm{Q}_t^d)$, compute
+    the reduced gradient $\bm{g}_t = \nabla_{\bm{p}} F(\bm{p}_t; \bm{w}_t)$
+    and the reduced Hessian $H_t = \nabla^2_{\bm{p}\bm{p}} F(\bm{p}_t; \bm{w}_t)$
+    using Algorithm~\ref{algo:batchreduction}.
+  \item \textbf{Step 2:} Update the tracking control $\bm{p}_t$ with
+    $\bm{p}_{t+1} = \bm{p}_t + \bm{d}_t$, where $\bm{d}_t$
+    is a descent direction computed as solution of the dense linear system
+    \begin{equation}
+      \label{eq:qp_rto}
+      H_t \; \bm{d}_t = - \bm{g}_t \; .
+    \end{equation}
+\end{itemize}
+In practice, we use the dense Cholesky factorization implemented in \cusolver\
+to solve the dense linear system~\eqref{eq:qp_rto} efficiently on the GPU.
+
+We compare the tracking controls $\{\bm{p}_t\}_{t=1,\cdots,T}$ with the optimal solutions
+$\{\bm{p}_t^\star\}_{t=1,\cdots,T}$ associated to the sequence of optimization problems~\eqref{eq:nonlinearoptreduced_time}.
+Note that solving each~\eqref{eq:nonlinearoptreduced_time} to optimality is an expensive operation, involving
+calling a nonlinear optimization solver. On the contrary, the real-time tracking algorithm
+involves only (i) updating the gradient and the Hessian for the new loads $\bm{w}_t$
+and (ii) solving the dense linear system~\eqref{eq:qp_rto}.
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=\linewidth]{figures/1354_tracking.png}
+    \caption{Performance of the real-time tracking algorithm on PEGASE1354, compared
+      with the optimal solutions. The real-time algorithm is applied every minute, during one hour.
+      The first plot shows the evolution
+      of the operating cost along time, whereas the second plot shows the evolution
+      of the absolute difference between the tracking control $\bm{p}_t$ and the optimum
+    $\bm{p}_t^\star$.}
+    \label{fig:rto}
+\end{figure}
+We depict in Figure~\ref{fig:rto} the performance of the real-time tracking algorithm, compared
+with an optimal solution computed by a nonlinear optimization solver.
+In the first subplot, we observe that the operating cost associated
+to $\{\bm{p}_t\}_t$ is close to the optimal cost associated to $\{\bm{p}_t^\star\}_t$.
+The second subplot depicts the evolution of the absolute difference $| \bm{p}_t - \bm{p}_t^\star|$,
+component by component. We observe that the difference remains tractable: the median
+(Quantile 50\%) is almost constant, and close to $10^{-2}$ (which in our case is not a large deviation
+from the optimum) whereas the maximum difference remains below $0.5$. At each time $t$, the real-time
+algorithm takes in average $0.10$s to update $\bm{p}_t$ on the GPU (with $N=256$ batches), comparing
+to $2.22$s on the CPU (see Table~\ref{tab:timing_rto}). We achieve such a 20 times speed-up on the GPU
+as
+(i) the evaluation of the reduced Hessian is faster on the GPU
+(ii) we do not have any data transfer between the host and the device to perform
+the dense Cholesky factorization with {\tt cusolver}.
+Hence, this real-time use case leverages the high parallelism of our algorithm
+to evaluate the reduced Hessian.
+\begin{table}[!ht]
+  \centering
+  \resizebox{.4\textwidth}{!}{
+    \begin{tabular}{l|ccr}
+       \hline
+       & Step 1 (s) & Step 2 (s) & Total (s) \\
+       \hline
+      CPU & 1.41 & 0.81 & 2.22  \\
+      GPU & 0.05 & 0.05 & 0.10 \\
+       \hline
+    \end{tabular}
+  }
+    \caption{Time to update the tracking point $\bm{p}_t$ for {\tt case1354pegase} with the real-time algorithm,
+      on the CPU and on the GPU.
+    }
+    \label{tab:timing_rto}
+\end{table}
+

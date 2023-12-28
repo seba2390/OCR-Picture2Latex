@@ -1,0 +1,312 @@
+\section{Overview} \label{sec:isolation}
+
+In this section we describe the role of transitions in making SFI secure, give
+an overview of existing heavyweight transitions, and introduce our zero-cost
+model, which makes it possible for SFI systems to replace heavyweight
+transitions with simple function calls.
+
+\subsection{The need for secure transitions}
+\label{subsec:overview-secure}
+
+As an example, consider sandboxing an untrusted font rendering library (e.g.,
+\libgraphite) as used in a browser like Firefox:
+%
+\begin{lstlisting}[style=C, escapeinside=||]
+void onPageLoad(int* text) {
+  ...
+  int* screen = ...; // stored in r12
+  int* temp_buf = ...;
+  gr_get_pixel_buffer(text, temp_buf);
+  memcpy(screen, temp_buf, 100); |\label{code:memcpy}|
+  ...
+}
+\end{lstlisting}
+This code calls the \libgraphite \Cinline{gr_get_pixel_buffer} function to
+render text into a temporary buffer and then copies the temporary buffer to the
+variable \Cinline{screen} to be rendered.
+
+\sloppy
+Using SFI to sandbox this library ensures that the browser's memory is isolated
+from \texttt{libgraphite}\dash---memory isolation ensures that
+\Cinline{gr_get_pixel_buffer} cannot access the memory of \Cinline{onPageLoad}
+or any other parts of the browser stack and heap.
+%
+Unfortunately, memory isolation alone is not enough:
+%
+if transitions are simply function calls, attackers can violate the calling
+convention at the application-library boundary (e.g., the
+\Cinline{gr_get_pixel_buffer} call and its return) to break isolation.
+%
+Below, we describe the different ways a compromised \libgraphite can do this.
+
+
+\para{Clobbering callee-save registers}
+%
+Suppose the \Cinline{screen} variable in the above \Cinline{onPageLoad} snippet
+is compiled down to the register \Asminline{r12}.
+%
+In the System V calling convention \Asminline{r12}
+is a \emph{callee-saved} register~\cite{system-v},
+so if \Cinline{gr_get_pixel_buffer} clobbers
+\Asminline{r12}, then it is also supposed to restore it to
+its original value before returning to \Cinline{onPageLoad}.
+%
+A compromised \libgraphite doesn't have to do this; instead, the attacker can
+poison the register:
+%
+\begin{lstlisting}[style=asm, escapeinside=||]
+mov r12, |\Biohazard|
+ret
+\end{lstlisting}
+%
+\noindent Since \Asminline{r12} (\Cinline{screen}) in our hypothetical example
+is then used on \coderef{code:memcpy} to \Cinline{memcpy} the
+\Cinline{temp_buf} from the sandbox memory, this gives the attacker a write
+gadget that they can use to hijack Firefox's control flow.
+%
+To prevent such attacks, we need \emph{callee-save register integrity}, i.e.,
+we must ensure that sandboxed code restores callee-save registers upon
+returning to the application.
+
+\para{Leaking scratch registers}
+%
+Dually, \emph{scratch registers} can potentially leak sensitive information
+into the sandbox.
+%
+Suppose that Firefox keeps a secret (e.g., an encryption key) in a
+scratch register.
+%
+Memory isolation alone would not prevent an attacker-controlled \libgraphite
+from using uninitialized registers, thereby reading this secret.
+%
+To prevent such leaks, we need \emph{scratch register confidentiality}.
+
+\para{Reading and corrupting stack frames}
+%
+Finally, if the application and sandboxed library share a stack, the attacker
+could potentially read and corrupt data (and pointers) stored on the stack.
+%
+To prevent such attacks, we need \emph{stack frame encapsulation}, i.e., we
+need to ensure that sandboxed code cannot access application stack frames.
+
+
+\subsection{Heavyweight transitions}
+\label{sec:background-heavyweight}
+
+SFI toolchains\dash---from NaCl~\cite{yee_native_2009} to Wasm native compilers
+like Lucet~\cite{lucet} and WAMR~\cite{wamr}\dash---use \emph{heavyweight
+transitions} to wrap calls and returns and address the aforementioned attacks.
+%
+These heavyweight transitions are secure transitions.
+%
+They provide:
+
+\para{1. Callee-save register integrity}
+%
+The \emph{springboard}\dash---the transition code which wraps calls\dash---saves
+callee-save registers to a separate stack stored in protected application
+memory.
+%
+When returning from the library to the application,
+the \emph{trampoline}\dash---the code which wraps returns\dash---restores the
+registers.
+
+\para{2. Scratch register confidentiality}
+%
+Since any scratch register may contain secrets, the springboard clears
+\emph{all} scratch registers before transitioning into the sandbox.
+
+\para{3. Stack frame encapsulation}
+Most (but not all) SFI systems provision separate stacks for trusted and
+sandboxed code and ensure that the trusted stack is not accessible from the
+sandbox.
+%
+The springboard and trampoline account for this in three ways.
+%
+First, they track the separate stack pointers at each transition in order to
+switch stacks.
+%
+Second, the springboard copies arguments passed on the stack to the sandbox
+stack, since sandboxed code cannot access arguments stored on the
+application stack.
+%
+Finally, the trampoline tracks the actual return address on transition by
+keeping it in the protected memory, so that the sandboxed library cannot tamper
+with it.
+
+\para{The cost of wrappers}
+%
+Heavyweight springboards and trampolines guarantee secure transitions
+but have two significant drawbacks.
+%
+First, they impose an overhead on SFI\dash---calls into the sandboxed library become significantly more expensive than
+simple application function calls  (\secref{sec:eval}).
+%
+Heavyweight transitions conservatively save and clear more state than might be necessary, essentially
+reimplementing aspects of an OS process switch and duplicating work done by
+well-behaved libraries.
+%
+Second, springboards and trampolines must be customized to different platforms,
+i.e., different processors and calling conventions, and, in extreme cases such
+as in \citet{vahldiek-oberwagner_erim_2019}, even different applications.
+%
+Implementation mistakes
+can\dash---and have~\cite{nacl-bugs, nacl-bug-2919, nacl-bug-775, nacl-bug-1607,
+nacl-bug-1633, bartel2018twenty}\dash---resulted in sandbox escape attacks.
+
+\subsection{Zero-cost transitions}
+\label{subsec:overview-zero}
+
+Heavyweight transitions are conservative because they make few assumptions
+about the structure (or possible behavior) of the code running in the sandbox.
+%
+SFI systems like NaCl and Wasm \emph{do}, however, impose structure on
+sandboxed code to enforce memory isolation.
+%
+In this section we show that by imposing structure on sandboxed code we can
+make transitions less conservative.
+%
+Specifically, we describe a set of \emph{zero-cost conditions}
+that impose \emph{just enough} internal structure on sandboxed code to ensure
+that it will behave like a high-level, compositional language while maintaining
+SFI's high performance.
+%
+SFI systems that meet these conditions can safely elide almost all the extra
+work done by heavyweight springboards and trampolines, thus moving toward the
+ideal of SFI transitions as simple, fast, and portable function calls.
+
+\para{Zero-cost conditions}
+%
+We assume that the sandboxed library code is split into functions and that each
+function has an expected number of arguments.
+%
+We \emph{formalize} the internal structure required of library code via a
+\emph{safety monitor} that checks the zero-cost conditions, i.e., the local
+requirements necessary to ensure that calls-into and returns-from the untrusted
+library functions are ``well-behaved'' and, hence, that they satisfy the secure
+transition requirements.
+
+\para{1. Callee-save register restoration}
+%
+First, our monitor enforces function-call level adherence to callee-save
+register conventions: our monitor tracks callee-save state and checks that it
+has been correctly restored upon returning.
+%
+Importantly, satisfying the monitor means that application calls to a
+well-behaved library function do not require a transition which separately saves
+and restores callee-save registers, since the function is known to obey the
+standard calling convention.
+
+\para{2. Well-bracketed control-flow}
+%
+Second, our monitor requires that the library code adheres to well-bracketed
+return edges.
+%
+Abstractly, calls and returns should be well-bracketed: when \verb+f+ calls
+\verb+g+ and then \verb+g+ calls \verb+h+, \verb+h+ ought to return to \verb+g+
+and then \verb+g+ ought to return to \verb+f+.
+%
+However, untrusted functions may subvert the control stack to implement
+arbitrary control flow between functions.
+%
+This unrestricted control flow is at odds with compositional reasoning,
+preventing \emph{local} verification of functions.
+%
+Further, subverting well-bracketing could enable an attacker to cause \verb+h+
+to return directly to \verb+f+.
+%
+Then, even if \verb+h+ and \verb+f+ both restore their callee-save registers,
+those of \verb+g+ would be left unrestored.
+%
+Accordingly, we require two properties of the library to ensure that calls and
+returns are well-bracketed.
+%
+First, each jump must stay within the same function.
+%
+This limits inter-function control flow to function calls and returns.
+%
+Second, the (specification) monitor maintains a ``logical'' call stack, 
+which is used to ensure that returns go only to the preceding caller.
+
+\para{3. Type-directed forward-edge CFI}
+%
+Our monitor also requires that library code obeys type-directed forward-edge
+CFI.
+%
+That is, for every call instruction encountered during execution, the jump
+target address is the start of a library function and the arguments
+passed match those expected by the called function.
+%
+This ensures that each function starts from a (statically) known stack
+shape, preventing a class of attacks where a benign function can be tricked into
+overwriting other stack frames or hijacking control flow because it is passed
+too few (or too many) arguments.
+%
+If this were not the case, a locally well-behaved function that was passed too
+few arguments could write to a saved register or the saved return address,
+expecting that stack slot to be the location of an argument.
+
+\para{4. Local state encapsulation}
+%
+Our monitor establishes \emph{local state encapsulation} by checking
+that all stack reads and writes are within the current stack frame.
+%
+This check allows us to \emph{locally}, i.e., by checking each function in
+isolation, ensure that a library function correctly saves and restores
+callee-save registers upon entry and exit.
+%
+To see why local state encapsulation is needed, consider
+the following idealized assembly function \Asminline{library_func}:
+%
+\begin{lstlisting}[style=asm, escapeinside=||, morekeywords={library_func:, library_helper:}]
+library_func:         library_helper:
+  push r12              store sp - 1 := |\Biohazard|
+  mov r12 <- 1          ret
+  load r1 <- sp - 1
+  add r1 <- r12
+  call library_helper
+  pop r12
+  ret
+\end{lstlisting}
+%
+If \Asminline{library_helper} is called it will overwrite the stack slot where
+\Asminline{library_func} saved \Asminline{r12}, and \Asminline{library_func}
+will then ``restore'' \Asminline{r12} to the attacker's desired value.
+%
+Our monitor prohibits such cross-function tampering, thus ensuring that
+all subsequent reasoning about callee-save integrity can be carried out
+locally in each function.
+
+\para{5. Confidentiality}
+%
+Finally, our monitor uses dynamic information flow control (IFC) tracking to
+define the confidentiality of scratch registers.
+%
+The monitor tracks how (secret application) values stored in scratch registers
+flow through the sandboxed code, and checks that the library code does not leak
+this information.
+%
+Concretely, our implementations enforce this by ensuring that, within each
+function's localized control flow, all register and local stack
+variables are initialized before use.
+
+The individual properties making up our zero-cost conditions are well-known to be beneficial to software security, and their enforcement in low-level code has been extensively studied~(\secref{sec:related}): our insight\dash---made manifest in the monitor
+soundness proofs of \sectionref{sec:overlay:secure}\dash---is that in
+conjunction these conditions are \emph{sufficient} to eliminate heavyweight
+transitions in SFI systems, which can currently be a source of significant overhead when sandboxing arbitrary code.
+%
+Indeed, in \sectionref{sec:web-assembly-secure} we show that the Wasm
+type system is strict enough to ensure that a Wasm compiler generates native
+code that already meets these conditions.
+%
+To increase the trustworthiness of this zero-cost compatible Wasm, in
+\sectionref{sec:wasm-verifier} we describe a verifier that statically checks
+that compiled Wasm code meets the zero-cost conditions.
+%
+In \sectionref{sec:wasm-proof} we describe our proof of soundness for the
+verifier, proving that the verifier's checks ensure monitor safety and therefore
+zero-cost security.
+%
+Further, in \sectionref{sec:segments-secure} we demonstrate how the zero-cost
+conditions can be used to design a new SFI scheme by combining hardware-backed
+memory isolation with existing LLVM compiler passes.

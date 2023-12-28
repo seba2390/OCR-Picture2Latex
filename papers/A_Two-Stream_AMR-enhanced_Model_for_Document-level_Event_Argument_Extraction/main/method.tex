@@ -1,0 +1,163 @@
+Figure~\ref{fig:model} shows the overall architecture of our model \modelname. 
+The document is fed into the two-stream encoding module, followed by the AMR-guided interaction module to derive both global and local contextualized representations.
+The information fusion module fuses these two-stream representations, and the classification module finally predicts argument roles for candidate spans.
+
+\subsection{Two-Stream Encoding Module}
+
+Although more context is provided by the document, it also inevitably introduces irrelevant and distracting information towards the event.
+These noise signals can be harmful to the argument extraction as shown in Figure~\ref{fig:running-example}.
+To capture useful information and filter distracting one, we propose a two-stream encoding module, consisting of a global encoder that is aware of all context, and a local encoder that only prudently focuses on the most essential information.
+Therefore, we can leverage their complementary advantages to make better use of the context information.
+
+Specifically, the global and local encoders share the same Transformer-based pre-trained language model such as BERT.
+By controlling the reception field of the words in the self-attention module, we can encode the document from different perspectives.
+In the global encoder, the attention technique is the same as the traditional Transformer:
+\begin{equation*}
+\resizebox{\linewidth}{!}{$
+\mathrm{Attention}^G \left (Q,K,V \right ) = \mathrm{softmax} \left (\frac{QK^\top}{\sqrt{d_m}} \right )V
+$
+}
+\label{eq:global-encoder}
+\end{equation*}
+where $Q$, $K$, $V$ refers to query, key, and value matrix, and $d_m$ is the model dimension.
+However, in the local encoder, we introduce a mask matrix $M$, such that tokens can only attend to the sentence itself and the sentence where the trigger locates, to avoid redundant distracting information:
+\begin{equation*}
+\resizebox{\linewidth}{!}{$
+\mathrm{Attention}^L \left (Q,K,V 
+\right ) = \mathrm{softmax} \left (\frac{QK^\top+M}{\sqrt{d_m}} \right )V
+$
+}
+\label{eq:local-encoder}
+\end{equation*}
+\begin{equation*}
+\resizebox{\linewidth}{!}{ $
+M_{ij} =\left\{
+\begin{array}{ll}
+0, &  \mathrm{SEN}\left (w_j \right ) \in \left \{\mathrm{SEN} \left (w_i \right ), \mathrm{SEN}\left (t \right ) \right \} \\
+-\infty, & Otherwise
+\end{array} \right.
+$
+}
+\end{equation*}
+where $\mathrm{SEN}\left ( w_i \right )$ is the sentence that the word $w_i$ belongs to, and $t$ refers to the trigger of the event.
+
+Hence, we encode the document with two different streams, a global encoder $\mathrm{Encoder}^G$ and a local encoder $\mathrm{Encoder}^L$, finally deriving two representations, $Z^G$ and $Z^L$:
+
+\begin{equation*}
+\resizebox{\linewidth}{!}{$
+\begin{aligned} 
+Z^G &= \left [z_1^G, z_2^G, \dots, z^G_{\left | \mathcal{D} \right | } \right ] = \mathrm{Encoder}^G \left (\left [w_1, w_2, \dots, w_{\left | \mathcal{D} \right | } \right ] \right ) \\
+Z^L &= \left [z_1^L, z_2^L, \dots, z^L_{\left | \mathcal{D} \right | } \right ] = \mathrm{Encoder}^L \left ( \left [w_1, w_2, \dots, w_{\left | \mathcal{D} \right | } \right ] \right )
+\end{aligned}
+$
+}
+\end{equation*}
+
+
+\subsection{AMR-Guided Interaction Module}
+\input{float/figure-amr}
+
+One key challenge to extract arguments from the document is to capture the intra-sentential and inter-sentential features.
+Therefore, we propose an AMR-guided  interaction module that adopts Abstract Meaning Representation ~\cite[AMR,][]{banarescu-etal-2013-abstract} graph to provide rich semantic structure to facilitate the interactions among concepts, which also offers logical meanings of the document from a linguistic-driven perspective to benefit the language understanding.
+
+AMR semantic graph models the meaning representations of a sentence as a rooted, directed, labeled graph.
+Concretely, with an AMR parser, a natural sentence can be parsed into an AMR graph $G=(V, E)$.
+The node $v=(a,b) \in V$ represents a concept that corresponds to the span ranging from $w_a$ to $w_b$ in the origin sentence, while the edge represents a specific AMR relation (detail in Appendix~\ref{sec:appendix-amr}).
+Thus, AMR focuses on semantic relations rather than syntactic ones, which is more high-level and beneficial to event understanding, and the structures are more close to the event trigger-arguments  structures.
+For example, Figure~\ref{fig:amr} demonstrates how a sentence is parsed into an AMR semantic graph.
+As event arguments play essential roles in the text, most of them would be involved, if not all, in the AMR graphs ($90\%$ and $88\%$ arguments in RAMS and WikiEvents datasets).
+We use the state-of-the-art AMR parser~\citet{fernandez-astudillo-etal-2020-transition}, which achieves satisfactory results (up to $81.3$ Smatch on AMR2.0 data) for downstream application.
+As the number of AMR relation types is large, which results in too many demanded parameters, we also follow~\citet{zhangzixuan} to cluster the relation types into main categories.
+More details can be found in Appendix~\ref{sec:appendix-amr}.
+
+The AMR-guided interaction module is attached after the global and local encoders as shown in Figure~\ref{fig:model}.
+We use the AMR graphs as skeletons for information interactions, under a \textit{composition, interaction, and decomposition} paradigm.
+
+From the local perspective, we construct AMR graphs for each sentence in the document, and they are isolated from each other.
+For initialization, the vector representation of node $u=(a_u, b_u)$ is \underline{\textit{\textbf{composed}}} by averaging the local representations of its corresponding text span:
+\begin{equation*}
+    h^0_u = \frac{1}{\left | b_u-a_u+1 \right | } \sum_{i=a_u}^{b_u} z^L_i
+\end{equation*}
+
+Similar to \citet{zeng-etal-2020-double}, we then use $L$-layer stacked Graph Convolution Network \citep{kipf2017semi} to model the \underline{\textit{\textbf{interactions}}} among different concept nodes through edges with different relation types.
+Given node $u$ at the $l$-th layer, the information interaction and aggregation operation is defined as follows:
+\begin{equation*}
+\resizebox{\linewidth}{!}{ $
+       h_{u}^{(l + 1)} = \mathrm{ReLU} \left(\sum_{k\in\mathcal{K}}\sum_{v\in\mathcal{N}_k(u) \bigcup \{u\}} \frac{1}{c_{u,k}} W^{(l)}_k h_{v}^{(l)} \right)
+$
+}
+\end{equation*}
+where $\mathcal{K}$ denotes different relation types, $\mathcal{N}_k(u)$ denotes the neighbors for $u$ connected with $k$-th relation types and $c_{u,k}$ is a normalization constant.
+Besides, $W^{(l)}_k\in \mathbb{R}^{d_m \times d_m}$ is a trainable parameter.
+
+Finally, we concatenate vectors in all layers and derive the final node representation by $h_u= W_1[h_{u}^{0}; h_{u}^{1}; \ldots; h_{u}^{L}] \in \mathbb{R}^{d_{m}}$.
+Then $h_u$ is  \underline{\textit{\textbf{decomposed}}} into the local representations of corresponding words, followed by token-wise aggregation, where $\mathbb{I}(\cdot)$ refers to the indication function:
+\begin{equation*}
+    \widetilde{h}^L_i = z^L_i + \frac{\sum_{u} \mathbb{I}(a_u<=i \wedge b_u>=i)h_u}{\sum_{u}\mathbb{I}(a_u<=i \wedge b_u>=i)} 
+\end{equation*}
+
+From the global perspective, we first construct the global AMR graphs by fully connecting the root nodes of AMR graphs of different sentences, since the root nodes contain the core semantics according to the AMR core-semantic principle~\citep{cai-lam-2019-core}
+\footnote{We find more elaborate methods yield no further improvements, so we adopt this simple connection paradigm.}.
+Then similar graph-based interaction methods are used to obtain the AMR-enhanced global representations $\widetilde{h}^G_i$, but based on global AMR graphs instead.
+In this way, the inter-sentential information can flow through the sentence boundaries, and therefore long-distance dependency can also be better captured.
+
+\subsection{Information Fusion Module}
+
+In the information fusion module, we fuse the global representations $\widetilde{H}^G = \left [\widetilde{h}_1^G, \widetilde{h}_2^G, \dots, \widetilde{h}^G_{\left | \mathcal{D} \right | } \right ]$ and local representations $\widetilde{H}^L = \left [\widetilde{h}_1^L, \widetilde{h}_2^L, \dots, \widetilde{h}^L_{\left | \mathcal{D} \right | } \right ]$, to construct the final vector representations for the candidate spans.
+
+In detail, we use a gated fusion to control how much information is incorporated from the two-stream representations.
+Given $\widetilde{h}_i^G$ and $\widetilde{h}_i^L$, we calculate the gate vector $g_i$ with trainable parameters $W_2$ and $W_3$, $g_i = \mathrm{sigmoid}(W_2\widetilde{h}_i^G+W_3\widetilde{h}_i^L+b)$.
+Then we derive the fused representations $\widetilde{h}_i$:
+\begin{equation*}
+    \widetilde{h}_i =  g_i \odot \widetilde{h}_i^G+(1-g_i) \odot \widetilde{h}_i^L
+\end{equation*}
+
+For a candidate text span ranging from $w_i$ to $w_j$, its fused representation consists of the start representation $\widetilde{h}_{i}^{start}$, the end representation $\widetilde{h}_{j}^{end}$ and the average pooling of the hidden state of the span with $W_{span} \in \mathbb{R}^{ d_m \times (3 \times d_m)}$:
+\begin{equation*}
+s_{i:j} = W_{span}\left [ \widetilde{h}_i^{start};\widetilde{h}_i^{end}; \frac{1}{j-i+1} \sum_{k=i}^{j} \widetilde{h}_k \right ]
+\end{equation*}
+where $\widetilde{h}_{i}^{start} = W_{s}\widetilde{h}_i$ and $\widetilde{h}_{i}^{end} = W_{e}\widetilde{h}_i$.
+
+Since we extract arguments in span level, whose boundary may be ambiguous, we introduce an auxiliary boundary loss to enhance boundary information for the $\widetilde{h}_{i}^{start}$ and $\widetilde{h}_{i}^{end}$.
+In detail, we predict whether the word $w_i$ is the first or last word of a golden argument span with token-wise classifiers.
+We use a linear transformation followed by a sigmoid function, to derive the probability of the word $w_i$ being the first or last word of a golden argument span, i.e., $P^s_i$ and $P^e_i$.
+\begin{equation*}
+\resizebox{\linewidth}{!}{ $
+P^s_i = \mathrm{sigmoid}\left ( W_4 \widetilde{h}_i^{start} \right ) 
+,
+P^e_i = \mathrm{sigmoid}\left ( W_5 \widetilde{h}_i^{end} \right ) 
+$
+}
+\end{equation*}
+Finally, the boundary loss is defined as the following cross-entropy losses of detecting the start and end position.
+\begin{equation}
+\begin{aligned} 
+\mathcal{L}_{b} = - \sum_{i=1}^{\left | \mathcal{D} \right | }
+[  y_i^{s} \mathrm{log}P_i^s + \left (1-y_i^{s} \right )\mathrm{log} \left (1-P_i^s \right ) \\
+ +y_i^{e}\mathrm{log}P_i^e + \left (1-y_i^{e} \right )\mathrm{log}\left (1-P_i^e \right ) ] 
+\end{aligned} 
+\end{equation}
+where, $y_i^s$ and $y_i^e$ denote the golden labels.
+In this way, we introduce an explicit supervision signal to inject boundary information of the start and end representation of an span, which is shown to be necessary and important to the extraction in our exploring experiments.
+
+\subsection{Classification Module}
+
+In the classification module, we predict what argument role the candidate span plays, or it does not belong to any specific argument roles.
+Besides the span representation $s_{i:j}$, we also consider the trigger, event type, and the length of the span.
+Specifically, we concatenate the following representations to obtain the final prediction vector $I_{i:j}$:
+1) the trigger representation $\widetilde{h}_t$, and the span representation $s_{i:j}$, with their absolute difference $\left | \widetilde{h}_t-s_{i:j} \right |$, and element-wise multiplication, $\widetilde{h}_t \odot s_{i:j}$; 
+2) the embedding of the event type $\mathrm{E}_{type}$.
+3) the embedding of the span length $\mathrm{E}_{len}$;
+
+\begin{equation*}
+ I_{i:j} = \left [ \widetilde{h}_t; s_{i:j};  \left | \widetilde{h}_t-s_{i:j} \right |; \widetilde{h}_t \odot s_{i:j};
+\mathrm{E}_{type}; \mathrm{E}_{len} \right ] 
+\end{equation*}
+We then use the cross entropy $\mathcal{L}_{c}$ as loss function:
+\begin{equation}
+\mathcal{L}_{c} = - \sum_{i=1}^{\left | \mathcal{D} \right | } \sum_{j=i}^{\left | \mathcal{D} \right | }
+y_{i:j} \mathrm{log} P \left (r_{i:j} = y_{i:j} \right )
+\end{equation}
+where $y_{i:j}$ is the golden argument role, and $P\left (r_{i:j} \right)$ is derived by a feed-forward network based on $I_{i:j}$.
+
+Finally, we train the model in an end-to-end way with the final loss function $\mathcal{L} = \mathcal{L}_{c} + \lambda\mathcal{L}_{b}$ with hyperparameter $\lambda$.

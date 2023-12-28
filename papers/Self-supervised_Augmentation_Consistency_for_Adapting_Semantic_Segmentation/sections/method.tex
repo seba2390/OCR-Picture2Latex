@@ -1,0 +1,202 @@
+% !TEX root = ../arxiv.tex
+
+\subsection{Framework overview}
+
+Shown in \cref{fig:model_overview}, our framework comprises a segmentation network, which we intend to adapt to a target domain, and its slowly changing copy updated with a momentum, a \emph{momentum network}.
+To perform self-supervised scene adaptation, we first supply a batch of random crops and horizontal flips from a sample image of the target domain to both networks.
+For each pixel we average the predictions (\ie~semantic masks) from the momentum network after the appropriate inverse spatial transformation.
+We then create a pseudo ground truth by selecting confident pixels from the averaged map using thresholds based on running statistics, which are capable of adapting to individual samples.
+Finally, the segmentation network uses stochastic gradient descent to update its parameters \wrt these pseudo labels.
+
+Our approach closely resembles the mean teacher framework \cite{FrenchMF18,tarvainen2017mean} and temporal ensembling \cite{IzmailovPGVW18,LaineA17}.
+However, as we will show empirically, the ensembling property itself plays only an auxiliary role.
+More importantly, akin to the critic network in reinforcement learning \cite{LillicrapHPHETS15} and the momentum encoder in unsupervised learning \cite{He0WXG20}, our momentum network provides stable targets for self-supervised training of the segmentation network.
+This view allows us to focus on the target-generating process, detailed next.
+
+\subsection{Batch construction}
+\label{sec:batch}
+
+For each sampled target image, we generate $N$ crops with random scales, flips and locations, but preserving the aspect ratio.
+We re-scale the crops as well as the original image to a fixed input resolution $h \times w$
+and pass them as the input to the networks.
+\cref{fig:batch} demonstrates this process.
+Following the noisy student model in image classification \cite{XieLHL20}, the input to the segmentation network additionally
+undergoes a photometric augmentation:
+we add random colour jitter and smooth the images with a Gaussian filter at random.
+The momentum network, on the other hand, receives a `clean' input, \ie~without such augmentations.
+This is to encourage model invariance to photometric perturbations.
+
+\subsection{Self-supervision}
+\label{sec:selftrain}
+
+\paragraph{Multi-scale fusion.}
+We re-project the output masks from the momentum network back to the original image canvas of size $h \times w$, as illustrated in \cref{fig:fusion}.
+For each pixel, the overlapping areas average their predictions.
+Note that some pixels may lie outside the crops, hence contain the result of a single forward pass with the original image.
+We keep these predictions intact.
+The merged maps are then used to extract the pseudo masks for self-supervision.
+
+\myparagraph{A short long-tail interlude.}
+Handling rare classes (\ie\ classes with only a few training samples) is notoriously difficult in recognition \cite{GuptaDG19}.
+For semantic segmentation, we here distinguish between the classes with low image-level (\eg, ``truck'', ``bus'') and pixel-level (\eg, ``traffic light'', ``pole'') frequency.
+While generating self-supervision, we take special care of these cases and encourage
+\begin{enumerate*}[label=(\roman*), font=\itshape]
+  \item lower thresholds for selecting their pseudo labels,
+  \item increased contributions to the gradient with a focal loss, and
+  \item employ importance sampling.
+\end{enumerate*}
+We describe these in detail next.
+
+\myparagraph{Sample-based moving threshold.}
+Most previous work with self-training employs multi-round training that requires interrupting the training process and re-generating the pseudo labels \cite{Li_2020_ECCV,LiYV19,Mei_2020_ECCV,subhani2020learning,ZouYKW18}.
+One of the reasons is the need to re-compute the thresholds for filtering the pseudo labels for supervision, which requires traversing the predictions for the complete target dataset with the model parameters fixed.
+In pursuit of our goal of enabling end-to-end training without expert intervention, we take a different approach and compute the thresholds on-the-go.
+As the main ingredient, we maintain an \emph{exponentially moving class prior}.
+In detail, for each softmax prediction of the momentum network, we first compute a prior estimate of the probability that a pixel in sample $n$ belongs to class $c$ as
+\begin{equation}
+\chi_{c,n} = \frac{1}{h w} \sum_{i,j} m_{c,n,i,j},
+\label{eq:prior}
+\end{equation}
+where $m_{c,n,:,:}$ is the mask prediction for class $c$ (with resolution $h \times w$).
+We keep an exponentially moving average after each training iteration $t$ with a momentum $\gamma_\chi \in [0, 1]$:
+\begin{equation}
+\chi_c^{t+1} = \gamma_\chi \chi^t_c + (1 - \gamma_\chi) \chi_{c,n}.
+\end{equation}
+Our sample-based moving threshold $\theta_{c,n}$ takes lower values when the moving prior $\chi_c \approx 0$ (\ie~for long-tail classes), but is bounded from above as $\chi_c \rightarrow 1$.
+We define it as
+\begin{equation}
+\theta_{c,n} = \zeta \big(1 - e^{-\chi_c / \beta}\big) m^\ast_{c,n},
+\label{eq:sbrt}
+\end{equation}
+where $\beta$ and $\zeta$ are hyperparameters and $m^\ast_{c,n}$ is the predicted peak confidence score for class $c$, \ie
+\begin{equation}
+m^\ast_{c,n} = \max_{i,j} m_{c,n,i,j}.
+\label{eq:peak-class-confidence}
+\end{equation}
+\cref{fig:threshold} plots \cref{eq:sbrt} as a function of the moving class prior $\chi_c$ for a selection of $\beta$.
+For predominant classes (\eg, ``road''), the exponential term has nearly no effect; the threshold is static \wrt the peak class confidence, \ie $\theta_{c,n} \approx \zeta m^\ast_{c,n}$.
+However, for long-tail classes such that $\chi_c \approx \beta$, the threshold is lower than this upper bound, hence more pixels for these classes are selected for supervision.
+To obtain the pseudo labels, we apply the threshold $\theta_{c,n}$ to the peak predictions of the merged output from the momentum network:
+\begin{equation}
+\hat{m}_{n,i,j} =
+\begin{cases}
+      c^\ast & m_{c^\ast,n,i,j} > \theta_{c,n} \\
+      \text{ignore} & \text{otherwise},
+\end{cases}
+\label{eq:pseudo}
+\end{equation}
+where $c^\ast = \argmax_{c} m_{c,n,i,j}$ is the dominant class for that pixel.
+Note that the pixels with confidence values lower than the threshold, as well as non-dominant predictions, will be ignored in the self-supervised loss.
+
+\begin{figure}[t]
+\input{figures/threshold/threshold.tex}
+\caption{\textbf{Sample-based moving threshold.} Our thresholding scheme has two hyperparameters, $\zeta$ and $\beta$. In this example, $m^\ast_{c,n} = 1$ and $\zeta=0.75$. Predominant classes (\eg, ``road'') have $\chi_c \gg 0$, hence their threshold approximates $\zeta m^\ast_{c,n}$. Long-tail classes (\eg, ``traffic light'') have $\chi_c \approx 0$ and their thresholds are further reduced with a steepness controlled by $\beta$ (see Eq.~\ref{eq:sbrt}).}
+\label{fig:threshold}
+%\vspace{-0.25em}
+\end{figure}
+
+\myparagraph{Focal loss with confidence regularisation.}
+Our loss function incorporates a focal multiplier \cite{LinGGHD20} to further increase the contribution of the long-tail classes in the gradient signal.
+Unlike previous work \cite{LinGGHD20,subhani2020learning}, however, our moving class prior $\chi_c$ regulates the focal term:
+\begin{equation}
+\mathcal{L}^t_{n}(\bar{m}, m \mid \phi) = -m_{c^\ast\!,n} (1 - \chi_{c^\ast})^\lambda \log(\bar{m}_{c^\ast\!,n}),
+\label{eq:loss}
+\end{equation}
+where $\bar{m}$ is the prediction of the segmentation network with parameters $\phi$, the pseudo label $c^\ast$ derives from $\hat{m}$ in \cref{eq:pseudo} and $\lambda$ is a hyperparameter of the focal term.
+Recall that low values of $\chi_c$ signify a long-tail category, hence should have a higher weight.
+High values of $\lambda$ (\ie~$> 1$) increase the relative weighting on the long-tail classes, while setting $\lambda = 0$ disables the focal term.
+Note that we also regularise our loss with the confidence value of the momentum network, $m_{c^\ast,n}$ (\Eq~\ref{eq:peak-class-confidence}).
+In case of an incorrect pseudo label, we expect this confidence to be low and to regularise the training owing to its calibration with the multi-scale fusion.
+We minimise the loss in \cref{eq:loss}, applied for each pixel, \wrt $\phi$.
+
+
+
+\begin{figure*}[t]
+\begin{subfigure}{.2\linewidth}
+  \centering
+    \includegraphics[width=0.98\linewidth]{figures/example/input/001.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/input/002.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/input/003.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/input/004.png}
+  \caption{\scriptsize Input}
+  \label{fig:ex_fusion_input}
+\end{subfigure}%
+\begin{subfigure}{.2\linewidth}
+  \centering
+    \includegraphics[width=0.98\linewidth]{figures/example/pred_seg/001.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pred_seg/002.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pred_seg/003.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pred_seg/004.png}
+  \caption{\scriptsize Segmentation net output}
+  \label{fig:ex_fusion_seg}
+\end{subfigure}%
+\begin{subfigure}{.2\linewidth}
+  \centering
+    \includegraphics[width=0.98\linewidth]{figures/example/pred_mom/001.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pred_mom/002.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pred_mom/003.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pred_mom/004.png}
+  \caption{\scriptsize Momentum net output}
+  \label{fig:ex_fusion_mom}
+\end{subfigure}%
+\begin{subfigure}{.2\linewidth}
+  \centering
+    \includegraphics[width=0.98\linewidth]{figures/example/merged/001.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/merged/002.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/merged/003.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/merged/004.png}
+  \caption{\scriptsize Fused prediction}
+  \label{fig:ex_fusion_merged}
+\end{subfigure}%
+\begin{subfigure}{.2\linewidth}
+  \centering
+    \includegraphics[width=0.98\linewidth]{figures/example/pseudo/001.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pseudo/002.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pseudo/003.png}\\
+    \includegraphics[width=0.98\linewidth]{figures/example/pseudo/004.png}
+  \caption{\scriptsize Pseudo labels}
+  \label{fig:ex_fusion_pseudo}
+\end{subfigure}
+\caption{\textbf{Self-supervision example.} In this image sample \emph{\subref{fig:ex_fusion_input}} and its crops, the segmentation network \emph{\subref{fig:ex_fusion_seg}} tends to mistake the ``motorcycle'' for a ``bicycle''.
+The momentum network \emph{\subref{fig:ex_fusion_mom}} improves on this prediction, but may still produce an inconsistent labelling.
+Averaging the predictions over multiple scales \emph{\subref{fig:ex_fusion_merged}} corrects this inconsistency, allowing to produce high-precision pseudo labels \emph{\subref{fig:ex_fusion_pseudo}} for self-supervision.}
+\label{fig:example_fusion}
+\vspace{-0.6em}
+\end{figure*}
+
+
+\subsection{Training}
+\label{sec:training}
+
+\paragraph{Pre-training with source-only loss.}
+Following \cite{LianDLG19,ZhangQYNL020}, we use Adaptive Batch Normalisation (ABN) \cite{LiWSHL18} to jump-start our model on the segmentation task by minimising the cross-entropy loss on the source data only.
+In our experiments, we found it unnecessary to re-compute the mean and the standard deviation only at the end of the training.
+Instead, in pre-training we alternate batches of source and target images, but ignore the loss for the latter.
+For a target batch, this implies updating the running mean and the standard deviation in the Batch Normalisation (BN) \cite{IoffeS15} layers and leaving the remaining model parameters untouched.
+
+\myparagraph{Importance sampling.}
+Our loss function in \cref{eq:loss} accounts for long-tail classes with a high image frequency (\eg, ``traffic light'', ``pole''), and may not be effective for the classes appearing in only few samples (\eg, ``bus'', ``train'').
+To alleviate this imbalance, we use importance sampling \cite{DoucetFG01} and increase the sample frequency of these long-tail classes.
+We minimise the \emph{expected} target loss by re-sampling the target images using the density $p_t$:
+\begin{equation}
+\underset{\phi}{\min} \: \mathbb{E}_{n \sim p_t} \big[\mathcal{L}^t_n (\phi) \big].
+\label{eq:is_obj}
+\end{equation}
+To obtain $p_t$, we use our pre-trained segmentation network and pre-compute $\chi_{c,n}$, the class prior estimate, for each image $n$ using \cref{eq:prior}.
+At training time, we \textit{(i)} sample a semantic class $c$ uniformly, and then \textit{(ii)} obtain a target sample $l$ with probability 
+\begin{equation}
+\hat{\chi}_{c,l} = \frac{\chi_{c,l}}{\sum_n \chi_{c,n}}.
+\end{equation}
+This two-step sampling process ensures that all images have non-zero sample probability owing to the prevalent classes for which $\hat{\chi}_{c,l} > 0$ for all $l$ (\eg, ``road'' in urban scenes).
+
+\myparagraph{Joint target-source training.}
+We train the segmentation network with stochastic gradient descent using the cross-entropy loss for the source and our focal loss for the target data sampled from $p_t$, as defined by \cref{eq:loss,eq:is_obj}.
+\cref{fig:example_fusion} illustrates the synthesis of pseudo labels.
+We periodically update the parameters $\psi$ of the momentum network as
+\begin{equation}
+\psi_{t+1} = \gamma_\psi \psi_t + (1 - \gamma_\psi) \phi,
+\end{equation}
+where $\phi$ are the parameters of the segmentation network.
+$\gamma_\psi$ regulates the pace of the updates: low values result in faster, but unstable training,
+while high $\gamma_\psi$ leads to a premature and suboptimal convergence.
+We keep $\gamma_\psi$ moderate, but update the momentum network only every $T$ iterations.

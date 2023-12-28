@@ -1,0 +1,205 @@
+\section{Method}
+
+\subsection{Vision QA Models}
+
+% \filip{surprising the BLIP was not introduced in the related work}
+% \jiarui{maybe move the whole 3.1 to related work?}
+
+We focus on two BLIP-family models (BLIP and BLIP2), due to their strong performance and speed, and BLIP2's high accuracy on the zero-shot Vision QA task. 
+% \filip{I would start with a sentence that tells how the model works, or what it consists of, then we can talk about tasks and implications}\jiarui{fixed}
+The \textbf{BLIP}~\citep{blip} model consists of an image encoder and pre-trained text-decoder, which enable it to effectively utilize noisy web data by bootstrapping captions. 
+Distinctively, BLIP is designed to transfer flexibly to both understanding-based and generation-based tasks, which most existing pre-trained models struggle with. Thus,
+BLIP has gained tremendous success across a spectrum of multi-modal downstream tasks such as image-text retrieval (+2.7\% in average R@1), image captioning (+2.8\% in CIDEr), and Visual QA (+1.6\% in VQA-v2 score). 
+% BLIP effectively utilizes noisy web data by bootstrapping captions, where a captioner generates synthetic captions and a filter removes the noisy ones. 
+% This results in state-of-the-art performance on a wide range of vision-language tasks, such as image-text retrieval, image captioning, and VQA. 
+% BLIP also demonstrates strong generalization ability when directly transferred to video-language tasks in a zero-shot manner. 
+% Code, models, and datasets are released to facilitate future vision-language research. 
+Its successor, \textbf{BLIP2}~\citep{li2023blip}, 
+% \filip{this sentence is better than for BLIP, but we also should say how the model works (q-formers etc.)}\jiarui{fixed}
+leverages frozen pre-trained image models and large language models and connects them with a Q-former that maps vision features into text spaces. As a result, BLIP2 reaches state-of-the-art performance on various vision-language tasks while training with significantly fewer parameters. Additionally, the zero-shot ability of BLIP2 increases its robustness and applicability across diverse datasets and real-world scenarios, e.g., BLIP2 can generate personalized image captions based on natural language instructions, without any fine-tuning on a specific dataset and it can perform visual commonsense reasoning by generating a plausible explanation for an image that is not explicitly described in the input prompt. 
+
+
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.7\textwidth]{figures/gradient2.pdf}
+    \caption{Localization of area of interest using \textbf{gradient-based cropping}.}
+    \label{fig: gradient}
+\end{figure}
+
+\subsection{Visual Cropping Approaches}
+
+To investigate the utility of cropping, i.e., localizing an area in an image that is most relevant to answer a question, we start with a \texttt{human} cropping procedure. Human cropping is based on examining the image and the questions, followed by drawing the smallest bounding box that encapsulates all the necessary visual information for answering the question. While this strategy enables us to study whether ideal cropping helps the BLIP-family models, it is unrealistic in practice. Therefore, we next present two cropping methods based on BLIP model gradients and multi-modal CLIP encoding, each with its variants. Both localization methods use the entire question as a prompt.
+
+% hree methods for automatic cropping based on state-of-the-art vision and language models.
+% \subsubsection{Human cropping}
+
+
+\subsubsection{Gradient-based Cropping (\texttt{grad})}
+
+
+Due to their high performance, we expect that BLIP-family models are able to recognize the regions of interest within an image using a cross-attention mechanism. Still, their overall design using an image encoder, compels them to process the entire image, without the ability to re-focus solely on the relevant areas. Inspired by this, we devise \texttt{grad}: an innovative cropping pipeline that exploits the parameters of the BLIP visual QA model to pinpoint the areas of interest in the image for addressing the corresponding question. We then use a cropped version of the image centered on these identified regions, thus
+ensuring that the model's processing power is directed toward the most relevant portions of the image during the question-answering phase. 
+The \texttt{grad} method consists of the following steps (\autoref{fig: gradient}): 1) we \textbf{extract the gradient} of each pixel from the model and normalize it, 2) we apply \textbf{high-frequency masking} to the original image by using a high-frequency filter to produce a mask and applying this mask to the gradient map, 3) we apply percentile\textbf{ token pooling} to the image according to the size of image tokens and make the result a binary image, and 4) we perform \textbf{bounding box extraction} by locating the largest connected region in the binary image and draw the smallest bounding box which covers the whole region. We describe each step in turn.
+
+\textbf{Gradient Extraction}~
+Given an image-question pair, the model generates the answer in an auto-regressive way using the language modeling head. We take the answer given by the model and compute the language modeling loss of generating such answer: 
+\begin{equation}
+\small
+L = -\sum_{t=1}^{T} \log p(y_t | y_{<t}, I, Q; \theta)
+\end{equation}
+
+where $L$ denotes the language modeling loss, $T$ is the total number of tokens in the answer, $y_t$ is the $t^{th}$ token in the answer, $y_{<t}$ are the tokens before the $t^{th}$ token, $I$ is the image, $Q$ is the question and $\theta$ represents the model parameters. 
+We then compute the derivative of the language modeling loss with respect to each pixel. For each pixel, the gradient of $R_{ij}, G_{ij}, and~B_{ij}$ values are computed separately.
+We combined the gradients of them for each pixel and emphasize the positive gradients by applying a $ReLU$:
+
+\begin{equation}
+\small
+E_{ij} = ReLU(\frac{\partial L}{\partial R_{i,j}}) + ReLU(\frac{\partial L}{\partial G_{i,j}}) + ReLU(\frac{\partial L}{\partial B_{i,j}})
+\end{equation}
+
+% where 
+$E_{ij}$ is a combined representation of the gradient of each pixel.
+Considering extremely high or low values can distort the scale when normalizing, compressing the majority of values into a narrow range, we discard the highest and lowest $k_{discard}\%$ of gradients before normalization. 
+Then we highlight the pixels that have higher $E_{ij}$  by recursively retaining only the values that are greater than their mean:
+    
+\begin{minipage}{.5\linewidth}
+\begin{equation}
+\small
+\label{formula3}
+E^0_{ij} = 
+\begin{cases}
+E_{ij} & \text{if } P_{k_{discard}} \leq E_{ij} \leq P_{100-k_{discard}} \\
+0 & \text{otherwise}
+\end{cases}
+\end{equation}
+\end{minipage}%
+\begin{minipage}{.5\linewidth}
+\begin{equation}
+\small
+\label{formula4}
+E^{(i+1)}_{ij} = 
+\begin{cases}
+E^{(i)}_{ij} & \text{if } E^{(i)}_{ij} > \text{mean}(E) \\
+0 & \text{otherwise}
+\end{cases}
+\end{equation}
+\end{minipage}
+
+
+
+\textbf{High-frequency Masking}
+To minimize the influence of irrelevant information (e.g., the difference in brightness of each region), we apply a high-pass Gaussian frequency filtering by subtracting the Gaussian blur from the original image. Then we produce a binary mask image that filters all the pixels larger than the average~\autoref{binary mask}. 
+
+\begin{equation}
+\small
+\label{binary mask}
+M_{ij} = \begin{cases} 
+1 & \text{if } H(I^n_{ij}, k, \sigma) > \overline{H(I, k, \sigma)} \\
+0 & \text{otherwise}
+\end{cases}, H(I^n_{ij}, k, \sigma) = I - G(I^n_{ij}, k, \sigma)
+\end{equation}
+
+% \begin{equation}
+% \label{GB}
+% \small
+% where~G(I_{ij}, \sigma) = \sum_{k, l=-\frac{K_{size}-1}{2}}^{\frac{K_{size}-1}{2}} G(k, l, \sigma) I_{i-k, j-l}, ~G(x, y, \sigma) = \frac{1}{2\pi\sigma^2}e^{-\frac{x^2+y^2}{2\sigma^2}}
+% \end{equation}
+
+where $I$ denotes the original image, $G$ is result of the Gaussian blur,
+and $K_{size}$ is the kernel size of it, $\sigma$ is the Gaussian kernel standard deviation. 
+$H$ denotes the high-frequency pass over the image, $M$ is the final mask. Then the mask is applied to the gradient map: $E_{masked} = E \circ M$. 
+
+% \filip{Figure talks about connected components}
+
+\textbf{ViT Token Pooling}
+We employ a vision-token-based pooling strategy because image features are primarily extracted via a Vision-transformer (ViT)~\citep{vit}. For each token within image (e.g., a 16$\times$16 patch), we select top $n_{pool}\%$ percentile of values from the corresponding patch of $E_{masked}$ as the representative value for that particular patch. Subsequently, these values are converted into a binary map where values surpassing average are set to $1$, and those below are set to $0$.
+
+\textbf{Bounding Box Extraction}
+Finally, we identify the most extensive connected component on the post-pooling binary map and establish the smallest bounding box that encompasses this specific region. To ensure that the bounding box image includes comprehensive content, we expand the bounding box by a factor of 1.5 in each direction.
+
+\subsubsection{CLIP-based Cropping (\texttt{clip-*})}
+
+CLIP~\citep{clip} is a state-of-the-art model for multi-modal encoding, which efficiently learns visual concepts from the text. CLIP uses a transformer-based model to encode both images and text into a shared feature space, which allows for direct alignment between the two modalities and enables zero-shot classification. We devise two cropping variants based on CLIP.
+
+\textbf{Sliding-window Cropping (\texttt{clip-w})} 
+divides an image into several square patches $P_{ij}$, each with dimensions of $N*N$.\footnote{\scriptsize \url{https://www.pinecone.io/learn/zero-shot-object-detection-clip}, accessed on May 17th, 2023.} After splitting the image into patches, we use square windows encompassing $w*w$ patches:
+\begin{equation}
+\small
+W_{ij} = I[iN:(i+w)N, jN:(j+w)N]
+\end{equation}
+where $i \in [0, \left\lceil\frac{W}{N}\right\rceil-w)$ and $j \in [0, \left\lceil\frac{H}{N}\right\rceil-w)$. $W$ and $H$ represent the width and height of the original image, respectively, $\left\lceil\right\rceil$ indicates rounding up, and $w$ denotes window size. Then the CLIP similarity score of a window $W_{ij}$ with respect to the text prompt $(TP)$ is computed, then the window traverses the full image with a stride $s$, resulting in an accumulated similarity score for each patch. The scores are then divided by the number of times the window covered the patch:
+\begin{equation}
+\small
+\bar{A}_{kl} = \frac{\sum_{(i,j): P_{kl} \in W_{ij}} S_{ij}}{\sum_{(i,j): P_{kl} \in W_{ij}}},~
+S_{ij} = \text{CLIP-Similarity}(W_{ij}, TP)
+\end{equation}
+Then the $\bar{A}_{kl}$ is normalized and the high-value is highlighted (see~\autoref{formula4}) to $\hat{A}_{kl}$  and we select all the patches that are higher than a threshold $\theta$. The final bounding box is the smallest rectangle encompassing all selected patches.
+
+
+% For a given complete image, we divide it into several square patches $P_{ij}$, each with dimensions of $N*N$. In total, there are $[W/N]*[H/N]$ patches, where $W$ and $H$ represent the width and height of the original image, respectively, and $[]$ indicates rounding up. After splitting the image into patches, we use a square window encompassing $w*w$ patches and slide it across the entire image, similar to the operation of a convolutional layer. For each window of patches, we use the CLIP model to compute a similarity score relative to the provided text description. After the window has traversed the entire image, each patch will have an accumulated similarity score. The scores are then divided by the number of times the window covered the patch. The divided similarity scores are then normalized and any patches with scores exceeding a threshold $\theta$ are selected. \filip{It would be good to include a formula for these steps, to make it easier to follow and consistent with 3.2.1} The final bounding box is the smallest rectangle encompassing all selected patches. \jiarui{Since this idea is from a blog, do we need to cite the blog?} \filip{there is likely a paper that the blog is based on, I suggest looking for that}
+
+\textbf{Recursive Cropping (\texttt{clip-r}})~
+Given an image and a text prompt as input, the \texttt{clip-r} algorithm crops the input image from four directions: top, bottom, left, and right, to generate four overlapping cropped images, each cropped by a specific cropping ratio $r$. 
+% Formally, an image with a bounding box $(x, y, w, h)$ will be cropped into $(x, y+(1-r)\times h, w, r\times h)~(x, y, w, r\times h)~(x+(1-r)\times w, y, r\times w, h)~(x, y, r\times w, h)$ if we crop from the top, bottom, left, and right, respectively. Here, $x, y$ are the position of the top-left corner of the bounding box, while $w$ and $h$ are its width and height.
+For instance, the height of the top crop will be $r$ times the original height with the width remaining the same as the original bounding box. 
+Similarly, the width of the left crop will be $r$ times the original width, and its height will retain. 
+The partitioned images are then processed with CLIP~\citep{clip} along with the text prompt to evaluate the semantic similarity between the four cropped images and the prompt. Then the crop with the highest score is selected as the input for the next iteration. This process is repeated for a specified number of iterations, progressively narrowing down the region of interest in the image that semantically aligns best with the text prompt.
+
+
+% Given an image and a text prompt as input, the \texttt{clip-r} algorithm crops the current bounding box from 4 directions: top, bottom, left, and right, to 4 cropped images,
+% each by a specific cropping ratio $r$. 
+
+
+% For instance, the height of the top crop will be $r$ times the original height, whereas the width of the left crop will be $r$ times the original width.
+
+% The partitioned images are then processed with CLIP~\citep{clip} along with the text prompt to evaluate the semantic similarity between the 4 cropped images and the prompt. Then the crop with the highest score is selected as the new bounding box for the next iteration. This process is repeated for a specified number of iterations, progressively narrowing down the region of interest in the image that semantically aligns best with the text prompt.
+
+% \textbf{Selection of text prompt}
+
+
+% \subsubsection{Segment-based Cropping}
+% We utilize the Segment Anything Model (SAM) to generate image segmentation, which is subsequently used to create bounding boxes around the objects present in the image (\cite{kirillov2023segment}). To ensure the quality of bounding boxes, we filtered out those with an area smaller than a defined threshold. Furthermore, we selected the top k bounding boxes based on their coverage area in the original image. \filip{And then, we use their union, or use each one in turn?}
+
+
+
+% \subsection{Generalization of the cropping method}
+
+% Our ultimate objective is to identify and address the issues with the off-the-shelf VQA model while enhancing its overall performance and dependability. To accomplish this, we have implemented a universal approach and tested it on the entire VQA dataset.
+
+% \subsubsection{Directly crop on the whole dataset}
+% For the general VQA valid set, we directly apply our cropping method 
+
+% \subsubsection{Merging the original image with the cropped image into the model}
+
+% \jiarui{TBD (including how to overcome the harm of cropping, how to decide whether to crop)}
+
+\subsection{Dataset Construction}
+
+To investigate whether image cropping improves the ability of BLIP-family models to focus on salient content, we systematically construct three datasets by subsetting existing visual QA data.
+% : VQA-text, VQA-random, and VQA-hard.  
+% Each dataset instance comprises five attributes, namely \textit{image\_id}, \textit{question}, \textit{question\_id}, \textit{answers}, and \textit{bbox}, providing comprehensive information for analysis and evaluation.
+
+\textbf{\texttt{1)} VQA-text} contains reading questions whose answers can be found as symbols, typically a sequence of letters and/or digits in the image. The specific location of symbols is sometimes indicated by a constraint in question, e.g., \textit{what is the brand of the camera placed on the white table?} We build \textit{VQA-text} from the validation set of Text-VQA~\citep{textvqa}. 
+To ensure a fair testing ground for a one-time cropping experiment, we perform an additional step that maintains the model's focus on a single textual entity at a time. Namely, we take the Optical Character Recognition (OCR)~\citep{ocr} annotations from the dataset and keep the questions where the OCR result is perfectly aligned with ground truth in a single bounding box. 
+After dataset selection, to ensure the inclusion of all relevant textual information, we expand the bounding boxes by a factor of 1.5. 
+The resulting VQA-text dataset consists of 500 questions paired with 408 images.
+% \filip{add a paragraph and a table to describe what the resulting dataset looks like}
+
+
+\textbf{\texttt{2)} VQA-hard} collects visual QA model failures that could be hypothetically remedied via cropping. Our collection process starts with the extraction of intersecting failure instances from two distinct visual QA models, the zero-shot visual QA model \textit{BLIP-2-FlanT5XL}~\citep{li2023blip} and the fine-tuned \textit{BLIP-vqav2}~\citep{blip}. 
+An example is considered a failure when the answer is not the same as the majority of human annotations.
+Then we randomly select 400 samples from the intersection of the model failures, and we reserve the questions which: 1) truly represent a model failure (e.g., leaving out near-synonyms like city and town), and 2) could potentially be rectified by image cropping (i.e., preserving cases with a clear focus on a small number of locations in the image). For the selected examples, we examine their images and questions and draw the smallest bounding box that encapsulates all the necessary visual information for answering the question.
+The resulting VQA-hard dataset includes 109 questions with their corresponding images.
+
+% \filip{add a paragraph and a table to describe what the resulting dataset looks like}
+
+
+
+% \filip{not sure where this paragraph fits, was in the intro} To quantify the extent of this problem, we construct a dataset called \textit{fine-detail VQA} as follows: 1) For each image-question pair in VQA~\tocite, we identify the main object of the question \mahyar{using what? how?}, if not identifiable, we drop the question; 2) We identify the location of the object in the corresponding image using YOLO-v7~\tocite \mahyar{any other method?}, if not identifiable, we drop the question; 3) If the object covers less than 10 percent of the area of the image, we include the image-question pair in the dataset.
+
+
+\textbf{\texttt{3)} VQA-random:} Due to the significant computational requirements needed to process VQA-v2's validation set, which contains 214K questions, we do not evaluate our cropping model on this entire set. Instead, we randomly select a subset with 1,001 questions and 973 images from VQA-v2 for our evaluation, which we refer to as the VQA-random. This approach allows us to maintain a balance between computational feasibility and the robust evaluation of our methods. 
+% \filip{let's describe how large the data is, and any other relevant stats we have}
+
+% \filip{We also have a third dataset, no? I added a section for it, let's describe it even if briefly}

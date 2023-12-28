@@ -1,0 +1,132 @@
+
+\section{Methods}
+\label{sec:methods}
+Pre-training a foundation model requires that we first collect a large amount of diverse training
+data and then train a base model that could subsequently be used with TL for a downstream  application. 
+There are several possible methods for TL of the foundation model.
+One approach is in-context learning, where the foundation model is prompted with
+few-shot input-output examples for the downstream problem followed by the target input.
+The model then sees these examples and learns how to compute the target output.
+This is the approach used by the GPT models~\cite{radford2018improving,radford2019language,brown2020language} as well as the work of~\cite{yang2023context}.
+While this approach is very useful for cases with very few training datapoints available, it is often better to fine-tune a foundation model for a downstream task, when one has access to more downstream training data. 
+This is also supported by GPT models, and it often results in better performance---if enough training data is available.
+We focus on the latter setup, and we study how the TL performance behaves for different problem setups.
+Our goal is to understand the different moving parts associated with training a foundation model for SciML applications and, specifically, the impact of model scaling, dataset size, and different physics involved in the problem. 
+Below, we discuss (i) the different physics operators considered and our pre-training setup that includes the training dataset generation, (ii) NN model architecture setup for training and inference, and (iii) performance metrics.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{figure*}
+  \centering
+  % include first image
+  \includegraphics[width=.77\linewidth]{figs/sampling_overview-crop}  
+\caption{Visualization of the source function sampling (left) and the effect of certain PDE coefficients (right) on the solutions for the different systems. On the left, as we go down, the sparsity of Gaussians is increasing, leading to more sparse and spread out source functions encouraging heterogeneity in the dataset. For one of these source functions, we apply the different PDE operators with varying ranges of certaino PDE coefficients to illustrate their effect on the solutions. On the top row, for \sysA{} (Poisson's), we show that by increasing the diffusion tensor eigenvalue $e$ (but keeping the direction $\theta$ fixed), we increasing anisotropy and diffusion as we move towards the right. In the middle, we increase the velocity scales for \sysB{} (Advection-Diffusion), but keep the diffusion tensor and velocity direction the same, to demonstrate the increasing competing advection and diffusion processes as we go right. Finally, at the bottom, we show the highly oscillatory behavior in \sysC{} (Helmholtz) as we increase the wavenumber $\omega$. Note the significant differences between the solutions of the different systems.
+}
+\label{fig:vis}
+\end{figure*}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\medskip
+\noindent \textbf{PDE/physics system setup.}
+We consider three PDE systems that are common building blocks for many scientific application: 2D Poisson's; Advection-Diffusion; and Helmholtz equations. 
+These PDE systems can be formulated as follows:
+\begin{enumerate}[leftmargin=5ex, nosep]
+    \item
+    \textit{Poisson's} (\sysA{}): We consider a prototypical elliptic system with periodic boundary conditions in domain $\Omega = [0, 1]^2$:
+    % $- \idiv \mat{K} \igrad u = f$,
+    \begin{equation}
+       - \idiv \mat{K} \igrad u = f \quad \text{in} \ \Omega, \label{eq:poisson}
+    \end{equation}
+    where $u(\vect{x})$ is the solution (state) function,  $f(\vect{x})$ is a source (forcing) function, and $\mat{K}$ is the diffusion coefficient tensor. We use $\mat{K}$ to quantify the physics of this system.
+    \item \textit{Advection-Diffusion} (\sysB{}): We also consider a steady-state advection-diffusion equation that illustrates competing physical processes (advective and diffusive processes) through two differential operators. We use periodic boundary conditions in domain $\Omega = [0, 1]^2$: 
+    % $- \idiv \mat{K} \igrad u + \vect{v} \cdot \igrad u = f $,
+    \begin{equation}
+       - \idiv \mat{K} \igrad u + \vect{v} \cdot \igrad u = f \quad \text{in} \ \Omega, \label{eq:ad}
+    \end{equation}
+    where $u(\vect{x})$ is the solution (state) function,  $f(\vect{x})$ is a source (forcing) function, $\mat{K}$ is the diffusion coefficient tensor, and $\vect{v}$ is the velocity vector. 
+    To quantify the competing advective/diffusive scales of this system, we define the ratio of advection to diffusion as $\Psi = \|\vect{v} \cdot \igrad u \|/\| \idiv \mat{K} \igrad u \|$.
+    \item \textit{Helmholtz} (\sysC{}): Finally, we also consider the inhomogeneous Helmholtz equation with periodic boundary conditions in domain $\Omega = [0, 1]^2$. We take this as an example challenging system that can exhibit high-frequency oscillatory spatial patterns that can be difficult to generalize. 
+    This system is formulated as:
+    % $- \ilap u + \omega u = f $,
+    \begin{equation}
+       - \ilap u + \omega u = f \quad \text{in} \ \Omega, \label{eq:helm}
+    \end{equation}
+    where $u(\vect{x})$ is the solution (state) function,  $f(\vect{x})$ is a source (forcing) function, $\omega > 0 $ is the wavenumber used to quantify the underlying physics of this system.
+\end{enumerate}
+
+\medskip
+\noindent 
+\textbf{Data setup.}
+For the above PDE systems, we are interested in (i) a large and diverse training dataset for pre-training and (ii) several downstream datasets (tasks) to quantify the TL performance.
+Since we can solve these PDEs numerically, we can generate a diverse set of training and testing datasets in a controllable fashion by varying the different parameters in these PDEs. In particular, we vary the following parameters for dataset generation:
+\begin{enumerate}[leftmargin=5ex,nosep]
+    \item \textit{Source function sampling:} We sample different source functions $f \sim \mathcal{S}(\sigma, s)$, where $\mathcal{S}$ is a distribution that generates diverse and heterogeneous functions.
+    % (see \fref{fig:schematic} and Fig. A.1 (appendix) for examples). 
+    Here, $\mathcal{S}$ represents a parameterization of the source function as a linear combination of $n_g$ radial (Gaussian) basis functions $\{\phi_i(\vect{x})\}_{i=1}^{n_g}$, where $\phi_i(\vect{x}) = \phi(\vect{x} - \vect{x_i})$ is a Gaussian function centered at grid point $\vect{x}_i$. Specifically: $f(\vect{x}) = \sum_{i = 1}^{n_g} \phi_i(\vect{x}) p_i$, 
+with $\vect{p} = \{p_i\}_{i=1}^{n_g}$ as the parameterization vector. 
+The
+spatial profile controlled by $\sigma$, the standard deviation of the Gaussian
+function, is preset to a small value to encourage high variability. Examples are
+sampled by uniformly randomly sampling $p_i \sim \mathcal{U}(0,1)$. 
+We further introduce heterogeneity by controlling the sparsity $s$ of $\vect{p}$ ($s$ defined as the number of zero components; see Appendix \sref{sec:data_creation} for details). We visualize some examples in \fref{fig:vis}
+on the left. As we go down, the sparsity is increased (and
+hence Gaussians are more sparse and spread apart).
+   \item \textit{PDE coefficient sampling:} 
+   In \sysA{}, we sample diffusion coefficient  tensors $\mat{K} \sim \mathcal{K}(\lambda)$, where $\mathcal{K}$ is a distribution that generates 
+   % controllable but 
+   varying scales of anisotropy and spread in the diffusion process:
+   $\mat{K} = \mat{R}^{-1}\mat{D}\mat{R}$ with $\mat{D} = \text{diag}(1, e)$ and $\mat{R} = \text{rot}(\theta)$, where $e$ is an eigenvalue of the tensor that controls the anisotropy and extent of diffusion and $\text{rot}(\theta)$ is a rotation matrix with angle $\theta \sim \mathcal{U}(0, 2\pi)$ that controls the general diffusion direction. 
+   We visualize the effect of $e$ in \fref{fig:vis} (top row). With a fixed $\theta$ (direction of diffusion), we see that with larger $e$, the solution is more anisotropic and diffuse. 
+   In \sysB{}, we additionally also sample the velocity vector $\vect{v}$ direction from $\mathcal{U}(0, 2\pi)$. 
+    We define $\Psi = \|\vect{v} \cdot \igrad u \|/\| \idiv \mat{K} \igrad u \|$, the ratio of advection to diffusion to quantify the different processes and $\Psi$ is changed by scaling the velocity. In \fref{fig:vis} (middle row), we visualize increasing advection (from left to right) when the diffusion tensor is kept the same---observe that the solution changes significantly as $\Psi$ increases and the two processes (advection and diffusion) compete more strongly.
+   In \sysC{}, we sample the wavenumber $\omega$ as uniform integers.
+   We visualize the effect of increasing $\omega$ in \fref{fig:vis} (bottom row) and observe that increasing frequency leads to highly oscillatory behavior. We also underscore the significant differences in the output of the three systems here. See Appendix \sref{sec:data_creation} for details.
+\end{enumerate} 
+%
+For each of the problems that we consider in the results section, we generate $2^{15}$ input-output samples (pairs) of data, where the inputs include the source $f$ as well as any PDE
+coefficients
+($\mat{K}, \vect{v}, \omega$), along with $2^{12}$ validation and testing samples each. 
+The validation dataset is used for hyperparameter optimization, and the testing dataset is used for quantifying model performance.
+%
+The pre-trained model is trained on the $2^{15}$ pre-training examples. 
+
+We then perform different experiments to evaluate how this model can adapt/TL to different downstream tasks whose data could come from the following distributions: 
+(i) same distribution as in the pre-training dataset (i.e., different input/output pairs but drawn from the same distribution of PDE coefficients/sources); and 
+(ii) the harder
+task of adapting/TL to a downstream problem that can have slight/large deviation from the dataset used to pre-train the model. 
+For the latter, we create the OOD data by keeping the PDE operator the same as the pre-training task, but sample the coefficients from a different range as in the pre-training. 
+Given this dataset, we then study the TL behaviour for each case (both within distribution and OOD) by scaling both the downstream dataset size, as well the model architecture size which is discussed next. 
+
+\medskip
+\noindent \textbf{Pre-training method for training and inference.}
+The inputs to our model are 2D spatial functions discretized at $h \times w$ and represent the sources and PDE coefficients.\footnote{Constant coefficients are simply replicated across the $h \times w$ dimensions.} 
+These input discretized functions are batched together to form an input tensor in $\mathbb{R}^{h\times w\times c}$. The output of the model is the numerical solution of the PDE in $\mathbb{R}^{h\times w}$. 
+%
+For the model architecture, we consider the FNO (details in Appendix \sref{sec:fno_app}). 
+This model bears similarities to both vision transformer-like architectures (fixed image/feature resolution across the depth of the network) and convolutional architectures (successive global convolutions facilitated via FFTs).
+% and a number of compute/memory-optimized FNO variants have been proposed to scale to large physical PDE-based systems\cite{guibas2021adaptive,rahman2022u,pathak2022fourcastnet}.
+FNO is also a good choice for our setup as the problems we consider all have periodic boundary conditions (the FNO can also be adapted for non-periodic boundaries). 
+The main modification that we make to the FNO is to incorporate a per-instance normalization layer in the model. 
+We found that this is a critical component as the norm of the input data spans a wide range of values (up $100\times$ for our dataset). 
+Please see Appendix \sref{sec:normalization} for details.
+%
+Furthermore, we consider an $\ell_2$ loss function for pre-training. 
+That is, the model is trained to predict the output solution given the input by minimizing a mean-squared error loss between the prediction and the ground truth.
+
+To test how this pre-trained model can adapt to different downstream applications we consider the following cases. 
+First,
+we consider zero-shot adaptation where the pre-trained model is tested on a downstream application without any fine-tuning. 
+Second, we consider few-shot learning, where the pre-trained model can be fine-tuned on the downstream training dataset. 
+We consider varying sizes for this downstream dataset size. 
+Ideally, we prefer the pre-trained model to achieve good performance with as few examples as needed from the downstream application. 
+We also perform an ablation study by training a model from scratch on the downstream dataset alone to see how much gain can be achieved by using a pre-trained model.
+
+We also test how the pre-training adaptation performance changes as we scale the model size. 
+This is motivated by observations in NLP that after a critical model size, we can expect significantly better adaptation performance. To do the model scaling,
+we focus on two model hyperparameters: the embedding dimension $d$ and the number of Fourier modes used in the FNO $m$. 
+(See Appendix \sref{sec:fno_app} for the details.) 
+We first fix $d =
+16$ and scale $m \in \{4, 16\}$, then fix $m = 32$ and scale $d \in \{32, 128\}$
+to approximately increase the parameter count $16\times$ in each scaling experiment from $64K$ to $256M$ parameters. 
+
+The main limitation of our work is that we focus on only the FNO model, whereas several other architectures (e.g. ViT models) exist, and this analysis needs to be done across these other models. 

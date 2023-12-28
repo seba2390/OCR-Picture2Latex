@@ -1,0 +1,262 @@
+%-------------------------------------------------------------------------------
+\section{Evaluation}
+\label{sec_evaluation}
+% We implement \SysName on top of DeepSpeed 0.9.0 and Pytorch 2.0.
+% % To ensure ease of integration for users, 
+% We also present a user-friendly interface that necessitates only minimal modifications to the existing DeepSpeed code. 
+% Upon initializing LinS, we employ an integrated Integer Linear Programming (ILP) solver to automatically optimize the communication based on the parsed configuration. The resultant fine-grained communication patterns are then realized using PyTorch's NCCL functions to establish the corresponding replication and partitioning groups. Subsequently, to achieve more granular communication and computation operations, we introduce three global communication control variables for P, G, and OS. 
+
+In this section, we evaluate the following three aspects:
+\begin{itemize}[leftmargin=*]
+\item \textbf{End-to-end experiments with up to 1024 GPUs} (\S\ref{sec:e2e}): Does \SysName demonstrate near-linear scalability? Why do we claim that \SysName unifies the ZeRO family?
+   
+\item \textbf{Throughput breakdown and analysis} (\S\ref{sec:design-analysis}): Which partitioning approaches have a profound influence on performance outcomes? And do the refinements we've made on $P$, $G$, and $OS$ lead to enhanced performance?
+
+\item \textbf{Fidelity} (\S\ref{sec:fidelity}): Does \SysName inadvertently compromise crucial conditions for successful training convergence? Can it align precision with existing training methods?
+
+\item  \textbf{Case study} (\S\ref{sec:case-study}): We selected a representative model training scenario, analyzed the memory and communication overhead under various sharding strategies, and derived insightful conclusions.
+
+\end{itemize}
+
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\linewidth]{4IB.pdf}
+    \caption{Scalability on up to 1024 GPUs of LLaMA model size range from 6.7B $\sim$ 30B. For the LLaMA-6.7B and 13B models, we use ZeRO-1 and ZeRO-2 as the respective baselines. For the LLaMA-30B model, ZeRO-3 serves as the baseline. Additionally, MiCS Shard8 acts as a benchmark for both LLaMA-6.7B and 13B, while MiCS Shard16 is designated as the baseline for the 30B model. \SysName, equipped with its refined model-state partitioning approach driven by its integral partitioner, consistently outperforms the competitors. \SysName gets near-linear (90.3\%) strong scaling efficiency in LLaMA-6.7B training using 1024 GPU.}
+    \label{4IB}
+\end{figure*}
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{vsMega.pdf}
+    \caption{Performance Comparison to Megatron-LM. For model sizes 6.7B, 13B, and 30B, we use Megatron-LM(1), Megatron-LM(2), and Megatron-LM(3) as baselines, respectively. The throughput of \SysName outperforms Megatron-LM up to 37\% at LLaMA-13B training on 256 GPUs.}
+    \label{megatron}
+\end{figure}
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{1IBvs4IB.pdf}
+    \caption{Throughput of training LLaMA-30B with different numbers of InfiniBand connection. The performance of ZeRO-3 is more sensitive to network alterations, while \SysName is more stable and resilient amidst the network change}.
+    \label{1IB}
+\end{figure}
+
+\subsection{Experimental Setup}
+\textbf{Implementation}. We implement \SysName on top of DeepSpeed 0.9.0 and Pytorch 2.0.
+% To ensure ease of integration for users, 
+We also present a user-friendly interface that necessitates only minimal modifications to the existing DeepSpeed code. 
+Upon initializing \SysName, we employ an ILP solver to automatically optimize the communication based on the parsed configuration. The resultant fine-grained communication patterns are then realized using PyTorch's NCCL functions to establish the corresponding replication and partitioning groups. 
+
+% Subsequently, to achieve more granular communication and computation operations, we introduce three global communication control variables for $P$, $G$, and $OS$. 
+
+\textbf{Hardware and Software}. Our testbed comprises 128 nodes, collectively harnessing the power of 1024 GPUs. Each node is equipped with 8 NVIDIA A100 80GB GPUs, 128 CPUs, and 2 TB memory. The GPUs within a node are interconnected via NVLink, while there is a 4*200Gb Infiniband for inter-node communication. For the LLM training configuration, we use the O2 level mixed-precision technique \cite{ApexMixedPrecision} and gradient accumulation is also enabled.
+
+% To facilitate seamless communication, the 128 nodes operate within a single placement group. 
+% For the software environment, we integrate CUDA 11.7, DeepSpeed v0.9.0, and NCCL version 2.14.3 along with PyTorch v1.13.1. 
+
+
+
+% Please add the following required packages to your document preamble:
+% \usepackage{booktabs}
+\begin{table}[]
+\caption{Language model structure for LLaMA variants. We use sequence lengths of 512 and 1024 for all models.}
+\label{tab:LLaMA_config}
+\begin{tabular}{@{}cccc@{}}
+\toprule
+model     & hidden size & layer & attention heads \\ \midrule
+LLaMA 6.7B  & 4096        & 32    & 32              \\
+LLaMA 13B & 5120        & 40    & 40              \\ 
+LLaMA 30B & 6144        & 60    & 48             \\ \bottomrule
+\end{tabular}
+\end{table}
+
+
+\noindent\textbf{Metrics}. Our primary assessment metric is throughput - samples/s. The experiments adopt a sequence length of 512. 
+% To align with real-world training as closely as possible, unless specifically mentioned, all experiments maintain a consistent consumption of 4096 samples per step (i.e., global batch size) with different numbers of GPUs. 
+The global batch size is set to 4096 unless specifically mentioned and is kept constant among different experiments. 
+% We use the O2 level mixed-precision technique \cite{ApexMixedPrecision} and gradient accumulation. 
+% To maximize the system performance, we prioritize increasing the micro-batch size to its maximum limit (beyond which it would cause CUDA OOM) while keeping the global batch size constant. Once the micro-batch size reaches the upper limit, the number of gradient accumulation per step will increase.
+% Therefore, the per-GPU and system throughput could be calculated by measuring the wall time of a training step and counting the tokens (samples $\times$ batch size $\times$ sequence length $\times$ umber of gradient accumulation steps) processed within the step. 
+For optimal system performance, our foremost strategy is to expand the micro-batch size to its highest permissible limit—ensuring it doesn't lead to CUDA OOM—while maintaining a consistent global batch size. When the micro-batch size hits this ceiling, there's an escalation in the number of gradient accumulations per step. 
+To determine the per-GPU and overall system throughput, we assess the training step's time and quantify the tokens processed within that duration. This is done by multiplying the samples, batch size, sequence length, and the number of gradient accumulation steps.
+
+\noindent\textbf{Model Configurations.}
+We opt for cutting-edge and widely recognized model architectures, with all our models being derivatives from LLaMA \cite{LLaMA}. For a range of model configurations, we vary the count of transformer layers and their dimensions. The details can be found in Table \ref{tab:LLaMA_config}. 
+
+\noindent\textbf{Baselines}. We select Megatron-LM v2 \cite{Megatron-LM}, DeepSpeed-ZeRO\cite{ZeRO}, and DeepSpeed-MiCS \cite{MiCS} as the baselines for LLaMA models. We use different stages for DeepSpeed-ZeRO. We grid-search the optimal parallel strategy of these baseline systems. We implement \SysName on top of DeepSpeed-ZeRO. The parallel configurations of Megatron-LM-3D used in the experiments are provided in Table \ref{tab:megatron}.
+
+
+\begin{table}[]
+\caption{The configs of Megatron-LM used in experiments.}
+\label{tab:megatron}
+\begin{tabular}{@{}ccc@{}}
+\toprule
+Configs            & TP Size & PP Size \\ \midrule
+Megatron-LM (1) & 4                    & 1                      \\
+Megatron-LM (2) & 8                    & 1                      \\
+Megatron-LM (3) & 8                    & 2                      \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[]
+\caption{In the experiments, we explored various partitioning configurations for \SysName. The numbers presented here correspond to the value of Shard-X.}
+\label{tab:lins_shared}
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+States        & \SysName(1) & \SysName(2) & \SysName(3) & \SysName(4) & \SysName(5) \\ \midrule
+$P$                & 1       & 1      & 8       &  8      &  1          \\
+$G$                & 8       & 1      & 8        &  8     & 1 \\
+$OS$               & DP       & DP    &  DP       &  8    & 8  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{End-to-end System Evaluation}
+\label{sec:e2e}
+
+\noindent\textbf{Performance Scalability}.
+In Figure \ref{4IB}, we present a systematic analysis of the scalability of \SysName from 128 GPUs up to 1024 GPUs, using models LLaMA-6.7B, LLaMA-13B, and LLaMA-30B. From the \ref{4IB}, it is evident that ZeRO experiences scalability problems, especially when scaled to 512 GPUs. These limitations are directly attributed to the constraints of communication operator scalability, as referenced in \ref{Comm_scaless}. 
+
+MiCS, aiming to address these limitations, reduces the communication scale at a single node for the 6.7B and 13B models, resulting in near-linear scaling during training. However, for the 30B training, the memory requirements necessitate cross-node sharding. In this scenario, MiCS experiences increased inter-node communication and its performance falls behind that of ZeRO.
+
+Contrastingly, \SysName, with its optimized model-state partition strategy determined by its integral partitioner, consistently exhibits superior performance. Specifically, during the 30B model training, \SysName achieves a throughput almost four times higher than the baseline.
+
+In summation, \SysName demonstrates robustness, delivering consistent speed enhancements across varying model complexities and GPU counts. This reinforces its effectiveness and adaptability in diverse training scenarios.
+% In Figure \ref{4IB}, we present \SysName scalability evaluation from 128 GPUs to 1024 GPUs with LLaMA-7B, LLaMA-13B, and LLaMA-30B on 800 Gpbs cross-node network. For all size of the model, ZeRO present less scalability with respect to up to 512 GPUs, due to the fact of limited communication operator scalability \ref{Comm_scaless}. By reducing the communication scale at 1 node on 7B and 13B, MiCS achieves near-scaling training. When the need for cross-node sharding is caused by memory bound at 30B training, cross-node communication is inevitable, and MiCS performs worse than ZeRO. However, \SysName outperforms and achieves throughput nearly up to 4 $\times$ that of the baseline at 30B model training based on its more flexible model-state partition strategy searched by the partitioner. \SysName is robust and offers consistent speedup across different model sizes and number of GPUs.
+
+\noindent\textbf{Comparing to Megatron-LM-3D}.
+% We follow the takeaways from Megatron-LM-3D \cite{Megatron-LM1} to tune the tensor parallel size and pipeline parallel size for better performance. Specifically, we avoid using tensor MP across nodes and use more pipeline MP than DP size if applicable. We report three reasonable setups of Megatron-LM-3D, as listed in table \ref{tab:megatron}. In the table, we omit the DP size, because it depends on the size of the training cluster.
+For 6.7B,13B, and 30B Megatron follow the configurations in Table \ref{tab:megatron} (1), (2), and (3) as baseline respectively. As illustrated in Figure \ref{megatron}, \SysName consistently outperforms Megatron in speed and efficiency. For the 6.7B, 13B, and 30B models, Megatron uses configurations from tables (1), (2), and (3) as baselines. As illustrated in Figure \ref{megatron}, \SysName consistently surpasses Megatron in both speed and efficiency. Specifically, when training the 6.7B, 13B, and 30B models on 256 GPUs, \SysName outperforms Megatron by 18\%, 37\%, and 32\% respectively. On a 512 GPU setup, these performance gains are 25\%, 10\%, and 0.9\%. It can be seen that for this scenario where small models scale to large-scale training, Megatron achieves the same performance as \SysName at the configuration of Megatron-LM(3) that $PP size = 2, TP size = 8$.
+
+% achieving a notable 25\% faster rate during a 7B LLaMA model training on 512 GPUs. \SysName stands out with its dynamic adaptability. It is engineered to automatically discern and implement the optimal strategy tailored to the user's specific requirements, thereby eliminating manual configuration efforts.
+
+
+
+
+% Contrastingly, \SysName stands out with its dynamic adaptability. It is engineered to automatically discern and implement the optimal strategy tailored to the user's specific requirements, thereby eliminating manual configuration efforts.
+
+% A comparative performance evaluation, as showcased in Figure \ref{megatron}, places \SysName in a favorable light. It consistently eclipses Megatron in terms of speed and efficiency. Remarkably, when subjected to the task of training a 7B LLaMA model over a 256 GPU infrastructure, \SysName delivered performance rates that were a staggering 25\% swifter. 
+
+
+\noindent\textbf{Stability in different InfiniBand network}.
+In this section, we delve into how \SysName fares over distinct inter-node InfiniBand network configurations, specifically 1*$HDR$ (200 Gbps) and 4*$HDR$ (800 Gbps). As demonstrated in Figure \ref{1IB}, the performance of ZeRO-3 is considerably contingent upon the underlying network. When scaling the training of the LLaMA-30B model from 64 GPUs to 128 GPUs and further to 512 GPUs, under 1*$HDR$, ZeRO3's throughput decreased by 1.63, 1.75, and 0.63 times respectively compared to 4*$HDR$. In contrast, \SysName experienced an average decline of only 0.32 times, which is relatively marginal. The cornerstone of this stability can be attributed to \SysName's design philosophy: to minimize the amount of cross-node communication, thus making it less susceptible to network fluctuations.
+
+
+% it is inherently architected to pinpoint and deploy strategies that radically curtail the volume of cross-node communications, thereby rendering it less susceptible to networking fluctuations.
+
+% \SysName emerges as a more resilient and stable framework. Even with the fluctuations in the network, \SysName's performance dip is relatively marginal, 
+
+
+
+% In the context of the 1*$HDR$ setup, ZeRO-3 exhibits training speeds that lag, often up to 2$\times$, when juxtaposed with the speeds achieved on the 4*$HDR$ setup.
+
+% However, in this comparative landscape, \SysName emerges as a more resilient and stable framework. Even with the fluctuations in the network, \SysName's performance dip is relatively marginal, slowing down by merely 1.2 $\times$ across the two setups. 
+
+% In this section, we evaluate \SysName on different cross-node InfiniBand networks 1IB-200 Gpbs and 4IB-800 Gpbs. As shown in Figure \ref{1IB}, the performance of ZeRO-3 is sensitive to the IB network, 1IB generally up to 2$\times$ slower than 4IB training. In contrast, \SysName shows more stability with the changing network, only slower 1.2 $\times$. This is because that \SysName commitment to finding strategies that minimize the number of cross-node communications.
+
+% \textbf{LLaMA-7B}
+% The baseline for LLaMA-7B includes ZeRO1, MiCS-Shard8 and Megatron-LM-3D(1) \ref{tab:megatron}. \SysName significantly outperforms several strategies and achieves near-linear scaling. The throughput of \SysName is up to 3 $\times$ that of ZeRO-1 increasing 10\% and 25\% compared to MiCS and Megatron respectively. \SysName achieves 82\% efficiencies with respect to 512 GPUs. In contrast, ZeRO1 and Megatron only achieve 72\% and 72.8\% respectively.
+
+\subsection{Design Analysis}
+\label{sec:design-analysis}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{analysis1.pdf}
+    \caption{Throughput change with different $\SysName$ strategy when training a LLaMA-6.7B with 800Gbps network. \SysName(2) emerges as the most efficient configuration at 64 GPUs, \SysName(3) is the most efficient strategy training on 128 or 256 GPUs, \SysName(5) becomes the best on a 512GPUs scale.}
+    \label{analysis1}
+\end{figure}
+
+\noindent\textbf{Analysis of partition strategy from $\SysName$}.
+In our research, we investigate the efficacy of different partitioning strategies of \SysName in response to varying scales. The \SysName configurations with different partitioning strategies are presented in Table \ref{tab:lins_shared}.
+We base our experimentation on the LLaMA-6.7B model, keeping the micro-batch size constant at 4 and deploying an 800Gbps inter-node network. Figure \ref{analysis1} elucidates the comparative performance of these strategies. Notably, \SysName(2) emerges as the most efficient configuration at 64 GPUs, registering a performance that is 6 $\%$ superior to \SysName(3). However, when extended to 128 or 256 GPUs, \SysName(3) takes the lead in throughput. Interestingly, the dynamics shift again at 512 GPUs: \SysName(5) becomes the frontrunner, closely trailed by \SysName(4). This analysis underscores the significance of choosing an optimal partitioning strategy in \SysName, contingent on the specific scale and architecture of the training environment.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{breakdown1.pdf}
+    \caption{Throughput of LLaMA-30B model on 256 and 512 GPUs with $\SysName$, without optimization of P, G, OS and baseline ZeRO-3, and keep micro batch size as 1.}
+    \label{breakdown}
+\end{figure}
+
+% \begin{table}[]
+% \caption{Language model structure for LLaMa variants. We use sequence lengths of 512 and 1024 for all models.}
+% \label{tab:breakdoown_metircs}
+% \begin{tabular}{@{}ccc@{}}
+% \toprule
+%   & notation      & explanation  \\ \midrule
+% 1 & LinS-w/o-P &     row 2 without independent G partition scope        \\
+% 2 & LinS-w/o-G  &    row 3 without independent OS partition scope              \\ 
+% 3 & LinS-w/o-OS &  LinS without hierarchical all-gather prefetching    \\ 
+% \bottomrule
+% \end{tabular}
+% \end{table}
+\noindent\textbf{Throughput breakdown and analysis of Communication Optimizer}.
+In Figure \ref{breakdown}, we show the individual impact of communication optimizer for $P$, $G$, and $OS$ on the throughput of the LLaMA-30B model on 256 and 512 GPUs. 
+For this high bandwidth cluster, the individual speedup range between 1.13-1.16 $\times$, for a combined speedup of up to 1.3 $\times$.  
+$P$, $G$ as members of the model state with high communication costs, as shown in \S\ref{scale_aware_partition}, the performance of \SysName will be greatly degraded when they are not optimized. Meanwhile, $OS$, as the least expensive member, can improve the throughput by about 8\% when we use prefetching.
+
+
+% If even fully redundant training states cannot further increase the batch size, there is no choice but to rely on gradient accumulation to increase the batch size. In such a scenario, partitioning communication consuming states like $P$ and $G$ within intra-node scope, will significantly reduce the communication overhead of gradient accumulation. This accounts for the performance improvement from \SysName-w/o-$P$ to \SysName-w/o-$OS$ in the graph. It's worth noting that after we completely eliminate cross-node communication during non-boundary stages of gradient accumulation, the throughput experiences a substantial increase from \SysName-w/o-$G$ to \SysName-w/o-$OS$. The performance gain from \SysName-w/o-$OS$ to \SysName in the graph is attributed to hierarchical all-gather prefetching, further reducing communication overhead during boundary stages. 
+
+% We vary the cluster size from 63 to 512 GPUs and evaluate \SysName with and without communication optimizer for P. As shown in Figure , \SysName with hierarchical communication is consistently better than the case where hierarchical communication is disabled. In particular, hierarchical communication improves the end-to-end training throughput by 30.6\% to 38\%.
+
+
+\subsection{Fidelity}
+\label{sec:fidelity}
+
+In this section, we show that \SysName achieves consistent convergence as DeepSpeed, which validates the correctness of our system. 
+We provide the training loss curves Figure \ref{loss} for training a LLaMA-6.7B  model on the Wikipedia-en dataset. The global batch size is 4096. And the micro-batch size is 4 (the number of gradient accumulation steps is 4). The loss validation process does not aim to produce exactly the same loss as DeepSpeed but to ensure the convergence behaviors are the same. We report the training losses on 1 million sequences. As shown in Figure, \SysName provides the same convergence as DeepSpeed.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{loss.pdf}
+    \caption{The training loss curve of 4000 steps under the same model  configuration and random seeds.}
+    \label{loss}
+\end{figure}
+
+
+\subsection{Case Study: LLaMA-30B}
+\label{sec:case-study}
+To demonstrate how different state partitioning strategies affect memory size, communication efficiency, and, ultimately, throughput, we selected the LLaMA-30B model for training at a scale of 512 GPUs as a typical case. This allows us to showcase our findings and the insights we gained from this scenario. Figure \ref{CommVSmem} provides information about the memory size occupied by the training state after partitioning for four representative optimizer partitioning strategies, as well as the activation occupied memory and throughput.
+
+% In Figure \ref{Visualization}, \SysName's optimal partition strategy for LLaMA-30B on 1024 GPUs is displayed. It partitions $P$ and $G$ within the intra-node scope while using the full GPU scope for other partitioning. The key to \SysName's enhanced training efficiency lies in its ability to optimize memory redundancy. While ZeRO-3 has minimal memory redundancy, the micro-batch-size it can process is limited by the global-batch-size for training convergent. MICS, on the other hand, partitions training states equally, leading to increased communication when memory-bound. \SysName optimally partitions the larger $OS$ state, reducing communication costs, and employs prefetching techniques in smaller groups rather than a global all-gather approach, ensuring efficient training.
+
+% In Figure \ref{Visualization}, \SysName's optimal partition strategy for LLaMA-30B on 1024 GPUs is displayed. It partitions $P$ and $G$ within the intra-node scope while using the full GPU scope for other partitioning. The key to \SysName's enhanced training efficiency lies in its ability to optimize memory redundancy. While ZeRO-3 has minimal memory redundancy, the micro-batch-size it can process is limited by the global-batch-size for training convergent. MiCS has some ability to use the redundant GPU memory by partition model states to smaller group, but it is a fully redundant partially.
+
+% supports larger micro-batch sizes due to its minimal memory redundancy, its throughput is bound by global batch size and communication scalability. MICS, on the other hand, partitions training states equally, leading to increased communication when memory-bound. \SysName optimally partitions the larger $OS$ state, reducing communication costs, and employs prefetching techniques in smaller groups rather than a global all-gather approach, ensuring efficient training.
+
+
+% We visualize the optimal partition strategy \SysName finds for LLaMA-30B on 1024 GPUs in Figure \ref{Visualization}, \SysName uses intra-node scope GPUs to partition $P$ and $G$ while using the 1024 GPU scope to partition. Why does \SysName achieve better training efficiency? 
+
+% More significant memory redundancy implies more opportunities to increase the micro-batch size. ZeRO-3 is the partitioning method with the lowest memory redundancy, making it capable of supporting a larger micro-batch size, resulting in a higher proportion of computation and communication. However, the limitation on the global batch size means that the throughput of ZeRO-3 cannot grow indefinitely. Additionally, when using 1024 GPUs, ZeRO-3's communication is constrained by the scalability of all-gather and reduce-scatter communication.
+
+% For MICS, it can only equally partition all training states, forcing it to enlarge subgroups when memory-bound, introducing additional communication. However, in reality, if we can prioritize partitioning the $OS$, which is larger than other states, and the communication cost is lower, it becomes easier to increase the micro-batch size while keeping the communication groups for $P$ and gradients $G$ within the node. This is precisely the optimization plan that \SysName has insightfully identified.  Besides, \SysName uses prefetching techniques within specific smaller communication groups(size=128) instead of globally all-gather(size=1024). 
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{Visualization.pdf}
+    \caption{Visualization of the LLaMA-30B training partitioning strategy for \SysName searching in 512 GPUs.}
+    \label{Visualization}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{CommVSmem.pdf}
+    \caption{LLaMA-30B training with 512 GPUs throughput and memory usage under different train states sharding strategies.}
+    \label{CommVSmem}
+\end{figure}
+
+MiCS(Shared-16) and \SysName(3) exhibit the same runtime memory peak; however, the former achieves nearly half the throughput of the latter. From Figure \ref{CommVSmem}, it is evident that MiCS(Shared-16), after partitioning, retains too much redundant training state to further increase the micro-batch size. As a result, it needs to perform gradient accumulation to satisfy the global batch size constraint. Nevertheless, the inter-node gradient accumulation in MiCS(Shared-16) is more costly compared to the intra-node gradient accumulation in \SysName(3). The results of this discussion apply similarly to the comparison between MiCS(Shared-32) and \SysName(3).
+
+Conversely, ZeRO-3, which entirely eliminates the redundant storage of the training state compared to MiCS(Shared-16), allows for a larger micro-batch size of 4. A larger micro-batch size increases the proportion of computation to communication time and reduces the number of communications. Finally, when we compare \SysName(3) and ZeRO-3, we observe that \SysName(3) achieves higher throughput with a smaller micro-batch size. This is due to \SysName(3) substantially reducing the communication scope compared to ZeRO-3, avoiding the inefficient DP scope collective communications. In Figure \ref{Visualization}, \SysName's optimal partition strategy for LLaMA-30B on 1024 GPUs is displayed. Through the case study of LLaMA-30B, we observed several intriguing phenomena:
+
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{The cost of redundancy cannot be ignored}, different sharding strategies exhibit significant differences in training efficiency at similar memory footprints. Too much redundancy will lose the opportunity to increase micro-batch-size. A special case arises when limiting redundancy within one node. In this scenario, communication overhead is very low, and additional gradient accumulations are no longer an issue.
+
+% \item \textbf{}, Different sharding strategies exhibit significant differences in training efficiency at similar memory footprints. Under the same GPU memory consumption, the more occupied by activation, the higher the training efficiency.
+\item \textbf{Memory sharding has marginal effect}, especially when the GPU count exceeds 256. For a ZeRO-3 based 30B model, the training states are already divided into relatively small portions(<5GB), and at this point, the vast majority of the memory is occupied by activations. This suggests that, when scaling the training, it's essential not to expand the partitioning scope of training states without bounds.
+\end{itemize}

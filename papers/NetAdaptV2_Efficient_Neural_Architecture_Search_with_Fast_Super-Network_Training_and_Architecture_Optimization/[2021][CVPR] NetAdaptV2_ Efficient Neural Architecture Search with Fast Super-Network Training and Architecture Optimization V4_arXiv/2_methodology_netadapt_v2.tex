@@ -1,0 +1,110 @@
+\section{Methodology: NetAdaptV2}
+
+\subsection{Algorithm Overview}
+
+NetAdaptV2 searches for DNNs with different network depths, layer widths, and kernel sizes. The proposed \textbf{channel-level bypass connections (CBCs, Sec.~\ref{subsec:channel_level_bypass_connections})} enables NetAdaptV2 to discover DNNs with different network depths and layer widths by only searching layer widths because different network depths become the natural results of setting the widths of some layers to zero. To search kernel sizes, NetAdaptV2 uses the superkernel method~\cite{stamoulis2019singlepath, stamoulis2019singlepathautoml, yu2020bignas}.
+
+Fig.~\ref{fig:overview} illustrates the algorithm flow of NetAdaptV2. It takes an initial network and uses its \emph{sub-networks}, which can be obtained by shrinking some layers in the initial network, to construct the search space. In other words, a sample in NetAdaptV2 is a sub-network of the initial network. Because the optimizer needs the accuracy of samples for comparing their performance, the samples need to be trained. NetAdaptV2 adopts the concept of jointly training all sub-networks with shared weights by training a super-network, which has the same architecture as the initial network and contains these shared weights. We use CBCs, the proposed \textbf{ordered dropout (Sec.~\ref{subsec:ordered_droput})}, and superkernel~\cite{stamoulis2019singlepath, stamoulis2019singlepathautoml, yu2020bignas} to efficiently train the super-network that contains sub-networks with different layer widths, network depths, and kernel sizes. After training the super-network, the proposed \textbf{multi-layer coordinate descent optimizer (Sec.~\ref{subsec:optimizer})} is used to discover the architectures of DNNs with optimal performance. The optimizer iteratively samples the search space to generate a bunch of samples and determines the next set of samples based on the performance of the current ones. This process continues until the given stop criteria are met (e.g., the latency is smaller than 30ms), and the discovered DNN is then trained until convergence. Because of the trained super-network, the accuracy of samples can be directly evaluated by using the shared weights without any further training.
+
+\begin{figure*}[t]
+\begin{center}
+   \includegraphics[width=1.0\linewidth]{figures/overview}
+\end{center}
+\vspace{-2mm}
+   \caption{The algorithm flow of the proposed NetAdaptV2.}
+\label{fig:overview}
+\end{figure*}
+
+
+
+
+\subsection{Channel-Level Bypass Connections}
+\label{subsec:channel_level_bypass_connections}
+
+Previous NAS algorithms generally treat network depth and layer width as two different search dimensions. The reason is evident in the following example. If we remove a filter from a layer, we reduce the number of output channels by one. As a result, if we remove all the filters, there are no output channels for the next layer, which breaks the DNN into two disconnected parts. Hence, reducing layer widths typically cannot be used to reduce network depths. To address this, we need an approach that keeps the network connectivity while removing filters; this is achieved by our proposed channel-level bypass connections (CBCs).
+
+The high-level concept of CBCs is ``when a filter is removed, an input channel is bypassed to maintain the same number of output channels''. In this way, we can preserve the network connectivity when all filters are removed from a layer. Assuming the target layer in the initial network has $C$ input channels, $T$ filters, and $Z$ output channels\footnote{If we do not use CBCs, $Z$ is equal to $T$.}, we gradually remove filters from the layer, where there are $M$ filters remaining. Fig.~\ref{fig:cbc} illustrates how CBCs handle three cases in this process based on the relationship between the number of input channels ($C$) and the initial number of filters ($T$) (only $M$ changes, and $C$ and $T$ are fixed):
+\begin{itemize}
+    \item Case 1, $C = T$ (Fig.~\ref{fig:cbc_case1}): When the $i$-th filter is removed, we bypass the $i$-th input channel, so the number of output channels ($Z$) can be kept the same. When all the filters are removed ($M = 0$), all the input channels are bypassed, which is the same as removing the layer.
+    \item Case 2, $C < T$ (Fig.~\ref{fig:cbc_case2}): We do not bypass input channels at the beginning of filter removal because we have more filters than input channels (i.e., $M > C$) and there are no corresponding input channels to bypass. The bypass process starts when there are fewer filters than input channels ($M < C$), which becomes case 1.
+    \item Case 3, $C > T$ (Fig.~\ref{fig:cbc_case3}): When the $i$-th filter is removed, we bypass the $i$-th input channel. The extra ($C-T$) input channels are not used for the bypass.
+\end{itemize}
+
+
+\begin{figure*}[t]
+    \centering
+    \subfloat[Case 1: Same number of input channels and initial filters. \\ ($C = T = 4$)]
+    {
+        \includegraphics[width=0.225\linewidth]{figures/cbc_1}
+        \label{fig:cbc_case1}
+        
+    }
+    \hfill
+    \centering
+    \subfloat[Case 2: Fewer input channels than initial filters. \\ ($C = 4 < T = 6$)]
+    {
+        \includegraphics[width=0.225\linewidth]{figures/cbc_2}
+        \label{fig:cbc_case2}
+    }
+    \hfill
+    \centering
+    \subfloat[Case 3: More input channels than initial filters. \\ ($C = 4 > T = 2$)]
+    {
+        \includegraphics[width=0.225\linewidth]{figures/cbc_3}
+        \label{fig:cbc_case3}
+    }
+    \hfill
+    \centering
+    \subfloat[Case 4: Same number of input channels and initial filters but with a given T. ($C = 4, T = 2$)]
+    {
+        \includegraphics[width=0.225\linewidth]{figures/cbc_4}
+        \label{fig:cbc_case4}
+    }
+    \caption{An illustration of how CBCs handle different cases based on the relationship between the number of input channels ($C$) and the initial number of filters ($T$) (only the number of filters remaining ($M$) changes, and $C$ and $T$ are fixed). For each case, it shows how the architecture changes with more filters removed from top to bottom. The numbers above lines correspond to the letters below lines. Please note that the number of output channels ($Z$) will never become zero.}
+    \label{fig:cbc}
+\end{figure*}
+
+These three cases can be summarized in a rule: when the $i$-th filter is removed, the corresponding $i$-th input channel is bypassed if that input channel exists. Therefore, the number of output channels ($Z$) when using CBCs can be computed by $Z = max(min(C, T), M)$. The proposed CBCs can be efficiently trained when combined with the proposed ordered dropout, as discussed in Sec.~\ref{subsec:ordered_droput}.
+
+As a more advanced usage of $T$, we can treat $T$ as a hyper-parameter. Please note that we only change $M$, and $C$ and $T$ are fixed. From the formulation $Z = max(min(C, T), M)$, we can observe that the function of $T$ is limiting the number of bypassed input channels and hence the minimum number of output channels ($Z$). If we set $T \geq C$ to allow all $C$ input channels to be bypassed, the formulation becomes $Z = max(C, M)$, and the minimum number of output channels is $C$. If we set $T < C$ to only allow $T$ input channels to be bypassed, the formulation becomes $Z = max(T, M)$, and the minimum number of output channels is $T$. 
+
+Setting $T < C$ enables generating the bottleneck, where we have fewer output channels than input channels ($Z < C$). The bottleneck has been shown to be effective in improving the accuracy-efficiency (e.g., accuracy-latency) trade-offs in MobileNetV2~\cite{Sandler_2018_CVPR}/V3~\cite{Howard_2019_ICCV}. We take the case 1 as an example. In Fig.~\ref{fig:cbc_case1}, we can observe that the number of output channels is always $4$, which is the same as the number of input channels ($Z=C=4$) no matter how many filters are removed. Therefore, the bottleneck cannot be generated. In contrast, if we set $T$ to 2 as the case 4 in Fig.~\ref{fig:cbc_case4}, no input channels are bypassed until we remove the first two filters because $Z = max(min(4, 2), 2) = 2$. After that, it becomes the case 3 in Fig.~\ref{fig:cbc_case3}, which forms a bottleneck.
+
+
+\subsection{Ordered Dropout}
+\label{subsec:ordered_droput}
+
+Training the super-network involves joint training of multiple sub-networks with shared weights. After the super-network is trained, comparing sub-networks of the super-network (i.e., samples) only requires their \emph{relative} accuracy (e.g., sub-network A has higher accuracy than sub-network B). Generally speaking, the more sub-networks are trained, the better the relative accuracy of sub-networks will be. However, previous works usually require one forward-backward pass for training one sub-network. As a result, training more sub-networks requires more forward-backward passes and hence increases the training time.
+
+To address this problem, we propose ordered dropout (OD) to enable training $N$ sub-networks in a single forward-backward pass with a batch of $N$ images. OD is inserted after each convolutional layer in the super-network and zeros out \emph{different output channels for different images in a batch}. As shown in Fig.~\ref{fig:ordered_dropout}, OD simulates different layer widths with a constant number of output channels. Unlike the standard dropout~\cite{dropout} that zeros out a random subset of channels regardless of their positions, OD always zeros out the last channels to simulate removing the last filters. As a result, while sampling the search space, we can simply drop the last filters from the super-network to evaluate samples without other operations like sorting and avoid a mismatch between training and evaluation.
+
+
+\begin{figure}[t]
+\begin{center}
+   \includegraphics[width=0.9\linewidth]{figures/od}
+\end{center}
+   \caption{An illustration of how NetAdaptV2 uses the proposed ordered dropout to train two different sub-networks in a single forward-backward pass. The ordered dropout is inserted after each convolutional layer to simulate different layer widths by zeroing out some channels of activations. Note that all the sub-networks share the same set of weights.}
+\label{fig:ordered_dropout}
+\end{figure}
+
+
+When combined with the proposed CBCs, OD can train sub-networks with different network depths by zeroing out \emph{all} output channels of some layers to simulate layer removal. As shown in Fig.~\ref{fig:bypass_connections_train}, to simulate CBCs, there is another OD in the bypass path (upper) during training, which zeros out the \textit{complement} set of the channels zeroed by the OD in the corresponding convolution path (lower).
+
+\begin{figure}[t]
+\begin{center}
+   \includegraphics[width=1.0\linewidth]{figures/cbc_ordered_dropout}
+\end{center}
+   \vspace{-3mm}
+   \caption{An illustration of how NetAdaptV2 uses the proposed channel-level bypass connections and ordered dropout to train a super-network that supports searching different layer widths and network depths.}
+\label{fig:bypass_connections_train}
+\end{figure}
+
+Because NAS only requires the relative accuracy of samples, we can decrease the number of training iterations to further reduce the super-network training time. Moreover, for each layer, we sample each layer width almost the same number of times in a forward-backward pass to avoid biasing towards any specific layer widths.
+
+
+\subsection{Multi-Layer Coordinate Descent Optimizer}
+\label{subsec:optimizer}
+
+The single-layer coordinate descent (SCD) optimizer~\cite{book2020sze}, used in NetAdaptV1~\cite{eccv2018-netadapt}, is a simple-yet-effective optimizer with the advantages such as supporting both differentiable and non-differentiable search metrics and having only a few interpretable hyper-parameters that need to be tuned. The SCD optimizer runs an iterative optimization. It starts from the super-network and gradually reduces its latency (or other search metrics such as multiply-accumulate operations and energy). In each iteration, the SCD optimizer generates $K$ samples if the super-network has $K$ layers. The $k$-th sample is generated by shrinking (e.g., removing filters) the $k$-th layer in the best sample from the previous iteration to reduce its latency by a given amount. This amount is referred to as \emph{per-iteration resource reduction} and may change from one iteration to another. Then, the sample with the best performance (e.g., accuracy-latency trade-off) will be chosen and used for the next iteration. The optimization terminates when the target latency is met, and the sample with the best performance in the last iteration is the discovered DNN.
+
+The shortcoming of the SCD optimizer is that it generates samples by shrinking only one layer per iteration. This property causes two problems. First, it does not consider the interplay of multiple layers when generating samples in an iteration, which may lead to sub-optimal performance of discovered DNNs. Second, it may take many iterations to search for very deep networks because the layer with the lowest latency limits the maximum value of the per-iteration resource reduction; the lowest latency of a layer becomes small when the super-network is deep. To address these problems, we propose the \emph{multi-layer coordinate descent (MCD) optimizer}. It generates $J$ samples per iteration, where each sample is obtained by randomly shrinking $L$ layers from the previous best sample. In NetAdaptV2, shrinking a layer involves removing filters, reducing the kernel size, or both. Compared with the SCD optimizer, the MCD optimizer considers the interplay of $L$ layers in each iteration so that the performance of the discovered DNN can be improved. Moreover, it enables using a larger per-iteration resource reduction (i.e., up to the total latency of $L$ layers) to reduce the number of iterations and hence the search time.

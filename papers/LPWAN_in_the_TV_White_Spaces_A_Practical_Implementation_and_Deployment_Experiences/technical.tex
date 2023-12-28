@@ -1,0 +1,283 @@
+\section{SNOW Implementation on TI CC13x0}\label{sec:implementation}
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.49\textwidth]{figs/devices-new.eps}
+\caption{Devices used in our SNOW implementation. A node is a CC1310 or CC1350 device. The BS has two USRP B200s, each having its own antenna. An antenna is approximately 2x bigger than a B200.}
+\label{fig:devices}
+\end{figure}
+%talk about what devices are used in BS and as nodes
+The original SNOW implementation in~\cite{snow_ton} uses the USRP hardware platform for both the BS and the nodes. In our implementation, we use the CC13x0 devices as SNOW nodes and USRP in the BS (Figure~\ref{fig:devices}).
+%A USRP B200 device with a half-duplex radio costs approximately \$750 USD, as of today. As such, it becomes costly to deploy the SNOW network and examine its scalability. In contrast, in this work, we realize the functionality of a SNOW node in TI CC1310 LaunchPad~\cite{cc1310} that costs approximately \$30 USD, thus much cheaper and widely available to the research community to develop and deploy SNOW networks. 
+For BS implementation, we adopt the open-source code provided in~\cite{snow_bs}. The BS uses two half-duplex USRP devices (Rx-Radio and Tx-Radio), each having its own antenna. Also. the BS is implemented on the GNURadio software platform that gives a high magnitude of freedom to perform baseband signal processing~\cite{gnuradio}.
+In the following, we explore a number of implementation considerations and feasibility for a CC13x0 device to work as a SNOW node in practical deployments. 
+First, we show how to configure a CC13x0 device to make it work as a SNOW node. We then address the practical challenges (e.g., PAPR problem, CSI estimation, and CFO estimation) associated with our CC13x0-based SNOW implementation.
+
+\subsection{Configuring TI CC13x0}
+%talk about how to configure nodes and BS
+We configure the subcarrier center frequency, bandwidth, modulation, and the Tx power by setting appropriate values to the CC13x0 command inputs \code{centerFreq, rxBw, modulation}, and \code{txPower}, respectively, using {\em Code Composer Studio} (CCS) provided by Texas Instruments~\cite{snow_cots}. A graphical user interface alternative to CCS is {\em SmartRF Studio}. The MAC protocol of SNOW in CC13x0 is implemented on top of the example CSMA/CA project that comes with CCS. Note that the functionalities of a SNOW node are very simple and may be incorporated easily in the IoT devices that have both storage and computational limitations like the CC13x0 devices.
+
+\subsection{Peak-to-Average Power Ratio Observation}\label{sec:papr}
+By transmitting on a large number of subcarriers simultaneously (in the downlink), the BS suffers from a traditional OFDM problem called {\em peak-to-average power ratio (PAPR)}. PAPR of an OFDM signal is defined as the ratio of the maximum instantaneous power to its average power.
+In the SNOW downlink communications (i.e., BS to nodes), after the IFFT is performed by the BS, the composite signal can be represented as
+$\nonumber x(t) = \frac{1}{\sqrt{N}}\sum_{k=0}^{N-1}X_k~e^{j2 \pi f_k t},~~0 \le t \le NT.$
+% \begin{equation}
+% \nonumber x(t) = \frac{1}{\sqrt{N}}\sum_{k=0}^{N-1}X_k~e^{j2 \pi f_k t},~~0 \le t \le NT
+% \end{equation} 
+Here, $X_k$ is the modulated data symbol for node $k = \{0, 1, \cdots, N-1\}$ on subcarrier center frequency $f_k = k\Delta f$, where $\Delta f = \frac{1}{NT}$ and $T$ is the symbol period. Therefore, the PAPR may be calculated as%~\cite{jiang2008overview}
+\begin{equation}
+\nonumber \text{PAPR}[x(t)] = 10\log_{10}\Bigg( \frac{\max\limits_{0~ \le ~t~ \le~ NT} [|x(t)|^2 ]}{P_{\text{avg}}}\Bigg)~~dB.
+\end{equation}
+Here, the average power $P_{\text{avg}} = E [|x(t)|^2]$.
+A node's signal detection on its subcarrier is very sensitive to the nonlinear signal processing components used in the BS, i.e., the digital-to-analog converter (DAC) and high power amplifier (HPA), which may severely impair the bit error rate (BER) in the nodes due to the induced spectral regrowth. If the HPA does not operate in the linear region with a large power back-off due to high PAPR, the out-of-band power will exceed the specified limit and introduce severe ICI~\cite{jiang2008overview}. Moreover, the in-band distortion (constellation tilting and scattering) due to high PAPR may cause severe performance degradation~\cite{kamali2012understanding}. It has been shown that the PAPR reduction results in significant power saving at the transmitters~\cite{baxley2004power}.
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.35\textwidth]{figs/papr/papr.eps}
+\caption{PAPR distribution of D-OFDM signal in Tx-Radio.}
+\label{fig:papr}
+\end{figure}
+
+
+As shown in Figure~\ref{fig:papr}, the PAPR in the SNOW downlink communications (for N = 64) follows the Gaussian distribution. Thus, the peak signal occurs quite rarely and the transmitted D-OFDM signal will cause the HPA to operate in the nonlinear region, resulting in a very inefficient amplification. To illustrate the power efficiency of the HPA for N = 64, let us assume the probability of the clipped D-OFDM frames is less than 0.01\%. We thus need to apply an input back-off (IBO)~\cite{baxley2004power} equivalent to the PAPR at a probability of $10^{-4}$. Here, PAPR $\approx$ 14dB or 25.12. Thus, the efficiency ($\eta = 0.5/\text{PAPR}$) of the HPA~\cite{jiang2008overview} is $\eta = 0.5/25.12 \approx 1.99\%$. Such low efficiency at the HPA motivates us to explore the high PAPR in SNOW for practical deployments.
+%show some results explaining how PARP affects the BS-Node communication
+Several uplink PAPR reduction techniques for single-user OFDM systems have been proposed (see survey~\cite{jiang2008overview}). However, the characteristics of the downlink PAPR in SNOW, where different data are concurrently transmitted to different nodes, are entirely different from the PAPR observed in a single-user OFDM system. To adopt an uplink PAPR reduction technique used in the single-user OFDM systems for the downlink PAPR reduction in SNOW, each node has to process the entire data frame transmitted by the BS and then demodulate its own data. However, a SNOW node has less computational power and does not apply FFT to decode its data~\cite{snow_ton}, or any other node's data. Thus, the existing PAPR reduction techniques will not work in our implementation.
+
+%To this extent, we address the PAPR problem in SNOW by allocating a special subcarrier  called {\em downlink subcarrier} for the downlink communications.
+We propose to handle the PAPR problem in SNOW by using only one subcarrier (called {\em downlink subcarrier}) for downlink communication. All the nodes use this subcarrier to receive from the BS. Namely, the Tx-Radio transmits only on one subcarrier that is not used by any node for uplink communication.
+The BS may send any broadcast message, ACK, or data to the nodes using that downlink subcarrier. A node has to switch to the downlink subcarrier to listen to any broadcast message, ACK, or data.
+The BS may reserve multiple subcarriers  as {\slshape backup subcarriers} for downlink communication. 
+If the currently used downlink subcarrier becomes overly noisy or unreliable, it can be replaced by a backup subcarrier.
+Note that the dual-radio in the BS allows it to receive concurrent packets from a set of nodes (uplink) and transmit broadcast/ACK/data packets to another set of nodes (downlink), simultaneously. 
+The BS can acknowledge several nodes using a single transmission by using a bit-vector of size equals to the number of subcarriers.
+If the BS receives a packet from a node operating on subcarrier $i$, it will set the $i$-th bit in the bit-vector. Upon receiving the bit-vector, that node may get an ACK by looking at the $i$-th bit of the vector. Because of the bit-vector, the downlink ACKs also scale up like the uplink traffic. In the case of different packets for different nodes, the volume of downlink traffic (compared to the uplink traffic) is also practical since the IoT applications may not require high volume downlink traffic~\cite{whitespaceSurvey}.
+
+%A node retransmits the packet if that packet is not acknowledged in the first ACK received by that node. 
+%In the following, we describe our technique below to handle a {\bf rare} case in practical SNOW deployments, and hence may be kept optional in implementation.
+
+%\revise{Let nodes $A$ and $B$ share subcarrier $i$. The BS may receive a packet from node $B$ while preparing the ACK for node $A$'s packet. If both packets are decoded correctly, the BS acknowledges them by setting the $i$-th bit of the vector. However, if only one packet is decoded correctly, the BS resets the $i$-th bit of the vector. Thus, none of the packets are acknowledged. To compensate for this, the BS (Tx-Radio) switches to subcarrier $i$ and sends separate ACKs for nodes $A$ and $B$. On the other hand, if a node finds that its packet is not acknowledged in the downlink subcarrier, it listens to its subcarrier for a short fixed window before attempting a retransmission. A node knows about that fixed window when it joins the network. Note that {\em a very few} nodes (sharing the same subcarrier) may be involved in this scenario since the ACK generation time at the BS is very small. Other ways of addressing this issue may include the use of \emph{hash functions}, which we do not consider due to the scalability issues in hash-related collisions.}
+
+When a node $u$ transmits to the BS, if another node $v$ sharing the same subcarrier wants to transmit, $v$ senses the channel as busy and refrain from transmitting. When the BS transmits ACK to $u$ on the downlink subcarrier using the Tx-Radio, node $v$ may also transmit to the BS. Since the Tx-Radio at that time is making a downlink transmission, it may not send the ACK upon $v$'s transmission immediately. However, the Tx-Radio can send $v$'s ACK immediately after completing its current downlink transmission. Thus, $v$ may need to wait for ACK for a little longer than the time needed to send a downlink transmission from the BS. A node may go to sleep mode or its next state right after receiving an ACK. However, if a node that has transmitted but not yet received ACK, should wait for a little longer (e.g., up to one or two downlink transmission time). Note that a very few nodes (sharing the same subcarrier) may be involved in this scenario since the ACK generation time at the BS is very small. For the same reason, the waiting time for ACK will also not be very long (e.g., up to one or two downlink transmission time). Note that this scenario is quite rare and most of the times the nodes will receive ACK immediately upon transmission.
+
+
+%When a subcarrier (say, $i$) is shared by multiple nodes, the BS may receive a packet (say, from node A) before transmitting the ACK for another packet (say, from node B). In this case, both nodes A and B may be acknowledged by setting the $i$-th bit of the vector. However, if the packet from node A (or, B) is valid and the packet from node B (or, A) is invalid, the BS will reset the $i$-th bit of the vector and transmit the ACK. Thus, none of the packets are acknowledged even if one of them is valid. To compensate for that, the BS (Tx-Radio) will switch to node A's (or, B's) subcarrier and transmit an ACK packet. Thus, in our implementation, if a node finds that its packet is not acknowledged in the first valid ACK it received, before retransmission it listens to its subcarrier for a fixed amount of time. Each node may know this fixed time when it joins the network. Typically, if a subcarrier is shared by $G$ nodes, the fixed amount of time (worst case) may be set to $GD_p$ (ignoring the frequency switching time in the Tx-Radio), where $D_p$ is the time to transmit one packet. Other ways of addressing such issue may include the use of \emph{hash functions}. However, we do not explore that in our implementation for scalability issue due to hash collision.
+
+%In the case where each subcarrier is assigned to only a node, the size of the bit-vector may be set to the total number of subcarriers. Thus, if the BS receives a packet from a node operating on subcarrier $i$, it will set the $i$-th bit in the bit-vector. Upon receiving the bit-vector in ACK subcarrier, that node can check the $i$-th bit of the vector. However, in practical deployments with thousands of nodes, a subcarrier may be shared by multiple nodes, making the creation of the bit-vector non-trivial. We cannot also use any hashing technique because of the hash collisions and scalability issues. 
+
+\begin{figure*}[!htbp] 
+    \centering
+      \subfigure[RSSI under varying distance\label{fig:csi_rssi}]{
+    \includegraphics[width=0.35\textwidth]{figs/csi/rssi.eps}
+      }\hfill
+      \subfigure[Path Loss under varying distance\label{fig:csi_pathloss}]{
+        \includegraphics[width=.35\textwidth]{figs/csi/pathloss.eps}
+      }\hfill
+      \subfigure[BER under varying distance\label{fig:csi_ber}]{
+        \includegraphics[width=.35\textwidth]{figs/csi/ber.eps}
+      }
+    \caption{RSSI, path loss, and BER at the SNOW BS for a TI CC1310 node.}
+    \label{fig:csi}
+ \end{figure*}
+\subsection{Channel State Information Estimation}\label{sec:csi}
+
+Multi-user OFDM communication requires channel estimation and tracking to ensure high data rate at the BS. One way to avoid channel estimation is to use the \emph{differential phase-shift keying (DPSK)} modulation. DPSK, however, results in a lower bitrate at the BS due to a 3dB loss in the signal-to-noise ratio (SNR)~\cite{van1995channel}. Additionally, the current SNOW design does not support DPSK modulation. SNR at the BS for each node is different in SNOW. Also, SNR of each node is affected differently due to channel conditions, deteriorating the overall bitrate in the uplinks. Thus, it requires handling of the channel estimation in SNOW.
+
+Figure~\ref{fig:csi} shows the experimentally found received signal strength indicator (RSSI), path loss, and BER at the SNOW BS for a CC1310 device that transmits successive 1000 30-byte (payload) packets from 200 to 1000m distances, respectively, with a Tx power of 15dBm, subcarrier center frequency at 500MHz, and a bandwidth of 98kHz. Figure~\ref{fig:csi_rssi} indicates that the RSSI decreases rapidly with the increase in distance. Also, the path loss in Figure~\ref{fig:csi_pathloss} shows that it is significantly higher than the theoretical free space loss~\cite{rappaport1996wireless}. We also compare with the Okumura-Hata~\cite{rappaport1996wireless} loss to check if it fits the model, however, it does not. Finally, Figure~\ref{fig:csi_ber} confirms that the BER goes above $10^{-3}$ (which is not acceptable~\cite{rnr}) beyond 400m due to the unknown channel conditions. Figure~\ref{fig:csi_ber} also shows that the BER worsens for an increase in the subcarrier bandwidth. Thus, to make our implementation more resilient, we need to incorporate the CSI estimation in SNOW.
+
+We calculate the CSI for each SNOW node independently on its subcarrier. We consider a slow flat-fading model~\cite{tse2005fundamentals}, where the channel conditions vary slowly with respect to a single node to BS packet duration. Note that joint-CSI estimation~\cite{jiang2007iterative, ribeiro2008uplink} in SNOW is not our design goal since it would require SNOW nodes to be strongly time-synchronized.  
+Similar to IEEE 802.16e, we run CSI estimation independently for each node because of their different fading and noise characteristics. In the following, we explain the CSI estimation technique for one node on its subcarrier for each packet. The BS uses the same technique to estimate CSI for all other nodes. 
+
+For a node, in a narrowband flat-fading subcarrier, the system is modeled as $y = Hx + w$,
+% \begin{equation}
+% \nonumber y = Hx + w,
+% \end{equation}
+where $y$, $x$, and $w$ are the receive vector, transmit vector, and noise vector, respectively. $H$ is the channel matrix. 
+We model the noise as additive white Gaussian noise, i.e., a circular symmetric complex normal ($CN$) with $w \sim CN(0, W)$, where the mean is zero and noise covariance matrix $W$ is known.
+%Noise is modeled as circular symmetric complex normal ($CN$) with $w \sim CN(0, W)$, where the mean is zero and noise covariance matrix $W$ is known, thus an additive white Gaussian noise. 
+As the subcarrier conditions vary, we estimate the CSI on a short-term basis based on popular approach called {\em training sequence}. We use the known preamble transmitted at the beginning of each packet. $H$ is estimated using the combined knowledge of the received and the transmitted preambles. To make the estimation robust, we divide the preamble into $n$ equal parts (preamble sequence). E.g., n = 4, which is similar to the estimation in IEEE 802.11.
+
+Let the preamble sequence be $(p_1, p_2, \cdots, p_n)$, where vector $p_i$ is transmitted as $y_i = Hp_i + w_i$.
+% \begin{equation}
+% \nonumber y_i = Hp_i + w_i.
+% \end{equation}
+Combining the received preamble sequences, we get $Y = [y_1, \cdots, y_n] = HP + W$, where 
+% \begin{equation}
+% \nonumber Y = [y_1, \cdots, y_n] = HP + W.
+% \end{equation}
+$P = [p_1, \cdots, p_n]$ and $W = [w_1, \cdots, w_n]$. With combined knowledge of $Y$ and $P$, channel matrix $H$ is estimated. Similar to the CSI estimation in the uplink communications by the BS, each node also estimates the CSI during its downlink communications. Note that the computational complexity of CSI estimation at the nodes is lightweight since each SNOW packet has a 32-bit preamble~\cite{snow_ton}, divided into four equal parts. A node thus processes a vector of only 8 bits at a time.
+%during CSI estimation.
+
+
+
+
+\subsection{Carrier Frequency Offset Estimation} \label{sec:cfo}
+
+Multi-user OFDM systems are very sensitive to the CFO between the transmitters and the receiver. CFO causes the OFDM systems to lose orthogonality between subcarriers, which results in severe ICI. 
+A transmitter and a receiver observe CFO due to (i) the mismatch in their local oscillator frequency as a result of hardware imperfections; (ii) the relative motion that causes a Doppler shift. 
+%CFO originates in a transmitter and a receiver due to their (i) local oscillator's frequency mismatch as a result of hardware imperfections; (ii) relative motion that causes a Doppler shift. 
+ICI degrades the SNR between an OFDM transmitter and a receiver, which results in significant BER. Thus, we investigate the needs for CFO estimation in our implementation.
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.35\textwidth]{figs/cfo/ber.eps}
+\caption{BER at different $E_b/N_0$.}
+\label{fig:cfo}
+\end{figure}
+The loss in SNR due to the CFO between the SNOW BS and a node can be estimated as 
+$SNR_{loss} = 1 + \frac{1}{3}(\pi \delta f T)^2\frac{E_s}{N_0}$~\cite{nee2000ofdm}, where
+% \begin{equation} \scriptsize
+%  \nonumber SNR_{loss} = 1 + \frac{1}{3}(\pi \delta f T)^2\frac{E_s}{N_0} 
+% \end{equation}
+$\delta f$ is the frequency offset, $T$ is the symbol duration, $E_s$ is the average received subcarrier energy, and $N_0/2$ is the two-sided spectral density of the noise power.
+
+To observe the effects of CFO, we choose two neighboring orthogonal subcarriers in the BS and send concurrent packets from two nodes at 200m distance. Each node sends successive 1000 30-byte packets. We repeat this experiment varying the transmission powers at the nodes to generate signals with different $E_b/N_0$, where $E_b$ is the average energy per bit in the received signals. 
+Figure~\ref{fig:cfo} shows the BER at the BS while receiving packets from these two nodes. This figure shows that BER is nearly $10^{-3}$ even for very high $E_b/N_0$ ($\approx 40$dB), which is also very high compared to the theoretical BER~\cite{choi2000carrier}. Thus, CFO is heavily pronounced in SNOW.
+The distributed and asynchronous nature of SNOW does not allow CFO estimation similar to the traditional multi-user OFDM systems.
+While the USRP-based SNOW implementation provides a trivial and {\em coarse} CFO estimation, it is not robust and does not account for the mobility of the nodes~\cite{snow_ton}.
+We propose a pilot-based robust CFO estimation technique, combining both coarse and finer estimations, which accounts for the mobility of the nodes as well. We use training symbols for CFO estimation in an ICI free environment for each node independently, while it joins the network by communicating with the BS using a non-overlapping {\em join subcarrier}.
+
+
+We explain the CFO estimation technique between a node and the BS (uplink) on a join subcarrier $f$ based on time-domain samples. Note that the BS keeps running the G-FFT on the entire BS spectrum. We thus extract the corresponding time-domain samples of the join subcarrier by applying IFFT during a node join. The join subcarrier does not overlap with other subcarriers; hence it is ICI-free. If $f_{\text{node}}$ and $f_{\text{BS}}$ are the frequencies at a node and the BS, respectively, then their frequency offset $\delta f = f_{\text{node}}-  f_{\text{BS}}$.
+For transmitted signal $x(t)$ from a node, the received signal  $y(t)$ at the BS that experiences a CFO of $\delta f$ is given by 
+$y(t)  = x(t) e^{j2\pi \delta f t}$.
+Similar to IEEE 802.11a, we estimate $\delta f$ based on short and long preamble approach. Note that the USRP-based implementation has considered only one preamble to estimate CFO.
+In our implementation, the BS first divides a $n$-bit preamble from a node into short and long preambles of lengths $n/4$ and $3n/4$, respectively. Thus for a 32-bit preamble (typically used in SNOW), the lengths of the short and long preambles are  8 and 24, respectively. 
+The short preamble and the long preamble are used for coarse and finer CFO estimation, respectively. 
+Considering $\delta t_s$ as the short preamble duration and $\delta f_s$ as the coarse CFO estimation, we have
+$y(t-\delta t_s)  = x(t) e^{j2\pi \delta f_s (t-\delta t_s)}.$
+
+Since $y(t)$ and $y(t-\delta t_s)$ are known at the BS, we have
+\begin{align*}
+y(t-\delta t_s) y^*(t)  & = x(t) e^{j2\pi \delta f_s (t-\delta t_s)}       x^*(t) e^{-j2\pi  \delta f_s t}
+                           = |x(t)|^2  e^{j 2\pi  \delta f_s -\delta t_s }.
+\end{align*}
+Taking angle of both sides gives us as follows.
+% $$\sphericalangle  y(t-\delta t_s) y^*(t)   =  \sphericalangle     |x(t)|^2  e^{j 2\pi  \delta f_s -\delta t_s }  =      - 2\pi  \delta f_s \delta t_s$$
+\begin{align*}
+\sphericalangle  y(t-\delta t_s) y^*(t)   &=  \sphericalangle     |x(t)|^2  e^{j 2\pi  \delta f_s -\delta t_s } =      - 2\pi  \delta f_s \delta t_s
+                                          %&=      - 2\pi  \delta f_s \delta t_s
+\end{align*}
+By rearranging the above equation, we get
+$$\delta f_s   =  - \frac{\sphericalangle  y(t-\delta t_s) y^*(t) }{2\pi\delta t_s}.$$
+
+Now that we have the coarse CFO $\delta f_s$, we correct each time domain sample (say, $P$) received in the long preamble as $ P_a = P_a e^{-ja \delta f_s}$, where $a = \{1, 2, \cdots, A\}$ and $A$ is the number of time-domain samples in the long preamble. Taking into account the corrected samples of the long preamble and considering $\delta t_l$ as the long preamble duration, we estimate the finer CFO as follows. 
+\begin{equation} 
+\delta f  =  - \frac{\sphericalangle  y(t-\delta t_l) y^*(t) }{2\pi\delta t_l} \label{eqn:finer_cfo}
+\end{equation}
+To this extent, considering the join subcarrier $f$, the {\slshape ppm (parts per million)} on the BS's crystal is given by $ \text{ppm}_\text{BS} = 10^6  \big(\frac{\delta f}{f}\big) $. Thus, the BS calculates $ \delta f_i$ on subcarrier $f_i$ (assigned for node $i$) as 
+$\delta f_i =  \frac{(f_i * \text{ppm}_\text{BS})}{10^6}.$ The CFO between the Tx-Radio and the Rx-radio can be estimated using a basic SISO CFO estimation technique~\cite{yao2005blind}. Thus, BS also knows the CFO for the downlink.
+
+
+We now explain the CFO estimation to compensate for the Doppler shift. Note that if the signal bandwidth is sufficiently narrow at a given carrier frequency and mobile velocity, the Doppler shift can be approximated as a common shift across the entire signal bandwidth~\cite{talbot2007mobility}. Thus, the Doppler shift in the join subcarrier for a node also represents the Doppler shift at its assigned subcarrier, and hence the estimated CFO in Equation (\ref{eqn:finer_cfo}) is not affected due to the Doppler Shift.
+For simplicity, we consider that a node's velocity is constant and the change in Doppler shift is negligible during a single packet transmission in SNOW.
+Considering $\delta f_d$ as the CFO due to the Doppler shift, $v$ as the velocity of the node, and $\theta$ as the angle of the arrived signal at the BS from the node, we have $f_d = f_i\big(\frac{v}{c}\big)\cos(\theta)$~\cite{talbot2007mobility}, where
+% \begin{equation}
+% 	\nonumber \delta f_d = f_i\big(\frac{v}{c}\big)\cos(\theta).
+% \end{equation}
+$f_i$ is the subcarrier center frequency and $c$ is the speed of light. The node itself may consider its motion as circular and approximate $\theta = \frac{\delta s}{r}$, where $\delta s$ is the amount of anticipated change in position during a packet transmission and $r$ is the {\em line-of-sight} distance between the node and BS. Thus, CFO compensation due to the Doppler shift is done at the nodes during uplink communications. In the downlink communications, the BS Tx-Radio can also compensate for the node's mobility as the node can report its Doppler shift to the BS during the uplink communications.
+
+In summary, as the nodes asynchronously transmit, estimating joint-CFO of the subcarriers at the BS is very difficult. We thus use a simple feedback approach for proactive CFO correction in the uplink communications. Specifically, 
+$\delta f_i$  estimated at the BS for subcarrier $f_i$ is given to the node (during joining process at subcarrier $f_i$).
+The node may then adjust its transmitted signal based on $\delta f_i$ and $\delta f_d$, calculated as $(\delta f_i + \delta f_d)$, which will align its signal so that the BS does not need to compensate for CFO in the uplink communications. Such feedback-based proactive compensation scheme was studied before for multi-user OFDM and is also used in global system for mobile communication (GSM)~\cite{van1999time}.
+
+\section{Handling the Near-Far Power Problem} \label{sec:near-far}
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=0.5\textwidth]{figs/near-far-flat.eps}
+\caption{An illustration of the near-far power problem. B is farther from the BS than A and both transmit concurrently using the same Tx power.}
+\label{fig:near-far}
+\end{figure}
+Wireless communication is susceptible to the near-far power problem, especially in CDMA (Code Division Multiple Access)~\cite{muqattash2003cdma}. Multi-user D-OFDM system in SNOW may also suffer from this problem. Figure~\ref{fig:near-far} illustrates the near-far power problem in SNOW. Suppose, nodes A and B are operating on two adjacent subcarriers. Node A is closer to the BS compared to node B. When both nodes A and B transmit concurrently to the BS, the received frequency domain signals from node A and B may look as shown on the right of Figure~\ref{fig:near-far}. Here, transmission from node B is severely interfered by the strong radiations of node A's transmission. As such, node B's signal may be buried under node A's signal making it difficult for the BS to decode the packet from node B. 
+A typical SNOW deployment may have such scenarios if the nodes operating on adjacent subcarriers use the same transmission power and transmit concurrently at the BS from different distances. 
+\begin{figure}[t]
+    \centering 
+      \subfigure[Avg. PDR at different Tx powers\label{fig:nf_pdr}]{
+    \includegraphics[width=0.35\textwidth]{figs/nearfar/pdr.eps}
+      }\hfill
+      \subfigure[Avg. PDR at different Tx powers and time\label{fig:nf_time}]{
+        \includegraphics[width=.35\textwidth]{figs/nearfar/pdr-time.eps}
+      }
+    \caption{Packet delivery ratio at different Tx powers}
+    \label{fig:nf-effects}
+ \end{figure}
+
+
+To observe the near-far power problem in SNOW, we run experiments by choosing 3 different adjacent subcarriers, where the middle subcarrier observes the near-far power problem introduced by both subcarriers on its left and right. We place two CC1310 nodes within 20m of the BS that use the left and the right subcarrier, respectively. We use another CC1310 node that uses the middle subcarrier and is placed at different distances between 200 and 1000m from the BS. Nodes that are within 20m of the BS transmit packets continuously with a transmission power of 0dBm. At each distance, for each transmission power between 8 and 15dBm, the node that uses the middle subcarrier sends 100 rounds of 1000 consecutive packets (sends one packet then waits for the ACK and then sends another packet, and so on) to the BS and with a random interval of 0-500ms. For each transmission power level, at each distance, that node calculates its average {\em packet delivery ratio (PDR)}. PDR is defined as the ratio of the number of successfully acknowledged packets to the number of total packets sent.
+We repeat the same experiments for 7 days at 9 AM, 2 PM, and 6 PM.
+
+Figure~\ref{fig:nf_pdr} shows that the average PDR increases at each distance with the increase in the transmission power. Figure~\ref{fig:nf_time} depicts the result for 7-day experiments (only at a distance of 200m) and shows that the average PDR changes at different time of the day. Overall, Figure~\ref{fig:nf_pdr} and~\ref{fig:nf_time} confirms that the average PDR increases with the increase in the transmission power. To ensure the energy-efficiency at the nodes, i.e., to find a  transmission power  that suffices to eliminate the effects of near-far power problem, we propose an adaptive transmission power control for the SNOW design, as described below.
+
+% To demonstrate the effects of near-far problem, we run experiments in SNOW by placing 5 nodes at different distances ranging between 200-1000m. The subcarriers assigned to the nodes are chosen in a way such that they observe the near-far problem as shown in Figure~\ref{fig:nf-effects}.  
+% At each distance, a node transmits 1000 packets using a fixed transmission power (concurrently with other nodes at other distances using the same transmission power) and calculate its packet delivery ratio (PDR). A packet is correctly delivered if the node receives an ACK for that packet. At each location we vary the transmission power between 0-15dBm and repeat the same strategy. Figure~\ref{fig:nf_rssi} shows that the average RSSI at the BS increases with the increase in the transmission power, as expected. However, Figure~\ref{fig:nf_pdr} shows that the PDR at nodes at different distances vary unexpectedly. For example, node at distance 400m observes very low PDR due to the node at 200m, and so on. Thus, the near-far problem needs to be addressed in SNOW. To this extent, we propose an adaptive transmission power control in SNOW.
+
+
+\subsection{Adaptive Transmission Power Control}\label{sec:atpc}
+Our design objective for the adaptive Tx power control is to correlate the subcarrier-level Tx power and link quality (i.e., PDR) between each node and the BS. We thus formulate a predictive model to provide each node with a proper Tx power to make a successful transmission to the BS using its assigned subcarrier. Note that our work differs from the work in~\cite{lin2016atpc} in fundamental concepts of the network design and architecture. In~\cite{lin2016atpc}, the authors have considered a multi-hop wireless sensor network based on IEEE 802.15.4 with no concurrency between a set of transmitters and a receiver. Additionally, our model is much more simpler since we deal with single hop communications. As such, the overheads (i.e., energy consumption and latency at each node) associated with our model are fundamentally lesser than that in~\cite{lin2016atpc}, or the other techniques developed for multi-hop wireless networks~\cite{son2006experimental, li2005cone}. In the following, we describe our model.
+
+
+Whenever a node is assigned a new subcarrier or observes a lower PDR, e.g., PDR below quality of service (QoS) requirements due to mobility, it runs a lightweight predictive model to determine the convenient Tx power to make successful transmissions to the BS.
+Our predictive model uses an approximation function to estimate the PDR distribution at different Tx power levels. Over time, that function is modified to adapt to the node's changes. The function is built from the sample pairs of the Tx power levels and PDRs between the node and the BS via a curve-fitting approach. A node collects these samples by sending groups of packets to the BS at different Tx power levels. A node may not be assigned new subcarriers or may not observe lower PDR due to mobility (as per our CSI and CFO estimations) frequently. Thus, the overhead (e.g., energy consumption) for collecting these samples may be negligible compared to the overall network lifetime (which is several years).
+
+Specifically, our predictive model uses two vectors: $TP$ and $L$, where $TP = \{ tp_1, tp_2, \cdots, tp_m \}$ contains $m$ different Tx power levels that the node uses to send $m$ groups of packets to the BS and $L = \{ l_1, l_2, \cdots, l_m \}$ contains the corresponding PDR values at different Tx power levels. Thus, $l_i$ represents the PDR value at Tx power level $tp_i$. We use the following linear function to correlate between Tx power and PDR.
+\begin{equation}
+	l(tp_i) = a~.~tp_i + b \label{eqn:linear_model}
+\end{equation}
+To lessen the computational overhead in the node, we adopt the {\em least square approximation} technique to determine the unknown coefficients $a$ and $b$ in Equation (\ref{eqn:linear_model}). Thus, we find the minimum of the function $S(a, b)$, where $\nonumber S(a, b) = \sum |l_i - l(tp_i)|^2.$
+% \begin{equation}
+% \nonumber	S(a, b) = \sum |l_i - l(tp_i)|^2.
+% \end{equation}
+The minimum of $S(a, b)$ is determined by taking the partial derivatives of $S(a, b)$ with respect to $a$ and $b$, respectively, and setting them to zero. Thus, $ \frac{\partial S}{\partial a} = 0$ and $\frac{\partial S}{\partial b} = 0$ give us
+\begin{align}
+	\nonumber a~\sum (tp_i)^2 + b~\sum tp_i &= \sum l_i.tp_i \text{ and} \\ 
+  \nonumber a~\sum tp_i + b~m &= \sum l_i.
+\end{align}
+Simplifying the above two equations, we find the estimated values of $a$ and $b$ as follows.
+\begin{equation}\nonumber
+\begin{split}
+	\begin{bmatrix}
+		\hat{a}\\
+        \hat{b}
+	\end{bmatrix}
+    = \frac{1}{m \sum (tp_i)^2 - (\sum tp_i)^2} \times \\
+    \begin{bmatrix}
+    	m \sum l_i.tp_i - \sum l_i \sum tp_i\\
+    	\sum l_i \sum (tp_i)^2 - \sum l_i.tp_i \sum tp_i
+    \end{bmatrix}
+\end{split}
+\end{equation}
+Using the estimated values of $a$ and $b$, the node can calculate the appropriate Tx power as follows.
+\begin{equation}\label{eqn:estimated}
+tp = \big[\frac{PDR_{\text{threshold}} - \hat{b}}{\hat{a}}\big] \in TP
+\end{equation}
+Here, $PDR_{\text{threshold}}$ is the threshold set empirically or according to QoS requirements, and $[.]$ denotes the function that rounds the value to the nearest integer in the vector $TP$.
+
+Now that the initial model has been established in Equation (\ref{eqn:estimated}), this needs to be updated continuously with the node's changes over time. In Equation (\ref{eqn:linear_model}), both $a$ and $b$ are functions of time that allow the node to use the latest samples to adjust the curve-fitting model dynamically. 
+It is empirically found that (Figure~\ref{fig:nf_pdr}) the slope of the curve does not change much over time; hence $a$ is assumed time-invariant in the predictive model. On the other hand, the value of $b$ changes drastically over time (Figure~\ref{fig:nf_time}). Thus, Equation (\ref{eqn:linear_model}) is rewritten as follows that characterizes the actual relationship between Tx power and PDR.
+\begin{equation}
+	\nonumber l(tp(t)) = a.tp(t) + b(t)
+\end{equation}
+Now, $b(t)$ is determined by the latest Tx power and PDR pairs using the following feedback-based control equation~\cite{lin2016atpc}.
+\begin{align}
+	\nonumber \Delta \hat{b}(t) &= \hat{b}(t) - \hat{b}(t+1) \\
+    			\nonumber	  &= \frac{\sum^K_{k=1} [PDR_{\text{threshold}} - l_k(t - 1)]}{K} \\ 
+                      &= PDR_{\text{threshold}} - l(t-1) \label{eqn:control}
+\end{align}
+Here, $l(t-1)$ is the average value of $K$ readings denoted as 
+\begin{equation}
+	\nonumber l(t-1) = \frac{\sum^K_{k=1} l_k(t - 1)}{K}.
+\end{equation}
+Here, $l_k(t-1)$, for $k = \{1, 2, \cdots, K\}$, is one reading of PDR during the time period $t-1$ and $K$ is the number of feedback responses at time period $t-1$. Now, the error in Equation (\ref{eqn:control}) is deducted from the previous estimation; hence the new estimation of $b(t)$ can be written as: $\hat{b}(t) = \hat{b}(t-1) - \Delta \hat{b}(t)$.
+Given the newly estimated $\hat{b}(t)$, the node now can set the Tx power at time $t$ as
+\begin{equation}
+	\nonumber tp(t) = \big[\frac{PDR_{\text{threshold}} - \hat{b}(t)}{\hat{a}}\big].
+\end{equation}
+
+
+
+
+
+
+
+
+
+
+
+
+

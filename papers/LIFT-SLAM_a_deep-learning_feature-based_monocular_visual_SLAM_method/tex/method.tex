@@ -1,0 +1,181 @@
+\section{Proposed Method}
+\label{sec:method}
+
+Our proposed method is a deep-learning feature-based monocular VSLAM system called LIFT-SLAM. It reconstructs sparse maps that are graph-based and keyframe-based, which allows us to perform bundle adjustment to optimize the estimated poses of the camera. We use the DNN called LIFT \cite{lift} to extract features that are used in a pipeline based on ORB-SLAM \cite{orb-slam}. 
+
+\subsection{LIFT}
+\label{sec:lift}
+The Learned Invariant Feature Transform (LIFT) is a DNN proposed by Yi et al. \cite{lift} that implements local feature detection, orientation estimation, and description in a supervised end-to-end approach. The network architecture comprises three main modules based on CNNs: Detector, Orientation Estimator, and Descriptor.
+
+The algorithm works with patches of images. After giving a patch as input, the detector network provides a score map of this patch. A soft argmax operation \cite{softargmax} is performed over this score map to return the potential feature point location. After this, it performs a crop operation centered on the feature location, used as input to the orientation estimator. The orientation estimator module predicts an orientation to the patch. Thus, a rotation is applied in the patch according to the estimated orientation. Lastly, the descriptor network computes a feature vector from the rotated patch, that is the output. This pipeline is presented in Figure \ref{fig:lift}.
+
+\begin{figure}
+\centering
+\subfloat[LIFT pipeline.]{
+\includegraphics[width=0.9\textwidth]{figures/LIFT_pipeline.png}
+\label{fig:lift}}
+
+\subfloat[LIFT fine-tuned pipeline.]{
+\includegraphics[width=0.9\textwidth]{figures/LIFT_finetuned_pipeline.png}
+\label{fig:lift-finetuned}}
+
+\caption{LIFT and LIFT fine-tuned pipelines.}
+\label{fig:lift-pipelines}
+\end{figure}
+
+
+Originally, LIFT was trained with photo-tourism image sets. They used a Structure from Motion (SfM) algorithm called VisualSFM \cite{visual-sfm} to reconstruct the scenes from the image sets with SIFT features. Photo-tourism data contains different geometrical aspects when compared to a typical VO dataset. Usually, in VO datasets, the images are sequential, captured with the same camera that progressively changes its position and orientation. On the other hand, the photo-tourism images capture views of the same scene from different perspectives. Therefore, to address this aspect, we perform a transfer learning in the LIFT network to generate a version of the LIFT that is fine-tuned with VO datasets' features. The only LIFT module that was improved after training the network was the orientation estimator, as shown in Figure \ref{fig:lift-finetuned}. 
+
+The LIFT training architecture is a four-branch Siamese, as shown in figure \ref{fig:lift-architecture}. In training, four patches of images are used as input, $\mathbf{P^1}$ and $\mathbf{P^2}$ correspond to different views of the same 3D point, $\mathbf{P_3}$ is a view from a different 3D point, and the last one $\mathbf{P^4}$ is a patch without any distinctive feature point. Each patch $\mathbf{P^i}$ corresponds to the $i$th branch of the network it will be used as input. The last branch trains only the detector network since it can only show negative examples to the detector.
+
+\begin{figure}
+\centerline{\includegraphics[scale=0.35]{figures/lift-architecture.png}}
+\caption[Siamese LIFT training architecture.]{The Siamese LIFT training architecture, composed of four branches. Where $\mathbf{P^i}$ is a patch of a image inputed on the $i$th branch, $S^i$ is a score map computed by the detector, $\mathbf{x^i}$ is a feature point location, and $\mathbf{p^i}$ is a smaller patch used as input to the orientation estimator. The orientation estimator computes a $\theta^i$ orientation that produces the rotated patch $\mathbf{p_{\theta}^i}$, this is processed by the descriptor network and produces a description vector $\mathbf{d^i}$. Extracted from \cite{lift}.}
+\label{fig:lift-architecture}
+\end{figure}
+
+The descriptor network is trained with a loss to minimize the differences between the corresponding patches and maximizing the difference between different patches. The descriptor is formalized as $h_{\rho}(\mathbf{p}_{\theta})$, where $\rho$ are the descriptor parameters. The descriptor is trained to minimize the loss defined in equation \ref{eq:desc-loss}.
+
+\begin{equation}
+    L_{desc}(\mathbf{p}_{\theta}^{k}) = \left\{\begin{matrix}
+ \left \| h_{\rho}(\mathbf{p}_{\theta}^{k}) - h_{\rho}(\mathbf{p}_{\theta}^{l})  \right \|_2 & $for positive pairs$ \\ 
+$max$(0, C-\left \| h_{\rho}(\mathbf{p}_{\theta}^{k})  -  h_{\rho}(\mathbf{p}_{\theta}^{l}) \right \|_2) & $for negative pairs,$ 
+\end{matrix}\right.
+    \label{eq:desc-loss}
+\end{equation}
+
+where C = 4, and positive pairs are patches that correspond to the same 3D point, and negative patches are the ones that do not correspond.
+
+Moreover, the orientation estimator network is trained to provide the orientations that minimize the distances between description vectors for different views of the same 3D points. In training the orientation estimator, the description vectors are provided by the already trained descriptor, and the keypoints are taken from VisualSFM. The orientation estimator loss is defined in equation \ref{eq:ori-loss}.
+
+\begin{equation}
+    L_{ori}(\mathbf{P}^{1}, \mathbf{x}^{1}, \mathbf{P}^{2}, \mathbf{x}^2) =  \left \| h_{\rho}(G(\mathbf{P}^{1}, \mathbf{x}^{1}) - h_{\rho}(G(\mathbf{P}^{2}, \mathbf{x}^{2})) \right \|_2,
+    \label{eq:ori-loss}
+\end{equation}
+where $G(\mathbf{P},\mathbf{x})$ is rotation applied to the patch $P$ centered in location $x$.
+
+Finally, the detector learns to minimize the distance between the description vectors for corresponding patches (with the already learned descriptor and orientation estimator) and maximize the classification score for patches that do not correspond to the same physical point. Therefore, the loss in detector ($L_{det}$) is the sum of two losses $L_{class}$ and $L_{pair}$, as shown in equation \ref{eq:loss-det}. The detector output (score map) is defined as $\emph{f}_{\mu}(\mathbf{P})$, where $\mu$ are the network parameters.
+
+\begin{equation}
+    L_{det}(\mathbf{P}^{1}, \mathbf{P}^{2}, \mathbf{P}^{3}, \mathbf{P}^{4}) = \gamma L_{class}(\mathbf{P}^{1}, \mathbf{P}^{2}, \mathbf{P}^{3}, \mathbf{P}^{4}) + L_{pair}(\mathbf{P}^{1}, \mathbf{P}^{2}),
+    \label{eq:loss-det}
+\end{equation}
+where $\gamma$ is a hyper-parameter that defines a balancing between the two terms, with $L_{class}$ increasing when detecting a keypoint in patch $\mathbf{P}^{4}$, as in equation \ref{eq:loss-class}. $L_{pair}$ is defined in equation \ref{eq:loss-pair}, it defines the distance between two corresponding description vectors.
+
+\begin{equation}
+    L_{class}(\mathbf{P}^{1}, \mathbf{P}^{2}, \mathbf{P}^{3}, \mathbf{P}^{4}) = \sum_{i=1}^{4} \alpha_{i} \textrm{max}(0, (1-\textrm{softmax}(\emph{f}_{\mu}(\mathbf{P}^i))y_{i}))^2,
+\label{eq:loss-class}
+\end{equation}
+where $y_i = -1$ and $\alpha_i = 3/6$ if $i=4$ (for a non-keypoint patch), and $y_i = +1$ and $\alpha_i = 1/6$ otherwise. The \textrm{softmax} is a non-linear function.
+
+\begin{equation}
+\begin{split}
+     L_{pair}(\mathbf{P}^{1}, \mathbf{P}^{2}) = \parallel &h_{\rho}(G(\mathbf{P}^{1}, \textrm{softargmax}(\emph{f}_{\mu}(\mathbf{P}^1)))) - \\& h_{\rho}(G(\mathbf{P}^{2}, \textrm{softargmax}(\emph{f}_{\mu}(\mathbf{P}^2))))\parallel_2,
+\end{split}
+\label{eq:loss-pair}
+\end{equation}
+where the \textrm{softargmax} is a function that computes the center of mass of the score map, returning the feature location $\mathbf{x}$.
+
+Before constructing the pipeline of LIFT-SLAM, we tested the robustness of LIFT descriptors under different scenarios. To this end, we performed a qualitative analysis of the LIFT feature matching in sequential images from the KITTI dataset and compared them with ORB feature matching in the same conditions. First, we extract the features from a pair of images. Then, we find the descriptors' pair with a smaller distance between them (similarity) to create a match. LIFT descriptors are vectors of float numbers. Therefore, we compute the distance between the two descriptors with the Euclidean distance. On the other hand, ORB descriptors are binary vectors. Thus, we calculate the similarity between two ORB descriptors with Hamming distance.
+
+We have created three different scenarios:
+\begin{itemize}
+    \item Frame skipping: To evaluate the feature matching performance, we emulate different camera frequencies by skipping frames in sequences of the KITTI dataset. Therefore, given an image in time $t$, we look for feature matches with an image in time $t+5$.
+    
+    \item Gamma power transformation with $\gamma > 1$: We can emulate under and overexposed images with gamma power transformation, as shown in \cite{emulate-exposure}. This transformation creates a new image $I'$ from image $I$ by applying: $I'=I^{\gamma}$. For $\gamma > 1$, we emulate an underexposed image.
+    
+    \item Gamma power transformation with $\gamma < 1$: We apply the same operation as before, but using $\gamma < 1$ to emulate an overexposed image.
+\end{itemize}
+
+From the qualitative results shown in Figure \ref{fig:lift-orb-features}, we concluded that LIFT is robust to all of the proposed scenarios. In frame skipping (Figure \ref{fig:lift-skip5}), we can notice that LIFT is still able to find correct correspondences between images, whereas ORB creates several wrong correspondences (Figure \ref{fig:orb-skip5}). In gamma power transformations, the feature matching with both descriptors can create correct correspondences, however, the ORB keypoints are grouped in only a few regions of the images (Figures \ref{fig:orb-gamma2} and \ref{fig:orb-gamma0.5}). On the other side, the LIFT keypoints matched are spread within the whole image (Figures \ref{fig:lift-gamma2} and \ref{fig:lift-gamma0.5}), this aspect can improve accuracy of VO systems, as discussed in \cite{tutorial-vo-2}.
+
+\begin{figure}
+\centering
+\subfloat[LIFT feature matching in KITTI dataset after skipping 5 frames.]{
+\includegraphics[width=0.9\textwidth]{figures/lift_skip5.png}
+\label{fig:lift-skip5}}
+
+\subfloat[ORB feature matching in KITTI dataset after skipping 5 frames.]{
+\includegraphics[width=0.9\textwidth]{figures/orb_skip5.png}
+\label{fig:orb-skip5}}
+
+\subfloat[LIFT feature matching in KITTI dataset after gamma power transformation with $\gamma = 2$.]{
+\includegraphics[width=0.9\textwidth]{figures/lift_gamma2.png}
+\label{fig:lift-gamma2}}
+
+\subfloat[][ORB feature matching in KITTI dataset after gamma power transformation with $\gamma = 2$.]{
+\includegraphics[width=0.9\textwidth]{figures/orb_gamma2.png}
+\label{fig:orb-gamma2}}
+
+\subfloat[LIFT feature matching in KITTI dataset after gamma power transformation with $\gamma = \frac{1}{2}$.]{
+\includegraphics[width=0.9\textwidth]{figures/lift_gamma0.5.png}
+\label{fig:lift-gamma0.5}}
+
+\subfloat[ORB feature matching in KITTI dataset after gamma power transformation of $\gamma = \frac{1}{2}$.]{
+\includegraphics[width=0.9\textwidth]{figures/orb_gamma0.5.png}
+\label{fig:orb-gamma0.5}}
+
+\caption{Comparison between features LIFT and ORB under different conditions. Lines are connecting corresponding keypoints computed by feature matching. We show only the best 100 matches in each Figure.}
+\label{fig:lift-orb-features}
+\end{figure}
+
+
+\subsection{LIFT-SLAM Pipeline}
+
+As aforementioned, our pipeline is very similar to the pipeline of ORB-SLAM \cite{orb-slam}. However, as we are not aiming, at this point, in an online version of the method, the mapping step runs sequentially after tracking and not in parallel, as in ORB-SLAM. Thus the only task we run in parallel is loop closure detection. Figure \ref{fig:lift-slam-pipeline} shows an overview of our pipeline that is described next.
+
+\begin{figure}
+\centerline{\includegraphics[scale=0.25]{figures/LIFT_SLAM-pipeline.png}}
+\caption[LIFT-SLAM pipeline.]{An overview of LIFT-SLAM pipeline, where tracking and mapping are sequential tasks, relocalization is called when the tracking of the camera pose is lost, and loop closing is a task that runs in parallel over the keyframes processed by mapping.}
+\label{fig:lift-slam-pipeline}
+\end{figure}
+
+\textbf{Tracking.} In tracking, for each frame, we extract LIFT keypoints and descriptors. We use these features in all feature matching operations needed in initialization, tracking, mapping, and place recognition. Then, as in ORB-SLAM, the camera pose is predicted with a constant velocity model. Later, we optimize the camera pose by searching for more map point correspondences in the current frame by projecting the local map 3D points into the image. Lastly, the tracking step decides if the current frame should be a keyframe.
+
+\textbf{Mapping.} For each new keyframe, the mapping step is performed. First, it inserts the keyframe into the covisibility graph as a new node, and its edges are computed based on the shared map points with other keyframes. Furthermore, new map points are created by triangulating LIFT features from keyframes connected in the covisibility graph. A local bundle adjustment is responsible for optimizing the covisibility graph. It is applied to all keyframes connected to the current keyframe in the covisibility graph (including the current keyframe) and all map points seen by those keyframes. Finally, in keyframes culling, we discard keyframes that are redundant to improve the covisibility graph's size. This is useful since BA is a costly operation that grows in complexity as the number of keyframes increases. 
+
+\textbf{Relocalization and loop closure.} To perform place recognition, we have created a visual vocabulary in an offline step with the DBoW2 library\footnote{https://github.com/dorian3d/DBoW2} \cite{dbow2}. The dictionary was created with LIFT descriptors of approximately 12,000 images collected from outdoors and indoor sequences from the TUM-mono VO dataset \cite{tum-mono-vo}. In this way, we can generate a vocabulary that provides good results in both environments. The built vocabulary has six levels and 10 clusters per level. Thus we get $10^6$ visual words, as suggested in \cite{vocabulary-based-slam}. If the tracking is lost, we query the Bag of Words (BoW) of the current frame into the database to find keyframe candidates for global relocalization.
+
+%Therefore, after creating the BoW of a keyframe in the execution of the VSLAM, a TF-IDF score is computed for each word presented in the image. The BoW of the current keyframe is then compared with the BoW vectors of the images in the database using an inverted index, which stores for each visual word, in which images it has been seen. If the tracking is lost, we query the BoW of the current frame into the database to find keyframe candidates for global relocalization.
+
+The loop closing task runs in a separate thread. It gets the last keyframe processed by the local mapping and tries to detect if it closes a loop. After converting the keyframes to BoW, a similarity score between the current keyframe and its neighbors' covisibility graph is computed. The similarity between two BoW is given by the L2-score, as defined in \cite{vocabulary-tree}. The loop candidates are accepted if there are at least three candidates detected in the same covisibility graph. After finding the loop candidates, it computes a rigid-body transformation from the candidate keyframe to the loop keyframe. This transformation, the similarity transformation, informs about the drift accumulated in the trajectory, and it also works as a geometrical validation of the loop. If a similarity transformation is successfully found, we proceed to correct the loop. 
+
+%Before correcting the loop, the duplicated map points are fused, and the new edges are inserted in the covisibility graph. The loop is corrected by adjusting the current keyframe with the similarity transformation, and this correction is propagated to all of its neighbors. Lastly, a pose graph optimization is performed over a reduced version of the covisibility graph, called an essential graph. After the optimization, the map points are also transformed according to the correction of one of the keyframes that observed it. 
+
+
+\subsection{Versions of LIFT-SLAM}
+To explore the potential of our approach and to find changes that might lead to an improvement in general results, we developed some different versions of LIFT-SLAM. The next sections describe the decision process to create these versions and how we developed them.
+
+\subsubsection{Fine-tuned LIFT-SLAM}
+\label{sec:finetuned-lift}
+
+In this version of LIFT-SLAM, we use these fine-tuned models to perform feature detection and description, as shown in Figure \ref{fig:lift-finetuned}. To refine the LIFT network, we had to collect the ground-truth data. As proposed in LIFT's paper \cite{lift}, we generate the ground-truth with SIFT keypoints collected with VisualSFM. We created two sets of ground-truth data. The first one comprises images from sequences 00, 06, 09, and 10 (8434 images) of the KITTI dataset, whereas the second contains images from the sequences MH\_04, V1\_03, and V2\_03 (6104 images) of the Euroc dataset. After collecting the datasets, we train the network in two versions, one for each dataset. We used the TensorFlow version of LIFT provided by the authors in their \textit{github}\footnote{All LIFT code used in this project comes from github.com/cvlab-epfl/tf-lift}. %The three LIFT modules were fine-tuned separately, following the same training procedure described in \cite{lift}: training first the descriptor, then, the orientation estimator, and lastly, the detector.
+
+
+\subsection{Adaptive LIFT-SLAM}
+A wrong data association in feature matching might affect the quality of the motion estimation. Therefore, to select the best features, a threshold is applied right after feature matching. In this way, the matches with greater distance than this threshold are discarded. On the other hand, if the threshold value is too small, we might reject good matches and loose track of the camera pose in challenging environments. We define two thresholds to mitigate this problem: the higher threshold ($TH_{HIGH}$) and the lower threshold ($TH_{LOW}$). We use $TH_{LOW}$ when we need to be more restrictive about the quality of the matches, as in relocalization or map point triangulation.
+
+However, while performing our experiments, we found out that for different datasets, the best values for these thresholds could change, as shown in table \ref{tab:threshold-problem}. Therefore, we had to change the limits every time we needed to change the dataset. This is not desirable since, in real-world applications, it is not possible to deduce these thresholds' values. Hence, we have developed an adaptive method that decides the threshold values online, based on the number of outliers of the current frame and the number of map points in the last frame.
+
+%euroc table
+\begin{table}[!htb]
+\centering
+\resizebox{0.5\textwidth}{!}{\begin{tabular}{|cc|cc|}
+\hline
+\multicolumn{2}{|c|}{\textbf{Threshold}} & \multicolumn{2}{c|}{\textbf{ATE (m)}} \\\hline
+\textbf{$TH_{LOW}$} & \textbf{$TH_{HIGH}$} & MH\_01 & KITTI 05  \\ \hline
+1.0 & 2.0 & 0.052 & X \\ \hline
+1.0 & 1.5 & 0.049 & X \\ \hline
+2.0 & 3.0 & 0.629 &  12.61\\ \hline
+\end{tabular}}
+\caption{Absolute Trajectory Error (ATE) \cite{tum-vi} for different matching thresholds in KITTI and Euroc datasets. In Euroc MH\_01 sequence, the error is completely different for different thresholds, where the best thresholds are $TH_{LOW} = 1.0$ and $TH_{HIGH}=1.5$. Furthermore, in KITTI 05 sequence, the algorithm could track the camera pose only with $TH_{LOW} = 2.0$ and $TH_{HIGH}=3.0$.}
+\label{tab:threshold-problem}
+\end{table}
+
+After estimating the pose with the constant velocity model, we search map point correspondences by projecting the map points from the last frame into the current frame. If the number of outliers gets approaches the number of map points, the number of matches gets too small and, consequently, the tracking is lost. We use this fact to create our adaptive method. It changes the thresholds values based on the difference between the number of map points and the number of outliers. Therefore, if this difference decrease, we increase the values of the thresholds. Figure \ref{fig:adaptive-thresholds} depicts the variation of the threshold based on the number of map points used to match and the number of outliers after performing the matching with the adaptive method used in this version of LIFT-SLAM. 
+
+\begin{figure}
+\centerline{\includegraphics[width=\textwidth]{figures/adaptive-thresholds2.png}}
+\caption[Thresholds in Adaptive LIFT-SLAM.]{Thresholds variation based on the number of map points used to match and the number of outliers after performing the matching. The threshold values decrease as the difference between the number of outliers and map points increases and vice versa.}
+\label{fig:adaptive-thresholds}
+\end{figure}

@@ -1,0 +1,145 @@
+\section{Introduction}
+\label{sec:intro}
+
+Many of today's Internet services rely on geo-distributed data stores, which
+replicate data in different geographical locations. This improves user
+experience by allowing accesses to the closest site and ensures
+disaster-tolerance. However, geo-distribution also makes it more challenging to
+keep the data consistent. The classical approach is to make replication
+transparent to clients by providing strong consistency models, such as
+linearizability~\cite{linearizability} or
+serializability~\cite{wv}. The downside is that this approach requires
+synchronization between data centers in the critical path. This significantly
+increases latency~\cite{pacelc} and makes the system unavailable during network
+partitionings~\cite{cap}. Thus, even though several commercial geo-distributed
+systems follow this approach~\cite{spanner,cockroachdb,yugabytedb,faunadb,giza},
+the associated cost has prevented it from being adopted more widely.
+
+An alternative approach is to relax synchronization: the data store executes an
+operation at a single data center, without any communication with others, and
+propagates updates to other data centers in the
+background~\cite{bayou,dynamo}. This minimizes the latency and makes the system
+{\em highly available}, i.e., operational even during network partitionings. But
+on the downside, the systems following this approach provide weaker consistency
+models: e.g., eventual consistency~\cite{bayou,vogels} or {\em causal
+  consistency}~\cite{causal-memory}. The latter is particularly appealing: it
+guarantees that clients see updates in an order that respects the potential
+causality between them.
+For example, assume that in a banking application Alice deposits \$100 into
+Bob's account ($u_1$) and then posts a notification about it into Bob's inbox
+($u_2$). Under causal consistency, if Bob sees the notification ($u_3$), and
+then checks his account balance ($u_4$), he will see the deposit. This is not
+guaranteed under eventual consistency, which does not respect causality
+relationships, such as those between $u_1$ and $u_2$. In some settings, causal
+consistency has been shown to be the strongest model that
+allows availability during network partitionings~\cite{hagit-cc,alvisi-cc}. It
+has been a subject of active research in recent years, with scalable
+implementations~\cite{cure,cops,occult} and some industrial
+deployments~\cite{MongoDB,redis}.
+
+
+
+However, even causal consistency is often too weak to preserve critical
+application invariants. For example, consider a banking application that
+disallows overdrafts and thus maintains an invariant that an account balance is
+always non-negative. Assume that the %
+balance of an account stored at two replicas is $100$, and clients concurrently
+issue two ${\tt withdraw}(100)$ operations ($u_5$ and $u_6$) at different
+replicas. Since causal consistency executes operations without synchronization,
+both withdrawals will succeed, and once the replicas exchange the updates, the
+balance will go negative. To ensure integrity invariants in examples such as
+this, the programmer has to introduce synchronization between replicas, and,
+since synchronization is expensive, it pays off to do this sparingly. To this
+end, several research~\cite{red-blue,valter,pileus,por} and
+commercial~\cite{cosmosdb,documentdb,google,dynamodb,cassandra} data stores
+allow the programmer to choose whether to execute a particular operation under
+weak or strong consistency. For example, to preserve the integrity invariant in
+our banking application, only withdrawals need to use strong consistency, and
+hence, synchronize; deposits may use weaker consistency and proceed without
+synchronization.
+
+Given the benefits of causal consistency, it is particularly appealing to marry
+it with strong consistency in a geo-distributed data store. But like real-life
+marriages, to be successful this one needs to hold together both in good times
+and in bad -- when data centers fail due to catastrophic events or power
+outages. Unfortunately, none of the existing data stores meant for
+geo-replication combine causal and
+strong consistency while providing such fault tolerance~\cite{valter,red-blue,por}.
+In this paper we present \System{} -- the first fault-tolerant and scalable data
+store that combines causal and strong consistency. More precisely, \System
+implements a transactional variant of {\em Partial Order-Restrictions
+  consistency (PoR consistency)}~\cite{por,cise-popl16}. This guarantees
+transactional causal consistency by default~\cite{cure} and allows the
+programmer to additionally specify which pairs of transactions \emph{conflict},
+i.e., have to synchronize. For instance, to preserve the integrity invariant in
+our previous example, the programmer should declare that withdrawals from the
+same account conflict. Then one of the withdrawals $u_5$ and $u_6$ will observe
+the other and will fail.
+
+
+
+The key challenge we have to address in \System is to maintain liveness despite
+data center failures. Just adding a Paxos-based commit protocol for strong
+transactions~\cite{discpaper,spanner,mdcc} to an existing causally consistent
+protocol does not yield a fault-tolerant data store.
+In such a data store, a committed strong transaction $t_2$ may never become
+visible to clients if a causal transaction $t_1$ on which it depends is lost due
+to a failure of its origin data center. This compromises the liveness of the
+system, because no transaction $t_3$ conflicting with $t_2$ can commit
+from now on: according to the PoR model, one of the transactions $t_2$ and
+$t_3$ has to observe the other, but $t_2$ will never be visible and
+$t_2$ did not observe $t_3$.
+
+\System addresses this problem by ensuring that, before a strong transaction
+commits, all its causal dependencies are \emph{uniform}, i.e., will eventually
+become visible at all correct data centers. This adapts the classical notion of
+uniformity in distributed computing to causal
+consistency~\cite{cachin-book}. \System does so without defeating the benefits
+of causal consistency. Causal transactions remain
+highly available at the cost of increasing the latency of strong
+transactions: a strong transaction may have to wait for some of its
+dependencies to become uniform before committing. To minimize this cost,
+\System executes causal transactions on a snapshot that is slightly in the
+past, such that a strong transaction will mostly depend on causal
+transactions that are already uniform before committing.
+Furthermore, \System reuses the mechanism for
+tracking uniformity to let clients make causal transaction durable on
+demand and to enable consistent client migration.
+
+
+In addition to being fault tolerant, \System scales horizontally, i.e., with the
+number of machines in each data center;
+this also goes beyond previous proposals~\cite{valter,red-blue,por}. To this
+end, \System builds on Cure~\cite{cure} -- a scalable implementation of
+transactional causal consistency. Our protocol extends Cure with a novel
+mechanism that distributes the task of tracking the set of uniform transactions
+among the machines of a data center.
+We also add the ability for data centers to
+forward transactions they receive from others, so that a transaction can
+propagate through the system even if its origin data center fails.
+Finally, we carefully integrate an existing fault-tolerant atomic commit for
+strong transactions~\cite{discpaper} into the protocol for causal consistency.
+
+We have rigorously proved the correctness of the \System protocol
+(\S\ref{sec:correctness} and \tr{\ref{section:correctness-proof}}{\nappproof}).
+We have also evaluated it on Amazon EC2 using both microbenchmarks and a more
+realistic RUBiS benchmark. Our evaluation demonstrates that \System scalably
+combines causal and strong transactions, with the latter not affecting the
+performance of the former. Under the RUBiS mix workload, causal transactions
+exhibit a low latency (1.2ms on average), and the overall average latency is
+3.7$\times$ lower than that of a strongly consistent system.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

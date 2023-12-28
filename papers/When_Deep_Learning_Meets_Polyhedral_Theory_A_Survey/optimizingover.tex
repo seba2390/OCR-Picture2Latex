@@ -1,0 +1,535 @@
+
+
+\section{Optimizing Over a Trained Neural Network}\label{sec:optimizing}
+In Section \ref{sec:training} we will see how polyhedral-based methods can be used to \emph{train} a neural network. In this section, we will focus on how polyhedral-based methods can be used to do something with a neural network \emph{after it has been trained.}
+Specifically, after the network architecture and all parameters have been fixed, a neural network $f$ is merely a function. If each activation function $\sigma$ used to describe the network is piecewise linear (as is the case with those presented in Table~\ref{tab:activations}), $f$ is also a piecewise linear function. Therefore, any optimization problem containing $f$ in some way will be a piecewise linear optimization problem. For example, in the simple case where the output of $f$ is univariate, the optimization problem 
+\[
+    \min_{x \in \mathcal{X}} f(x)
+\]
+is a piecewise linear optimization problem. 
+As discussed in Section \ref{sec:LR}, this problem can have an enormous number of ``pieces'' (linear regions) when $f$ is a neural network; solving this problem thus heavily depends on the size and structure of the neural network $f$. For example, the training procedure by which $f$ is obtained can greatly influence the performance of optimization strategies \citep{tjeng2017evaluating,xiao2018training}. 
+
+In this section, we first explore situations in which you might want to optimize over a trained neural network in this manner. We will then survey available methods for solving this method (either exactly or on the dual side) using polyhedral-based methods. 
+We conclude with a brief view of future directions. 
+
+\subsection{Applications of optimization over trained networks}
+Applications where you might want to optimize over a trained neural network $f$ broadly fall into two categories: those where $f$ is the ``true'' object of interest, and those where $f$ is a convenient proxy for some unknown, underlying behavior.
+
+\subsubsection{Neural network verification} \label{sec:verification}
+Neural network verification is a burgeoning field of study in deep learning. 
+Starting in the early 2000s, researchers began to recognize the importance of rigorously verifying the behavior of neural networks, mainly in aviation-related applications \citep{schumann2003verification,zakrzewski2001verification}. 
+More recently, the seminal works of \cite{szegedy2014intriguing} and \cite{goodfellow2015explaining} observed that neural networks are unusually susceptible to \emph{adversarial attacks}. These are small, targeted perturbations that can drastically affect the output of the network; as shown in Figure \ref{fig:adversarial}, even powerful models such as MobileNetV2 \citep{sandler2018mobilenetv2} are susceptible. The existence and prevalence of adversarial attacks in deep neural networks has raised justifiable concerns about the deployment of these models in mission-critical systems such as autonomous vehicles \citep{deng2020analysis}, aviation \citep{kouvaros2021formal}, or medical systems \citep{finlayson2019adversarial}. One fascinating empirical work by  \cite{eykholt2018robust} showed the susceptibility of standard image classification networks that might be used in self-driving vehicles to a very analogue form of attacks: black/white stickers, placed in a careful way, could confuse these models enough that they would mis-classify road signs (e.g., mistaking stop signs for ``speed limit 80'' signs).
+
+\begin{figure}
+    \centering
+    \begin{tikzpicture}
+        \node[] at (0,0){\includegraphics[width=2.5cm]{adversarial/before.png}};
+        \node[] at (1.9,-0.30){\Large \bf{+}};
+        \node[] at (3.8,-0.26){\includegraphics[width=2.5cm]{adversarial/noise.png}};
+        \node[] at (5.7,-0.30){\Large \bf{=}};
+        \node[] at (7.6,0){\includegraphics[width=2.5cm]{adversarial/after.png}};
+        \node[] at (3.8,1.2){$\times (\epsilon = 0.15)$};
+    \end{tikzpicture}
+    \caption{Example of adversarial attack on MobileNetV2 \citep{sandler2018mobilenetv2}. The original image taken by one of the survey authors is classified as `siberian\_husky,' but is re-classified as `wallaby' with a small (in an $\ell_\infty$-norm sense) targeted attack.}
+    \label{fig:adversarial}
+\end{figure}
+
+Neural network verification seeks to prove (or disprove) a given input-output relationship, i.e., $x \in \mathcal{X} \Rightarrow y \in \mathcal{Y}$, that gives some indication of model robustness. 
+Methods for verifying this relationship are classified as being sound and/or complete. 
+A method that is \textit{sound} will only certify the relationship if it is indeed true (no false positives), while a method that is \textit{complete} will (i) always return an answer and (ii) only disprove the relationship if it is false (no false negatives). 
+An early set of papers \citep{FischettiMIP,LomuscioMIP,tjeng2017evaluating} recognized that MILP provides an avenue for verification that is both sound and complete, given that $\mathcal{X}$ and $f(x)$ are both linear, or piecewise linear. 
+We refer the readers to recent reviews \citep{huang2020survey,leofante2018automated,li2022sok,liu2021algorithms} for a more comprehensive treatment of the landscape of verification methods, including MILP- and LP-based technologies.
+
+
+\begin{example}
+Consider a classification network $f : [0,1]^{n_0} \to \mathbb{R}^d$ where the $j$-th output, $f(x)_j$, corresponds to the probability that input $x$ is of class $j$.\footnote{In actuality, we will instead typically work with the outputs corresponding to ``logits'', or unnormalized probabilities. These are typically fed into a softmax layer that then normalize these values to correspond to a probability distribution over the classes. However, this nonlinear softmax transformation is not piecewise linear. Thankfully, it can be omitted in the context of the verification task without loss of generality.} Then consider a labeled image $\hat{x}$ known to be of class $i$, and a ``target'' adversarial class $k \neq i$. 
+Then verifying local robustness of the prediction corresponds to checking $x \in \{ x: ||x-\hat{x}|| \leq \epsilon \} \Rightarrow y=f(x) \in \{ y: y_i \geq y_k \}$, where $\epsilon > 0$ is a constant which prescribes the radius around which $\hat{x}$ we will search for an adversarial example. 
+
+This verification task can be formulated as an optimization problem of the form:
+\begin{equation} \label{eq:verification}
+\begin{aligned} 
+    \max_{x \in [0,1]^{n_0}} \quad& f(x)_k - f(x)_i \\
+    \text{s.t.}& ||x - \hat{x}|| \leq \epsilon.
+\end{aligned}
+\end{equation}Any feasible solution $x$ to this problem with positive cost is an adversarial example: it is very ``close'' to $\hat{x}$ which has true label $i$, yet the network believes it is more likely to be of class $k$.\footnote{Alternative objectives are sometimes used which would allow us to strengthen this statement to say that the network \emph{will} classify $x$ to be of class $k$. However, this will require a more complex reformulation to model this problem via MILP, so we omit it for simplicity.} If, on the other hand, it is proven that the optimal objective value is negative, this proves that $f$ is robust (at least in the neighborhood around $\tilde{x}$). 
+Note that the verification problem can terminate once the sign of the optimal objective value is determined, but solving the problem returns an optimal adversarial example. 
+\end{example}
+
+The objective function of \eqref{eq:verification} models the desired input-output relationship, $x \in \mathcal{X} \Rightarrow y \in \mathcal{Y}$, while the constraints model the domain $\mathcal{X}$. 
+The domain $\mathcal{X}$ is typically a box or hyperrectangular domain. Extensions to this are described in Section \ref{sec:domains}.
+Some explanation-focused verification applications define the input-output relationship in a derivative sense, e.g., $x \in \mathcal{X} \Rightarrow \partial y / \partial x \in \mathcal{Y}'$ \citep{wicker2022robust}. 
+As the derivative of the ReLU function is also piecewise linear, this class of problems can also be modeled in MILP. For example, in the context of fairness and explainability, \cite{liu2020monotonic} and \cite{jordan2020exact} used MILP to certify monotonicity and to compute local Lipschitz constants, respectively. 
+
+
+Although in this survey we focus on optimization over trained neural networks, it is important to note that polyhedral theory underlies numerous strategies for neural network verification. 
+For example, SAT and SMT (Satisfiability Modulo Theories) solvers designed for Boolean satisfiability problems (and more general problems for the case of SMT) can also be used to search through activation patterns for a neural network \citep{pulina2010abstraction}, resulting in tools that are sound and complete, such as Planet \citep{ehlers2017formal} and Reluplex \citep{katz2017reluplex}. 
+\cite{bunel2018unified} presented a unified view to compare MILP and SMT formulations, as well as the relaxations that result from these formulations (we will revisit this in Section~\ref{sec:relaxations}).  
+On the other hand, strategies such as ExactReach~\citep{xiang2017reachable} exploit polyhedral theory to compute reachable sets: given an input set to a ReLU function defined as a union of polytopes, the output reachable set is also a union of polytopes. 
+Other methods over-approximate the reachable set to improve scalability, e.g., for vision models \citep{yang2021reachability}, often resulting in methods that are sound, but not complete. 
+
+
+\subsubsection{Neural network as proxy}
+Another situation in which you may want to solve an optimization problem containing trained neural networks is when you would like to optimize some other, unknown function for which you have historical input/output data. 
+A similar situation arises when you want to solve an optimization problem where (some of) the constraints are overly complicated, but you can query samples from the constraints on which to train a simpler \textit{surrogate} model. 
+In these cases, you might imagine training a neural network in a standard supervised learning setting to approximate this underlying, unknown or complicated function. Then, since the neural network is known, you are left with a deterministic piecewise linear optimization problem. 
+Note that we focus here on using a neural network as a surrogate; neural networks can additionally learn other components of an optimization problem, e.g., uncertainty sets for robust optimization \citep{goerigk2023data}. 
+
+Several software tools have been developed for this class of problems. For the case of constraint learning, \texttt{JANOS} \citep{bergman2022janos} and \texttt{OptiCL} \citep{maragno2021mixed} both provide functionality for learning a ReLU neural network to approximate a constraint based on data and embedding the learned neural network in MILP. 
+The \texttt{reluMIP} package \citep{reluMIP} has also been introduced to handle the latter embedding step. 
+More generally, \texttt{OMLT} \citep{ceccon2022omlt} translates neural networks to \texttt{pyomo} optimization blocks, including various MILP formulations and activation functions. 
+Finally, recent developments in \texttt{gurobipy}\footnote{\url{https://github.com/Gurobi/gurobi-machinelearning}} enable directly parsing in trained neural networks.
+
+
+Applications of this paradigm can be envisioned in a number of domain areas. This approach is common in deep reinforcement learning, where neural networks are used to approximate an unknown ``$Q$-function'' which models the long-term cost of taking a particular action in a particular state of the world. In $Q$-learning, this $Q$-function is optimized iteratively to produce new candidate policies, which are then evaluated (typically via simulation) to produce new training data for future iterations. 
+Optimization over the learned $Q$-function must be relatively fast in control applications, and several practical methods have been proposed. 
+When the action space is discrete, the $Q$-function neural network is trained with one output value for each possible action, simplifying optimization to evaluating the model and selecting the largest output. 
+Continuous action spaces require the $Q$ network be optimized over \citep{burtea2023safe,delarue2020reinforcement,ryu2020caql}, or an ``actor'' network can be trained to learn the optimal actions \citep{lillicrap2015continuous}. 
+In a related vein, ReLU neural networks can be used as a process model for optimal scheduling or control \citep{wu2020scalable}.
+
+Chemical engineering also presents applications where surrogate models have proven beneficial for optimization, as  is the subject of recent reviews \citep{bhosekar2018advances,mcbride2019overview,tsay2019110th}.  
+In particular, ReLU neural networks can be seamlessly embedded in larger MILP problems such as flow networks and reservoir control where the other constraints are also mixed-integer linear \citep{grimstad2019surrogate,Planning,yang2022modeling}. 
+Focusing on control applications where the neural network is embedded in a MILP that must be solved repeatedly, \cite{katz2020integrating} showed how multiparametric programming can be used to learn the solution map of the resulting MILP itself, which is also piecewise affine. 
+An emerging area of research uses verification tools to reason about neural networks used as controllers, e.g., see \citet{ARCH_COMP_20}. These applications involve optimization formulations combining the neural network with constraints defining the controlled system. 
+For example, verification can be used to bound the reachable set \citep{sidrane2022overt} (alongside piecewise linear bounds on the dynamical system) or the maximum error against a baseline controller \citep{schwan2022stability}.
+
+
+Finally, applications for optimization over neural networks arise in machine learning applications. 
+MILP formulations can be used to compress neural networks \citep{serra2020lossless,serra2021compression,elaraby2020importance}, which consequently result in more tractable surrogate models \citep{kody2022modeling}. The main idea is to use MILP to identify \textit{stable} nodes, i.e., nodes that are always on or off over an input domain, which can then be algebraically eliminated. 
+Optimization has also been employed in techniques for feature selection, based on identifying strongest input nodes \citep{sildir2022mixed,zhao2023model}. 
+In the context of Bayesian optimization, \cite{volpp2020meta} use reinforcement learning to meta-learn acquisition functions parameterized as neural networks; selecting ensuing query points then requires optimization over the trained acquisition function. 
+Later work modeled both the acquisition function and feasible region in black-box optimization as neural networks \citep{papalexopoulos22constrained}. 
+In that work, exploration and exploitation are balanced via Thompson sampling and training multiple neural networks from a random parameter initialization.
+
+%[Sequence design for DNA?]
+
+
+\paragraph{A word of caution}
+Standard supervised learning algorithms aim to learn a function which fits the underlying function according to some distribution under which the data is generated. However, optimizing a function corresponds to evaluating it at a single point. This means that you may end up with a model that well-approximates the underlying function in distribution, but for which the pointwise minimizer is a poor approximation of the true function. This phenomena is referred to as the ``Optimizer's curse'' \citep{smith2006}.
+
+% \paragraph{Outline}
+
+% We split this section into four main parts. We begin by analyzing the most common case in the simplest setting: A single ReLU neuron. We first explore exact representations for such a neuron using mixed-integer programming. Next, we study relaxed models for a single neuron that can be solved using linear programming (albeit sometimes in a disguised manner). Next, we study extensions to the single neuron model with different types of nonlinearities or domains. Finally, we study how single neuron models can be used to model entire neural networks, and briefy step beyond the single neuron model.
+
+\subsubsection{Single neuron relaxations}
+
+For the following subsections, consider the $i$-th neuron in the $l$-th layer of a neural network, endowed with a ReLU activation function, whose behavior is governed by \eqref{eq:single-neuron}. Presume that a input domain of interest $\mathcal{D}^{l-1} \subset \mathbb{R}^{n_l}$ is a bounded region. Further, since $\mathcal{D}^{l-1}$ is bounded, presume that finite bounds are known on each input component, i.e. that vectors $L^{l-1},U^{l-1} \in \mathbb{R}^{n_l}$ are known such that $\mathcal{D}^{l-1} \subseteq [L^{l-1},U^{l-1}] \subset \mathbb{R}^{n_l}$. We can then write the \emph{graph} of the neuron, which couples together the input and the output of the nonlinear ReLU activation function:
+\begin{align*}
+    \gr = &\Set{ (\vh^{l-1},h^l_i) \in \mathcal{D}^{l-1} \times \mathbb{R} | h^l_i = 0 \geq \vw^l_i \vh^{l-1} + b^l_i} \\
+    \cup &\Set{ (\vh^{l-1},h^l_i) \in \mathcal{D}^{l-1} \times \mathbb{R} | h^l_i = \vw^l_i \vh^{l-1} + b^l_i \geq 0}.
+\end{align*}
+This is a disjunctive representation for $\gr$ in terms of two polyhedral alternatives.
+We assume that every included neuron exhibits this disjunction, i.e., every neuron can be on or off depending on the model input. 
+This assumption of \emph{strict activity} implies that $L^{l-1} < 0$ and $U^{l-1} > 0$, noting that neurons not satisfying this property can be exactly pruned from the model \citep{serra2020lossless}. 
+%[TODO: Add assumption of strict activity, otherwise prune.]
+
+We observe that, given this (or any) formulation for each individual unit, it is straightforward to construct a formulation for the entire network. For example, if we take $X^l_i = \Set{(\vh^{l-1},h^l_i,z^l_i) | \eqref{eqn:relu-big-m} }$ for each layer $l$ and each unit $i$, we can construct a MILP formulation for the graph of the entire network, $\Set{(x,f(x)) : x \in \mathcal{D}^0}$ as
+\[
+    (\vh^{l-1},h^l_i,z^l_i) \in X^l_i \quad \forall l \in \sL, i \in \llbracket n_l \rrbracket.
+ \]  
+
+This also generalizes in a straightforward manner to more complex feedforward network architectures (e.g. convolutions, or sparse or skip connections), though we omit the explicit description for notational simplicity.
+
+\subsubsection{Beyond the scope of this survey}
+
+The effectiveness of the single-neuron formulations described above is bounded by the tightness of the optimal univariate formulation; this property is known as the ``single-neuron barrier'' \citep{salman2019convex}. 
+This has motivated research in convex relaxations that jointly account for multiple neurons within a layer \citep{singh2019beyond}. 
+Nevertheless, the analysis of polyhedral formulations for multiple neurons simultaneously quickly becomes intractable, and is beyond the scope of this survey. Instead, we point the interested reader to the recent survey by \cite{roth2021primer}, and highlight a few approaches taken in the literature. Multi-neuron analysis has been used to: improve bounds tightening schemes \citep{rossig2021advances}, prune linearizable neurons \citep{botoeva2020efficient}, design dual decompositions \citep{ferrari2022complete}, and generate strengthening inequalities \citep{serra2020empirical}. %Additional work has investigated mixed-integer programming \cite{Partition-Based Formulations for Mixed-Integer Optimization of Trained ReLU Neural Networks, Between Steps: Intermediate Relaxations between big-M and Convex Hull Formulations} and linear programming \cite{k-ReLU: Beyond the Single Neuron Convex Barrier for Neural Network Certification, https://arxiv.org/pdf/2103.03638.pdf} formulations for multiple neurons in a single layer. 
+Similarly, we do not review formulations for ensembles of ReLU networks, though MILP formulations have been proposed \citep{wang2021ensemble,wang2023optimizing}. 
+
+Additionally, recent works have exploited polyhedral structure to develop sampling based strategies, which can be used to warm-start MILP or accelerate local search in verification \citep{perakis2022optimizing,wu2022efficient}. 
+\cite{lombardi2017empirical} computationally compare MILP against local search and constraint programming approaches. 
+In a related vein, \cite{cheon2022outer} examines local solutions and proposes an outer approximation method to improve gradient-based optimization. 
+Finally, following \cite{raghunathan2018semidefinite}, a large body of work has presented optimization-based methods for verification that use semidefinite programming concepts \citep{dathathri2020enabling,fazlyab2020safety,newton2021exploiting}.
+Notably, \cite{batten2021efficient} showed how combining semidefinite and MILP formulations can produce a new formulation that is tighter than both. This was later extended with reformulation-linearization technique, or RLT, cuts \citep{lan2022tight}. 
+While related to linear programming and other methods based on convex relaxations, this stream of work is beyond the scope of this survey. 
+We refer the reader to \cite{zhang2020tightness} for a discussion of the tightness of these formulations. 
+
+\subsection{Exact models using mixed-integer programming}
+\label{sec:MIPmodels}
+
+Mixed-integer programming offers a powerful algorithmic framework for \emph{exactly} modeling nonconvex piecewise linear functions. The Operations Research community has studied has a long and storied history of developing MILP-based methods for piecewise linear optimization, with research spanning decades \citep{croxton2003comparison,dantzig1960significance,geissler2012using,huchette2022nonconvex,lee2001polyhedral,misener2012global,padberg2000approximating,vielma2010mixed}.
+%\cite{A mixed integer approach for time-dependent gas network optimization,Mixed integer models for the stationary case of gas network optimization}. 
+However, many of these techniques are specialized for low-dimensional or separable piecewise linear functions. While a reasonable assumption in many OR problems, this is not the case when modeling neurons in a neural network. Therefore, the standard approach in the literature is to apply general-purpose MILP formulation techniques to model neural networks.
+
+%[TODO: Note that methods like Reluplex and Planet (cite!) and \cite{https://arxiv.org/pdf/2107.12855.pdf} essentially roll their own MIP solvers. 
+\paragraph{Connection to Boolean satisfiability}
+Some SMT-based methods such as Reluplex \citep{katz2017reluplex} and Planet \citep{ehlers2017formal} effectively construct branching technologies similar to MILP solvers. 
+Indeed, \texttt{Marabou} \citep{katz2019marabou} builds on Reluplex, and a recent extension \texttt{MarabouOpt} can optimize over trained neural networks \citep{strong2021global}. 
+The authors also outline general procedures to extend verification solvers to optimization. 
+%Then, say we focus on methods that can be incorported into off-the-shelf MIP solvers. See also for a discussion of the two: A Unified View of Piecewise Linear Neural Network Verification, Branch and Bound for Piecewise Linear Neural Network Verification]
+Our focus in this review is on more general MILP formulations, or those that can be incorporated into off-the-shelf MILP solvers with relative ease. 
+\cite{bunel2020branch,bunel2018unified} provide a more comprehensive discussion of similarities and differences to SMT. 
+
+\subsubsection{The big-$M$ formulation} 
+
+The big-$M$ method is a standard technique used to formulate logic and disjunctive constraints using mixed-integer programming \citep{bonami2015mathematical,vielma2015mixed}. Big-$M$ formulations are typically very simple to reason about and implement, and are quite compact, though their convex relaxations can often be quite poor, leading to weak dual bounds and (often) slow convergence when passed to a mixed-integer programming solver. Since $\gr$ is a disjunctive set, the big-$M$ technique can be applied to produce the following formulation:
+\begin{subequations} \label{eqn:relu-big-m}
+\begin{align}
+    h^l_i &\geq \vw^l_i \vh^{l-1} + b^l_i \label{eqn:relu-big-m-1} \\
+    h^l_i &\leq \left(\vw^l_i \vh^{l-1} + b^l_i\right) - M^{l}_{i,-}(1-z) \\
+    h^l_i &\leq M^{l}_{i,+}z \\
+    (\vh^{l-1},h^l_i) &\in [L^{l-1},U^{l-1}] \times \mathbb{R}_{\geq 0} \label{eqn:relu-big-m-4} \\
+    z^l_i &\in \{0,1\}. \label{eqn:relu-big-m-5}
+\end{align}
+\end{subequations}
+Here, $M^l_{i,-}$ and $M^l_{i,+}$ are data which must satisfy the inequalities
+\begin{align*}
+    M^l_{i,-} &\leq \min_{\vh^{l-1} \in \mathcal{D}^{l-1}} \vw^l_i \vh^{l-1} + b^l_i \\
+    M^l_{i,+} &\geq \max_{\vh^{l-1} \in \mathcal{D}^{l-1}} \vw^l_i \vh^{l-1} + b^l_i.
+\end{align*}
+This big-$M$ formulation for ReLU-based networks has been used extensively in the literature \citep{bunel2018unified,Cheng2017,DuttaMIP,FischettiMIP,kumar2019equivalent,LomuscioMIP,serra2020empirical,serra2018bounding,tjeng2017evaluating,xiao2018training}.
+
+The big-$M$ formulation is compact, with one binary variable and $\mathcal{O}(1)$ general inequality constraints for each neuron. 
+Applied for each unit in the network, this leads to a MILP formulation with $\mathcal{O}(\sum_{l \in \sL} n_l) = \mathcal{O}(Ln_{\max} )$ binary variables and general inequality constraints, where $n_{\max} = \max_{l \in \sL} n_L$. However, it has been observed \citep{anderson2019strong,anderson2020strong} that this big-$M$ formulation is not strong in the sense that its LP relaxation does not, in general, capture the convex hull of the graph of a given unit; see Figure~\ref{fig:relu-neuron} for an illustration. In fact, this LP relaxation can be arbitrarily bad \citep[Example 2]{anderson2019strong}, even in fixed input dimension.
+As MILP solvers often bound the objective function between the best feasible point and its tightest optimal continuous relaxation, a weak formulation can negatively impact performance, often substantially. 
+
+It is worth dwelling on where this lack of strength comes from. If the input $\vh^{l-1}$ is one dimensional, the big-$M$ formulation is \emph{locally} ideal \citep{vielma2015mixed}: the extreme points of the linear programming relaxation (\ref{eqn:relu-big-m-1}-\ref{eqn:relu-big-m-4}) naturally satisfy the integrality constraints \eqref{eqn:relu-big-m-5}. However, this fails to hold in the general multivariate input case. To see why, observe that the bounds on the input variables $\vh^{l-1}$ are only coupled with the logic involving the binary variable $z$ only in an aggregated sense, through the coefficients $M^l_{i,-}$ and $M^l_{i,+}$. In other words, the ``shape'' of the pre-activation domain is not incorporated directly into the big-$M$ formulation. 
+Furthermore, the strength of this formulation highly depends on the big-$M$ coefficients. 
+These coefficients can be obtained using techniques ranging from basic interval arithmetic to optimization-based bounds tightening. 
+\cite{grimstad2019surrogate} show how constraints external to the neural network can yield tighter bounds via optimization- or feasibility-based bounds tightening. 
+\cite{rossig2021advances} compare several methods for deriving bounds and further develop optimization-based bounds tightening based on pairwise dependencies between variables. 
+
+\tikzstyle{yzx} = [
+  x={(1.2*.9625cm, 1.2*.9625cm)},
+  y={(1.2*2.5cm, 0cm)},
+  z={(0cm, 1.2*3cm)},
+]
+
+\begin{figure}[t]
+    \centering
+    \begin{tikzpicture}[yzx]
+        \draw [->, dashed, line width=1] (0,0,0) -- (1.2,0,0);
+        \draw [->, dashed, line width=1] (0,0,0) -- (0,1.2,0);
+        \draw [->, dashed, line width=1] (0,0,0) -- (0,0,0.7);
+        \node[above right] at (1.2,-0.075,0) {$h^1_2$};
+        \node[right] at (0,1.2,0) {$h^1_1$};
+        \node[above] at (0,0,.7) {$h^2_1$};
+        \coordinate (LL) at (0,0,0);
+        \coordinate (UL) at (1,0,0);
+        \coordinate (LU) at (0,1,0);
+        \coordinate (UU) at (1,1,0.5);
+        \coordinate (UM) at (1,0.5,0);
+        \coordinate (MU) at (0.5,1,0);
+        
+        \draw [fill=gray!80] (LL) -- (UL) -- (UM) -- (MU) -- (LU) -- cycle;
+        \draw [fill=gray!80] (UU) -- (UM) -- (MU) -- cycle;
+        \draw (LL) -- (UL) -- (UU) -- cycle;
+        \draw (LL) -- (LU) -- (UU) -- cycle;
+    \end{tikzpicture}  \hspace{2em}
+    \begin{tikzpicture}[yzx]
+        \draw [->, dashed, line width=1] (0,0,0) -- (1.2,0,0);
+        \draw [->, dashed, line width=1] (0,0,0) -- (0,1.2,0);
+        \draw [->, dashed, line width=1] (0,0,0) -- (0,0,0.7);
+        \node[above right] at (1.2,-0.075,0) {$h^1_2$};
+        \node[right] at (0,1.2,0) {$h^1_1$};
+        \node[above] at (0,0,.7) {$h^2_1$};
+        \coordinate (LL) at (0,0,0);
+        \coordinate (UL) at (1,0,0);
+        \coordinate (LU) at (0,1,0);
+        \coordinate (UU) at (1,1,0.5);
+        \coordinate (UM) at (1,0.5,0);
+        \coordinate (MU) at (0.5,1,0);
+        \coordinate (E1) at (1,0,1/4);
+        \coordinate (E2) at (0,1,1/4);
+
+        \draw [fill=gray!80] (LL) -- (UL) -- (UM) -- (MU) -- (LU) -- cycle;
+        \draw [fill=gray!80] (UU) -- (UM) -- (MU) -- cycle;
+        \draw (LL) -- (E2) -- (UU) -- (E1) -- cycle;
+        \draw (LL) -- (UL) -- (E1) -- cycle;
+        \draw (LL) -- (LU) -- (E2) -- cycle;
+        
+        % \begin{scope}[canvas is yz plane at x=0]
+        %     \draw [fill] (1,1/4) circle [radius=.025];
+        % \end{scope}
+    \end{tikzpicture}
+    \caption{\textbf{Left:} The convex hull of a ReLU neuron \eqref{eqn:balas-relu}, and \textbf{Right:} the convex relaxation offered by the big-$M$ formulation \eqref{eqn:relu-big-m} Adapted from Anderson et al. \cite{anderson2020strong,anderson2019strong}}
+    \label{fig:relu-neuron}
+\end{figure}
+
+\subsubsection{A stronger extended formulation} 
+A much stronger MILP formulation can be constructed through a classical method, the extended formulation for disjunctions \citep{balas1998disjunctive,jeroslow1984modelling}. This formulation for a given ReLU neuron takes the following form~\citep[Section 2.2]{anderson2019strong}:
+\begin{subequations} \label{eqn:balas-relu}
+\begin{align}
+    (\vh^{l-1},h^l_i) &= (x^+,y^+) + (x^-,y^-) \label{eqn:balas-relu-1} \\
+    y^- &= 0 \geq \vw^{l}_i x^- + b^l_i(1-z) \\
+    y^+ &= \vw^{l}_i x^+ + b^l_iz \geq 0 \\
+    L^{l-1}(1-z) &\leq x^- \leq U^{l-1}(1-z) \\
+    L^{l-1}z &\leq x^+ \leq U^{l-1}z \label{eqn:balas-relu-5} \\
+    z &\in \{0,1\}. \label{eqn:balas-relu-6}
+\end{align}
+\end{subequations}
+This formulation requires one binary variable and $\mathcal{O}(n_{l-1})$ general linear constraints and auxiliary continuous variables. It is also locally ideal, i.e., as strong as possible. While the number of variables and constraints for an individual unit seems quite tame, applying this formulation for unit in a network leads to a formulation with $\mathcal{O}(n_0 + \sum_{l \in \sL} n_ln_{l-1}) = \mathcal{O}(|\sL|n_{\max}^2)$ continuous variables and linear constraints. Moreover, while the formulation for \emph{an individual unit} is locally ideal, the composition of many locally ideal formulations will, in general, fail to be ideal itself. 
+Consider that, while each node can be modeled as a two-part disjunction, the full network requires exponentially many disjuncts, each corresponding to one activation pattern. 
+
+Despite its strength and relatively modest increase in size relative to the big-$M$ formulation \eqref{eqn:relu-big-m}, it has been empirically observed that this formulation often performs worse than expected \citep{anderson2019strong,vielma2019small}, both in the verification setting and more broadly.
+
+\subsubsection{A class of intermediate formulations}
+The previous sections observed that the big-$M$ formulation \eqref{eqn:relu-big-m} is compact, but may offer a weak convex relaxation, while the extended formulation \eqref{eqn:balas-relu} offers the tightest possible convex relaxation for an individual unit, at the expense of a much larger formulation.
+\cite{kronqvist2022psplit,kronqvist2021steps} present a strategy for obtaining formulations intermediate to \eqref{eqn:relu-big-m} and \eqref{eqn:balas-relu} in terms of both size and strength. 
+The key idea is to partition $\vw_i^l \vh^{l-1}$ into a number of aggregated variables, $\vw_i^l \vh^{l-1} = \sum_{p=1}^P \hat{x}_p$. 
+Each auxiliary variable $\hat{x}_p$ is defined as a sum of a subset of the $j$-th weighted inputs $\hat{x}_p = \sum_{j \in \mathbb{S}_p} w_{i,j}^l h_j^{l-1}$, with $\mathbb{S}_1, ..., \mathbb{S}_P$ partitioning $\{1,...,n_{l-1}\}$.  
+This technique can be applied to the ReLU function, giving the convex hull over the directions defined by $\hat{x}_p$ \citep{tsay2021partition}: 
+\begin{subequations} \label{eq:relu-partition}
+\begin{align}
+\left( \sum_{j \in \mathbb{S}_p} w_{i,j}^l h_j^{l-1},h^l_i \right) &= (\hat{x}_p^+,y^+) + (\hat{x}_p^-,y^-) \label{eq:Pextended1} \\
+    y^- &= 0 \geq \sum_p \hat{x}_p^- + b^l_i(1-z) \\
+    y^+ &= \sum_p \hat{x}_p^+ + b^l_iz \geq 0 \\
+    \hat{\boldsymbol{M}}_{i,-}^l(1-z) &\leq \hat{x}^- \leq \hat{\boldsymbol{M}}_{i,+}^l(1-z) \\
+    \hat{\boldsymbol{M}}_{i,-}^l z &\leq \hat{x}^+ \leq \hat{\boldsymbol{M}}_{i,+}^l z \\
+    z &\in \{0,1\}. \label{eq:Pextended_1end}
+\end{align}
+\end{subequations}
+
+Here, the $p$-th elements of $\hat{\boldsymbol{M}}_{i,-}^l$ and $\hat{\boldsymbol{M}}_{i,+}^l$ must satisfy the inequalities
+\begin{align*}
+    \hat{M}^l_{i,-,p} &\leq \min_{\vh^{l-1} \in \mathcal{D}^{l-1}} \sum_{j \in \mathbb{S}_p} w_{i,j}^l h_j^{l-1} \\
+    \hat{M}^l_{i,+,p} &\geq \max_{\vh^{l-1} \in \mathcal{D}^{l-1}} \sum_{j \in \mathbb{S}_p} w_{i,j}^l h_j^{l-1}.
+\end{align*}
+
+These coefficients can be derived using techniques analagous to those for the big-$M$ formulation (note that tighter bounds may be derived by considering $\hat{x}^-$ and $\hat{x}^+$ separately). 
+Observe that when $P=1$, we recover the same tightness as the big-$M$ formulation \eqref{eqn:relu-big-m}, as, intuitively, the formulation is built over a single ``direction'' corresponding to $\vw_i^l \vh^{l-1}$. Conversely, when $P=n_{l-1}$, we recover the tightness of the extended formulation \eqref{eqn:balas-relu}, as each direction corresponds to a single element of $\vh^{l-1}$.
+\cite{tsay2021partition} study partitioning strategies and show that intermediate values of $P$ result in formulations that can outperform the two extremes, by balancing formulation size and strength.
+
+
+\subsubsection{Cutting plane methods: Trading variables for inequalities} \label{sec:strengthening-inequalities}
+% To quickly summarize: When formulating a trained neural network, the standard approach is to formulate each unit individually, and then compose a number of such formulations together to represent the entire network. The big-$M$ formulation \eqref{eqn:relu-big-m} is compact, but may offer a weak convex relaxation, while the extended formulation \eqref{eqn:balas-relu} offers the tightest possible convex relaxation for an individual unit, at the expense of a much larger formulation. We now turn our attention to strengthening inequalities that can be added to these formulations that either: i) tighten the big-$M$ formulation to achieve the strength of the extended formulation, or ii) consider more global network structure. These strengthening inequalities are intended to be used as cutting planes: there may be a large family of them, and their intended use is that a small number of them are generated dynamically as-needed to strengthen the relaxation only in the regions of greatest interest.
+The extended formulation \eqref{eqn:balas-relu} achieves its strength through the introduction of auxiliary continuous variables. However, it is possible to produce a formulation of equal strength by projecting out these auxiliary variables, leaving an ideal formulation in the ``original'' $(\vh^{l-1},h^l_i,z)$ variable space. While in general this projection may be difficult computationally, for the simple structure of a single ReLU neuron it is possible to characterize in closed form. The formulation is given by \cite{anderson2020strong,anderson2019strong} as
+\begin{subequations} \label{eqn:relu-ideal}
+\begin{align}
+    h^l_i &\geq \vw_i^l \vh^{l-1} + b^l_i \label{eqn:relu-ideal-1} \\
+    h^l_i &\leq \sum_{j \in J} w^{l}_{i,j}(h^{l-1}_i - \breve{L}^{l}_j(1-z)) + \left(b + \sum_{j \not\in J} w^{l}_{i,j}\breve{U}_j \right)z \quad \forall J \subseteq \llbracket n_{l-1} \rrbracket \label{eqn:relu-ideal-2} \\
+    (\vh^{l-1},h^l_i) &\in \mathcal{D}^{l-1} \times \mathbb{R}_{\geq 0} \label{eqn:relu-ideal-3} \\
+    z^l_i &\in \{0,1\},
+\end{align}
+\end{subequations}
+where notationally, for each $j \in \llbracket n_{l-1} \rrbracket$, we take 
+\begin{equation*}
+\breve{L}^{l-1}_j = \begin{cases} L^{l-1}_j & w^{l}_{i,j} \geq 0 \\ U^{l-1}_j & w^{l}_{i,j} < 0 \end{cases} \quad \mathrm{and} \quad \breve{U}^{l-1}_j = \begin{cases} U^{l-1}_j & w^{l}_{i,j} \geq 0 \\ L^{l-1}_j & w^{l}_{i,j} < 0 \end{cases} 
+\end{equation*}
+
+We note a few points of interest about this formulation. First, it is ideal, and so recovers the convex hull of a ReLU activation function, coupled with its preactivation affine function and bounds on each of the inputs to that affine function. Second, it can be shown that, under very mild conditions, each of the exponentially many constraints in \eqref{eqn:relu-ideal-2} are necessary to ensure this property; none are redundant and can be removed without affecting the relaxation quality. Third, note that by selecting only those constraints in \eqref{eqn:relu-ideal-2} corresponding to $J = \emptyset$ and $J = \llbracket n_{l-1} \rrbracket$, we recover the big-$M$ formulation \eqref{eqn:relu-big-m} in the case where $\mathcal{D}^{l-1} = [L^{l-1},U^{l-1}]$. This suggests a practical approach for using this large family of inequalities: Start with the big-$M$ formulation, and then dynamically generate violated inequalities from \eqref{eqn:relu-ideal-2} as-needed in a cutting plane procedure. As shown by \cite{anderson2020strong}, this separation problem is separable in the input variables, and hence can be completed in $\mathcal{O}(n_{l-1})$ time. 
+
+The cutting plane strategy is in general compatible with weaker formulations, such as relaxation-based verification \citep{zhang2022general} and  formulations from the class \eqref{eq:relu-partition}. 
+In fact, \cite{tsay2021partition} show that the intermediate formulations in \eqref{eq:relu-partition} effectively pre-select a number of inequalities from \eqref{eqn:relu-ideal-2}, in terms of their continuous relaxations. 
+While adding these constraints results in a tighter continuous relaxation, the added constraints can eventually significantly increase the model size. Practical implementations may therefore only perform cut generation at a limited number of branch-and-bound search nodes \citep{depalma2021scaling,tsay2021partition}. 
+
+\paragraph{A subtlety when using \eqref{eqn:relu-ideal}}
+This third point above raises a subtlety discussed in the literature~\citep[Appendix F]{depalma2021scaling}. Often, additional structural information is known about $\mathcal{D}^{l-1}$ beyond bounds on the variables. In this case, it is typically possible to derive tighter values for the big-$M$ coefficients. In this case, when using a separation-based approach it is preferable to initialize the formulation with these tightened big-$M$ constraints, and then proceed with the cutting plane approach as normal from there.
+
+\subsection{Scaling further: Convex relaxations and linear programming}
+\label{sec:relaxations}
+
+The above demonstrate MILP as a powerful framework for exactly modeling complex, nonconvex trained neural networks, but standard solvers are often not sufficiently scalable to adequately handle large-scale networks. A natural approach to increase the scalability, then, is to \emph{relax} the network in some manner, and then apply convex optimization methods. For the verification problem discussed in Section~\ref{sec:verification}, this yields what is known as an \emph{incomplete verifier}: any certification of robustness provided can be trusted (no false positives), but there may be robust instances that the method cannot prove are (some false negatives). 
+In other words, over-approximation produces a verifier that is sound, but not complete. 
+
+While a variety of methods exist for accomplishing this, in this section we briefly outline techniques relevant to polyhedral theory. 
+In particular, we focus on some techniques for building convex polyhedral relaxations. 
+The most natural convex relaxation for a MILP formulation is its linear programming (LP) relaxation, constructed by dropping any integrality constraints. For example, the LP relaxation of \eqref{eqn:relu-big-m} is given by the system (\ref{eqn:relu-big-m-1}-\ref{eqn:relu-big-m-4}). This is a compact linear programming relaxation for a ReLU-based network, and is the basis for methods due to \cite{bunel2020lagrangian} and \cite{ehlers2017formal}.
+
+\subsubsection{Projecting the big-$M$ and ideal MILP formulations}
+This section examines projections of the linear relaxations of formulations \eqref{eqn:relu-big-m} and \eqref{eqn:relu-ideal}. \\
+
+\textbf{(Projecting the big-$M$).}
+Note that the LP relaxation given by (\ref{eqn:relu-big-m-1}--\ref{eqn:relu-big-m-4}) maintains the variables $z^l_i$ in the formulation, though they are no longer required to satisfy integrality. Since these variables are ``auxiliary'' and are no longer necessary to encode the nonconvexity of the problem, they can be projected out without altering the quality of the convex relaxation. Doing this yields what is commonly known as the ``triangle'' or ``$\Delta$'' relaxation \citep{salman2019convex}:
+\begin{subequations} \label{eqn:triangle-relaxation}
+\begin{align}
+    h^l_i &\geq \vw^l_i \vh^{l-1} + b^l_i \\
+    h^l_i &\leq \frac{M^l_{i,+}}{M^l_{i,+} - M^l_{i,-}}(\vw^l_i \vh^{l-1} + b^l_i) \\
+    (\vh^{l-1},h^l_i) &\in [L^{l-1},U^{l-1}] \times \mathbb{R}_{\geq 0}.
+\end{align}
+\end{subequations}
+
+While the LP relaxation \eqref{eqn:triangle-relaxation} for an individual unit is compact, modern neural network architectures regularly comprise millions of units. The resulting LP relaxation for the entire network may then require millions of variables and constraints. Additionally, unless special precautions are taken, many of these constraints will be relatively dense. All this quickly leads to LP that are beyond the scope of modern off-the-shelf LP solvers. As a result, researchers have explored alternative schemes for scaling LP-based methods to these larger networks.
+\cite{salman2019convex} present a framework for LP-based methods (LP solvers, propagation, dual methods), which we review in the following subsections. However, they do not account for the ideal formulation developed in later works \citep{anderson2020strong,depalma2021scaling}. 
+
+
+\textbf{(Projecting the ideal).}
+Figure~\ref{fig:relu-neuron} shows that the triangle (big-$M$) relaxation fails to recover the convex hull of the ReLU activation function and the multivariate input to the affine pre-activation function.  
+We can similarly project the LP relaxation of the ideal formulation \eqref{eqn:relu-ideal} into the space of input/output variables \citep{anderson2020strong}, yielding a description for the convex hull of $\{ (\vh^{l-1},h^l_i) | L^{l-1} \leq \vh^{l-1} \leq U^{l-1}, \: h^l_i = \sigma(\vw^{l}_i \vh^{l-1} + b^l_i) \}$:%\cite{anderson2020strong} derive this convex hull description as:
+\begin{subequations}
+\begin{align}
+    h^l_i &\geq \vw^l_i \vh^{l-1} + b^l_i \\
+    h^l_i &\leq \sum_{k \in I} w_{i,k}^l (x_k - \breve{L}_k) + \frac{\ell(I)}{\breve{U}_h - \breve{L}_h}(x_h - \breve{L}_h) \quad \forall (I,h) \in \mathcal{J} \label{eqn:projected-ideal-relu-2} \\
+    (\vh^{l-1},h^l_i) &\in [L^{l-1},U^{l-1}] \times \mathbb{R}_{\geq 0},
+\end{align}
+\end{subequations}
+where $l(I) \coloneqq \sum_{k \in I} w^l_{i,k}\breve{L}_k + \sum_{k \not\in I} w^l_{i,k} \breve{U}_k + b^l_i$ and
+\[
+    \mathcal{J} \coloneqq \Set{ (I,h) \in 2^{\llbracket n_{l-1} \rrbracket} \times \llbracket n_{l-1} \rrbracket | l(I) \geq 0, \: l(I \cup \{h\} < 0, \: w^l_{i,k} \neq 0 \forall k \in I }.
+\]
+\cite{anderson2020strong} also show that the inequalities \eqref{eqn:projected-ideal-relu-2} can be separated over in $\mathcal{O}(n_{l-1})$ time. 
+Interestingly, in contrast to \eqref{eqn:relu-ideal}, the number of facet-defining inequalities depends heavily on the affine function. While in the worst case the number of inequalities will grow exponentially in the input dimension, there exist instances where the convex hull can be fully described with only $\mathcal{O}(n_{l-1})$ inequalities.
+
+%\subsubsection{Projecting the ideal formulation}
+
+\subsubsection{Dual decomposition methods}
+
+A first approach for greater scalability for LP-based methods is decomposition, a standard technique in the large-scale optimization community. Indeed, the cutting plane approach of Section~\ref{sec:strengthening-inequalities} can be viewed as a decomposition method operating in the original variable space. However, the method is initialized with the big-$M$ formulation for each neuron, and hence this initial model will be of size roughly equal to the size of the network. Therefore, it should be understood to use decomposition to provide a tighter verification bound, rather than for providing greater scalability to larger networks.
+
+In contrast, dual decomposition can be used to scale inexact verification methods to larger networks. Such methods maintain dual feasible solutions throughout the algorithm, meaning that upon termination they yield valid dual bounds on the verification instance, and hence serve as incomplete verifiers.
+
+\cite{wong2018provable,wong2018scaling} use as their starting point the triangle relaxation \eqref{eqn:triangle-relaxation} for each neuron, and then take the standard LP dual of the (relaxed) verification problem. Alternatively, \cite{dvijotham2018dual} propose a Lagrangian-based approach for decomposing the original nonlinear formulation of the problem \eqref{eq:verification}. Crucially, since the complicating constraints coupling the layers in the network are imposed as objective penalties instead of ``hard'' constraints, the optimization problem (given fixed dual variables) decomposes along each layer and the subproblems induced by the separability can be solved in closed form. This approach dualizes separately the equations characterizing the pre-activation and post-activation functions:
+\begin{align*}
+    \max_{\mu,\lambda}\quad \min_{\vh,\hat{\vh}} \quad& \left( \mW^L {\vh}^{L-1} + \vb^L \right) + \sum_{k=1}^{L-1} \left( \mu_k^T(\hat{\vh}^k - \mW^k \vh^{k-1} - \vb^k) + \lambda_k^T(\vh^k - \sigma(\hat{\vh}^k) \right) \\
+    \text{s.t.} \quad& L^k \leq \hat{\vh}^k \leq U^k \quad \forall k \in \llbracket n - 1 \rrbracket \\
+    & \sigma(L^k) \leq \vh^k \leq \sigma(U^k) \quad \forall k \in \llbracket n - 1 \rrbracket.
+\end{align*}
+
+Here, the $\hat{\vh}$ variables track the pre-activation values for the neurons in the network. 
+The dual variables $\mu_k^T$ correspond to the equality constraints defining the pre-activation values, $\hat{\vh}^k = \mW^k \vh^{k-1} + \vb^k$. 
+Likewise, the dual variables $\lambda_k^T$ correspond to enforcing the ReLU activation function, $\vh^k = \sigma(\hat{\vh}^k) = \mathrm{max} (0, \hat{\vh}^k)$. 
+Any feasible solution for the neural network is feasible for this dualized problem, making the multiplier terms for $\mu_k^T$ and $\lambda_k^T$ zero. 
+Thus, the inner problem gives a lower bound for the original problem---a property known as \emph{weak duality}. 
+The outer (dual) problem optimizing over the Lagrangian multipliers then seeks to maximize this lower bound, i.e., to give the tightest possible lower bound. This can be solved using a subgradient-based method, or learned along with the model parameters in a ``predictor-verifier'' approach \citep{dvijotham2018training}. 
+
+%Another work \cite{Lagrangian Decomposition for Neural Network Verification} alternatively explores Lagrangian decomposition (i.e. variable splitting) applied to the verification problem, 
+On the other hand, this approach can be combined with other relaxation-based methods. 
+The Lagrangian decomposition can be applied to dualize only the coupling constraints between layers, and a convex relaxation used for the activation function \citep{bunel2020lagrangian}: 
+\begin{align*}
+    \max_\lambda \quad \min_{\vh,\hat{\vh}} \quad& \left( \mW^L {\vh}^{L-1} + \vb^L \right) + \sum_{k=1}^{L-1} \left( \lambda_k^T(\vh^k - \sigma(\hat{\vh}^k) \right) \\
+    \text{s.t.} \quad
+    %& \vh_0 \in D^0 \\
+    %& \hat{\vh}_1 = W_1\vh_0 + b^1 \\
+    & L^k \leq \hat{\vh}^k \leq U^k \quad \forall k \in \llbracket n - 1 \rrbracket \\
+    & \hat{\vh}^{k} = \mW^{k} \vh^{k-1} + b^k \quad \forall k \in \llbracket n - 1 \rrbracket \\
+    & \vh^k \geq 0 \quad \forall k \in \llbracket n - 1 \rrbracket \\
+    & \vh_i^k \geq \hat{\vh}_i^k \quad \forall k \in \llbracket n - 1 \rrbracket, \forall i \in \llbracket n_k \rrbracket \\
+    & \vh^k_i \leq \frac{U^k_i(\hat{\vh}^k_i - L^k_i)}{U^k_i - L^k_i} \quad \forall k \in \llbracket n - 1 \rrbracket, \forall i \in \llbracket n_k \rrbracket.
+\end{align*}
+Note that the final three constraints apply the big-$M$/triangle relaxation \eqref{eqn:triangle-relaxation} to each ReLU activation function. 
+The dual problem can then be solved via subgradient-based methods, proximal algorithms, or, more recently, a projected gradient descent method applied to a nonconvex reformulation of the problem \citep{bunel2020efficient}.
+
+More recently, \cite{depalma2021scaling} presented a dual decomposition approach based on \eqref{eqn:relu-ideal}. 
+However, creating a dual formulation from the exponential number of constraints produces an exponential number of dual variables. The authors therefore propose to maintain an ``active set'' of dual variables to keep the problem sparse. A selection algorithm (e.g., selecting entries that maximize an estimated super-gradient) can then be used to append the active set. 
+Similar to the above discussion on cut generation, the frequency of appending the active set should be chosen strategically. 
+
+
+
+\subsubsection{Fourier-Motzkin elimination and propagation algorithms}
+\newcommand{\defeq}{\vcentcolon=}
+Alternatively, one can project out \emph{all} of the decision variables. For example, in order to solve the linear programming problem $\min_{x \in \mathcal{X}} c \cdot x$, we can augment the problem with a new decision variable to $\min_{(x,y) \in \Gamma} y$ for $\Gamma \defeq \Set{(x,y) \in \mathcal{X} \times \mathbb{R} : y = c \cdot x}$, and project out the $x$ variables. The transformed problem is the a trivial univariate optimization problem: $\min_{y \in \operatorname{Proj}_y(\Gamma)} y$.
+
+Of course, the complexity of the approach described is hidden in the projection step, or building $\operatorname{Proj}_y(\Gamma)$. The most well-known algorithm for computing projections of linear inequality systems is Fourier-Motzkin elimination, described by \cite{dantzig1973fourier}, which is notorious for its practical inefficiency. 
+The process effectively comprises replacing variables from a set of inequalities with all possible implied inequalities, which can produce many unnecessary constraints.  
+However, it turns out that neural network verification problems are well-structured in such a way that Fourier-Motzkin elimination can be performed very efficiently: for instance, by imposing one inequality upper bounding and one inequality lower bounding each ReLU function. 
+Note that while Section \ref{sec:algebraoflinearegions} describes the use of Fourier-Motzkin elimination to obtain \emph{exact} input-output relationships in linear regions of neural networks, here we are interested in obtaining linear \emph{bounds} for a nonlinear function.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\textwidth]{relaxations.pdf}
+    \caption{Convex approximations for the ReLU function commonly used by propagation algorithms, given as a function of the preactivation function $\hat{h_i^l}$. The ReLU applies $h_i^l = \max(0,\hat{h_i^l} )$.}
+    \label{fig:convexapproximations}
+\end{figure}
+
+In fact, this general approach was independently developed in the verification community.
+While MILP research has focused on formulations tighter than the big-M, such as \eqref{eqn:balas-relu} and \eqref{eq:relu-partition}, the verification community often prefers greater scalability at the price of weaker convex relaxations.
+The continuous relaxation of the big-M is equivalent to the triangle relaxation \eqref{eqn:triangle-relaxation}: the optimal convex relaxation for a single input, or in terms of the aggregated pre-activation function, as shown in Figure \ref{fig:convexapproximations}.  
+However, the lower bound involves two linear constraints, which is not used in several propagation-based verification tools owing to scalability or compatibility. 
+
+Such tools use methods such as abstract transformers to propagate polyhedral bounds, i.e., \textit{zonotopes}, through the layers of a  neural network. 
+DeepZ \citep{singh2018fast}, Fast-Lin \citep{weng2018towards}, and Neurify \citep{wang2018efficient} employ a parallel approximation, with the latter also implementing a branch-and-bound procedure towards completeness. 
+Subsequently, DeepPoly \citep{singh2019abstract}  and CROWN \citep{zhang2018efficient} select between the zero and identity approximations by minimizing over-approximation area. 
+OSIP \citep{hashemi2021osip} selects between the three approximations using optimization: approximations for a layer are select jointly to minimise bounds for the following layer. 
+These technologies are also compatible with interval bounds, propagating box domains \citep{mirman2018differentiable}. 
+Interestingly, bounds on neural network weights can also be propagated using similar methods, allowing reachability analysis of Bayesian neural networks \citep{wicker2020probabilistic}. 
+
+\cite{tjandraatmadja2020convex} provide an interpretation of these propagation techniques through the lens of Fourier-Motzkin elimination. 
+Consider the problem of propagating bounds through a ReLU neural network: for a node $h_i^l = \mathrm{max} \{0, \hat{h_i^l} \}$, convex bounds for $h_i^l$ can be obtained given bounds for $\hat{h}_i^l$ (Figure \ref{fig:convexapproximations}). Assuming the inputs are outputs of ReLU activations in the previous layer, $\hat{h}_i^l = \vw_i^l \vh^{l-1} + b_i^l$. 
+Computing an upper bound can then be expressed as:
+\begin{equation*}
+    \begin{aligned}
+    \max_{\vh^{l-1}} \quad& \vw_i^l \vh^{l-1} + b_i^l \\
+    \text{s.t.} \quad& \mathcal{L}_k(\vh^{l-2}) \leq h^{l-1}_k \leq \mathcal{G}_k(\vh^{l-2}) \forall k \in \{ 1,...,n_{l-1} \}.
+    \end{aligned}
+\end{equation*}
+
+As the objective function is linear, the solution of this problem can be computed by propagation without explicit optimization. 
+For each element in $\vh^{l-1}$, we only need to consider the associated objective coefficient in $\vw_i^l$ to determine whether $\mathcal{L}_k(\vh^{l-2}) \leq h^{l-1}_k$ or $h^{l-1}_k \leq \mathcal{G}_k(\vh^{l-2})$ will be the active inequality at the optimal solution. 
+We can thus replace $h^{l-1}_k$ with $\mathcal{L}_k(\vh^{l-2})$ or $\mathcal{G}_k(\vh^{l-2})$ accordingly. 
+This projection is mathematically equivalent to applying Fourier-Motzkin elimination, while avoiding redundant inequalities resulting from the `non-selected' bounding function. 
+Repeating this procedure for each layer results in a convex relaxation for the outputs that only involves the input variables.
+We naturally observe the desirability of simple lower bounds $\mathcal{L}_k(\vh^{l-2})$: imposing two-part lower bounds in each layer would increase the number of propagated constraints in an exponential manner, similar to Fourier-Motzkin elimination. 
+
+%Overview of DeepPoly (An Abstract Domain for Certifying Neural Networks) and FastLin, draw connection with Fourier-Motzkin elimination
+%Fast and Effective Robustness Certification: Modification of DeepPoly (DeepZ) by ``tilting'' zonotopic upper/lower bounding pairs to minimize volume.
+
+\paragraph{A path towards completeness}
+Given an input-output bound, the reachable set can be refined by splitting the input space \citep{henriksen2021deepsplit,rubies2019fast}---a strategy similar to spatial branch and bound. In other words, completeness is achieved by branching in the input space, rather than activation patterns: this strategy is especially effective when the input space is low dimensional \citep{strong2022zope}. For example, ReluVal \citep{wang2018formal} propagates symbolic intervals and implements splitting procedures on the input domain. As the interval extension of ReLU is Lipschitz continuous, the method converges to arbitrary accuracy in a finite number of splits.
+
+\subsection{Generalizing the single neuron model}
+
+\subsubsection{Extending to other domains} \label{sec:domains}
+In general, we will expect that the effective input domain $\mathcal{D}^{l-1}$ for a given unit may be quite complex. For the first layer ($l=1$) this may derive from explicitly stated constraints on the inputs of the networks, while for later layers this will typically derive from the complex nonlinear transformations applied by the preceding layers. 
+For example, in the context of surrogate models \cite{yang2022modeling} propose bounding the input to the convex hull of the training data set, while other works \citep{schweidtmann2022obey,shi2022careful} propose machine learning-inspired techniques for learning the trust region implied by the training data. 
+In effect, these methods assume a trained model is locally accurate around training data, which is a property similar to that which verification seeks to prove. 
+
+Nevertheless, most research focuses on hyperrectangular input domains, largely motivated by practical considerations: i) there are efficient, well-studied methods for computing valid (though not necessarily optimally tight) variable bounds, ii) characterizing the exact effective domain may be computationally impractical, and iii) and the hyperrectangular structure makes analysis simpler for complex formulations like those presented in Section~\ref{sec:strengthening-inequalities}. 
+We note that \cite{jordan2019neurips} use polyhedral analyses to perform verification over arbitrary (including non-polyhedral) norms, by fitting a $p$-norm ball in the decision region and checking adjacent linear regions. 
+On the other hand, robust optimization can be employed to find $p$-norm adversarial regions (rather than verifying robustness), as opposed to a single point adversary \citep{maragno2023finding}. 
+
+\cite{anderson2020strong} present two closely related frameworks for constructing ideal and hereditarily sharp formulations for ReLU units with arbitrary polyhedral input domains. This characterization is derived from Lagrangian duality, and requires an infinite number of constraints (intuitively, one for each choice of dual multipliers). Nonetheless, separation can still be done over this infinite family of inequalities via a subgradient-based algorithm; this approach will be tractable if optimization over $\mathcal{D}^{l-1}$ is tractable. 
+Many propagation algorithms are also fully compatible with arbitrary polyhedral input domains, as the projected problem (i.e., a linear input-output relaxation) remains an LP. 
+\cite{singh2021overcoming} show that simplex input domains can actually be beneficial, creating tighter formulations by propagating constraints on the inputs through the network layers.
+Similarly, optimization-based bound tightening problems based on solving LPs can embed constraints defining polyhedral input domains. 
+
+
+In certain cases, additional structural information about the input domain can be used to reduce this semi-infinite description to a finite one. For example, this can be done when $\mathcal{D}^{l-1}$ is a Cartesian product of unit simplices \citep{anderson2020strong} (note that this generalizes the box domain case, wherein each simplex is one-dimensional). This particular structure is particularly useful for modeling input domains with combinatorial constraints. For example, a network trained to predict binding propensity of a given length-$n$ DNA sequence is naturally modeled via an input domain that is the product of $n$ 4-dimensional simplices--one simplex for each letter in the sequence, each of which is selected from an alphabet of length 4.
+
+\subsubsection{Extending to other activation functions}
+The big-$M$ formulation technique can be any piecewise linear activation function. While much of the literature focuses on the ReLU due to its widespread popularity, models for other activation functions have been explored in the literature. For example, multiple papers \citep[Appendix K]{serra2018bounding} \citep[Appendix A.2]{tjeng2017evaluating} present a big-$M$ formulation for the maxout activation function. 
+Adapting a formulation from \cite{anderson2020strong} \citep[Proposition 10]{anderson2020strong}, a formulation for the maxout unit is
+\begin{alignat*}{2}
+    y^l_i &\leq u_j(\vh^{l-1}) + M^l_{i,j}(1-z_j) \quad ^\forall j \in \llbracket k \rrbracket \\
+    y^l_i &\geq u_j(\vh^{l-1}) \quad ^\forall j \in \llbracket k \rrbracket \\
+    \sum_{j=1}^k z_j &= 1 \\
+    (\vh^{l-1},v^l_i,z) &\in \mathcal{D}^{l-1} \times \mathbb{R} \times \{0,1\}^k,
+\end{alignat*}
+where each $M^l_{i,j}$ is selected such that
+\[
+    M^l_{i,j} \geq \max_{\tilde{\vh} \in \mathcal{D}^{l-1}} u_j(\tilde{\vh}).
+\]
+
+We can observe that the big-$M$ formulation can also handle other discontinuous activation functions, such as a binary/sign activations \citep{han2021single} or more general quantized activations \citep{nguyen2022}. 
+Nevertheless, the binary activation function naturally lends itself towards Boolean satisfiability, and most work therefore focuses on alternative methods such as SAT \citep{cheng2018verification,jia2020efficient,narodytska2018verifying}. 
+
+While this survey focuses on neural networks with piecewise linear activation functions, we note that recent research has also studied smooth activation functions with a similar aim. 
+For example, optimization over smooth activation functions can be handled by piecewise linear approximation and conversion to MILP \citep{sildir2022mixed}. 
+Researchers have also studied convex/concave bounds for nonlinear activation functions, which can then be embedded in spatial branch-and-bound procedures \citep{schweidtmann2019deterministic,wilhelm2022convex}.
+In contrast to MILP formulations for ReLU neural networks, these problems are typically nonlinear programs that must be solved via spatial branch and bound.
+
+Propagation methods \citep{singh2018fast,zhang2018efficient} can also naturally handle general activation functions: given convex polytopic bounds for an activation function, these tools can propagate them through network layers using the same techniques. 
+For example, Fastened CROWN \citep{lyu2020fastened} employs a set of search heuristics to quickly select linear upper and lower bounds on ReLU, sigmoid, and hyperbolic tangent activation functions. 
+Tighter polyhedral bounds can be employed, such as piecewise linear upper and lower bounds \citep{benussi2022individual}. %Note that these bounds are created in a single dimension, the aggregated preactivation, but more sophisticated methods for multivariate piecewise linear relaxations may also be applicable (e.g., \cite{misener2012global}). 
+
+\subsubsection{Extending to adversarial training} \label{sec:adversarialtraining}
+As described in Section \ref{sec:intro}, the \emph{training} of neural networks seeks to minimise a measure of distance between the output $y$ and the correct output $\hat{y}$.
+For instance, if this distance is prescribed as loss function $\ERMfunction(y,\hat{y})$, this corresponds to solving the \emph{training} optimization problem: 
+
+\begin{equation} \label{eq:training}
+\underset{\{ \mW^l \}_{l \in \sL}, \{ \vb^l \}_{l \in \sL}}{\mathrm{min}} \ERMfunction(y,\hat{y}).
+\end{equation}
+
+Further details about the training problem and solution methods are described in the following section. 
+Here, we briefly outline how verification techniques can be embedded in training. 
+Specifically, solutions or bounds to the verification problem (Section \ref{sec:verification}) provide a metric of how robust a trained neural network is to perturbations. These metrics can be embedded in the training problem to obtain a more robust network during training, often resulting in a bilevel training problem. For instance, the verification problem \eqref{eq:verification} can be embedded as a lower-level problem, giving the robust optimization problem:
+\begin{align*}
+\underset{\{ \mW^l \}_{l \in \sL}, \{ \vb^l \}_{l \in \sL}}{\mathrm{min}} \quad \underset{||x - \hat{x}|| \leq \epsilon}{\mathrm{max}} \quad \ERMfunction(y=f(x),\hat{y}).
+\end{align*}
+
+Solving these problems generally involves either bilevel optimization, or computing an adversarial solution/bound at each training step, conceptually similar to the robust cutting plane approach. 
+\cite{madry2018towards} proposed this formulation and solved the nonconvex inner problem using gradient descent, thereby losing a formal certification of robustness. 
+These approaches may also benefit from reformulation strategies, such as by taking the dual of the inner problem and using any feasible solution as a bound \citep{wong2018provable}. 
+The resulting models are not only more robust, but several works have also found it to be empirically easier to verify robustness in them  \citep{mirman2018differentiable,wong2018provable}. 
+
+Alternatively, robustness can be induced by designing an additional penalty term for the training loss function, in a similar vein to regularization. For example: 
+\begin{equation*} 
+\underset{\{ \mW^l \}_{l \in \sL}, \{ \vb^l \}_{l \in \sL}}{\mathrm{min}} \kappa \ERMfunction(y,\hat{y}) + (1-\kappa) \ERMfunction_\mathrm{robust}(\cdot).
+\end{equation*}
+
+Additionally, if these robustness penalties are differentiable, they can be embedded into standard gradient descent based optimization algorithms \citep{dvijotham2018dual,mirman2018differentiable}. 
+In the above formulation, the parameter $\kappa$ controls the relative weighting between fitting the training data and satisfying some robustness criterion, and its value can be scheduled during training, e.g., to first focus on model accuracy \citep{gowal2018effectiveness}.
+In these cases, over-approximation of the reachable set is less problematic, as it merely produces a model \emph{more} robust than required. 
+Nevertheless, \cite{balunovic2020adversarial} improve relaxation tightness by searching for adversarial examples in the ``latent'' space between hidden layers, reducing the number of propagation steps. \cite{zhang2020towards} provide an implementation that that tightens relaxations by also propagating bounds backwards through the network. 
+
+
+

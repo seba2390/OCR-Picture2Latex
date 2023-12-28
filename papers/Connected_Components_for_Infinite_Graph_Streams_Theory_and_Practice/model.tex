@@ -1,0 +1,278 @@
+% !TEX root = XStreamFull.tex
+To motivate our \XStream model, we first consider how the theoretical
+\WStream model might be implemented.  We show a plausible solution
+in Figure~\ref{fig:wstream-impl}.  A single processor reads and writes
+from files that store intermediate streams.  As these files may be of
+arbitrary size, a direct implementation of \WStream is only a notional
+idea.  \XStream is a theoretical variant of \WStream that can be
+implemented efficiently.
+
+In graph terms, \WStream stores only \emph{spanning tree} edges.  It
+may drop any \emph{non-tree} edge since there is no concept of deletion
+in that model.  Our \XStream model must accommodate bulk deletion by design
+since
+its input stream is infinite, and this means that non-tree edges must
+be retained.  If a spanning-tree edge is deleted, then some non-tree edge
+might reconnect the graph.
+
+Our \XStream model supports \WStreamns-like computations on infinite
+streams of graph edges.  We present \XSCCns, a connected components algorithm
+analogous to \DFR but implemented in the \XStream model.
+Concurrent, distributed processing allows the \XSCC algorithm to handle streams without end markers, which are necessary in the \DFR algorithm to distinguish between stream passes. Aging also allows the \XStream model to manage unending edge streams in 
+finite space.
+\XStream has a ring of $p$ processors, plus an I/O processor, shown in Figure~\ref{AMP:fig:ringdiagram}. The I/O processor passes the input stream of edges, as well as queries and other external commands, to the first processor of the ring. The I/O processor also outputs information received from the ring, such as query responses.
+
+Let ${\cal P} = \{p_0, \ldots, p_{P-1}\}$ be a set of non-I/O processors defining the
+current state of the system. 
+Processor $p_0$ is the \emph{head} (also called $p_H$), Processor
+$p_{P-1}$ is the \emph{tail} (also called $p_T$), and we define 
+successor and predecessor functions
+as usual: $\mbox{pred}(p_i) = p_{j}$ for $j =i-1 \pmod{P}$, $\mbox{succ}(p_i) = p_{k}$ for $k = i+1\pmod{P}$. 
+%\Jon{TODO: make consistent with later use of $\prec$}  JWB: it's ok
+Thus each processor passes data to its successor, including the tail,
+which passes data back to the head. 
+
+%Ring processors can change rank, but the ring structure will be preserved and the I/O processor will remain fixed.   
+% JWB: no more emptying, rotating, splicing, etc.
+Each $p_i$ has edge storage capacity $s_i$; for simplification we assume all processors have capacity $s$, for a total memory capacity of $S \equiv sP$ edges. We also assume $P \ll s$ since processors generally have at least megabytes of memory, even when there are enough processors for a relatively large $P$.
+
+
+
+We next define a notion of time for the \XStream model. For this paper, we 
+assume that all hashing and \ufns \ operations are effectively constant-time.
+
+\vspace*{2mm}
+\noindent
+\begin{definition}[{\bf \XStream Step}] the \emph{\XStream clock} marks units of time, or \emph{ticks}. At each
+tick, every processor is \emph{activated}: it receives a fixed-size \emph{\bundle}
+of $k$ \emph{slots} from its predecessor, does a constant amount of
+computation, and sends a size-$k$ output \bundle to its successor.
+The head processor also receives a single slot of information from the I/O
+processor at each tick.
+\end{definition}
+
+\XStream steps are thus conceptually systolic~\cite{kung1980algorithms}.
+though real implementations such as the one we present in 
+Section~\ref{sec:pseudocode} can be asynchronous.
+
+\begin{figure}[htb]
+\centerline{\includegraphics[width=0.5\textwidth]{xstreammodel.png}}
+\caption{\label{AMP:fig:ringdiagram}\XStream architecture. Bundles of slots
+circulate on a heartbeat. Input edges reside in the single primary (black) slot 
+of each \bundlens. Payload (white) slots are used during bulk deletion and complex
+queries.}
+\end{figure}
+
+%\Jon{This concept was introduced in semi-formal form earlier}
+%\begin{definition}
+%At any time $t > 0$, an edge is {\em active} if no aging (bulk delete) 
+%command has removed it since the last time it entered the system.
+%%if it has entered the system and no subsequent aging command has removed it.
+%\end{definition} 
+
+\noindent
+Using the notion of the \XStream clock, we can define the logical graph:
+\begin{definition}
+The {\em logical graph} at time $t$ is $G(t) = (V(t), E(t))$ is defined as:
+\begin{enumerate}
+\item the edge set $E(t)$ is the set of active edges at time $t$ and 
+\item the vertex set $V(t)$ is the set of endpoints of $E(t)$.
+\end{enumerate}
+\end{definition}
+
+%In practice, communication between processors in the X-Stream ring would be asynchronous, but we model communication synchronously for simplification. 
+%In this model, each processor receives input and emits output simultaneously. 
+Each message between ring processors is a \bundle of $k$ constant-sized slots. 
+The constant $k$ is the \emph{bandwidth expansion factor}
+mentioned in the abstract.  One of our key modeling assumptions is that
+the bandwidth within a ring of processors is at least $k$ times greater than
+the stream arrival rate, i.e., that the bandwidth expansion factor is at 
+least $k$.  We give theory governing this factor in Section~\ref{sec:aging} 
+and corroborate that theory via experiment in
+Section~\ref{sec:experiments}.
+
+Each slot can hold one edge and is
+designated 
+either \emph{primary} or \emph{payload} by its position in the \bundlens.  
+By convention, the first slot in a \bundle is primary and all others are payload.
+Primary slots generally contain information from outside the system, such as
+input stream edges or queries, while payload slots are
+used during the aging process and during queries with non-constant output
+size (for example, enumerating all vertices in small components).
+
+Once a processor receives a \bundle of slots, it processes the contents of each in turn. 
+The processor can modify or replace the slot contents, as we will describe
+below. When it has finished with all occupied slots, it emits the \bundle 
+downstream. 
+%In the synchronous model, a \bundle of $k$ slots moves between each pair of ring processor at each simultaneous activation of the entire set of processors.
+
+%\begin{definition}
+%An \emph{outside slot} has contents specified by the stream. The head processor can place edges received from the I/O processor into an outside slot, and edges may remain in an outside slot of a \bundle until they have completed two \Alex{three?} laps around the ring. Processors can update the meta information stored in an outside slot or clear out the slot if they store the edge, but cannot use the slot (except for the head placing I/O).  \end{definition}
+% \begin{definition}
+% An \emph{inside slot} has contents determined by the execution of the algorithm inside the system. Any processor can use any available inside slot to send information around the ring. These can be used for control information, edge data, and query responses.
+% \end{definition}
+
+In order to formally define the graph stored in the \XStream model we consider
+two \emph{edge states}:
+%\begin{definition}
+A \emph{settled edge} is incorporated into the data structures of exactly one 
+processor.
+%\end{definition}
+% \begin{definition}
+ A \emph{transit edge} is in the system, but is not settled. For example,
+ it may still be moving from processor to processor in a \bundlens.
+%\end{definition}
+
+%Communication between the head and the I/O processor does not follow the same bundle-of-slots model. Since the I/O processor can send edges, queries, and commands to the head regardless of the ring state, the I/O processor groups as many messages as possible into bundles to be sent. As the head finishes processing these input-stream bundles, it sends messages to request additional bundles from the I/O processor.
+
+
+\subsection{Distributed Data Structures}
+The \XStream data structure is a natural distributed version of the
+W-Stream data structure, except that we must store the entire graph to allow
+bulk deletions. \WStream pass $i$ identifies a set of connected subgraphs in
+the input stream. \XStream processor $i$ stores a spanning forest of these
+subgraphs.  By construction, the connected components of this forest are 
+the same as those of the W-Stream connectivity structure, 
+called $G_{B_i}$ in~\cite{AMP:demetrescu2009trading}.
+
+\noindent
+To describe how \XStreamns's distributed data structures implement the
+W-Stream nesting strategy, we define the concepts of \emph{local
+components} and \emph{building blocks}.
+\begin{definition}
+The connected components identified by the \uf structure on a processor $p_i$ are called the \emph{local components} (LCs) of $p_i$.
+\end{definition}
+
+A processor $p_j$ downstream of $p_i$ will see a local component of $p_i$ contracted into a single node, which $p_j$ might incorporate into one of its local components. Figure~\ref{fig:BBLCexample} shows an example of three processors and their \uf structures. As depicted in the first box of the figure, $b_A$ and $b_B$ are LCs of $p_0$ and $b_A$ and $b_B$ are incorporated in the LC $b_D$ on $p_1$.
+
+\begin{definition}
+ \emph{Building blocks} (BBs) for processor $p_j$ are the elements over which $p_j$ does \ufns.
+ %creates a \uf structure.  % JWB: caused ugly column overlap
+ A \emph{primitive building block} contains exactly one vertex of the input graph. The set of all primitive building blocks is ${\cal B}_P$. A non-primitive building block corresponds to a local component from a processor upstream of $p_j$.
+\end{definition}
+
+We say a processor \emph{consumes} its building blocks because notification of
+their existence arrives from upstream and does not propagate downstream.
+A local component corresponding to a
+set in a \uf structure \emph{encapsulates} all the building
+blocks in that set.  We now formalize the relationship between \XStream
+distributed data structures and \XStream processors.  Figure~\ref{fig:BBLCexample} illustrates these concepts.
+
+\begin{definition} 
+\label{def:alpha}
+\begin{tcolorbox}
+\begin{description} 
+\item \
+\item[{\bf $\lcloc$}:] The unique processor $p_i$ that creates local component $b_x$,  denoted $\lcloc(b_x) = p_i$.
+\item[{\bf $\nodeusr$}:] the local component that contains building block $b_x$,
+denoted $\nodeusr(b_x) = b_y$.
+%Note that the value of $\nodeusr(b_x)$ is the new label when $b_x$ is consumed. A processor $p_j$ consuming $b_z \in B_P$ in some local component $b_y$ does not necessarily mean that $\nodeloc(b_z) = \lcloc(b_y)$; there may be any number of encapsulations in between $\nodeloc(b_z)$ and $\lcloc(b_y)$.
+\item[{\bf $\nodeloc$:}]
+The unique processor $p_j$ that consumes building block $b_x$, denoted
+$\nodeloc(b_x) = p_j$.
+\end{description}
+\end{tcolorbox}
+\end{definition}
+
+\begin{figure}[hbt]
+\centerline{\includegraphics[width=0.5\textwidth]{bb_lc_example.pdf}}
+\caption{\label{fig:BBLCexample}
+Example usage of notation: 
+$\nodeloc(b_A)=p_1$ because processor $p_1$ consumed building block $b_A$, $\lcloc(b_A) = p_0$ because processor $p_0$ created local component $b_A$, $\nodeusr(b_A) = b_D$ because $b_A$ is a building block of local component $b_D$. Processor $p_1$ will relabel any vertex in $b_A$ to $b_D$ because
+$\nodeloc(b_A)= p_1 = \lcloc(b_D)$. 
+}
+\end{figure}
+
+\begin{definition}[\XStream nesting identity]
+Let $b_x$ be a building block. Then
+\begin{equation}
+\lcloc(\nodeusr(b_x))  =  \nodeloc(b_x) \label{eq:identity}
+\end{equation}
+\end{definition}
+\noindent
+The \XStream Nesting Identity, which is true by construction, says that the
+processor storing the local component that encapsulates building
+block $b_x$ is the processor that consumed $b_x$.
+
+We base our algorithm description and correctness arguments
+on~(\ref{eq:identity}).  In the \XStream nesting structure, a building block $b_x$
+is consumed by processor $\nodeusr(b_x)$ and incorporated into local
+component $\nodeloc(b_x)$.  The latter is a creation event, and the
+creating processor is $\lcloc(\nodeloc(b_x))$.
+
+\begin{figure*}[thb]
+\begin{center}
+\includegraphics[width=5in]{xstream_normal.png}
+\end{center}
+\caption{\label{fig:xstream-normal} \XStream normal operation.  Spanning 
+tree (red) edges are packed into $\{p_H,\ldots, p_B\}$ and store the 
+connectivity information of W-Stream.  Non-tree (blue) edges are retained and
+packed immediately afterwards. Note that $p_B$ will remain the building
+processor until it has completely filled with tree edges (jettisoning its
+current non-tree edges downstream). The gray edge ($e_{t+3}$) has not yet
+been classified as tree or non-tree.  }
+\end{figure*}
+
+\subsection{Relabeling}
+\label{sec:relabeling}
+Suppose that $V$ is the domain of possible vertex names from the edge 
+stream,  and ${\cal B}$ is the set of possible names of building blocks/local
+components.
+% Using the 'ns' macros seems to interfere with line breaks.  For example using
+% \XStreamns doesn't allow tex to break nesting into nest-ing (or insert
+% a line break after X-Stream).
+The \XStream \ nesting identity allows us to define a simple recursive \emph{relabeling function} $R_j : V \rightarrow {\cal B}$ for processor $p_j$, which returns the name of the local component that most recently encapsulates a primitive building block $b_v$ if such a local component exists, either on $p_j$ or upstream of $p_j$.  This function underlies correctness arguments
+for \XStream data structures and connectivity queries.
+ \begin{definition}
+ Let the \emph{relabeling function} $R_j: V \rightarrow {\cal B}$ be defined as follows. For $v \in V$, let $R_{-1}(v) =b_z \in {\cal B}_P$, where $b_z$ is the primitive building block corresponding to vertex $v$.
+For $j \geq 0$:
+\begin{equation}
+R_j(v) = \begin{cases}
+         \nodeusr(R_{j-1}(v) )& \text{if $p_j=\nodeloc(R_{j-1}(v))$} \\
+         R_{j-1}(v) & \text{otherwise}
+	\end{cases}
+\end{equation}
+\end{definition}
+
+
+
+In the example shown in Figure~\ref{fig:BBLCexample}, $R_1(v_1)= b_A$, $R_2(v_1) = b_D$, and $R_3(v_1) = b_E$. Since the first processor that knows of $v_5$ is $p_2$, $R_1(v_5) = R_{-1}(v_5)$, $R_2(v_5) = b_C$, and $R_3(v_5) = b_E$. $R_{-1}(v_1),R_{-1}(v_2),...,R_{-1}(v_7)$ are the primitive building blocks corresponding to the vertices and named using the vertex names. 
+
+An edge $e$ is received by the system as two vertices with their primitive building blocks and a time stamp $t$: $e=([u,R_{-1}(u)],[v,R_{-1}(v)],t)$ and $R_{-1}(u),R_{-1}(v) \in {\cal B}_P$. Since edges are undirected, an edge \[e'=([v,R_{-1}(v)],[u,R_{-1}(u)],t')\] will be referred to as having the same endpoints as $e$. Processor $p_i$ for $i>0$ then receives edges in the form $e = ([u,R_{i-1}(u)],[v,R_{i-1}(v)],t)$. For all edges, the most recent timestamp is stored. 
+
+% JWB: seems deprecated given new definitions of x-stream ticks
+%We describe time in the stream in terms of how many edges have entered the ring of processor. We assign timestamps as sequentially increasing integers, so the $i^{th}$ edge will have timestamp $i$, and when the $i^{th}$ edge enters the system we say the system is at time $t = i$.
+
+\subsection{Operation Modes}
+
+The \XSCC algorithm operates in two major modes. The \emph{aging} mode is active when a bulk deletion is occurring, as we will describe in Section~\ref{sec:aging}.  Otherwise the system is in \emph{normal} mode.
+
+
+\iffalse
+In the example in Figure~\ref{fig:BBLCexample}, all BBs on $p_0$ are primitive because each contains exactly one of the vertices $v_0$, $v_1$, $v_2$, $v_3$, and $v_4$. LC $b_D$ on $p_1$ is used as a non-primitive BB on $p_2$. 
+
+
+
+At any time $t$, each vertex $v$ in the set of edges stored by the system is contained in exactly one primitive building block, on one processor $p_i$. This processor $p_i$ is the first processor in the ring that uses an edge containing $v$ in its \uf structure. For example, $v_7$ is used in a primitive building block on $p_2$ since $p_0$ and $p_1$ have not used an edge containing $v_7$ in their \uf structures. \Alex{rewrote this - include it or leave out?}
+
+
+\paragraph{Nested-Structure Notation}
+Consider the instantaneous state of graph $G(t)$ being stored by the system at time $t$. The current vertex set is $V(t) = \{v_1,...,v_n\}$. Let ${\cal B}_P(t)$ be the set of primitive building block consumed by some processor at time $t$. \Alex{so each element in $B(t)$ corresponds to a unique element in $V(t)$?} Let $B_{LC}(t)$ be the set of non-primitive building block names used at time $t$, so each is also the name of a local component. Let $B(t) = {\cal B}_P(t) \cup B_{LC}(t) $. % and index the full set of building block labels as $B =\{b_1,b_2,...\}$.
+
+% Let\\ $B = \{b_1,b_2,...\}$ be the set of all current building block and local component names. We specify that $b_i$ with $1\leq i\leq n$ is the primitive building block containing vertex $v_i$ and let $B_V = \{b_1,...,b_n\}$.
+
+Consider $B(t)$ for some time $t$. We  will subsequently consider a fixed $t$ and use $B:=B(t)$,  ${\cal B}_P :={\cal B}_P(t)$ and $B_{LC}:= B_{LC}(t)$. For $b_x, b_y \in B$, let $V(b_x) \subseteq V(t)$ be the set of graph vertices encapsulated by building block $b_x$, and let $\prec$ be a relation defined such that $b_x \prec b_y$  iff $V(b_x) \subset V(b_y)$.  
+
+$$ V(b_y) = \cup_{b_x \prec b_y} V(b_x). $$
+Note that a processor $p_i$ with $b_x$ as a local component does not necessarily have all vertices in $V(b_x)$ as primitive vertices. Processor $p_i$ \emph{knows} only the vertices in its local components that are ends of edges $p_i$ holds. If processors knew the full set of vertices in each of their local components, it may require unbounded space.
+Building block $b_x$ exists as a node in a local component on exactly one processor, $p_i$. Thus we can define the following:
+\fi
+
+\XSCC uses the concept of relabeling, the \XStreamns \ ring
+of processors, and periodic bulk deletion events to 
+handle infinite streams of input edges. Each processor plays
+the role of an intermediate stream in \WStreamns, borrowing the
+concept of \emph{loop unrolling} from compiler optimization.  As
+with the latter, we can store information concerning only a finite number of 
+loop iterations (\WStream passes) at one time.  However, the periodic bulk 
+deletions allow \XSCC to run indefinitely.

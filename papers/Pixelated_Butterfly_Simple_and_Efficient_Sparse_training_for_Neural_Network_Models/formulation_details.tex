@@ -1,0 +1,89 @@
+\section{Problem Formulation}
+\label{app:problem_formulation}
+
+We formulate the problem of sparse model training as sparse matrix approximation with a simple hardware cost model (\cref{sec:problem_formulation}).
+
+
+
+
+
+We first describe our simple cost model for sparse matrix multiplication to reflect the fact that parallel hardware such as GPUs are block-oriented~\citep{cook2012cuda,gray2017gpu}: accessing one single element from memory costs the same as accessing one whole block of elements.
+We then formulate the sparse matrix approximation in the forward pass and the backward pass.
+The cost model necessitates narrowing the sparsity pattern candidates to those that are block-aligned.
+
+\paragraph{Cost model}
+We model the time cost of an operation based on the number of floating point operations and memory access.
+The main feature is that our cost model takes into account \emph{memory coalescing}, where accessing a memory location costs the same as accessing the whole block of $b$ elements around it (typically $b = 16 \text{ or } 32$ depending on the hardware).
+
+Let $\mathrm{Cost}_\mathrm{mem}$ be the memory access cost (either read or write) for a block of $b$ contiguous elements.
+Accessing any individual element within that block also costs $\mathrm{Cost}_\mathrm{mem}$ time.
+Let $\mathrm{Cost}_\mathrm{flop}$ be the compute cost of a floating point operation.
+Let $N_\mathrm{block mem}$ be the number of block memory access, and $N_\mathrm{flop}$ be the number of floating point operations.
+Then the total cost of the operation is
+\begin{equation*}
+  \mathrm{Total cost} = \mathrm{Cost}_\mathrm{mem} \cdot N_\mathrm{block mem} + \mathrm{Cost}_\mathrm{flop} \cdot N_\mathrm{flop}.
+\end{equation*}
+This cost model is a first order approximation of the runtime on modern hardware (GPUs), ignoring the effect of caching.
+
+\paragraph{Block-aligned sparsity pattern, Block cover, and Memory access cost}
+As the memory access cost depends on the number of block of memory being accessed, we describe how the number of nonzero elements in a sparse matrix relates to the number of blocks being accessed.
+We first define a \emph{block cover} of a sparse mask.
+\begin{definition}
+  A sparse mask $M \in \{ 0, 1 \}^{m \times n}$ is $(b_1, b_2)$-\emph{block-aligned} if for any index $i, j$ where $M_{ij} = 1$, we also have $M_{i'j'} = 1$ where:
+  \begin{equation*}
+     i' = b_1 \lfloor i / b_1 \rfloor + r_1, j' = b_2 \lfloor j / b_2 \rfloor + r_2 \text{ for all } r_1 = 0, 1, \dots, b_1 - 1 \text{ and } r_2 = 0, 1, \dots, b_2 - 1.
+  \end{equation*}
+
+  The $(b_1, b_2)$-\emph{block cover} of a sparse mask $M \in \{ 0, 1 \}^{m \times n}$ is the $(b_1, b_2)$-block-aligned mask $M' \in \{ 0, 1 \}^{m \times n}$ with the least number of nonzeros such that $M_{ij} \leq M'_{ij}$ for all $i, j$.
+\end{definition}
+We omit the block size $(b_1, b_2)$ if it is clear from context.
+
+A sparse mask $M$ being $(b_1, b_2)$ block-aligned means that if we divide $M$ into blocks of size $b_1 \times b_2$, then each block is either all zeros or all ones.
+To get the $(b_1, b_2)$-block cover of a sparse mask $M$, we simply divide $M$ into blocks of size $b_1 \times b_2$ and set each block to all ones if any location in that block is one.
+
+
+For a sparse matrix with sparse mask $M$ on a device with block size $b$, the number of block memory access $N_\mathrm{block mem}$ is the number of nonzero blocks in its $(1, b)$-block cover $M'$ (assuming row-major storage).
+This corresponds to the fact that to access a memory location on modern hardware (GPUs), the device needs to load a whole block of $b$ elements around that location.
+
+\paragraph{Fast sparse matrices means block-aligned sparsity pattern}
+For sparsity patterns that are not block-aligned, such as the random sparse pattern where each location is independently zero or nonzero, its $(1, b)$-block cover might increase the density by a factor of close to $b$ times (we show this more rigorously in the Appendix).
+As memory access often dominates the computation time, this means that non block-aligned sparsity will often result is $b$ times slower execution than block-aligned ones.
+In other words, exploiting hardware locality is crucial to obtain speed up.
+
+Therefore, this cost model indicates that instead of searching over sparsity patterns whose total cost is less than some budget $C$, we can instead search over block-aligned patterns whose number of nonzeros is less than some limit $k$.
+For our theoretical analysis, we consider sparsity patterns that are $(1, b)$-block-aligned.
+In practice, since we need to access both the matrix and its transpose (in the forward and backward pass), we require the sparsity pattern to be both $(1, b)$-block-aligned and $(b, 1)$-block-aligned.
+This is equivalent to the condition that the sparsity pattern is $(b, b)$-block-aligned.
+
+\paragraph{Sparse matrix approximation in the forward pass}
+We now formulate the sparse matrix approximation in the forward pass.
+That is, we have weight matrix $A$ with input $B$ and we would like to sparsify $A$ while minimizing the difference in the output.
+For easier exposition, we focus on the case where number of nonzeros in each row is the same.
+ \begin{definition}[Forward regression]\label{def:sparse_mask_factorization_before:informal}
+Given four positive integers $m \geq n \geq d \geq k \geq 1$, matrices $A \in \R^{m \times d}$ and $B \in \R^{d\times n}$. The goal is to find a $(1, b)$-block-aligned binary mask matrix $M\in \{0, 1\}^{m \times d}$ that satisfies
+\begin{align*}
+     \min_{M \in \{0,1\}^{m \times d} } & ~ \| A \cdot B - (A \circ M) \cdot B \|_1 \\
+    \mathrm{s.t.} & ~ \| M_{i} \|_0 = k , \forall i \in [d]
+\end{align*}
+where $M_i$ is the $i$-th row of $M$.
+\end{definition}
+
+\paragraph{Sparse matrix approximation in the backward pass}
+In the backward pass to compute the gradient wrt to the weight matrix $A$, we would like to sparsify the gradient $C B^\top$ while preserving as much of the gradient magnitude as possible.
+\begin{definition}[Backward regression]\label{def:sparse_mask_factorization_after:informal}
+Given four positive integers $m \geq n \geq d \geq k \geq 1$, matrices $B \in \R^{d \times n}$ and $C \in \R^{m \times n}$.
+The goal is to find a $(1, b)$-block-aligned binary mask matrix $M \in \{0,1\}^{m \times d}$ such that
+\begin{align*}
+  \min_{M \in \{0,1\}^{m \times d} } & ~ \| C \cdot B^\top  - ( C \cdot B^\top ) \circ M \|_1 \\
+  \mathrm{s.t.}& ~ \| M_i \|_0 = k , \forall i \in [d]
+\end{align*}
+where $M_i$ is the $i$-th row of $M$.
+\end{definition}
+Without making any assumptions, such problems are in general computationally hard \cite{fkt15,rsw16}.
+
+
+
+
+
+
+

@@ -1,0 +1,182 @@
+We formulate the problem as a general 3D reconstruction conditioned on inputs which can be spatially correlated with the output scene. This can be instantiated into applications like 3D super-resolution from low-resolution observations and surface reconstruction from a sparse set of 3D point measurements. 
+The proposed approach augments a generative model for synthesizing 3D scenes with external knowledge in the form of a database of existing 3D scene data. 
+Specifically, a typical learning-based 3D reconstruction function, $f_r$, trains on pairs $\{\mathbf{x}_i, \mathbf{y}_i\}$ of input and ground truth 3D data, with a loss to measure the distance between each $f_r(\mathbf{x}_i)$ and $\mathbf{y}_i$. 
+At inference time, given an unseen input $\mathbf{x}_j$, $f_r$ is applied as $f_r(\mathbf{x}_j) = \hat{\mathbf{y}}_j$, without using any additional information. 
+
+In contrast, our approach maintains the training data $\{\mathbf{y}_i\}$ to form a basis of an initial reconstruction estimate during inference. 
+An overview of our approach is visualized in Fig.~\ref{fig:teaser}.
+We first learn to retrieve similar train data to the input condition to construct multiple initial reconstruction estimates, $\mathbf{x}_j\rightarrow \{\mathbf{y}_j'\}$. 
+We then refine these estimates to produce the final reconstruction, $\mathbf{x}_j,\{\mathbf{y}_j'\} \rightarrow \mathbf{y}_j$. 
+This facilitates transfer of scene geometry characteristics such as detail and global structures from train data to produce more coherent and detailed output reconstructions.
+
+We demonstrate our approach on the 3D reconstruction tasks of super resolution and surface reconstruction from points, learning to reconstruct a distance field representation of an output 3D scene from a low-resolution distance field and point cloud, respectively. 
+For a set of train scenes $\{\mathbf{y} \in \mathbb{R}^{L \times W \times H}\}$, we consider cropped scene chunks $\{y_i \in \mathbb{R}^{l \times w \times h}\}$ as our additional knowledge database. 
+We first learn to map spatially corresponding input chunks $\{x_i\}$ to these $\{y_i\}$ by constructing a shared embedding space between the $x_i$ and $y_i$ and retrieving the $k$ nearest neighbors for a new $x_j$. These nearest neighbors then form candidates for a scene reconstruction.
+
+Based on the input condition and these candidates, which comprise $k$ distance fields for each chunk in the output scene, we then learn to refine the initial estimates to a final distance field scene reconstruction.
+The initial basis constructed by existing 3D scene data is composed of chunks of valid local and global structures (e.g., flat walls or floors, full structures as well as sharp details of objects), enabling our refinement to more easily maintain these characteristics in the output reconstruction.
+To encourage the transfer of desired global structures and fine details to the final reconstruction, we employ attention to help select the most meaningful parts of the initial estimate.
+This facilitates coherent reconstructions while maintaining local detail. 
+
+
+\subsection{Estimating Reconstruction as a Composition of Existing Scene Data}
+
+\begin{figure}
+	\centering
+	\includegraphics[width=\linewidth]{figures/method_retrieval.png}
+	\vspace{-0.6cm}
+	\caption{
+	Estimating reconstruction with database retrievals. 
+	(a) Input and target scenes are decomposed into a total of $n^3$ chunks each by \textit{unfold-n}; input/target chunks are embedded into a shared space which is trained using a contrastive loss.
+	The database is composed of embedded target chunks from the train set, and used for retrieval for new input queries.
+	(b) For a new input, the $k$-NN retrieved chunks create approximate reconstructions, which can then be refined.
+	}
+	\label{fig:method_retrieval}
+	\vspace{-0.25cm}
+\end{figure}
+
+We first aim to approximate a scene reconstruction as a composition of cropped chunks of existing scene data from the database $\{y_i\}$.
+%
+By recomposing cropped chunks of scene data, we can express diverse scene content while leveraging a basis of existing scene data.
+%
+To construct this approximation, we learn to retrieve $k$ candidate chunks from the database, providing a variety of candidate reconstruction estimates that can be used to inform the final reconstruction refinement.
+These multiple candidates provide alternatives to the following refinement stage, as we cannot expect to have exactly corresponding chunk geometry at test time.
+%
+We show an overview of our retrieval-based reconstruction estimation in Fig.~\ref{fig:method_retrieval}.
+
+To find the best candidate chunks from the database for the corresponding part of the input, we learn to embed chunks of input observations $\{x_i\}$ and target scene chunks $\{y_i\}$ into a shared latent space, where top-$k$ nearest neighbor retrieval is then performed.
+%
+We thus embed $x_i$ into a 64 dimensional latent space by passing it through a stack of convolutional layers followed by a fully connected layer, resulting in feature $g_{x_i} = g_{in}(x_i)$. We similarly embed the corresponding target $y_i$ into a 64 dimensional latent space by also passing it through a stack of convolutional layers with a fully connected layer at the end, resulting in feature $g_{y_i} = g_{tgt}(y_i)$.
+%
+Inspired by contrastive learning~\cite{hadsell2006dimensionality}, we construct the shared space using a normalized, temperature-scaled cross entropy loss (NTXent)~\cite{chen2020simple}:
+\begin{equation}\small
+    L^\text{NTXent} = -\log\frac{\exp\left(g_{x_i}\!\cdot\! g_{y_i}/\tau\right)}{\sum^{N}_{k=1}\mathbbm{1}_{[k\neq{i}]}\exp\left(g_{x_i}\!\cdot\!g_{y_i}/\tau'(\tau,y_i, y_k)\right)}
+\end{equation}
+where $N$ denotes the number of samples in the minibatch, $\mathbbm{1}_{[k\neq{i}]}$ evaluating to 1 iff $k\neq i$, and $\tau \in (0, 1]$ is a temperature parameter.
+%
+This encourages similarly structured target scene chunks to be retrieved for an input observation.
+
+A minibatch may contain target chunk $y_k$ similar in geometry to the target chunk $y_i$ where $k\neq i$. 
+We thus use $\tau'$ to discourage  heavy penalization in this scenario, by making the temperature scaling to be a function of IoU between the target chunks,
+\begin{equation}
+    \tau'(\tau,y_i, y_k) = \tau + (1 - \tau)\,\sigma\!\left(a\!\cdot\!\mathrm{IoU}\left(y_i, y_k\right) + b\right)
+\end{equation}
+where $a$ and $b$ are constant shift and bias, and $\sigma$ a sigmoid. 
+
+\paragraph{Retrieval Database.} 
+
+Once the networks have been trained, the target chunks $\{y_i\}$ are all embedded as $g_{y_i}$ into the latent space to support chunk retrieval.
+Then for a new input observation $\mathbf{x}$, it is split into spatial chunks $\{x_j\}$, for which $k$ nearest neighbors are found from $g_{x_j}$ by an $\ell_2$ distance metric.
+This provides $k$ candidate reconstruction estimates $\{\mathbf{y}'\}$.
+
+\subsection{Reconstruction Refinement}
+\begin{figure}
+	\centering
+	\includegraphics[width=\linewidth]{figures/method_refinement.jpg}
+	\vspace{-0.7cm}
+	\caption{
+	The input and reconstruction approximations are passed through feature extractors. 
+	The resulting input feature grid is split into patches spatially aligned with the patch features from the retrieval approximations, which are then fused together with our attention blending network. 
+	Finally, the patch-wise blended features are re-interpreted as a full feature volume and decoded to output geometry.
+	}
+	\label{fig:method_refinement}
+	\vspace{-0.25cm}
+\end{figure}
+%
+Our initial retrieval-based reconstruction estimate provides a strong prior for  global structures and fine-scale details in the scene, but the retrieved chunks may not be fully locally consistent with each other. Therefore, we leverage this estimated reconstruction to refine a globally coherent reconstruction while maintaining local detail.
+%
+We visualize this refinement in Fig.~\ref{fig:method_refinement}.
+%
+The input observation $\mathbf{x}$ and the estimated retrieval-based reconstructions $\{\mathbf{y}'\}$ inform the final refinement. 
+The input is passed through a U-Net~\cite{ronneberger2015u}-based feature extractor $f_{in}$ to produce a grid of features, which is split into a set of patch features. The retrieval approximations are first split into volumetric patches and are passed through feature extractor $f_{retr}$, analogously structured as $f_{in}$ but smaller in parameters since it operates on retrieved patches.
+Next, we blend together the features from the input with those from corresponding retrieval approximations.
+%
+We leverage a patch-based attention layer which learns to select and blend the retrieved patches, based on feature similarities to the spatially-corresponding features from the input data.
+%
+The resulting feature grid is finally decoded with convolutions to output the reconstructed geometry. 
+%
+
+\paragraph{Patch-based Attention.} We leverage a patch-based attention to encourage selection of robust patches from the retrieved chunks to inform the final reconstruction, i.e., only features that would most help the reconstruction are used.
+%
+\begin{figure}
+	\centering
+	\includegraphics[width=\linewidth]{figures/method_attention.jpg}
+	\vspace{-0.5cm}
+	\caption{Feature similarity between input and retrieved patch features informs attention scores. Attention weights derived from the scores determine the contribution among the retrievals. A learned blending function then fuses input and retrieval features based on the max attention score.}
+	\label{fig:method_attention}
+	\vspace{-0.25cm}
+\end{figure}
+%
+The features from the input $\mathbf{x}$ and from the retrieval-based reconstructions $\{\mathbf{y}'\}$ can be spatially aligned with each other.
+%
+To select the most relevant features, we consider patches of these aligned features (with the patch size smaller than the chunk size of the retrieval, as we want to be able to select features within retrieved chunks); each patch of the input then corresponds to $k$ patches of retrieved chunks.
+%
+Similarity between input and retrieval patch features is then computed in a lower-dimensional projection space, using cosine similarity to compute attention scores. 
+% Yawar: What do we cite for cosine similarity?
+%
+The process is visualized in Fig.~\ref{fig:method_attention}.
+
+More formally, if $p_{in}$ and $p_{retr_i}$ are the input and retrieved patch features for the $i^{th}$ nearest neighbor retrieval, the patched attention layer first computes the attention score as
+\begin{equation}
+    s_i = s(p_{in}, p_{retr_i}) = h_{in}(p_{in}) \cdot h_{retr}(p_{retr_i})
+\end{equation} where $h_{in}$ and $h_{retr}$ are networks implemented as MLPs that project $p_{in}$ and $p_{retr_i}$ to a 32-dimensional normalized space.
+%
+The attention weights are computed as softmax of attention scores:
+\begin{equation}
+    w_i = \frac{\exp(Cs_i)}{\sum_{j=1}^{k}\exp(Cs_j)}
+\end{equation} where $C$ is a hyperparameter controlling sharpness of the softmax.
+$C$ encourages selection over blending from the $k$ retrievals, in order to maintain the local detail present in the retrieved patches.
+The total contribution due to the $k$ retrievals is then given by the attention weighted sum of retrieval features.
+%
+Next, a learned blending function blends the input patch feature with this weighted sum based on the maximum attention score.
+%
+That is, once we have the attention weights, the output from attention layer is given as 
+\begin{equation}
+    (1 - \beta)\,p_{in} + \beta\sum_{i=1}^{k}w_i\,p_{retr_i}
+\end{equation} with the blending coefficient given as 
+\begin{equation}
+    \beta = \beta(s_1, s_2, ..., s_k) = \mathrm{sigmoid}(c\cdot\max_i s_i + d),
+\end{equation} $c$ and $d$ are learnable shift and bias parameters. Intuitively, the attention weights determine which of the retrievals should contribute, while $\beta$ determines how much input features should contribute compared to retrieval features.
+%
+Finally, the blended patches are reinterpreted as a full grid and decoded to an output distance field.
+%
+
+\paragraph{Refinement Loss.}
+To train the refinement, we employ a reconstruction loss on the final prediction as well as a retrieval-reconstruction loss and attention loss:
+\begin{equation}
+    L_{\mathrm{ref}} = L_{\mathrm{recon}} + \lambda_{\mathrm{retr}}\,L_{\mathrm{retr}} + \lambda_{\mathrm{attn}}\,L_{\mathrm{attn}}.
+\end{equation}
+$L_{\mathrm{recon}}$ denotes the reconstruction loss on the final predicted distance field $\mathbf{y}_{\textrm{recon}}$ with the ground truth distance field $\mathbf{y}_{\textrm{gt}}$ as an $\ell_1$ loss:
+\begin{equation}
+    L_{\mathrm{recon}} = |\mathbf{y}_{\textrm{recon}} - \mathbf{y}_{\textrm{gt}}|_1.
+\end{equation} 
+%
+$L_{\mathrm{retr}}$ ensures that the refinement decoder continues to decode to the original distance field of the retrieved chunk features: 
+\begin{equation}
+    L_{\mathrm{retr}} = |f_{dec}(f_{retr}(y_j)) - y_j|_1
+\end{equation}
+where $y_j$ is a chunk of $\mathbf{y}_{\textrm{gt}}$.
+%
+Finally, attention embedding space is supervised with
+\begin{equation}
+    L_{\mathrm{attn}} = \mathrm{NTXent}(h_{in}(p_{x_j}), h_{retr}(p_{y_j})) 
+\end{equation} 
+where NTXent is the normalized cross entropy loss, and $p_{y_j}$, $p_{x_j}$ are target and corresponding input patch features respectively. 
+
+\subsection{Implementation Details}
+%
+For both tasks of 3D super-resolution and point cloud to surface reconstruction, we use a $64^3$ truncated distance field (TDF) representation for the target geometry (larger scenes are processed in a sliding window fashion in $64^3$ windows), which are converted to meshes by Marching Cubes~\cite{lorensen1987marching}. 
+We use a $16^3$ chunk size in the target domain for retrievals, resulting in $4\times4\times4=64$ chunks per sample. 
+%
+The spatial attention uses a smaller patch size of $4^3$. 
+%
+
+We use a temperature of $0.2$ for the retrieval NTXent, and $0.05$ for the attention phase NTXent. We found that a lower temprature works better for the smaller sized patches.
+%
+The refinement phase uses $k = 4$ retrieval approximations for an input.
+%
+The refinement loss coefficients $\lambda_{\mathrm{retr}} = 0.5$ and $\lambda_{\mathrm{attn}} = 0.05$ to bring the losses to similar magnitudes.
+
+All networks are trained using Adam~\cite{kingma2014adam} with a learning rate of $10^{-4}$. We use a batch size of 196 for retrieval training, and 8 for refinement. 
+We train on a single NVIDIA 2080Ti for 150k iterations for retrieval ($\approx 10$ hours) and 350k iterations for refinement ($\approx 40$ hours)
+%

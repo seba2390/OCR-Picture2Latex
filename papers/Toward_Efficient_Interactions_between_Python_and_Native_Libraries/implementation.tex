@@ -1,0 +1,430 @@
+
+\section{Design and Implementation}
+\label{design}
+%In this section, we first describe the design of \tool. Then we introduce the method to construct call path for Python application. At last, we explain some technical details of \tool such as how to organize calling context tree and how to prevent exceptions caused by inappropriate sampling timing.
+% Figure~\ref{fig:overview} shows the system overview and highlights the prominent role of \tool during the profiling procedure. It performs a holistic analysis for Python applications without patching hardware, OS, interpreter, binary libraries and source code. Because \tool combines the information of top (application and interpreter) and bottom (OS and hardware) in system stack. In this section, we introduce the technical details of \tool's implementation.
+
+
+% \begin{enumerate}
+% \item \tool subscribes to the precise PMU event $E$ for each thread before the thread's initialization.
+% \item When an overflow interrupt triggered by PMUs, \tool capture the signal, construct the calling context $C_1$ of the signal, extract the effective address $M$ and the value $V_1$ stored at $M$
+% \item \tool set a watchpoint with the trap type as $T$ and resumes the application's execution.
+% \item A trap is triggered by a subsequent memory operation $O$. The \tool handles the trap, construct the calling context $C_2$ of the trap and inspects the value $V_2$ stored at $M$.
+% \item Check the Python runtime state. If the state is unchanged, resumes the execution and jump to step4.\footnote{A binary function call will block the Python runtime. If the runtime state is unchanged between two memory operations, it means these two operations are in a same binary function call. But we aim to detect wasting memory operations between different binary function calls. So we keep the watchpoint if the interpreter state is unchanged. }
+% \item \tool decides whether the context pair $<C_1, C_2>$ is wasting memory operation pairs or not depends on the $F(O, V_1, V_2)$, if $F$ doesn't give the result, resumes the execution and jump to step 4.
+% \item \tool disarms the debug register and resumes execution.
+% \end{enumerate}
+
+
+
+
+\subsection{Overview}
+See Figure~\ref{fig:new1}. Recall that the CL-algorithm controls PMUs and debug registers to report redundant member accesses of a process. \tool interact with Python runtime, native libraries, and the CL-algorithm through three major components: \emph{(i) Safeguard and sandbox.} A thin sandbox is built around Python interpreter and native libraries, and a safeguard is implemented inside the sandbox to moderate communication between Python runtime and the CL-algorithm. \emph{(ii) Measurement.} Upon receiving an event from the CL-algorithm, the measurement component determines whether to notify CCT (calling context tree) builder to update the CCT, and \emph{(iii) CCT Builder.} Upon receiving an update from the measurement component, CCT builder examines Python runtime and native call stacks to update CCT. 
+
+When an interaction inefficiency is detected, it will report to the end user (developer). 
+
+The measurement component helps to suppress false positive and avoid tracking irrelevant variables (e.g., reference counters), the CCT builder continuously update the lock-free CCT, and Safeguard/sandbox ensures that the Python application can be executed without unexpected errors. 
+
+We next discuss each component in details. 
+
+% Showing in Figure~\ref{fig:new1}, \tool consists of safe sampler, filter, inspector and formatter. \tool builds a thin sandbox around Python interpreter and native libraries, and use a safe sampler to coordinate the interaction between the Python runtime and the CL-algorithm, resulting in safe execution. During the profiling, CL-algorithm probabilistically monitors a small set of memory cells by reading memory access instruction streams. When a redundant access is detected, it will report to \tool. The filter of \tool take the redundant pairs from safe sampler and ignore interaction inefficiency unrelated ones based on pre-defined rules to improving measurement efficiencies. The filter deliver the interaction
+
+
+% \tool builds a thin sandbox around Python interpreter and native libraries, and uses hardware capacity through interactions with CL-algorithm. See Figure~\ref{fig:new1}. Roughly speaking, CL-algorithm probabilistically monitors a small set of memory cells by reading memory access instruction streams. When a redundant access is detected, it will report to \tool. Upon receiving the report, \tool dynamically updates the relevant fraction of the calling context tree and determines whether an interaction inefficiency occurs. To effectively do so, it needs to complete three major tasks. \emph{(i) Increase measurement efficiency.} \tool needs to block a fraction of irrelevant memory accesses from the Python interpreter so that the hardware monitoring resources are better utilized; it will also read call information from the interpreter to remove false alarms triggered by memory access activities within the same native function call or completely within the Python environment, \emph{(ii) Construct calling context trees with low overheads.} The calling context tree needs to be constructed in a signal-safe manner, and span Python and native function calls, both of which create implementation obstacles. Unlike compilation-based languages (C/C++/Java) that can concisely represent function calls, Python also tracks function calls using a fairly bloated mechanism (e.g., {\tt PyFrame}) so compression is needed to keep the overhead low, and \emph{(iii)  Keep the execution safe.} \tool needs to ensure that the Python code will not crash when the interpreter wants to deallocate memory that CL-algorithm is tracking, or when CL-algorithm interprets (sends reports to \tool) when the interpreter is in an inconsistent state. 
+
+
+% {\color{red} remove}To identify interaction inefficiencies, \tool{} first pinpoints the redundant loads and stores with performance monitoring units (PMUs) and debug registers available in commodity CPU processors. Such information only is too low level to understand Python semantics for optimization guidance, so we develop a new approach, leveraging combined calling contexts from both Python code and native libraries, to identify interaction behaviors. In the rest of this section, we elaborate on the mechanisms of pinpointing redundancies and determining the combined calling contexts. We then describe how we address some implementation challenges.
+
+%Figure 2
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=\linewidth]{Figures/overview_new.pdf}
+	\caption{Overview of \tool's workflow}
+	\label{fig:new1}
+\end{figure}
+
+
+% Figure 3
+\begin{figure*}[th]
+	\centering
+	\includegraphics[width=0.725\linewidth]{Figures/callpath.pdf}
+	\caption{Constructing a hybrid call path across Python runtime and native libraries. White arrows in call paths denote a series of elided call frames in PVM. The red circle in the hybrid call path shows the boundary of Python and native frames, where interaction inefficiencies occur.}
+	\label{fig:callpath}
+\end{figure*}
+
+
+\subsection{Measurement}
+\label{measurement}
+\myparabb{\textbf{CL-algorithm.}}
+CL-algorithm uses PMUs and debug registers to identify redundant loads and stores in an instruction stream. It implements a conceptually simple and elegant process: a sequence $a_1, a_2, \dots , a_m$ memory access instructions arrive at the CL-algorithm in a streaming fashion. Here, $a_i$ refers to the address of the memory access for the $i$-th instruction. Upon seeing a new memory access instruction $a_i$ (step 1, i.e \ding{182} in Figure~\ref{fig:new1}), the CL-algorithm uses PMUs to probabilistically determine whether it needs to be tracked (step 2), and if so, store the address in a debug register (step 3). If the debug registers are all used, a random one will be freed up. When a subsequent access to $a_i$ (or any addresses tracked by debug registers) occurs (step 4), the debug register will trigger an interrupt so that the CL-algorithm can determine whether the access is redundant (step 5), by using the rules outlined in 
+Section~\ref{commonpatterns}. Since the number of debug registers is usually limited, the CL-algorithm uses a reservoir sampling~\cite{vitter1985random} technique to ensure that each instruction (and its associated memory accesses) has a uniform probability of being sampled.
+
+% Here, there are usually a limited number of debug registers so we effectively can only sample a fraction of memory for tracking purposes. CL-algorithm uses a reservoir sampling technique to ensure that each instruction (and its associated memory accesses) has a uniform probability to be sampled \jtan{CITE}. 
+
+
+
+
+
+\myparabb{\textbf{Improving measurement efficiencies.}}
+First, PMUs sample instructions at the hardware level so it cannot distinguish memory accesses from the Python interpreter from those from the Python applications. In practice, a large fraction of memory access sequences are related to updating reference counters for Python objects. Therefore, most debug registers will be used to track reference counters if we bluntly use the CL-algorithm, and substantially reduces the chances of identifying memory access redundancies. Second, it needs to ignore redundant memory accesses occurring within the same native function call, or within a code region of \tool because they are not related to interaction inefficiencies. Note that tracking redundant memory accesses within the same native function call is worse than merely producing false positives because it can bury true instances. For example, two write instructions $w_1$ and $w_2$ of the same value are performed on the same memory from function $F_a$, and later function $F_b$ performs a third write instruction $w_3$ of the same value on the same location. If we track redundant accesses within the same function, the CL-algorithm says it has found a redundant pair $\langle w_1, w_2 \rangle$, evicts $w_1$ from the debug register. and never detects the redundant pair $\langle w_1, w_3 \rangle$ caused by the real interaction inefficiencies.
+
+%\yu{These redundant accesses are not related. Even worse, they may hide the real interaction inefficiencies. For example, a memory location is written twice, $w_1, w_2$ inside a native function $F_a$ with different value, the CL-Algorithm will not report $w_1, w_2$ as redundant pair and stop monitor it. However, another native function $F_b$ performs writing operation $w_3$, with same value to $w_1$, but the CL-Algorithm misses the redundant pair $\langle w_1, w_3 \rangle$.} % While these redundant accesses could indicate potential code quality issues, they are not related to interaction efficiencies so shall not be reported. 
+
+
+
+
+\tool performs instruction-based filter to drop a sample if \emph{(i)} its instruction pointer falls in the code region unrelated to native function calls (e.g., that of \tool), \emph{(ii)} its memory access address belongs to ``junky'' range, such as the head of {\tt PyObject} that contains the reference number. In addition, when the CL-algorithm delivers a redundant memory access pair to \tool, it checks the Python runtime states and drops the sample when these two memory accesses occur inside a same state (corresponding to within the same native function call).
+
+
+% {\color{blue}remove?
+% \tool{} adopts PMUs and debug registers to identify redundant loads and stores in an instruction steam. \tool{} configures PMUs to sample memory accesses and captures the instruction pointer and effective address upon each sample. \tool{} uses debug registers to watch the effective address and trap on the next access to the same effective address. By analyzing the sampled and trapped instructions, \tool{} can compare the values and determine whether they are a pair of redundant memory accesses. We leverage the existing approach~\cite{wen2018watching} to address the shortage of debug registers (only 4 in x86 architectures) via reservoir sampling~\cite{vitter1985random}. \tool{} interacts with Python runtime to correlate the low-level behavior in an instruction steam with high-level Python code.
+% The workflow of \tool{} consists of following steps:
+
+
+
+
+% %PMUs sample hardware events periodically and record event's detailed information. \tool uses PMUs to sample memory-related events. Hardware debug registers trap the CPU execution when an instruction accesses a designated address (watchpoint). \tool employs debug register to monitor specific types of subsequent memory accesses to a memory address. Also \tool overcomes the limitation of insufficient debug registers by reservoir sampling~\cite{vitter1985random, wen2018watching, wang2019featherlight}.
+
+% \begin{enumerate}
+%     \item \tool subscribes to the precise PMUs events $E$ for each thread before the thread's initialization. PMUs deliver samples of subscribed events to \tool periodically.
+    
+%     \item When \tool receives a sample, it snapshots the current Python runtime state. Combining the sample and runtime state, \tool builds hybrid call path $C_1$, and extracts the effective address $M$ and the value $V_1$ stored at $M$.
+    
+%     \item \tool sets watchpoint to monitor $M$ with access type $T$, and resumes runtime execution.
+    
+%     \item Memory accessing to $M$ triggers a watchpoint to trap.
+    
+%     \item \yu{\tool checks the current Python runtime state. If the state hasn't been a new native function call, go back to step 3, otherwise continue.} 
+    
+%     \item \tool snapshots the state of runtime again and builds the hybrid call path $C_2$, and inspects the current value $V_2$ stored at $M$.
+    
+%     \item \tool compares $V_1$ and $V_2$, and reports $<C_1, C_2>$ as an inefficiency pair if $V_1$ equals $V_2$.
+    
+% \end{enumerate}
+
+% }
+
+% Figure~\ref{fig:overview} highlights \tool's basic idea. \tool subscribes to the precise PMU events $E$ for each thread before the thread's initialization. When PMUs deliver a sample (step~1 in Figure~\ref{fig:overview}), \tool snapshots the state of Python runtime (step~2). Combining the sample and runtime state, \tool builds hybrid call path $C_1$, also extracts the effective address $M$ of sample. According to the value stored in $M$, \tool finds and saves the corresponding {\tt PyObject} $O_1$. Then \tool sets watchpoint to monitor $M$ (step~3) with access type $T$, and resumes runtime execution. When a trap is triggered (step~4), \tool snapshots the state of runtime again (step~5) and builds the hybrid call path $C_2$. Based on the the value stored in $M$, \tool finds the corresponding {\tt PyObject} $O_2$, then compares $O_1$ and $O_2$. \tool reports $<C_1, C_2>$ as inefficiency pair if $O_1$ equals $O_2$.
+
+% When detecting redundant stores, \tool sets the hardware event $E$ as memory store event and sets $T$ as memory store type, while \tool sets the hardware event $E$ as a memory load event and sets $T$ a as memory load type for detecting redundant loads.
+
+% \begin{figure}[t]
+% 	\centering
+% 	\includegraphics[width=\linewidth]{asplos21/paper/Figures/detector.pdf}
+% 	\caption{Overview of \tool's interaction inefficiency detection workflow.}
+% 	\label{fig:overview}
+% \end{figure}
+
+
+
+
+\subsection{Calling Context Trees Builder}
+This section first explains the construction of call paths, and then explains how they can be used to construct signal-free calling context trees (CCTs). 
+
+%We first explain construction of call paths, then describe how We describe how we can construct call paths, and use them to construct CCT. {\color{red} message.}
+
+\myparabb{\textbf{Hybrid call path.}}
+\tool{} uses libunwind~\cite{libunwind} to unwind the native call path of a Python process to obtain a chain of procedure frames on the call stack. See the chain of ``Native Call Path'' on the left in Figure~\ref{fig:callpath}.
+Here, call stack unwinding is not directly applicable to Python code because of the abstraction introduced by PVM. 
+The frames on the stack are from PVM, not Python codes. %, as the native call path shown in Figure~\ref{fig:callpath}. 
+For example, the bottom {\tt \_PyEval\_EvalFrameDefault}\footnote{{\tt \_PyEval\_EvalFrameDefault} is a frame (i.e., a function pointer) in the native call stack in runtime that corresponds to invocation of a function or a line of code in Python.} shows up in ``Native Call Path'', but we need the call to correspond to {\tt func2()} in Python code (connected through {\tt PyFrame1}). Thus, \tool{} needs to inspect the dynamic runtime to map native calls with Python calls on the fly. 
+
+% We first explain how each {\tt PyFrame} may be mapped to Python function calls, then explain how nodes in Native Call Path may be mapped to {\tt PyFrame}'s. 
+
+
+\noindent{\emph{1. Mapping {\tt PyFrame} to Python calls.}} First, we observe that each Python thread maintains its call stacks in a thread local object {\tt PyThreadState} (i.e., {\tt tstates} in Figure~\ref{fig:callpath}).  
+%As shown in Figure~\ref{fig:callpath}, each Python thread maintains its call stacks in a thread local object {\tt PyThreadState} (i.e., {\tt tstates}). 
+To obtain Python's calling context, \tool{} first calls {\tt GetThisThreadState()}\footnote{{\tt GetThisThreadState()} is a PVM API to retrieve an object that contains the state of current thread.} to get the {\tt PyThreadState} object of the current thread. Second \tool{} obtains the bottom {\tt PyFrame} object (corresponding to the most recently called function) in the PVM call stack from the {\tt PyThreadState} object. All {\tt PyFrame} objects in the PVM call stack are organized as a singly linked list so we may obtain the entire call stack by traversing from the bottom {\tt PyFrame}.  
+%from bottom to top. 
+Each {\tt PyFrame} object contains rich information about the current Python frame, such as source code files and line numbers that \tool{} can use to correlate a {\tt PyFrame} to a Python method. In Figure~\ref{fig:callpath}, {\tt PyFrame1}, {\tt PyFrame2}, and {\tt PyFrame3} are for Python methods {\tt main}, {\tt func2}, and {\tt func1}, respectively. 
+
+
+ %points to {\tt PyFrame1}, but we cannot tell {\tt PyFrame1} refers to {\tt func2()} in Python Runtime. 
+ 
+ \noindent{\emph{2. Extracting {\tt PyFrame}'s from Native Call Path.}} Each Python function call leaves a footprint of {\tt \_PyEval\_EvalFrameDefault} in the native call stack so we need only examine 
+ {\tt \_PyEval\_EvalFrameDefault}. Each {\tt \_PyEval\_EvalFrameDefault} maps to a unique {\tt PyFrame} in the call stack of the active thread in Python Runtime. In addition, the ordering preserves, e.g., the third {\tt \_PyEval\_EvalFrameDefault} in ``Native Call Path'' corresponds to the third {\tt PyFrame} in Python's call stack. Therefor use standard Python interpreter APIs to obtain the {\tt PyFrame}'s and map them back to nodes in the native call path. 
+
+% See also Hybrid Call Path in Fig. XX for an example of \tool{}'s output. 
+
+% {\color{red} check}
+% Figure~\ref{fig:callpath} illustrates the procedure of hybrid call path is constructed from native and Python call paths upon each PMU sample and debug register trap. The boundary of Python and native frames indicates the location where interaction inefficiencies potentiall occur.
+
+% {\color{blue} remove
+% To construct the hybrid call paths between Python code and native libraries, \tool{} needs to map PVM-related frames on the native call path to the Python methods (denoted as {\tt PyFrame}). 
+% From our observation, the frame {\tt \_PyEval\_EvalFrameDefault} on the native call path 1-to-1 maps to a {\tt PyFrame}. Based on this observation, \tool{} uses the following algorithm to construct the hybrid call paths:
+% \begin{enumerate}
+%     \item \tool{} scans all the frames in the native call paths and obtains the frames from PVM. 
+%     \item \tool{} leverages the instruction pointer stored in the frame to identify {\tt \_PyEval\_EvalFrameDefault} frames in the native call path and drop other unnecessary PVM frames.
+%     \item \tool{} replaces {\tt \_PyEval\_EvalFrameDefault} frames with {\tt PyFrame} frames according to the call relationship obtained from the Python runtime.
+% \end{enumerate}
+% }
+% with which \tool{} associates the measurement for intuitive optimization guidance. 
+
+%\tool traverses PVM call stack {\tt PyFrame} object from bottom to top, to build the Python call path\footnote{\tool gets current line number with {\tt PyFrame\_GetLineNumber()} function and the source file name with the {\tt PyCodeObject} object saved in {\tt PyFrame} object}. However, the Python call path itself fails to reflect raw application behaviors on OS/hardware.
+
+% {\color{red}I think there should be N-to-1 or 1-to-N mapping between PVM frame to real native frames. Can you discuss from this perspective?}
+%To deliver a holistic analysis for Python applications, \tool patches the native call path with Python runtime information. 
+
+
+% {
+% \color{red} 
+% Combining the call paths of Python code and native libraries at a given point of the execution provides unique insights into the interaction inefficiencies. 
+% }
+
+
+\begin{comment}
+
+Thus, \tool{} first identifies the frames in the native 
+
+To achieve this, 
+\tool{} leverages the memory address range allocated for each 
+{\tt \_PyEval\_EvalFrameDefault} to locate the {\tt PyFrame} objects' corresponding locations in the native call path by checking each level's instruction pointer. Then \tool fills the information of Python frames to the corresponding locations in the native call path, constructing a hybrid call path shown in Figure~\ref{fig:callpath}. Such a hybrid call path provides heuristic intuition for diagnosing Python applications.
+\end{comment}
+
+
+% However, it is nontrivial to join native call path and the information in {\tt PyFrame} objects, because Python runtime and native functions may recursively call each other, which leads to the interleaved call path. The key challenge is how to find appropriate patching slots in native call path where to fill with Python calling context. \tool addresses this challenge by mapping {\tt PyFrame} objects to native function calls. The procedure of {\tt PyFrame} execution is defined in a native function called {\tt \_PyEval\_EvalFrameDefault}. With {\tt \_PyEval\_EvalFrameDefault}'s memory address range, \tool locates all {\tt PyFrame} objects' corresponding patching slots by checking each level's IP of native function call. At last, \tool merges the Python call path in {\tt PyFrame} objects to patching slots, constructing a hybrid call path showing in Figure~\ref{fig:callpath}. Such a hybrid call path provides heuristic intuition for Python applications diagnosis.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=\linewidth]{Figures/cct.pdf}
+	\caption{A calling context tree constructed by \tool. Each parent node applies skip-list to organize children. {\tt INode} denotes an internal node and {\tt LNode} denotes a leaf node. Red box shows searching {\tt 0xa46} in the example skip-list.}
+	\label{fig:cct}
+\end{figure}
+
+
+
+
+%\noindent{\textbf{Maintaining Hybrid Calling Contexts}}
+\myparabb{\textbf{CCT from call paths.}}
+\tool applies a compact CCT~\cite{arnold2000approximating, ammons1997exploiting} to represent the profile. Figure~\ref{fig:cct} shows the structure of a CCT produced by \tool. The internal nodes represent native or Python function calls, and the leaf nodes represents the sampled memory loads or stores.
+%have basic information of caller function, such as native function instruction pointer or Python function line number. Leaf nodes have basic instruction information, as well as a data regions attribute to metrics. 
+Logically, each path from a leaf node to the root represents a unique call path. 
+%We need to address two issues to handle CCT operations efficiently. 
+
+%encompassing the leaf instruction and each call site.
+As mentioned, Python is a dynamic typing language, and uses meta-data to represent calling context (e.g., the function and file names in string form); therefore, its call stacks are usually substantially larger (in space) than those in static languages. One solution is to build a dictionary to map strings to integer ids but the solution must be signal-free because it needs to interact with the CL-algorithm and PMUs, which is prohibitively complex.
+
+
+Our crucial observation is that function calls in different threads near the root of a tree usually repeat so unlike solutions appeared in~\cite{chabbi2012deadspy, wen2017redspy, loadspy, chabbi2014call, su2019pinpointing}, which  produce a CCT for each thread/process, \tool{} constructs a single CCT for the entire program execution. In this way, the same function call appearing in different threads is compressed into one node and space complexity is reduced. \tool also implements a lock-free/signal-safe skip-list~\cite{pugh1990skip} to maintain CCT's edges for fast and thread-safe operations. In theory, Skip-list's lookup, insert, and delete operations have $O(\log n)$ time complexity.
+In practice,
+Skip-list with more layers has higher performance but higher memory overhead. In a CCT, the nodes closer to the root are accessed more frequently. \tool, however,proportionally adjusts the number of layers in the skip-lists at different levels in a CCT to optimize the performance and overhead tradeoffs. It uses more layers to represent the adjacency lists of nodes that are close to the root, and fewer layers to represent those that are close to the leaves. 
+
+
+
+
+% \begin{figure}[t]
+% \begin{lstlisting}[caption={\yu{TODO}},label=lst:debug_register]
+% arr = torch.empty(10k).fill_(1)
+% torch.pow(arr, 2)
+% torch.pow(arr, 4)
+% \end{lstlisting}
+% %\vspace{-1em}
+% \end{figure}
+
+% \subsection{Unbiased Memory Address Monitoring}
+% Hardware employs limited number of debug registers, which constrains \tool to monitor multiple memory addresses at the same time. If the PMU presents a sample when all debug registers are occupied, a strategy is demanded to decide which watchpoint should be replaced. The naive solutions -- replace the oldest/newest one, will cause the bias monitoring to a long/short interval memory access pair. Considering the silent store in Listing~\ref{lst:debug_register}, assume the {\tt torch.pow} function calculates the power of each element in array sequentially, and only triggers memory store when it updates each element's value. The sampling rate is set to be 1K and only one debug register is available. The first sample takes place when {\tt arr[1K]} is updated, and one available debug register is being used to monitor {\tt arr[1K]}. The second sample takes place when {\tt arr[2k]} is updated. Since there is not an available debug register, it's hard to decide whether to replace the old watchpoint or to ignore the new sample without looking ahead. Applying the method -- "replace the oldest/newest one" will potential miss the long/short interval silent store pair.
+
+% Similar with previous works, \yu{CITE}\tool utilizes reservoir sampling\yu{CITE} to address this issue, which guarantees the old and new samples have equal probabilities of being chosen. In the scenario of only one available debug register, the algorithm performs on $S_k$, the $k$-th sample ($k \textgreater 1$), as following:
+
+% \begin{itemize}
+%     \item If the debug register is available, $S_k$ occupy it.
+%     \item If the debug register is occupied by $S_i$ ($1 \leq i \textless k$), $S_k$ replaces the $S_m$ with the probability $P_k = \frac{1}{k-m+1}$
+% \end{itemize}
+% After making the decision of $S_k$, all samples:$\{S_i \mid i \in [1, k]\}$, have same probability $P_k$ to be monitored by the debug register. In the scenario of multiple debug registers, the new sample performs the same procedure above to each debug register with random order, until it replaces a previous sample or fails to occupy a debug register. This approach helps \tool to achieve unbiased memory address monitoring without the constrain of memory access interval.
+
+
+
+
+\subsection{Safeguard}
+%\yu{NEED POLISH}
+%We need to address two issues to ensure the Python application is properly executed without unexpected errors. 
+\tool uses two mechanisms to avoid unexpected errors in Python runtime. It will hibernate if it enters a block of code, interrupting which will cause state corruption in PVM, and will block certain activities from GC if the activities can cause memory issues.  
+
+
+
+
+\begin{table*}[!htbp]
+    \centering
+    %\vspace{-1em}
+    %\fontsize{5pt}{0}
+    %\fontsize{4}{4}\selectfont
+    %\fontsize{5pt}{6pt}
+    %\selectfont
+    %\scriptsize
+    \tiny
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{||c|c|c||c|c||c|c||}
+    %\toprule
+    \hline
+        \multicolumn{3}{||c||}{Program Information} &
+        \multicolumn{2}{c||}{Inefficiency} & 
+        \multicolumn{2}{c||}{Optimization}  \\
+    \hline
+        Applications & Library & Problem Code & Category & Pattern  & AS & FS \\
+    \hline
+    \hline
+        \multirow{2}{3em}{Ta~\cite{ta}} & \multirow{2}{2em}{Ta}  & 
+        volatily.py(45)/trend.py(536,  &  \multirow{2}{*}{Slice underutilization}  & \multirow{2}{*}{$L$}    & \multirow{2}{2em}{1.1$\times$}  & \multirow{2}{3em}{16.6$\times$} \\
+        
+        &   & 549, 557, 571, 579)
+         &    &    &   &  \\        
+    \hline
+        NumPyCNN~\cite{numpycnn} & Numpy~\cite{harris2020array, van2011numpy}  & numpycnn.py(161)  & Loop-invariant computation  & $S$  & 1.8$\times$  & 2.04$\times$    \\ 
+    \hline
+        Census\_main & NumpyWDL~\cite{numpywdl}  & ftrl.py(60)  & Loop-invariant computation &  $S$  & 1.03$\times$  & 1.1$\times$   \\ 
+    \hline
+        Lasso & Scikit-learn~\cite{scikit-learn}  & least\_angle.py(456, 458)  & Inefficient algorithms & $S$  &  1.2$\times$ & 6.1$\times$ \\ 
+    \hline
+        \multirow{2}{5em}{IrisData~\cite{irisdata}} & \multirow{2}{3em}{Numpy}  & nn\_backprop.py(222, 228,    &  Slice underutilization \& & \multirow{2}{*}{$L$}  & \multirow{2}{2em}{2$\times$}  & \multirow{2}{2em}{2.02$\times$}   \\
+    
+        &  & 247, 256, 263, 271, 278)  & API misuse  &    &  &    \\
+    \hline
+        \multirow{2}{5em}{Network} & Neural-network-  & \multirow{2}{9em}{network.py(103-115)}  & \multirow{2}{6em}{Repeated NFC}   & \multirow{2}{*}{$L$} &  \multirow{2}{2em}{1.03$\times$}  &  \multirow{2}{2em}{1.05$\times$} \\ 
+        
+        & from-scratch  &  &  &   &   &   \\ 
+    \hline 
+        Cnn-from-scratch~\cite{cnnscratch} & Numpy  & conv.py(62)  &  Slice underutilization  & $L$  & 2.5$\times$  & 3.9$\times$    \\ 
+    \hline
+        \multirow{5}{*}{Metaheuristics~\cite{nguyen2019building, nguyen2018resource}} & \multirow{5}{*}{Numpy} & FunctionUtil.py(374)  & API misuse
+        & $L$  & 1.4$\times$  & 1.9$\times$    \\
+    %\hline
+    \cline{3-7}
+        &  & FunctionUtil.py(270)  &  Slice underutilization & $L$ &  6.3$\times$  & 27.3$\times$ \\
+    %\hline
+    \cline{3-7}
+        &  & FunctionUtil.py(309, 375)  &  Loop-invariant computation & $S$  & 1.04$\times$  & 1.4$\times$    \\
+    %\hline
+    \cline{3-7}
+        &  & FunctionUtil.py(437) & Repeated NFC & $L$ &  1.02$\times$  & 1.1$\times$ \\
+
+    \cline{3-7}
+        &  & EPO.py(40)  & Loop-invariant computation & $S$ & 1.1$\times$  & 1.1$\times$    \\        
+    \hline
+    %\midrule
+        LinearRegression~\cite{linearregression} & LinearRegression   & LinearRegression.py(49, 50)  & Repeated NFC  & $L$ & 1.4$\times$  & 1.5$\times$    \\
+    \hline
+        Pytorch-examples~\cite{pytorch-example} & PyTorch~\cite{paszke2017automatic}  & adam.py:loop(66)  & Loop-invariant computation  & $L$ &  1.02$\times$ & 1.07$\times$     \\ 
+    \hline
+        Cholesky~\cite{zhou2020harp} & PyTorch  & cholesky.py(76)  & Slice underutilization  & $L$ & 3.2$\times$  & 3.9$\times$    \\
+    \hline
+        GGNN.pytorch~\cite{ggnn} & PyTorch  & model.py(122, 125)  & Loop-invariant computation & $S$  &  1.03$\times$  &  1.07$\times$   \\
+    \hline
+        Network-sliming~\cite{Liu_2017_ICCV} & \multirow{2}{*}{Torchvision~\cite{torchvision}}  & \multirow{2}{*}{functional.py(164)}  & \multirow{2}{*}{Slice underutilization} & \multirow{2}{*}{$L$}  & 1.1$\times$  &  1.7$\times$ \\
+    \cline{1-1}
+    \cline{6-7}
+        Pytorch-sliming~\cite{Liu_2017_ICCV} &   &   &   &  & 1.04$\times$ &  1.7$\times$ \\
+    % \hline
+    %      &   & transforms.py & Identical computation   &  &   & 1.02$\times$  & 2.83$\times$    \\
+    \hline
+        Fourier-Transform~\cite{fourier} & \multirow{3}{*}{Matplotlib~\cite{Hunter:2007}}  & \multirow{3}{*}{transforms.py(1973)} & \multirow{3}{6em}{Repeated NFC}   & \multirow{3}{*}{$S$} & 1.02$\times$  & 2.8$\times$    \\
+    %\hline
+    \cline{1-1}
+    \cline{6-7}
+        Jax~\cite{jax2018github} &   &  &   &   & 1.04$\times$  & 2.8$\times$  \\    
+    %\hline
+    \cline{1-1}
+    \cline{6-7}
+        Autograd~\cite{autograd} &   &   &   &   & 1.05$\times$  & 2.8$\times$  \\  
+    %\bottomrule
+    \hline
+
+%\multicolumn{6}{l}{{\vbox to 2ex{\vfil}} $Pattern^*$: $L$ means {\it redundant loads}, $S$ means {\it redundant stores}} \\
+
+% \multicolumn{6}{l}{{\vbox to 2ex{\vfil}} $AS^+$: Application level speedup} \\
+    
+% \multicolumn{6}{l}{{\vbox to 2ex{\vfil}} $LS^*$: Library level speedup} \\
+    \end{tabular}
+    }
+    \caption{Overview of performance improvement guided by \tool. {\it AS} denotes application-level speedup, {\it FS} denotes function-level speedup, $L$ refers to redundant loads and $S$ refers to redundant stores.}
+    \label{table}
+\end{table*}
+
+
+\myparabb{\textbf{Hibernation at function-level.}}
+Upon seeing an event (e.g., an instruction is sampled or a redundant memory access is detected), the
+PMUs or debug registers use interrupt signals to interact with \tool, which will pause Python's runtime. Error could happen if Python run time is performing certain specific tasks when an interrupt exception is produced. For example, if it is executing memory management APIs, memory error (e.g., segmentation fault) could happen, and if Python is loading native library, deadlock could happen. 
+
+
+%send signals to process, which pause Python runtime and execute \tool's code procedure. 
+
+
+\tool maintains a list of functions, inside which \tool needs to be temporarily turned off (i.e., in hibernation mode). To do so, \tool maintains a block list of function, and implements wrappers for each function in the list. Calls to these functions are redirected to the wrapper. The wrapper turns off \tool, executes the original function, and turns on \tool again.  
+%performs function-level protections. Function-level protection has a block list of functions, that will be redefined by mocking functions in the sandbox. The sandbox preloads mocking functions at the beginning of program execution to overload block functions. When a function on block list is called, it executes the function wrapper. The wrapper function first pauses \tool, then executes the real function by function pointer, and finally resumes \tool's profiling.
+
+\noindent{\emph{Dropping events vs. hibernation.}} We sometimes drop an event when it is unwanted (Section~\ref{measurement}). Complex logic can be wired to drop an event at the cost of increased overhead. Here, hibernating \tool is preferred to reduce overhead because no event needs to be kept for a whole block of code. 
+
+
+
+
+
+
+%Pausing Python runtime in specific states triggers exceptions. Some possible exceptions are: \emph{(i)} the memory error (e.g., segmentation fault) caused by handling samples when Python runtime is executing memory management APIs; \emph{(ii)} the dead lock caused by handling samples when Python runtime is loading native libraries; \emph{(iii)} the interference to profiling result caused by garbage collection;
+% \tool performs safe sampling by applying both instruction-level (fine-grained) and function-level (coarse-grained) protections. Fine-grained protection has a block list of virtual address ranges {\it (Block V List)}, which contains the memory range of pre-defined block functions/libraries. Through fine-grained protection, \tool ignores the samples whose instruction pointers are in the {\it Block V List}. Coarse-grained protection has a block list of functions {\it (Block F List)}, that will be redefined by mocking functions in a new shared library. \tool preloads mocking functions at the beginning of program execution to overload block functions. When a function on {\it Block F List} is called, it executes the function wrapper. The wrapper function first pauses \tool, then executes the real function by function pointer, and finally resumes \tool's profiling.
+
+\myparabb{\textbf{Blocking garbage collector.}}
+When Python GC attempts to deallocate the memory that debug registers are tracking, errors could occur. Here, we uses a simple trick to defer garbage collection activities: when \tool monitors memory addresses and it  is within a {\tt PyObject}, it increases the corresponding {\tt PyObject}'s reference, and decreases the reference once the address is evicted. This ensures that memories being tracked will not be deallocated. Converting addresses to {\tt PyObject}'s is done through progressively heavier mechanisms. First, {\tt PyObject}'s exist only in a certain range of the memory so we can easily filter out addresses that do not correspond to {\tt PyObject} (which will not be deallocated by GC). Second, we can attempt to perform a dynamic casting on the address and will succeed if that corresponds to the start of an {\tt PytObject}. This handles most of the cases. Finally, we can perform a full search in the allocator if we still cannot determine whether the address is within a {\tt PyObject}. 
+
+
+
+
+
+
+%Python uses reference counting and generational garbage collector to perform garbage collection (GC). \emph{(i)} generational garbage collector reads/writes {\tt PyObject}s, resulting in misreporting of redundant loads; \emph{(ii)} when \tool is monitoring a memory address, deallocating corresponding {\tt PyObject} by GC incurs unexpected errors. 
+
+%Python runtime does not provide APIs to investigate GC's behaviors. \tool has to employ multiple techniques to guarantee the correct measurement when handling Python garbage collection. First, \tool uses function level protection to ignore generational garbage collecting functions, avoiding the interference with generational garbage collector. Second, when \tool monitors memory addresses, it increases corresponding {\tt PyObject}'s reference to avoid the deallocation, and decreases the reference at the end of monitoring to prevent memory leak.
+
+
+% \noindent{\textbf{Dynamic Query of Native Function Addresses.}}
+% \tool needs to dynamically query native function addresses for calling context construction, {\it Block V List} and {\it Block F List} initialization and calculating  watchpoint's precise instruction pointer. Therefore, \tool maintains a function range map that has all native functions existing in application memory space. A function and its basic information (e.g., function name, library name, and virtual memory address range) are stored in the function range map for further usage.% One can lookup any instruction  and can be queried by the instruction pointer. 
+
+% We perform some optimizations to update the function range map, because the {\tt /proc/self/maps} file changes frequently during runtime. Previous work~\cite{chabbi2018featherlight} suggests periodic checking, but it is difficult to choose an appropriate checking interval. Long checking interval makes the function range map inconsistent with the runtime state, while short checking interval results a high overhead. \tool uses the ``lazy'' strategy, which triggers an updating operation when a query fails, to balance functionality and performance. Function range map is also subject to collisions when the same file is mapped/unmapped or the same virtual address is reused multiple times. To prevent collisions, \tool uses incremental version numbers for faster detection of outdated address ranges, deleting the corresponding functions from the map. \tool equips readers-write lock to protect the map because read operations are more frequent than write operations.  
+
+ 
+
+
+
+
+
+%Because Python runtime is a static executable and its functions cannot be mocked, \tool solves this issue by equipping embedded Python runtime. The embedded runtime is based on the shared library, under the coarse-grained protection.
+
+
+
+
+% \subsection{Disassembly of Instruction}
+% \tool employs the Intel Xed library \yu{CITE} to disassemble the instructions, resulting in details of the memory operation such as access type and length. \tool directly disassembles the IP in context of signal sent by PMUs event, because the Intel PEBS supports precise register state. However, such a mechanism is not suitable for the watchpoint event. The signal context IP of watchpoint event is one before the actual IP, because the watchpoint triggers trap after the instruction's execution. It is nontrivial to calculate the actual IP from context IP, because different instructions have different lengths in x86 instruction set. To overcome this issue, \tool fetches the start address of the IP's corresponding function from binary map, then disassembles every instruction from the start address till reaches the instruction before the context IP, which is the actual precise IP of trap.
+
+
+
+
+% Building and updating function range map is .
+% Binary map is the basic block of \tool, it is used to implement \yu{TODO}. 
+
+% Based on {\tt /proc/self/maps} file, \tool builds and updates the function range map. {\tt /proc/self/maps} contains the files that are mapped into memory space, it records the files' paths and corresponding virtual memory address ranges. In Python runtime space, most of the mapped files are shared libraries, which belong to the Executable and Linkable Format (ELF). ELF has a symbol table that contains function names and start address offsets. The memory addresses of functions in a mapped file can be calculated with file's virtual address range and symbol table. 
+
+% To sum up, updating binary map requires following steps: 
+% \begin{enumerate}
+%     \item Query the {\tt /proc/self/maps} file, get virtual addresses and file paths.
+%     \item Parse files in step 1, get their symbol tables.
+%     \item Calculate virtual address ranges of functions in each file with the file's virtual address and symbol table. Save all results in binary map.
+% \end{enumerate}
+
+
+
+
+
+
+%To further reduce overhead, readers return fail without waiting for lock release when \tool is updating function range map. Dropping a few samples does not harm profiling accuracy; in practice, the number of failed samples caused by lock contention is negligible.
+
+
+
+
+
+
+
+
+% to achieve the trade-off between functionality and performance, it only triggers the updating operation when query is failed. Second, mapping/unmapping a same file multiple times or virtual address reuse will cause collision in function range map. To prevent such a  collision, \tool uses incremental version numbers to fast detecting out-of-date address ranges, and removes corresponding functions from function range map. At last \tool uses the readers-write lock to protect function range map, because read operations are far more than the write operations. When \tool is updating function range map, readers return fail without waiting for lock release. \tool simply ignores samples in this period because dropping few samples does not harm the profiling accuracy. In practice, the number of failed samples that caused by the lock contention is negligible.
+
+
+
+% Next, \tool uses the readers-write lock to protect function range map, because read operations are far more than the write operations. At last, \tool applies non-blocking design to intensively reduce updating overhead. When \tool is updating function range map, readers returns fail without waiting for lock release. \tool simply ignores samples in this period because dropping few samples does not harm the profiling accuracy. In practice, the number of failed samples that caused by the lock contention is negligible.  
+

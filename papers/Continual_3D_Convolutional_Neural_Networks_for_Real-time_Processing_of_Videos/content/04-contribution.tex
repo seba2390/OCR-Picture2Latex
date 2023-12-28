@@ -1,0 +1,280 @@
+\vspace{-2mm}
+\section{Continual Convolutional Neural Networks}\label{sec:continual}
+\vspace{-2mm}
+\subsection{Regular 3D-convolutions lead to redundancy}\label{sec:regular-cnn-redundancy}
+\vspace{-1mm}
+% We could add something on LSTM-based methods
+Currently, the best performing architectures (e.g., X3D~\cite{feichtenhofer2020x3d} and SlowFast~\cite{feichtenhofer2019slowfast}) employ variations on 3D convolutions as their main building block and perform predictions for a spatio-temporal input volume (video-clip). 
+These architectures achieve high accuracy with reasonable computational cost for predictions on clips in the offline setting.
+They are, however, ill-suited for online video classification, 
+where the input is a continual stream of video frames and a class prediction is needed for each frame. 
+For regular 3D CNNs processing clips of $m_T$ frames to be used in this context, prior $m_T-1$ input frames need to be stored between temporal time-steps and assembled to form a new video-clip when the next frame is sampled.
+% This leads to computational redundancies in proportion to $m_T$, as illustrated in \cref{fig:conv-redundancy}.
+This is illustrated in \cref{fig:conv-redundancy}.
+
+Recall the computational complexity for a 3D convolution:
+\begin{equation}
+    \Theta( [k_H \cdot k_W \cdot k_T + b] \cdot c_I \cdot c_O \cdot n_H \cdot n_W \cdot n_T ),
+\end{equation}
+%
+\begin{figure}
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/conv-redundancy.pdf}
+	\caption{
+	\textbf{Redundant computations} for a temporal convolution during online processing, as illustrated by the repeated convolution of inputs (green $\mathbf{b,c,d}$) with a kernel (blue $\alpha, \beta$) in the temporal dimension.
+% 	During online processing of a continual video stream in a clip-wise manner, there is a redundancy in computations between time-steps due to the repeated convolution of inputs (green $\mathbf{b,c,d}$) with a kernel (blue $\alpha, \beta$) in the temporal dimension. 
+	Moreover, prior inputs ($\mathbf{b,c,d}$) must be stored between time-steps for online processing tasks. }
+    \label{fig:conv-redundancy}
+    \vspace{-5mm}
+\end{figure}
+%
+where $k$ denotes the kernel size, $T$, $H$, and $W$ are time, height, and width dimension subscripts, $b \in \{0,1\}$ indicates whether bias is used, and $c_I$ and $c_O$ are the number of input and output channels. 
+The size of the output feature map is $n = (m + 2p - d \cdot (k-1) - 1)/s + 1$ for an input of size $m$ and a convolution with padding $p$, dilation $d$, and stride $s$.
+% n source: https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html#torch.nn.Conv2d
+%
+During online processing, every frame in the continual video-stream will be processed $n_T$ times (once for each position in the clip), leading to a redundancy proportional with $n_T-1$.
+% The redundancy of performing the above-described computation in online processing is
+% \begin{equation}
+%     \Theta( [k_H \cdot k_W \cdot k_T + b] \cdot c_I \cdot c_O \cdot n_H \cdot n_W \cdot [n_T-1] ).
+% \end{equation}
+%
+Moreover, the memory-overhead of storing prior input frames is 
+\begin{equation}
+    \Theta(c_I \cdot m_H \cdot m_W \cdot [m_T - 1])),
+\label{eq:conv-mem-store-frames}
+\end{equation}
+%
+and during inference the network has to transiently store feature-maps of size 
+\begin{equation}
+    \Theta(c_O \cdot n_H \cdot n_W \cdot n_T).
+    \label{eq:reg-conv-transient}
+\end{equation}
+
+
+
+
+\vspace{-3mm}
+\subsection{Continual Convolutions}
+\vspace{-1mm}
+We can remedy the issue described in \cref{sec:regular-cnn-redundancy} by employing an alternative sequence of computational steps. 
+In essence, we reformulate the repeated convolution of a (3D) kernel with a (3D) input-clip that continually shifts along the temporal dimension as a \textit{Continual} Convolution (\textit{Co}Conv), where all convolution computations (bar the final sum) for the (3D) kernel with each (2D) input-frame are performed in one time-step. 
+Intermediary results are stored as states to be used in subsequent steps, while previous and current results are summed up to produce the output. 
+The process for a 1D input and kernel, which corresponds to the regular convolution in \cref{fig:conv-redundancy}, is illustrated in \cref{fig:conv-fixed}. 
+%
+% Characterisation
+In general, this scheme can be applied for online-processing of any $N$D input, where one dimension is a temporal continual stream.
+Continual Convolutions are causal~\cite{oord2016wavenet} with no information leaking from future to past 
+and can be efficiently implemented by zero-padding the input frame along the temporal dimension with $p = \text{floor}(k / 2)$. 
+Python-style pseudo-code of the implementation is shown in \cref{code:coconv3d}.
+%
+\begin{figure}
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/conv-fixed.pdf}
+	\caption{
+	\textbf{Continual Convolution}. 
+	An input (green $\mathbf{d}$ or $\mathbf{e}$) is convolved with a kernel (blue $\alpha, \beta$). The intermediary feature-maps corresponding to all but the last temporal position are stored, while the last feature map and prior memory are summed to produce the resulting output. For a continual stream of inputs, Continual Convolutions produce identical outputs to regular convolutions.
+	}
+    \label{fig:conv-fixed}
+    \vspace{-5mm}
+\end{figure}
+%
+\begin{center}
+\noindent\begin{minipage}{0.8\columnwidth}
+\begin{lstlisting}[
+    label={code:coconv3d},
+    language=python,
+    caption={
+    \textbf{Pseudo-code} for Continual Convolution.
+    Ready-to-use modules are available in the Continual Inference library~\cite{hedegaard2022colib}.
+    %and OpenDR~\cite{opendr2022} toolkits.
+    }
+]
+def coconv3d(frame, prev_state = (mem, i)):
+    frame = spatial_padding(frame)
+    frame = temporal_padding(frame)
+    feat = conv3d(frame, weights) 
+    output, rest_feat = feat[0], feat[1:]
+    mem, i = prev_state or init_state(output)
+    M = len(mem)
+    for m in range(M):
+        output += mem[(i + m) % M, M - m - 1]
+    output += bias
+    mem[i] = rest_feat
+    i = (i + 1) % M
+    return output, (mem, i)
+\end{lstlisting}
+\end{minipage}
+\end{center}
+
+% Computational complexity
+In terms of computational cost, we can now perform frame-by-frame computations much more efficiently than a regular 3D convolution. The complexity of processing a frame becomes:
+\begin{equation}
+    \Theta( [k_H \cdot k_W \cdot k_T + b] \cdot c_I \cdot c_O \cdot n_H \cdot n_W).
+\end{equation}
+% Memory overhead
+This reduction in computational complexity comes at the cost of a memory-overhead in each layer due to the state that is kept between time-steps. 
+The overhead of storing the partially computed feature-maps for a frame is:
+\begin{equation}
+    \Theta( d_T \cdot [k_T -1] \cdot c_O \cdot n_H \cdot n_W).
+\end{equation}
+However, in the context of inference in a deep neural network, the transient memory usage within each time-step is reduced by a factor of $n_T$ to
+\begin{equation}
+    \Theta(c_O \cdot n_H \cdot n_W).
+\end{equation}
+
+% These beneficial reductions in computational complexity and transient memory consumption scale linearly with the clip-length, while the state-overhead is constant.
+The benefits of Continual Convolutions thus include the independence of clip length on the computational complexity, state overhead, and transient memory consumption.
+The change from (non-causal) regular convolutions to (causal) Continual Convolutions has the side-effect of introducing a delay to the output. 
+This is because some intermediary results of convolving a frame with the kernel are only added up at a later point in time (see \cref{fig:conv-fixed}). 
+The delay for a continual convolution is
+%
+\begin{equation}
+    % \text{delay}_\text{CoConv} = 
+    \Theta(d_T \cdot [k_T - p_T - 1]).
+\label{eq:coconv-delay}
+\end{equation}
+
+
+\subsection{Continual Residuals} \label{sec:residual}
+The delay from Continual Convolutions has an adverse side-effect on residual connections. 
+Despite their simplicity in regular CNNs, we cannot simply add the input to a Continual Convolution with its output because the \textit{Co}Conv may delay the output.
+Residual connections to a \textit{Co}Conv must therefore be delayed by an equivalent amount (see \cref{eq:coconv-delay}).
+This produces a memory overhead of 
+%
+\begin{equation}
+    \Theta( d_T \cdot [k_T -1] \cdot c_O \cdot m_H \cdot m_W).
+\label{eq:residual-mem}
+\end{equation}
+
+
+\vspace{-3mm}
+\subsection{Continual Pooling}  \label{sec:pooling}
+\vspace{-1mm}
+The associative property of pooling operations allows for pooling to be decomposed across dimensions, i.e. $\textrm{pool}_{T, H, W}(\mathbf{X}) = \textrm{pool}_{T}(\textrm{pool}_{H, W}\left(\mathbf{X})\right)$.
+For continual spatio-temporal pooling, the pooling over spatial dimensions is equivalent to a regular pooling, while the intermediary pooling results must be stored for prior temporal frames. For a pooling operation with temporal kernel size $k_T$ and spatial output size $n_H \cdot n_W $, the memory consumption is
+%
+\begin{equation}
+    \Theta([k_T - 1] \cdot n_H \cdot n_W),
+\label{eq:pooling-mem}
+\end{equation}
+and the delay is
+\begin{equation}
+    \Theta(k_T - p_T - 1).
+\label{eq:pooling-delay}
+\end{equation}
+%
+Both memory consumption and delay scale linearly with the temporal kernel size.
+Fortunately, the memory consumed by temporal pooling layers is relatively modest for most CNN architectures ($1.5 \%$ for \textit{Co}X3D-M, see Appendix A). Hence, the delay rather than memory consumption may be of primary concern for real-life applications.
+For some network modules it may even make sense to skip the pooling in the conversion to a Continual CNN.
+One such example is the 3D Squeeze-and-Excitation (SE) block~\cite{hu2018squeeze} in X3D, where global spatio-temporal average-pooling is used in the computation of channel-wise self-attention. 
+Discarding the temporal pooling component (making it a 2D SE block) shifts the attention slightly (assuming the frame contents change slowly relative to the sampling rate) but avoids a considerable temporal delay.
+
+% 2.430 + 1620 + 35640 + 45360 + 6480 = 91.530 (1.48 % of 6.192.618)
+% For temporal average-pooling, the windowed pooling could be replaced by an exponential moving average in order to reduce the memory consumption to $\Theta( n_H \cdot n_W)$. 
+% The effect of this optimisation would thus be negligible, while being a source of computational misalignment between regular and continual CNNs.
+
+% \vspace{-3mm}
+\subsection{The issue with temporal padding}
+% \vspace{-1mm}
+Zero-padding of convolutional layers is a popular strategy for retaining the spatio-temporal dimension of feature-maps in consecutive CNN layers.
+For Continual CNNs, however, temporal zero-padding poses a problem, as illustrated in \cref{fig:padding}. 
+Consider a 2-layer 1D CNN where each layer has a kernel size of 3 and zero padding of 1.
+For each new frame in a continual stream of inputs, the first layer $l$ should produce two output feature-maps: One by the convolution of the two prior frames and the new frame, and another by convolving with one prior frame, the new frame, and a zero-pad. % (in the position of a future frame).
+The next layer $l+1$ thus receives two inputs and produces three outputs which are dependent on the new input frame of the first layer (one for each input and another from zero-padding).
+In effect, each zero padding in a convolution forces the next layer to retrospectively update its output for a previous time-step in a non-causal manner.
+% As we move through layers, the available computational redundancy to be exploited by Continual Convolutions is gradually reduced.
+Thus, there is a considerable downside to the use of padding.
+%
+This questions the necessity of zero padding along the temporal dimension.
+In regular CNNs, zero padding has two benefits:
+It helps to avoid spatio-temporal shrinkage of feature-maps when propagated through a deep CNN,
+and it prevents information at the boarders from ``washing away''~\cite{karpathy2020cs231n}.
+The use of zero-padding, however, has the downside that it alters the input-distribution along the boarders significantly~\cite{liu2018partialpadding}, \cite{nguyen2019distribution}. 
+% Besides its computational efficiency, there is nothing inherently optimal about the use of zero-padding; reflection and replication padding have shown similar performance, and partial-convolution padding and mean interpolation padding have outperformed zero-padding for image recognition ~\cite{liu2018partialpadding, nguyen2019distribution}.
+For input data which is a continual stream of frames, a shrinkage of the feature-size in the temporal dimension is not a concern, and an input frame (which may be considered a border frame in a regular 3D CNN) has no risk of ``washing away" because it is a middle frame in subsequent time steps.
+Temporal padding is thus omitted in Continual CNNs.
+As can be seen in the experimental evaluations presented in the following, this constitutes a ``model shift'' in the conversion from regular to Continual 3D CNN if the former was trained with temporal padding.
+
+
+\vspace{-10pt}
+\begin{figure}[t]
+     \centering
+     \begin{subfigure}[b]{0.48\linewidth}
+         \centering
+         \includegraphics[width=0.7\textwidth]{figures/no_padding.pdf}
+         \caption{No padding}
+         \label{fig:no_pad}
+     \end{subfigure}
+     \hfill
+     \begin{subfigure}[b]{0.48\linewidth}
+         \centering
+         \includegraphics[width=0.7\textwidth]{figures/padding_issue.pdf}
+         \caption{Zero padding}
+         \label{fig:padding_issue}
+     \end{subfigure}
+        \vspace{-5pt}
+        \caption{\textbf{Issue with temporal padding}: The latest frame $\mathbf{x}$ is propagated through a CNN with (purple) temporal kernels of size 3 (a) without or (b) with zero padding. Highlighted cubes can be produced only in the latest frame, with yellow boarder indicating independence of padded zero and red boarders dependence. In the zero-padded case (b), the number of frame features dependent on $\mathbf{x}$ following a layer $l$ increases with the number of padded zeros.}
+        \label{fig:padding}
+        \vspace{-5mm}
+\end{figure}
+
+
+% \vspace{-3mm}
+\subsection{Initialisation}\label{sec:init}
+% \vspace{-1mm}
+Before a Continual CNN reaches a steady state of operation, it must have processed $r_T - p_T - 1$ frames where $r_T$ and $p_T$ are the aggregated temporal receptive field and padding of the network.
+For example, Continual X3D-${\{\text{S, M, L}\}}$ models have receptive fields of size $\{69, 72, 130\}$, aggregated padding $\{28, 28, 57\}$, and hence need to process $\{40, 43, 72\}$ frames prior to normal operation.
+The initial response depends on how internal state variables are initialised. In \cref{sec:exp-transient}, we explore this further with two initialisation variants: 
+1)~Initialisation with \textit{zeros} and 
+2)~by repeating a ~\textit{replicate} of the features corresponding to the first input-frame. 
+The latter corresponds to operating in a steady state for a ``boring video''~\cite{carreira2017quo} which has one frame repeated in the entire clip.
+
+% Our hypothesis is that this improves performance in the transient response.
+
+% \vspace{-2pt}
+% \subsection{Memory consumption: A case study} \label{sec:memory}
+% \vspace{-2pt}
+% Where does this leave us with regards to the memory consumption during inference in online-scenarios?
+% To gauge this, we can compare the worst-case memory consumption for the regular X3D-M model~\cite{feichtenhofer2020x3d} with the corresponding Continual X3D-M (\textit{Co}X3D-M) model. 
+% Disregarding the (identical) storage requirement of the model weights, the  memory consumption of storing input-frames between time-steps for the regular model is computed by \cref{eq:conv-mem-store-frames}:
+% For a clip size of $m_T \times m_H \times m_W  = 16 \times 224 \times 224$, the memory requirement is $3 \cdot (16-1) \cdot 224 \cdot 224 = 2{,}257{,}920$ floating point numbers (floats). The final consumption in bytes depends on the floating-point precision. 
+% In addition, we need to account for the transient memory consumption, which occurs while storing the intermediary feature-maps. The worst case is the output of the first convolution which is of size $24 \times 16 \times 112 \times 112 $ corresponding to 4,816,896 floats. 
+% Thus, the regular X3D-M has a worst-case total memory-consumption of $7{,}074{,}816$ floats.
+
+% The continual version of X3D-M (\textit{Co}X3D-M) has no need to store input frames between time-steps, but it must keep state for the Continual Convolutions, Continual Pooling and Continual Residuals. 
+% $4{,}771{,}632$ floats are stored as state within the \textit{Co}X3D-M model (see Appendix A). 
+% The worst-case transient memory again occurs while storing the first feature-map, but this time it is only of size $24 \times 1 \times 112 \times 112$, or $301{,}056$ floats. 
+% The Continual X3D-M thus has a worst case total memory-consumption of $5{,}072{,}688$ floats.
+% This corresponds to a $28\%$ reduction in total memory-requirements relative to the regular model.
+
+
+% \vspace{-3mm}
+\subsection{Design considerations} \label{sec:design-considerations}
+\vspace{-1mm}
+Memory consumption is highly dependent on the clip size employed by the respective models. 
+Disregarding the storage requirement of the model weights (which is identical between for regular and continual 3D CNNs), X3D-M has a worst-case total memory-consumption of $7{,}074{,}816$ floats when prior frames and the transient feature-maps are taken into account.
+Its continual counterpart, \textit{Co}X3D-M, has a worst case memory only $5{,}072{,}688$ floats. 
+How can this be? 
+Since Continual 3D CNNs do not store prior input frames and has smaller transient feature maps, the memory savings outweigh the cost of caching features in each continual layer.
+Had the clip size been four instead of sixteen, X3D-M$_4$ would have had a worst-case memory consumption of $1{,}655{,}808$ floats and \textit{Co}X3D-M$_4$ of $5{,}067{,}504$ floats, and for clip size of 64, X3D-M$_{64}$ consumes $28{,}449{,}792$ floats and \textit{Co}X3D-M$_{64}$ uses $5{,}093{,}424$ floats.
+The memory consumption of regular 3D CNNs is this thus highly dependent on the clip size, while \textit{Co}3D CNNs are not.
+% in which the kernel size of the final pooling layer is reduced to 4, needs $5{,}067{,}504$ floats. 
+% Thus, it may still be worth considering the use of a regular CNN in some severely memory-constrained embedded systems, if lowering the spatial resolution is not an option. 
+% On the other hand, at a larger clip size of 64, X3D-M$_{64}$ would consume $28{,}449{,}792$ floats, whereas \textit{Co}X3D-M$_{64}$ has a worst-case consumption of only $5{,}093{,}424$ floats.
+%
+Continual CNNs utilise longer effective clip sizes much more efficiently than regular CNNs in online processing scenarios. 
+In networks intended for embedded systems or online processing, we may thus increase the clip size to achieve higher accuracy with minimal penalty in computational complexity and worst-case memory consumption.
+
+Another design-consideration, which has a considerable influence on memory consumption is the temporal kernel size and dilation of \textit{Co}Conv layers.
+Fortunately, the trend to employ small kernel sizes leaves the memory consumption reasonable for current state-of-the-art 3D CNNs~\cite{carreira2017quo}, \cite{tran2018closer}, \cite{feichtenhofer2019slowfast}, \cite{feichtenhofer2020x3d}. A larger temporal kernel size would not only affect the memory growth through the \textit{Co}Conv filter, but also for co-occuring residual connections, since these  consume a significant fraction of the total state-memory for real-life networks; in a Continual X3D-M model (\textit{Co}X3D-M) the memory of residual constitutes $20.5 \%$ of the total model state memory (see Appendix A).
+
+\vspace{-2mm}
+\subsection{Training}
+% \vspace{-1mm}
+\textit{Co}3D CNNs are trained with back-propagation like other neural networks. However, special care must be taken in the estimation of data statistics in normalisation layers: 1) Momentum should be adjusted to $\text{mom}_\text{step} = 2 / (1 + \text{timesteps}\cdot(2 / \text{mom}_\text{clip} - 1))$ to match the exponential moving average dynamics of clip-based training, where T is the clip size; 2) statistics should not be tracked for the transient response.
+% since their running average considers all input-data (including features during the transient response), not only the data on which gradients are computed. 
+% To learn correct steady-state statistics, layer-wise forward propagation of features from the transient response should be avoided during training.
+Alternatively, they can be trained offline in their ``unrolled'' regular 3D-CNN form with no temporal padding. %though clip-length may present a practical limitation in this regard.
+This is similar to utilising pre-trained weights from a regular 3D CNN, as we do in our experiments.
+
+

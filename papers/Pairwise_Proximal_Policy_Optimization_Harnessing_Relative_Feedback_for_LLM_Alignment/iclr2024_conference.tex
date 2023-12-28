@@ -1,0 +1,642 @@
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2024_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+\newcommand{\algn}{\text{P3O}}
+
+\usepackage{xcolor}
+\newcommand{\authnote}[2]{{\bfseries [#1]: #2}}
+\newcommand{\tianhao}[1]{{\color{red}\authnote{Tianhao}{#1}}}
+
+\title{Pairwise Proximal Policy Optimization:\\Harnessing Relative Feedback for LLM Alignment}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+% \author{Tianhao Wu\textsuperscript{1}\thanks{Contact author through \texttt{thw@berkeley.edu}}, Banghua Zhu\textsuperscript{1}, Ruoyu Zhang\textsuperscript{2}, Zhaojin Wen\textsuperscript{1}, Kannan Ramchandran\textsuperscript{1} \& Jiantao Jiao\textsuperscript{1}\\
+% \textsuperscript{1}{University of California, Berkeley}, \textsuperscript{2}{Peking University}
+% }
+
+\author{Tianhao Wu\thanks{Contact author through \texttt{thw@berkeley.edu}}, Banghua Zhu, Ruoyu Zhang, Zhaojin Wen, Kannan Ramchandran \& Jiantao Jiao\\
+University of California, Berkeley
+}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\iclrfinalcopy
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large Language Models (LLMs) can acquire extensive world knowledge through pre-training on large corpora. However, due to exposure to low-quality data, LLMs may exhibit harmful behavior without aligning with human values. The dominant approach for steering LLMs towards beneficial behavior involves Reinforcement Learning with Human Feedback (RLHF), with Proximal Policy Optimization (PPO) serving as the default RL optimizer. Despite its effectiveness, PPO has limitations when optimizing rewards trained from comparison-based loss. Primarily, PPO is not invariant to equivalent reward functions containing identical preference information due to the need to calibrate the reward scale. Additionally, PPO's necessity for token-wise updates introduces complexity in both function approximation and algorithm design compared to trajectory-wise optimization. This paper proposes a new framework, reinforcement learning with relative feedback, and a novel trajectory-wise policy gradient algorithm, Pairwise Proximal Policy Optimization (\algn) that operates directly on comparative rewards. We show theoretically that \algn\ is invariant to equivalent rewards and avoids the complexity of PPO. Empirical evaluations demonstrate that \algn\ outperforms PPO in the KL-Reward trade-off and can align with human preferences as well as or better than prior methods. In summary, this work introduces a simpler yet effective approach for aligning LLMs to human preferences through relative feedback.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+Large Language Models (LLMs) have made remarkable progress, profoundly influencing the AI community \citep{chowdhery2022palm,brown2020language,touvron2023llama,bubeck2023sparks}. However, due to the reliance on massive corpora of internet data, which encompasses a high portion of low-quality data, LLMs are likely to express unintended behavior. These include fabricating facts, generating biased or toxic text, and even harmful content to humans \citep{perez2022red,ganguli2022red}. Consequently, it is crucial to align LLMs with human values, \textit{e.g.}, helpful, honest, harmless \citep{bai2022training}. 
+
+A dominant approach in the realm of AI Alignment for LLMs named Reinforcement Learning with Human Feedback (RLHF) involves a three-stage procedure: supervised fine-tuning, reward learning, and reinforcement learning (RL) fine-tuning \citep{ziegler2019fine,ouyang2022training}. In the critical third stage, Proximal Policy Optimization (PPO) is widely adopted as the default RL optimizer \citep{schulman2017proximal}. Despite the acclaimed efficiency of PPO, recent studies have highlighted several intriguing questions and potential issues that require additional attention:
+
+\textbf{Instability of PPO.} Despite its acclaimed effectiveness, recent studies have identified instability associated with PPO. Factors such as reward normalization, reward scaling, reward clipping, KL control, advantage normalization and critic initialization \citep{zheng2023secrets,engstrom2020implementation} can contribute to this instability. 
+Moreover, we identify another source of instability:
+there is an inconsistency when it comes to optimizing the reward trained with the Bradley-Terry Loss (BTL) comparative reward model. In essence, BTL is invariant to constant shift while PPO is not. This means that even if two reward models carry identical information about human preferences, optimizing them using PPO can produce different outcomes. (Section~\ref{sec:instability})
+
+\textbf{Trajectory-wise vs Token-wise.} 
+A prevailing tension in fine-tuning LLMs using RL revolves around whether tuning should be trajectory-wise or token-wise. This dichotomy arises primarily from the nature of the reward model training phase wherein the reward model is trained using comparison dataset with human labelers ranking multiple completions of a single prompt. The obvious reason for taking this indirect approach based on trajectory-wise comparison is that it is often challenging for labelers to make a direct score assignment or provide comparison beyond a trajectory-wise perspective. An exception might be specific tasks with less ambiguity, such as math problems \citep{lightman2023let}, where partial credit for partially correct answers is feasible. This difficulty arises from the fact that the reward model returns only a single scalar reward after receiving the entire response (when the model hits the \texttt{<eos>} token). Given this complexity, two dominant viewpoints emerge: Should language generation be approached as a Contextual Bandit (CB) or a Markov Decision Process (MDP)? Although the prevalent approach is to use PPO to perform token-wise updates, it introduces additional complexity both in function approximation and in algorithmic design, \textit{i.e.}, PPO requires to additionally learn a value function $V$ and use Generalized Advantage Estimation (GAE) 
+\citep{schulman2015high} to redistribute the sparse reward to all tokens.
+\begin{figure}[t]
+\centering
+\includegraphics[width=1.0\textwidth]{figs/pipeline_final.pdf}
+\caption{The figure on the left illustrates the prevalent method for fine-tuning LMs using RL, which relies on \textbf{Absolute Feedback}. In this paradigm, algorithms like PPO has to learn a $V$ function, which capture not only the valuable relative preference information, but also less part, which is the scale of the reward for a given prompt. Contrastingly, the figure on the right presents paradigm for optimizing reward model trained via comparative loss, \textit{e.g.}, Bradley-Terry Loss \citep{bradley1952rank}. Our algorithm generate a pair of responses per prompt, leveraging only the \textbf{Relative Feedback} - derived from the difference in reward - for policy gradient updates. This method obviates the need for additional $V$ function approximations and intricate components like GAE \citep{schulman2015high}.}
+\vspace{-10pt}
+\label{figure:pipeline}
+\end{figure}
+
+In this paper, we provide new insights to address the above two issues. We summarize our primary contributions as:
+\begin{itemize}
+    \item[(1)] We define an equivalent relationship for reward functions trained from human preferences. We identify that BTL is invariant under this equivalent relationship, while PPO is not.
+    \item[(2)] We observed that Direct Preference Optimization (DPO) 
+    \citep{rafailov2023direct} can be used jointly with a trained reward model, leading to online-DPO. Further, we demonstrate that online-DPO remains invariant under the reward equivalent relationship. Empirical evidence suggest that online-DPO can achieve higher reward while being less KL efficient than PPO.
+    \item[(3)] We introduce a novel policy gradient algorithm, Pairwise Proximal Policy Optimization (\algn) under the framework of Reinforcement Learning with Relative Feedback (Figure \ref{figure:pipeline}). Our algorithm aligns perfectly with the comparative nature of the reward model, avoiding complications like estimating the $V$ function, GAE and various normalization techniques \citep{zheng2023secrets}. Empirical evaluations show that \algn\ consistently outperforms PPO and DPO in terms of KL-Reward trade-off and GPT-4 Evaluation.
+\end{itemize}
+\section{Related Work}
+Significant efforts have been made towards aligning LLMs with human values. These alignment strategies broadly fall into two categories: offline training and online training. 
+
+Offline training typically involve a static dataset, and doesn't require additional evaluations or generations. For instance, \citet{thoppilan2022lamda,gunasekar2023textbooks} use instruction fine-tuning to update the model on a high quality dataset tailored to a specific downstream task of interest. \citet{snell2022offline} proposed to employ offline $Q$ Learning to learn an add-on term for decoding. While \citet{rafailov2023direct} introduced DPO, an offline approach that can directly align LM with human preference data, drawing from the closed-form solution of the Contextual Bandit with KL control problem. There are also methods like PRO \citep{song2023preference} and RRHF \citep{yuan2023rrhf} that fine-tune the model based on ranking of the rewards.
+
+Our work is categorized under online training, which consist of a loop of generating new responses from the updated policy, evaluating them with the reward model and update the policy. The current dominant approach RLHF relies on online RL methods such as PPO \citep{schulman2017proximal}, A2C \citep{mnih2016asynchronous} or their variants \citep{ramamurthy2022reinforcement,zhu2023fine}. There are also few methods that deviate from this standard. For instance, \citet{gulcehre2023reinforced} introduce ReST, which use offline RL instead of online RL in the policy improvement phase; \citet{dong2023raft} proposed RAFT, which iteratively fine-tune the policy on the responses generated by the Best-of-N policy. Another paradigm parallel to RLHF is Reinforcement Learning with AI Feedback (RLAIF) \citep{bai2022constitutional,lee2023rlaif}, which aim for AI self-improvement. RLAIF substitute the role of human with AI in the feedback and yield comparable results with models of smaller scale.
+
+Outside of the context of language, preference-driven policy learning has been explored in both bandit and RL. Contextual dueling bandit \citep{dudik2015contextual, yue2012k} use preferences or rankings of actions to adjust the policy, rather than rewards. Similarly, PbRL \citep{jain2013learning,busa2014preference,christiano2017deep,sadigh2017active,kupcsik2018learning} learn from binary preferences generated by some unknown scoring function. Our work share resemblance to the pairwise policy gradient outlined in \citet{xu2020reinforcement}, though we integrate the critical clipping technique and the KL control that better fit into the language generation setting.
+\section{Preliminaries}
+\label{sec:preliminaries}
+In this section, we review the RLHF pipeline and discuss how language generation fits into CB and RL setting\citep{sutton2018reinforcement,yang2021reduction,lattimore2020bandit,wu2022nearly}.
+
+\begin{itemize}
+    \item \textbf{SFT Phase (Supervised Fine-Tuning):} This stage start with a pre-trained LM, and then fine-tuned with supervised learning (typically maximum likelihood loss) on a high quality dataset for the downstream task of interest. Outcome of this stage is denoted as $\pi^{\text{SFT}}$.
+    \item \textbf{Reward Learning Phase.} In the second phase the SFT model is prompted with prompts $\vx$ to produce pairs of answers $\vy_1,\vy_2\sim \pi^{\text{SFT}}(\vy|\vx)$. The responses pairs are then presented to human labelers who express preferences for one answer, denoted as $\vy_w \succ \vy_l |\vx$, where $\vy_w$ is the one favored by the labeler and $\vy_l$ is the one less favored. Under these preferences is the inaccessible latent reward model $r^*(\vy,\vx)$. According to the Bradley-Terry \citep{bradley1952rank} model, the human preference distribution $p^*$ can be expressed as:
+    \begin{align*}
+        p^*(\vy_1\succ\vy_2|\vx) &= \frac{\exp(r^*(\vy_1|\vx))}{\exp(r^*(\vy_1|\vx))+\exp(r^*(\vy_2|\vx))} = \frac{1}{1+\exp\left(r^*(\vy_1|\vx)-r^*(\vy_2|\vx)\right)}
+    \end{align*}
+    Assuming the access to a dataset $\{(\vx^{(i)},\vy^{(i)}_w,\vy^{(i)}_l)\}_{i=1}^N$ sampled from $p^*$. We parameterize the reward as $r_\phi$ and estimate it via maximum log-likelihood:
+    \begin{equation}\mathcal{L}_R = \sum_{i=1}^N \frac{1}{N} \log \sigma\left(r_\phi(\vy^{(i)}_w|\vx^{(i)})-r_\phi(\vy^{(i)}_l|\vx^{(i)})\right)\label{equation:rm}\end{equation}
+    where $\sigma$ is the sigmoid function. $r_\phi$ is initialized with $\pi^{\text{SFT}}$ augmented by additional linear layers on top. Constraints like $\E\left[r(\vy|\vx)\right] = 0$ might be incorporated to lower the variance.
+    \item \textbf{RL Fine-Tuning Phase.} Prior work formulate the optimization problem as:
+    \begin{equation}\max_{\pi_\theta}\E_{\vx\sim \mathcal{D}, \vy\sim \pi_\theta(\cdot|\vx)}\left[r_\phi(\vy|\vx)-\beta\KL(\pi_\theta(\cdot|\vx)\Vert \pi^{\text{SFT}}(\cdot|\vx))\right]\label{equation:rl_reward}\end{equation}
+    The $\beta\KL(\pi_\theta(\cdot|\vx)\Vert \pi^{\text{SFT}}(\cdot|\vx))$ term is used to regulate the deviation from the SFT model, it is important to prevent the model from completely forget the world knowledge acquired in the pre-training stage. The standard approach is to directly employ PPO \citep{schulman2017proximal, ouyang2022training} to optimize the modified reward $r_\phi(\vy|\vx)-\beta\left(\log\pi_\theta(\vy|\vx)-\log \pi^{\text{SFT}}(\vy|\vx)\right)$.
+\end{itemize}
+\subsection{MDP vs CB}
+\textbf{Language Generation modeled as an MDP:} A language model takes a sequence of tokens $(t_1,...,t_h)$ as input and produce the distribution for the next token $t_{h+1}$. The action space of this MDP consists of all potential tokens, with the state being a concatenation of all the history tokens as well as the prompt. The transition in the model is deterministic, the next state equal to the concatenation of current state and the recently produced token. Formally,
+$$P\left(s_{h+1}=(t_1,...,t_{h+1})|s_h=(t_1,...,t_h), a_{h+1}=t_{h+1}\right)=1$$
+An episode end either when the total tokens generated attain a predefined limit or when the language model produce the special token $\texttt{<eos>}$. Upon the end of an episode, the entire sequence is scored by a reward model, which produces a scalar reward $r$. PPO follows this formulation, where the single scalar reward will be assigned to the last token and combine with the token-wise KL penalty to form the ultimate reward. To tackle the challenge of sparse feedback, PPO employs the Generalized Advantage Estimation \citep{schulman2015high} to reallocate the scalar reward across all tokens.
+
+\textbf{Language Generation modeled as a CB:} A language model takes a prompt $\vx=(t_1,...,t_h)$ and generates a response $\vy = (t_{h+1},...,t_{h'})$. The response either terminates with with a $\texttt{<eos>}$ token or continues until a predefined token limit is met. Within this setting, every possible response is treated as an action, and there's no transition at all. The entire sequence is scored by a reward model, producing a scalar reward. This formulation is adopted by \citep{rafailov2023direct, zhu2023principled} as well as our paper. 
+
+\section{Algorithm}
+\label{sec:algorithm}
+\subsection{Proximal Pairwise Policy Optimization (\algn)}
+To derive \algn, we start from Vanilla Policy Gradient (VPG, Pseudocode \ref{pseudocode:vpg}) \citep{sutton1999policy,schulman2017proximal}. For simplicity, we omit the prompt $\vx$ in the formula and focus on the derivation for bandit setting and extend to the more general contextual bandit in theorem~\ref{theorem:ppg}. 
+
+In the bandit setting, assume we are updating a parameterized policy $\pi_\theta$ with actions denoted as $\vy$. The VPG aims for estimating the following formula with samples:
+\begin{align}\label{equation:plainpg}\nabla\mathcal{L}^{\text{VPG}} &= \underset{\vy\sim\pi_{\theta}}{\E}r(\vy)\nabla\log\pi_{\theta}(\vy)=\underset{\vy}{\sum}r(\vy)\nabla\pi_{\theta}(\vy)
+\end{align}
+Previous works on PG propose to subtract a baseline $b$ to reduce variance, resulting in 
+$$\nabla\mathcal{L}^{\text{VPG}} = \underset{\vy}{\sum}(r(\vy)-b)\nabla\pi_{\theta}(\vy)$$
+We plug in the popular choice of the baseline, $b=\sum_{\vy} r(\vy)\pi_{\theta}(\vy)$:
+\begin{align}
+    \nabla\mathcal{L}^{\text{VPG}} &=\underset{\vy_1}{\sum}r(\vy_1) \nabla\pi_{\theta}(\vy_1)-\sum_{\vy_1,\vy_2} r(\vy_2)\pi_{\theta}(\vy_2) \nabla\pi_{\theta}(\vy_1)\nonumber\\
+    &=\underset{\vy_1,\vy_2}{\sum}r(\vy_1)\pi_\theta(\vy_2) \nabla\pi_{\theta}(\vy_1)-\sum_{\vy_1,\vy_2} r(\vy_2)\pi_{\theta}(\vy_2) \nabla\pi_{\theta}(\vy_1)\nonumber\\
+    &=\underset{\vy_1,\vy_2}{\sum}\left(r(\vy_1)-r(\vy_2)\right)\pi_\theta(\vy_2) \nabla\pi_{\theta}(\vy_1) \label{equation:ppg}
+\end{align}
+Equation (\ref{equation:ppg}) gives rise to an expression that directly rely on the relative difference $r(\vy_1)-r(\vy_2)$. 
+We further introduce $\pi_{\theta_{\text{old}}}$ and rewrite Eq (\ref{equation:ppg}) with importance sampling:
+\begin{align*}
+    \nabla\mathcal{L}^{\text{VPG}} = \underset{\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}}{\E}\left(r(\vy_1)-r(\vy_2)\right)\frac{\pi_\theta(\vy_2)}{\pi_{\theta_{\text{old}}}(\vy_2)} \frac{\nabla\pi_{\theta}(\vy_1)}{\pi_{\theta_{\text{old}}}(\vy_1)}
+\end{align*}
+Swap actions $\vy_1, \vy_2$ and average together we get a symmetry gradient expression we termed Pairwise Policy Gradient (PPG):
+{\begin{align}
+\nabla \mathcal{L}^{\text{PPG}} &=\underset{\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}}{\E}\left(r(\vy_1)-r(\vy_2)\right)\left(\frac{\pi_\theta(\vy_2)}{\pi_{\theta_{\text{old}}}(\vy_2)}\frac{\nabla\pi_\theta(\vy_1)}{\pi_{\theta_{\text{old}}}(\vy_1)}-\frac{\pi_\theta(\vy_1)}{\pi_{\theta_{\text{old}}}(\vy_1)}\frac{\nabla\pi_\theta(\vy_2)}{\pi_{\theta_{\text{old}}}(\vy_2)}\right)/2\\
+&=\underset{\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}}{\E}
+\left(r(\vy_1)-r(\vy_2)\right)\frac{\pi_\theta(\vy_1)}{\pi_{\theta_{\text{old}}}(\vy_1)}\frac{\pi_\theta(\vy_2)}{\pi_{\theta_{\text{old}}}(\vy_2)}\nabla\left(\log\frac{\pi_\theta(\vy_1)}{\pi_\theta(\vy_2)}\right)/2
+\end{align}}
+\normalsize
+Its immediate generalization to contextual bandit is the following theorem:
+\begin{theorem}[Pairwise Policy Gradient with Importance Sampling] For any prompt $\vx$, the policy gradient can be expressed as $\nabla \mathcal{L}^{\text{VPG}} = \underset{\vx\sim \mathcal{D}}{\E} \nabla \mathcal{L}^{\text{VPG}}(\vx)$, where $\nabla\mathcal{L}^{\text{VPG}}(\vx)$ can be expressed as:
+{\begin{align*}
+&\underset{
+\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}
+}{\E}\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\left(\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\frac{\nabla\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}-\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\nabla\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\right)/2\\
+=&\underset{\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}}{\E}\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\nabla\left(\log\frac{\pi_\theta(\vy_1|\vx)}{\pi_\theta(\vy_2|\vx)}\right)/2
+\end{align*}}\label{theorem:ppg}
+\end{theorem}
+\normalsize
+\subsection{Combine with Clipping}
+\label{sec:clipping}
+A significant modification of PPO over VPG is to clip the loss function, which disincentivizes large updates to the policy. Specifically, PPO dictates that the ratio $\pi_\theta/\pi_{\theta_{\text{old}}}$ should remain close to $1$, guided by the sign of the Advantage function $\textsf{Adv}$. 
+Understanding this in an intuitive sense, if $\textsf{Adv}(\vy|\vx) > 0$, it implies that taking the action $\vy$ is beneficial on average. Hence, we aim to increase the probability $\pi_\theta(\vy|\vx)$. However, if the policy ratio $\pi_\theta/\pi_{\theta_{\text{old}}}$ exceeds $1+\epsilon$, we consider the change sufficient and halt the gradient; otherwise, the gradient is computed for further learning. Conversely, if $\textsf{Adv}(\vy|\vx)<0$, we strive to optimize the ratio towards $1-\epsilon$ instead of $1+\epsilon$. This intuition guides us to derive two variants of the algorithm, differentiated by whether clipping is applied separately or jointly for actions $\vy_1$ and $\vy_2$.
+
+\textbf{Clipping Separately (Version 1):} For $\{i,j\}=\{1,2\}$,
+{\begin{align*}
+\mathcal{L}^{\algn}_i(\vx) &=  \underset{
+\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}
+}{\E}\texttt{sg}\left(\left(r(\vy_i|\vx)-r(\vy_j|\vx)\right)\frac{\pi_\theta(\vy_j|\vx)}{\pi_{\theta_{\text{old}}}(\vy_j|\vx)}\right)\frac{\pi_\theta(\vy_i|\vx)}{\pi_{\theta_{\text{old}}}(\vy_i|\vx)}\\
+\mathcal{L}^{\algn}_{i,\texttt{clip}}(\vx) &= \underset{
+\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}
+}{\E}\texttt{sg}\left(\left(r(\vy_i|\vx)-r(\vy_j|\vx)\right)\frac{\pi_\theta(\vy_j|\vx)}{\pi_{\theta_{\text{old}}}(\vy_j|\vx)}\right)\texttt{clip}(\frac{\pi_\theta(\vy_i|\vx)}{\pi_{\theta_{\text{old}}}(\vy_i|\vx)}, 1-\epsilon, 1+\epsilon)\\
+\mathcal{L}^{\algn}_{\text{sep}} &= \underset{\vx\sim\mathcal{D}}{\E}\left[\min(\mathcal{L}^{\algn}_1(\vx), \mathcal{L}^{\algn}_{1,\texttt{clip}}(\vx)) + \min(\mathcal{L}^{\algn}_2(\vx), \mathcal{L}^{\algn}_{2,\texttt{clip}}(\vx))\right]/2
+\end{align*}}
+\normalsize
+\textbf{Clipping Jointly (Version 2):}
+{\begin{align*}
+\mathcal{L}^{\algn}(\vx) &=  \underset{
+\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}
+}{\E}\texttt{sg}\left(\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\right)\log\frac{\pi_\theta(\vy_1|\vx)}{\pi_\theta(\vy_2|\vx)}\\
+\mathcal{L}^{\algn}_{\texttt{clip}}(\vx) &= \underset{
+\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}
+}{\E}\texttt{sg}\left(\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\right) \\
+&\quad\quad\times\texttt{clip}\left(\log\frac{\pi_\theta(\vy_1|\vx)}{\pi_\theta(\vy_2|\vx)},\log\frac{\pi_{\theta_\text{old}}(\vy_1|\vx)}{\pi_{\theta_\text{old}}(\vy_2|\vx)}-\epsilon,\log\frac{\pi_{\theta_\text{old}}(\vy_1|\vx)}{\pi_{\theta_\text{old}}(\vy_2|\vx)}+\epsilon\right)\\
+\mathcal{L}^{\algn}_{\text{joi}} &= \underset{\vx\sim\mathcal{D}}{\E}\min(\mathcal{L}^{\algn}(\vx), \mathcal{L}^{\algn}_{\texttt{clip}}(\vx))
+\end{align*}}
+\normalsize
+The $\texttt{sg}$ and $\texttt{clip}$ refers to the stop-gradient and clip operator respectively. We present the entire pipeline of \algn\ in Pseudocode~\ref{pseudocode:p3o}.
+\subsection{Relationship with PPO and DPO}
+In this section, we briefly discuss the relationship of our proposed algorithm and two existing algorithms, PPO and DPO. We further elaborate their theoretical properties in Section~\ref{sec:instability}.
+
+\textbf{Comparison with PPO:} The objective of PPO, before clipping is applied and reduced to the contextual bandit setting, can be expressed as follows:
+$$\mathcal{L}^{\text{PPO}}_{\text{no clip}} = -\underset{\vy\sim\pi_{\theta_{\text{old}}}(\cdot|\vx)}{\E}(r(\vy|\vx)-V_\phi(\vx))\frac{\pi_\theta(\vy|\vx)}{\pi_{\theta_{\text{old}}}(\vy|\vx)}$$
+Where $V_\phi(\vx)$ is a proxy to the value function $V^{\pi_{\theta_{\text{old}}}} = \E_{\vy\sim\pi_{\theta_{\text{old}}}}r(\vy|\vx)$. In contrast to PPO, \algn\ expands $V_\phi(\vx)$ using another sample $\vy'$ to construct an unbiased estimator, bypassing the need to learn an additional value function $V$, which leads to more stable result.
+
+\textbf{Comparison with DPO:} Like \algn, DPO also adopts the contextual bandit (CB) formulation. The gradient of DPO's objective function takes the following form:
+\begin{align*}
+    \nabla\mathcal{L}^{\text{DPO}}(\vx,\vy_w,\vy_l) = -\beta\sigma\left(\beta\log \frac{\pi_\theta(\vy_l|\vx)}{\pi^{\text{SFT}}(\vy_l|\vx)} - \beta\log \frac{\pi_\theta(\vy_w|\vx)}{\pi^{\text{SFT}}(\vy_w|\vx)} \right)\nabla\left(\log\frac{\pi_\theta(\vy_w|\vx)}{\pi_\theta(\vy_l|\vx)}\right)/2
+\end{align*}
+The gradient direction of DPO resembles that of our formulation in Theorem~\ref{theorem:ppg}. However, DPO uses a different weight in front of the gradient. We hypothesize that the reason for DPO usually achieving a higher reward but falling short on KL-control (Figure~\ref{figure:tldr} and \ref{figure:hh}) compared to PPO is because DPO aligns the policy towards the goal policy while doesn't directly consider the reward. Unlike PPO and \algn, which applies policy gradient based on the idea of strict policy improvement for every gradient update \citep{schulman2015trust}, DPO aligns the policy via an alternate ``distance'', where the intermediary steps are not guaranteed to maximize the KL-Reward trade-off. We note that \algn\ combines the benefits of PPO and DPO, offering guaranteed policy improvement akin to policy gradient.
+
+\subsection{Reward Equivalence \& Instability of PPO}\label{sec:instability}
+In this section, we formally define the concept of reward equivalence (Definition~\ref{def:equivalence}). We show that BTL is invariant under this equivalent relationship in lemma~\ref{lem:equivalence}. We then discuss why it leads to a desirable property named invariance (Definition~\ref{definition:invariance}) that we want RL algorithms to satisfy. In the end, we present our main theorem (Theorem~\ref{theorem:invariance}) which shows that PPO does not satisfy this property, contributing to its instability.
+\begin{definition}[Reward Equivalence]\label{def:equivalence}
+    Two reward functions $r(\vy|\vx)$ and $r'(\vy|\vx)$ are termed equivalent, denoted as $r\sim r'$, if and only if there exist a function $\delta(\vx)$ depend solely on the prompt $\vx$, such that for every prompt and response pair $(\vx,\vy)$,
+    $$r(\vy|\vx)-r'(\vy|\vx) = \delta(\vx)$$
+    The equivalent class associated with reward $r$ is represented as $[r]$.
+\end{definition}
+Note that comparative losses such as Bradley-Terry loss and Plackett-Luce loss, is unaffected by a shift in the prompt's reward as in definition \ref{def:equivalence}. This observation leads to the following Lemma:
+\begin{lemma}[Invariance of BTL]\label{lem:equivalence}
+    For two reward functions that satisfy $r \sim r'$, they both yield identical loss for any response pairs (or K responses) under the Bradley-Terry Loss (or Plackett-Luce Loss).
+\end{lemma}
+Lemma \ref{lem:equivalence} underscores that the only information we can learn from the preference data is the reward difference of two responses to the same prompt. This implies that direct comparison of responses stemming from different prompts should be avoided. This is because we can craft an arbitrary function denoted as $\delta$ and replace $\hat{r}$ with the identical $\hat{r}+\delta$, while flipping the sign of $\hat{r}(\vy|\vx)-\hat{r}'(\vy'|\vx')$. As a result, an ideal algorithm should focus only on the relevant information within the reward function, filtering out the noise represented by $\delta$.  
+This leads the following definition:
+\begin{definition}[Invariance]
+    An algorithm is said to be \textbf{invariant} with respect to the equivalent relation ``$\sim$'', if for any two equivalent reward functions $r \sim r'$ and a fixed set of prompt and response pairs, the algorithm perform identical updates to the policy.\label{definition:invariance}
+\end{definition}
+To illustrate definition \ref{definition:invariance}, assume that we have two equivalent reward functions $\hat{r}$ and $\hat{r}'=\hat{r}+\delta$. Notably, even when initialized with the same random seed, \text{PPO} can result in distinct updates for an identical batch. This behavior can be attributed to PPO's reliance on learning a $V$ function to estimate advantage.
+In the simplest scenario, where the advantage is estimated via one-step TD ($\textsf{Adv}(\vy|\vx)=r(\vy|\vx)-V(\vx)$, corresponding to $\lambda_{\text{GAE}}=0$) and $\vy$ is a single token, we should expect the advantage function to stay unchanged. However, following the derivation
+\begin{align*}
+    \textsf{Adv}_{\hat{r}}(\vy|\vx)&=\textsf{Adv}_{\hat{r}'}(\vy|\vx)\\
+    \iff  \hat{r}(\vy|\vx) - V_{\hat{r}}(\vx) &= \hat{r}'(\vy|\vx) - V_{\hat{r}'}(\vx)\\
+    \iff V_{\hat{r}'}(\vx)-V_{\hat{r}}(\vx) &= \delta(\vx)
+\end{align*}
+We can see that even though $\hat{r}$ and $\hat{r}'$ are equivalent, they yield different updates for $V$ function. This give rise to our main theorem (full proof in Appendix~\ref{proof:equivalence}):
+\begin{theorem}[Non-invariance of PPO]
+    \algn\ and \text{DPO} are invariant with respect to ``$\sim$''. In contrast, \text{PPO} is not, given the same initialization of $V$. \label{theorem:invariance}
+\end{theorem}
+
+\section{Experiments}
+In this section, we empirically study how well can \algn\ align with human preference. 
+We conduct experiments on two widely-adopted RLHF tasks, summarization and question-answering, and we find that \algn\ achieves better performance in terms of both KL-Reward trade-off and quality of generation, against several strong baselines. 
+We will first briefly introduce the tasks, compared methods, and evaluations in our experiments, and then elaborate on these findings in detail.
+
+\textbf{Tasks.} We explore two different open-ended text generation tasks, \textit{i.e.} \textbf{summarization} and \textbf{question-answering}. For both tasks, algorithms are given a reward model pre-trained from a dataset of preference $\mathcal{D}=\{\vx^{(i)},\vy_w^{(i)},\vy_l^{(i)}\}$, and the goal is to obtain a policy $\pi(\vy|\vx)$ that can generate high-quality response $\vy$ given prompt $\vx$. In summarization, we use the \textbf{TL;DR} ``too long; didn't read'' dataset \citep{volske2017tl}, where $\vx$ is a forum post from Reddit, and $\vy$ is a corresponding summary. We use a 6B SFT model \texttt{CarperAI/openai\_summarize\_tldr\_sft} as the initial policy and \texttt{EleutherAI/gpt-j-6b} as the reward model.
+In question-answering, $\vx$ is a human query, which may come from diverse topics, and the policy should learn to produce an engaging and helpful response $\vy$. Following prior work, we use the Anthropic Helpful and Harmless (\textbf{HH}) dataset \citep{bai2022training}. We fine-tune two policies of sizes $\{\text{1B,6B}\}$, \texttt{Dahoas/pythia-1B-static-sft} and \texttt{Dahoas/pythia-6B-static-sft}. Both models have gone through supervised fine-tuning with labeled prompt-response pairs, similar to the protocol in \citet{ouyang2022training} and \citet{ramamurthy2022reinforcement}. For the reward model, we use the 6B model \texttt{Dahoas/gptj-rm-static} trained from the same dataset based on \texttt{EleutherAI/gpt-j-6b} as a proxy of human preference.
+
+\textbf{Methods.} We compare two versions of \algn, \textbf{\algn-V1} and \textbf{\algn-V2}, which represent clipping separately and jointly respectively, with several effective and representative approaches for LLM alignment. We start with the \textbf{SFT} policy trained by token-wise supervised fine-tuning. 
+It hasn't gone through further alignment; Every other method uses the SFT model as initialization. 
+For RL algorithms\footnote{Among methods directly involving RL, we note that PPO and a modified version A2C \citep{mnih2016asynchronous,lee2023rlaif} are the only two current online RL methods for LLM alignment. However, there is no strong evidence showing the supremacy of A2C over PPO, so we choose PPO as our baseline.}, we consider the dominant approach \textbf{PPO} \citep{schulman2017proximal,ouyang2022training} with reward specified in Eq~(\ref{equation:rl_reward}).  We follow the implementation of \texttt{trlx} \citep{trlx-library}. 
+Besides, we also consider the newly proposed \textbf{DPO} \citep{rafailov2023direct}, a method that directly optimizes the policy towards the closed-form solution of the KL-constrained reward maximization. Although DPO is proposed as an offline alignment method, we notice that we can make it online with the help of a proxy reward function. (More details can be found in Appendix~\ref{appendix:dpo})
+
+\begin{wrapfigure}{r}{0.5\textwidth}
+  \vspace*{-0.7cm}
+  % \centering
+  \hspace{-10pt}
+    \includegraphics[width=0.52\textwidth]{figs/tldr.png}\vspace{-0.02\textwidth}
+    \caption{KL-Reward frontier for TL;DR: $x$-axis represent $\KL(\pi_{\theta}\|\pi^{\text{SFT}})$, $y$-axis represent the reward evaluated by the proxy reward model, both averaged over 200 test prompts and evaluate every 500 gradient steps. We find that a simple linear function fit the curve well, and \algn\ have the best KL-Reward trade-off among the three.}
+  \vspace*{-0.4cm}
+    \label{figure:tldr}
+\end{wrapfigure}
+
+\textbf{Evaluations.}\label{metric:klreward} Deviating too much from the reference policy (\textit{e.g.} SFT model) would lead the online policy to cut corners of the reward model and produce incoherent continuations, as pointed out by previous works \citep{ziegler2019fine}.
+\citet{gao2023scaling} studied the scaling law of reward over-optimization in a synthetic setup, where labels are supplied by a ``gold standard'' reward model. They empirically find out the golden reward can be approximated by a simple function form involving the square-root KL-divergence from the reference policy.
+Therefore, it is important to balance the trade-off between the KL-divergence and asymptotic reward, and we measure the effectiveness of each algorithm by its frontier of achieved reward and KL-divergence from the reference policy (\textbf{KL-Reward Frontier}). To directly evaluate the quality of generated responses, we also perform \textbf{Head-to-Head Comparisons} between every pair of algorithms in the HH dataset. We use two metrics for evaluation: (1)~\textbf{Reward}, the optimized target during online RL, (2)~\textbf{GPT-4}, as a faithful proxy for human evaluation of response helpfulness. For the latter metric, we shall point out that previous studies show that LLMs can be better automated evaluators than existing metrics \citep{chen2023exploring}, and GPT-4 judgments correlate strongly with humans, with human agreement with GPT-4 typically similar or higher than inter-human annotator agreement \citep{rafailov2023direct}. Additional details can be found in Appendix~\ref{appendix:additional}.
+
+\begin{figure}[t]
+  \centering
+  \begin{minipage}[b]{0.52\textwidth}
+    \includegraphics[width=\textwidth]{figs/v1_1b.png}
+  \end{minipage}\hspace{-20pt}
+  \begin{minipage}[b]{0.52\textwidth}
+    \includegraphics[width=\textwidth]{figs/v2_1b.png}
+  \end{minipage}
+
+    \vspace{-6pt}
+
+  \begin{minipage}[b]{0.52\textwidth}
+    \includegraphics[width=\textwidth]{figs/v1_6b.png}
+  \end{minipage}\hspace{-20pt}
+  \begin{minipage}[b]{0.52\textwidth}
+    \includegraphics[width=\textwidth]{figs/v2_6b.png}
+  \end{minipage}
+  \caption{KL-Reward frontier for HH: $x$-axis and $y$-axis represents $\KL(\pi_\theta\|\pi^{\text{SFT}})$ and the reward respectively. Each point represent an average of results over 280 test prompts and calculated every 500 gradient updates. \textbf{Left} two figure compare \algn-V1 and PPO with varying base model sizes; \textbf{Right} two figures compare \algn-V2 and online-DPO. Results showing that \algn\ can not only achieve higher reward but also yield better KL control.}
+  \label{figure:hh}
+  \vspace{-15pt}
+\end{figure}
+
+\subsection{KL-Reward Frontier} We conduct experiments on both TL;DR and HH datasets to evaluate the efficacy of the alignment algorithms in optimizing reward while restricting policy deviation from the reference. Figures \ref{figure:tldr} and \ref{figure:hh} demonstrate the KL-Reward frontier for TL;DR and HH respectively. Each point represents the average evaluation over test prompts at every 500-step interval. The $x$-axis represents the average sequence-level KL-divergence $\KL(\pi_\theta\|\pi^{\text{SFT}})$, whereas the $y$-axis stands for the average reward given by the proxy reward model. 
+For summarization task, we find that \algn-V1 can reach a slightly higher reward than \algn-V2, while with a worse KL-Reward trade-off. Consequently, only \algn-V2 is included in Figure \ref{figure:tldr} for comparison. We find that \algn-V2 is able to produce almost the same highest reward whilst maintaining superior KL efficiency. DPO, despite its faster convergence, exhibits a 25\% higher KL-divergence than \algn-V2 under the same reward. For the question-answering task, \algn-V1 and \algn-V2 have strictly dominant frontiers than PPO and DPO respectively in both model sizes, shown by Figure~\ref{figure:hh}. Empirical findings establish \algn's superior trade-off between KL and Reward over other baselines, delivering a substantial higher reward in the range of $0.1$-$0.3$.
+
+\begin{figure}[t]
+  \centering
+    \begin{minipage}[b]{0.5\textwidth}
+    \includegraphics[width=\textwidth]{figs/gpt-4.pdf}
+  \end{minipage}\hspace{-10pt}
+  \begin{minipage}[b]{0.5\textwidth}
+    \includegraphics[width=\textwidth]{figs/reward.pdf}
+  \end{minipage}
+    \caption{Head-to-head comparisons between algorithm pairs from \{\algn, DPO, PPO, SFT\}. \textbf{Left} figure displays the win rate as evaluated by GPT-4. \textbf{Right} figure presents the win rate based on direct comparison of the proxy reward. Despite the high correlation between the figures, we found that the reward win rate must be adjusted according to the KL in order to align with the GPT-4 win rate.}
+    \label{figure:gpt4eval}
+    \vspace*{-15pt}
+\end{figure}
+
+\subsection{Head-to-Head Comparisons} 
+To verify the reliability of prior results, we conduct head-to-head comparisons between each algorithm pair among \{\algn, DPO, PPO, SFT\}. 
+Since the KL-Reward frontier indicates that joint-clipping (\algn-V2) produces more stable results than separate-clipping (\algn-V1), we only consider \algn-V2 in this section and refer it as \algn. 
+We sample completions from different policies\footnote{We select checkpoints with the highest reward for generation.} on the test set of the HH dataset at default temperature $1.0$, and we compute the average pairwise win rate using (1) \textbf{reward} and (2) \textbf{GPT-4} as evaluators. Previous studies \citep{chen2023exploring, rafailov2023direct} have shown that GPT-4 is a faithful proxy for human preference and is widely adopted for comparisons. The prompt used for evaluation is presented in Appendix \ref{appendix:prompt}.
+
+Figure \ref{figure:gpt4eval} presents the comprehensive pairwise comparison results, both via proxy reward and GPT-4. The average KL-divergence and reward ranking of these models is $\text{DPO} > \algn > \text{PPO} > \text{SFT}$. Although DPO marginally surpasses \algn\ in reward, it has a considerably higher KL-divergence (Table \ref{table:reward}), which may be detrimental to the quality of generation. As a result, DPO has a reward win rate 49.5\% against \algn\, but only 45.4\% as evaluated by GPT-4. Compared with other methods, \algn\ exhibits a GPT-4 win rate of 57.0\% against PPO and 69.3\% against SFT. This result is consistent with our findings from the KL-Reward frontier section, affirming that \algn\ could better align with human preference than previous baselines.
+\section{Conclusion \& Future Works}
+\label{sec:conclusion}
+This work presents new insights into aligning large language models with human preferences via reinforcement learning. We introduced the Reinforcement Learning with Relative Feedback framework, which unifies the core principles of reward modeling and RL fine-tuning. Under this framework, we designed a novel policy gradient algorithm, \algn, based on pairwise feedback. Empirical evaluations demonstrated that \algn\ outperforms prior methods in terms of the KL-Reward frontier as well as GPT-4 win-rate. \algn\ inherit the advantages of policy gradient methods, while maintaining a simplicity in both algorithmic design and function approximation.
+
+Looking ahead, several intriguing questions arise for future exploration. Firstly, we aim to understand the impacts of reward over-optimization on trajectory-based RL algorithms and token-based RL algorithms. Secondly, we are interested in whether we can generalize the policy gradient algorithm to accommodate more than two ranked responses, potentially enabling a better trade-off between human effort and AI alignment. Finally, we wish to explore the benefits of applying our \algn\ algorithm in contexts beyond training language models with human feedback. We eagerly anticipate investigating these questions in our future work.
+
+% \subsubsection*{Author Contributions}
+% If you'd like to, you may include  a section for author contributions as is done
+% in many journals. This is optional and at the discretion of the authors.
+
+% \subsubsection*{Acknowledgments}
+% Use unnumbered third level headings for the acknowledgments. All
+% acknowledgments, including those to funding agencies, go at the end of the paper.
+
+\bibliography{iclr2024_conference}
+\bibliographystyle{iclr2024_conference}
+
+\appendix
+\section{Algorithms}
+\subsection{Pseudocodes}
+\label{appendix:pseudocode}
+\begin{algorithm}[h]
+\caption{Vanilla Policy Gradient}\label{pseudocode:vpg}
+\begin{algorithmic}[1]
+\State \textbf{Initialization:} Initialize policy parameters $\theta_0$ and value function parameters $\phi_0$
+
+\For {$k = 0,1,2\cdots$}
+    \State Collect trajectories $\mathcal{D}_k=\{\tau_i\}$ by running policy $\pi_{\theta_k}$ starting from a batch of prompts and 
+    \Statex\hspace{\algorithmicindent}generate single trajectory from each prompt.
+
+    \State Compute token-wise rewards contain both token-wise KL and preference reward as in
+    \Statex\hspace{\algorithmicindent}Equation~\ref{equation:rl_reward}. And then rewards-to-go $\hat{R}_t$.
+
+    \State Estimate advantage estimates $\widehat{\textsf{Adv}}_t$ via GAE or other methods.
+
+    \State Estimate policy gradient via:
+    $$\hat{g}_k = \frac{1}{|\mathcal{D}_k|}\sum_{\tau\in\mathcal{D}_k}\sum_{k=0}^T\widehat{\textsf{Adv}}_t\nabla_\theta\log\pi_\theta(a_t|s_t)$$
+
+    \State Apply gradient updates to $\theta_k$ using gradient descent.
+
+    \State Fit value function by regression on mean-squared error via gradient descent:
+    $$\phi_{k+1} = \argmin_{\phi}\frac{1}{|\mathcal{D}_k|T}\sum_{\tau\in\mathcal{D}_k}\sum^T_{t=0}(V_\phi(s_t)-\hat{R}_t)^2$$
+
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{Pairwise Proximal Policy Optimization (\algn)}\label{pseudocode:p3o}
+\begin{algorithmic}[1]
+\State \textbf{Initialization:} Initialize policy parameters $\theta_0$
+
+\For {$k = 0,1,2\cdots$}
+    \State Collect pairwise trajectories $\mathcal{D}_k=\{\tau_i\}$ by running policy $\pi_{\theta_k}$ starting from a batch of 
+    \Statex\hspace{\algorithmicindent}prompts and generate two trajectories from each prompt.
+
+    \State Compute trajectory-wise rewards contain both trajectory-wise KL and preference reward:
+    $$\hat{r}_{\text{final}} = \hat{r}_{\text{preference}} - \beta\KL(\pi_{\theta_k}(\vy|\vx)\|\pi^{\text{SFT}}(\vy|\vx))$$
+
+    \State Estimate either version of clipped pairwise policy gradient via equation in section~\ref{sec:clipping}
+
+    \State Apply gradient updates to $\theta_k$ using gradient descent.
+
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+We present the pseudocode for both the Vanilla Policy Gradient (VPG) and our proposed algorithm \algn. While both algorithms follow the similar procedure of collecting trajectories and leveraging these trajectories to estimate the gradient, there are key differences: Our method collect pairwise trajectories and comput trajectory-wise rewards. This approach eliminates the need for estimating the value function $V$ and bypasses the requirement of estimating the advantage function using Generalized Advantage Estimation (GAE). Consequently, \algn\ is not only simpler to implement but also introduces less bias into the estimation of the policy gradient.
+
+\subsection{Derivation of DPO}
+\label{appendix:dpo}
+DPO start with a preference dataset $\mathcal{D}$ and minimize the loss:
+$$\mathcal{L}^{\text{DPO}} = -\underset{
+(\vx,\vy_w,\vy_l)\sim \mathcal{D}
+}{\E}\log\sigma\left(\beta\log\frac{\pi_\theta(\vy_w|\vx)}{\pi^{\text{SFT}}(\vy_w|\vx)}-\beta\log\frac{\pi_\theta(\vy_l|\vx)}{\pi^{\text{SFT}}(\vy_l|\vx)}\right)$$
+However, this is offline since the algorithm only make use of a fixed dataset. Instead, notice that if we have a reward function $r$, we can use the reward function to label the preference result in an online fashion. Assume there are two new generated responses $\vy_1,\vy_2$ that have reward $r_1, r_2$. Then we simply label the preference according to \citet{bradley1952rank},
+\begin{align*}
+    \vy_1& \succ \vy_2\quad\textit{w.p.}\quad\sigma(r_1-r_2)\\
+    \vy_2& \succ \vy_1\quad\textit{w.p.}\quad\sigma(r_2-r_1)
+\end{align*}
+We would like to use the notation $\vy_w$ and $\vy_l$ to represent the preferred and less preferred response chosen by the reward. We collect all the newly generated responses into a replay buffer $\mathcal{D}_{\text{replay}}$, therefore we can optimize the same DPO loss here:
+$$\mathcal{L}^{\text{DPO}} = -\underset{
+(\vx,\vy_w,\vy_l)\sim \mathcal{D}_{\text{replay}}
+}{\E}\log\sigma\left(\beta\log\frac{\pi_\theta(\vy_w|\vx)}{\pi^{\text{SFT}}(\vy_w|\vx)}-\beta\log\frac{\pi_\theta(\vy_l|\vx)}{\pi^{\text{SFT}}(\vy_l|\vx)}\right)$$
+We can further reduce the variance of the loss by eliminating the randomness in labelling the preference by incorporating the known labeling probability explicitly in the formula,
+$$\mathcal{L}^{\text{DPO}} = -\underset{\substack{
+(\vx,\vy_1,\vy_2)\sim \mathcal{D}_{\text{replay}} \\
+\epsilon \sim \text{Ber}(\sigma(r_1-r_2))
+}}{\E}\log\sigma\left(\epsilon\beta\log\frac{\pi_\theta(\vy_1|\vx)}{\pi^{\text{SFT}}(\vy_1|\vx)}-\epsilon\beta\log\frac{\pi_\theta(\vy_2|\vx)}{\pi^{\text{SFT}}(\vy_2|\vx)}\right)$$
+Here, $\text{Ber}(\sigma(r_1-r_2))$ is the two point Bernoulli distribution on $\{-1,1\}$.
+\section{Proofs}
+\subsection{Proof of Theorem~\ref{theorem:ppg}} 
+In the contextual bandit setting, VPG aims for estimating the gradient $\nabla\mathcal{L}^{\text{VPG}} = \E_{x\sim\mathcal{D}}\nabla\mathcal{L}^{\text{VPG}}(\vx)$, where $\nabla\mathcal{L}^{\text{VPG}}(\vx)$ can be expressed as:
+$$\nabla\mathcal{L}^{\text{VPG}}(\vx) = \underset{\vy\sim\pi_{\theta}(\vy|\vx)}{\E}r(\vy|\vx)\nabla\log\pi_\theta(\vy|\vx)$$
+The expectation can be replaced with a summation, leading to:
+\begin{align}
+\nabla \mathcal{L}^{\text{VPG}}(\vx) &= \sum_{\vy} r(\vy|\vx)\nabla\pi_\theta(\vy|\vx)\\
+&= \left(\sum_{\vy_1}r(\vy_1|\vx)\nabla \pi_\theta(\vy_1|\vx) - \sum_{\vy_1,\vy_2}r(\vy_2|\vx)\pi_\theta(\vy_2|\vx)\nabla \pi_\theta(\vy_1|\vx)\right)\label{equation:subtractbaseline}\\
+&=\left(\sum_{\vy_1,\vy_2}r(\vy_1|\vx)\pi_\theta(\vy_2|\vx)\nabla \pi_\theta(\vy_1|\vx) - \sum_{\vy_1,\vy_2}r(\vy_2|\vx)\pi_\theta(\vy_2|\vx)\nabla \pi_\theta(\vy_1|\vx)\right)\label{equation:multiply1}\\
+&=\sum_{\vy_1,\vy_2}\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\pi_\theta(\vy_2|\vx)\nabla\pi_\theta(\vy_1|\vx)\\
+&=\underset{\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}}{\E}\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\frac{\nabla\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\label{equation:is}
+\end{align}
+In Equation (\ref{equation:subtractbaseline}) we subtract the latter term which equals to $0$ because $\sum_{\vy_1}\nabla\pi_{\theta}(\vy_1|\vx) = \nabla\sum_{\vy_1}\pi_{\theta}(\vy_1|\vx) = \nabla\cdot 1 = 0$. We further multiply the first term by $1 = \sum_{\vy_2}\pi_{\theta}(\vy_2|\vx)$ in Equation (\ref{equation:multiply1}). Finally, we rephrase the previous equation using importance sampling and yield Equation \ref{equation:is}.
+
+Swap actions $\vy_1, \vy_2$ and average together we get the desired form:
+\begin{align*}
+\nabla \mathcal{L}^{\text{VPG}}(\vx)&=\underset{
+\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}
+}{\E}\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\left(\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\frac{\nabla\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}-\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\nabla\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\right)/2\\
+&=\underset{\vy_1,\vy_2\sim\pi_{\theta_{\text{old}}}}{\E}\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\nabla\left(\log\frac{\pi_\theta(\vy_1|\vx)}{\pi_\theta(\vy_2|\vx)}\right)/2
+\end{align*}
+
+\subsection{Proof of Lemma~\ref{lem:equivalence}}
+\label{proof:equivalence}
+ In this proof, we aim to show that two equivalent reward functions $r$ and $r'$ yield the same loss under the Bradley-Terry model. Assume that $r\sim r'$, then by definition there exist $\delta(\vx)$ such that for any prompt and response pair $(\vx,\vy)$, $r'(\vy|\vx) = r(\vy|\vx) + \delta(\vx)$. 
+ 
+ Consider any prompt $\vx$ and two responses $\vy_w,\vy_l$ labeled by human. According to Equation~\ref{equation:rm}, the Bradley-Terry loss for this pair given reward $r$ is:
+$$loss = \log\sigma\left(r(\vy_w|\vx) - r(\vy_l|\vx)\right)$$
+
+Similarly, the Bradley-Terry loss for this pair given reward $r'$ is:
+$$loss' = \log\sigma\left(r'(\vy_w|\vx) - r'(\vy_l|\vx)\right)$$
+
+By substituting $r'(\vy|\vx)$ with $r(\vy|\vx) + \delta(\vx)$ in $\text{loss}'$, we get:
+\begin{align*}
+    r'(\vy_w|\vx)-r'(\vy_l|\vx) = \left(r(\vy_w|\vx) +\delta(\vx)\right) - \left(r'(\vy_l|\vx) +\delta(\vx)\right) = r(\vy_w|\vx) - r(\vy_l|\vx)
+\end{align*}
+
+This shows that $loss' = loss$, indicating that the two reward functions $r$ and $r'$ are indeed equivalent with respect to the Bradley-Terry loss. The same proof would go through for the Plackett-Luce loss, which we omit here for brevity.
+
+\subsection{Proof of Lemma \ref{theorem:invariance}}
+We first prove the invariance for \algn\ and DPO, then we prove that PPO is not invariant. 
+
+Assume that we have two equivalent reward functions $r\sim r'$, by definition there exist $\delta(\vx)$ such that for any prompt and response pair $(\vx,\vy)$, $r'(\vy|\vx) = r(\vy|\vx) + \delta(\vx)$.
+
+\textbf{Invariance of \algn:} This is trivial since the gradient directly involve $r_1-r_2$. We take \algn-V2 as an example and write the gradient formulation with respect to the prompt responses pair $(\vx,\vy_1,\vy_2)$:
+
+If the reward is $r$, the update follows:
+\begin{align*}
+\mathcal{L}_r^{\algn} &=  \texttt{sg}\left(\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\right)\log\frac{\pi_\theta(\vy_1|\vx)}{\pi_\theta(\vy_2|\vx)}\\
+\mathcal{L}^{\algn}_{r,\texttt{clip}} &= \texttt{sg}\left(\left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\right) \\
+&\quad\quad\times\texttt{clip}\left(\log\frac{\pi_\theta(\vy_1|\vx)}{\pi_\theta(\vy_2|\vx)},\log\frac{\pi_{\theta_\text{old}}(\vy_1|\vx)}{\pi_{\theta_\text{old}}(\vy_2|\vx)}-\epsilon,\log\frac{\pi_{\theta_\text{old}}(\vy_1|\vx)}{\pi_{\theta_\text{old}}(\vy_2|\vx)}+\epsilon\right)\\
+\nabla\mathcal{L}^{\algn}_{r,\text{joi}} &= \nabla\min(\mathcal{L}_r^{\algn}, \mathcal{L}^{\algn}_{r,\texttt{clip}})
+\end{align*}
+Similarly, if the reward is $r'$, the gradient is:
+\begin{align*}
+\mathcal{L}_{r'}^{\algn} &=  \texttt{sg}\left(\left(r'(\vy_1|\vx)-r'(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\right)\log\frac{\pi_\theta(\vy_1|\vx)}{\pi_\theta(\vy_2|\vx)}\\
+\mathcal{L}^{\algn}_{r',\texttt{clip}} &= \texttt{sg}\left(\left(r'(\vy_1|\vx)-r'(\vy_2|\vx)\right)\frac{\pi_\theta(\vy_1|\vx)}{\pi_{\theta_{\text{old}}}(\vy_1|\vx)}\frac{\pi_\theta(\vy_2|\vx)}{\pi_{\theta_{\text{old}}}(\vy_2|\vx)}\right) \\
+&\quad\quad\times\texttt{clip}\left(\log\frac{\pi_\theta(\vy_1|\vx)}{\pi_\theta(\vy_2|\vx)},\log\frac{\pi_{\theta_\text{old}}(\vy_1|\vx)}{\pi_{\theta_\text{old}}(\vy_2|\vx)}-\epsilon,\log\frac{\pi_{\theta_\text{old}}(\vy_1|\vx)}{\pi_{\theta_\text{old}}(\vy_2|\vx)}+\epsilon\right)\\
+\nabla\mathcal{L}^{\algn}_{r',\text{joi}} &= \nabla\min(\mathcal{L}_{r'}^{\algn}, \mathcal{L}^{\algn}_{r',\texttt{clip}})
+\end{align*}
+We can see that the only difference between these two updates in the reward difference part. However, due to the fact that
+$$\left(r'(\vy_1|\vx)-r'(\vy_2|\vx)\right) = \left(r(\vy_1|\vx)+\delta(\vx)-r(\vy_2|\vx)-\delta(\vx)\right) = \left(r(\vy_1|\vx)-r(\vy_2|\vx)\right)$$
+We conclude that $\mathcal{L}_{r}^{\algn} =\mathcal{L}_{r'}^{\algn} $ and $\mathcal{L}^{\algn}_{r,\texttt{clip}}=\mathcal{L}^{\algn}_{r',\texttt{clip}}$. Consequently, the two updates $\nabla\mathcal{L}^{\algn}_{r,\text{joi}},\nabla\mathcal{L}^{\algn}_{r',\text{joi}}$ are the same.
+
+\textbf{Invariance of DPO:}
+Assume the same setting as in the previous paragraph:
+
+The gradient of DPO given reward $r$ can be written as:
+$$\nabla\mathcal{L}_r^{\text{DPO}} = -\underset{
+\epsilon \sim \text{Ber}(\sigma(r_1-r_2))
+}{\E}\log\sigma\left(\epsilon\beta\log\frac{\pi_\theta(\vy_1|\vx)}{\pi^{\text{SFT}}(\vy_1|\vx)}-\epsilon\beta\log\frac{\pi_\theta(\vy_2|\vx)}{\pi^{\text{SFT}}(\vy_2|\vx)}\right)$$
+Similarly, the gradient of DPO given reward $r'$ can be expressed as:
+$$\nabla\mathcal{L}_{r'}^{\text{DPO}} = -\underset{
+\epsilon \sim \text{Ber}(\sigma(r'_1-r'_2))
+}{\E}\log\sigma\left(\epsilon\beta\log\frac{\pi_\theta(\vy_1|\vx)}{\pi^{\text{SFT}}(\vy_1|\vx)}-\epsilon\beta\log\frac{\pi_\theta(\vy_2|\vx)}{\pi^{\text{SFT}}(\vy_2|\vx)}\right)$$
+The only difference between these two equations is the sampling distribution of the Bernoulli distribution. Easy to verify that they are the same since $\sigma(r_1 - r_2) = \sigma(r'_1-r'_2)$.
+
+\textbf{PPO is not Invariant:} The loss of PPO is the combination of policy-loss and $V$-loss, with the trade-off of these two terms controlled by hyper-parameter $\eta$:
+$$\mathcal{L}^{\text{PPO}} = \mathcal{L}_{\text{policy}}+\eta\mathcal{L}_{\text{V}}$$
+Suppose the policy network and the $V$ network have separate parameters, then taking the gradient of $\mathcal{L}^{\text{PPO}}$ is simply taking gradient of $\mathcal{L}_{\text{policy}}$. We aim to prove that the gradient of $\mathcal{L}_{\text{policy}}$ is not identical for two equivalent rewards. We first recap the formula of $\mathcal{L}_{\text{policy}}$:
+\begin{align*}
+    \mathcal{L}_{\text{policy}} = -\underset{(s_t,a_t)\sim\pi_{\theta_{\text{old}}}}{\E}\min\left(\frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}\widehat{\textsf{Adv}}(a_t|s_t),\texttt{clip}\left(\frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)},1-\epsilon,1+\epsilon\right)\widehat{\textsf{Adv}}(a_t|s_t)\right)
+\end{align*}
+Where the $\widehat{\textsf{Adv}}$ is estimated via GAE:
+\begin{align*}
+    \widehat{\textsf{Adv}}(a_t|s_t) &= \delta_t+(\lambda\gamma)\delta_{t+1}+\cdots+(\lambda\gamma)^{T-t+1}\delta_{T-1}\\
+    \delta_t &= r(s_t,a_t) + \gamma V(s_{t+1}) - V(s_{t}) 
+\end{align*}
+For simplicity, we consider the one-sample case, where we are taking gradient with respect to the sample $(s_t,a_t)$. According to the formula of $\widehat{\textsf{Adv}}$, and combine with the fact that the reward is only appended to the last token $T$. We have the following relation,
+$$\widehat{\textsf{Adv}}_{r'}(a_t|s_t) = \widehat{\textsf{Adv}}_r(a_t|s_t) + (\lambda\gamma)^{T-t+1}\delta$$
+Here, $\delta = \delta(\vx)$, $\vx$ represent the prompt corresponding to $s_t$, which is a prefix of $s_t$. As a result, $\nabla\min\left(\frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}\widehat{\textsf{Adv}}(a_t|s_t),\texttt{clip}\left(\frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)},1-\epsilon,1+\epsilon\right)\widehat{\textsf{Adv}}(a_t|s_t)\right)$ will not stay unchanged for different reward $r$, since $\widehat{\textsf{Adv}}$ can be arbitrary real number by choosing $\delta$.
+\section{Additional Experiment Results}
+\label{appendix:additional}
+\subsection{Setup}
+For the hyper-parameter tuning, we first run PPO to search the learning rate among $\{0.5,1,2,4,8\}\times 10^{-6}$ that yields the best KL-Reward frontier (Section \ref{metric:klreward}). We then use the same learning rate for \algn\ and online-DPO without further hyper-parameter tuning. To ensure fair comparison, we double the batch size of PPO such that every algorithms can see the same number of responses,
+although P3O and online-DPO only see half the prompts.
+\subsection{Ablation Study}
+In this study, we conducted ablation experiments to assess the impact of specific elements in our algorithm design, namely the clipping technique and the KL coefficient. Our study primarily aims to answer two questions:
+\begin{itemize}
+    \item[1] How does the clipping technique influence our algorithm's performance?
+    \item[2] What is the effect of varying the KL-control coefficient on the KL-Reward frontier?
+\end{itemize}
+\begin{figure}[th]
+  \centering
+  \begin{minipage}[b]{0.52\textwidth}
+    \includegraphics[width=\textwidth]{figs/ablation_kl.png}
+  \end{minipage}\hspace{-20pt}
+  \begin{minipage}[b]{0.52\textwidth}
+    \includegraphics[width=\textwidth]{figs/ablation_clip.png}
+  \end{minipage}
+  \caption{The \textbf{Left} figure illustrates the effect of varying the KL coefficient within the set ${0.02,0.05,0.1,0.2}$. The \textbf{Right} figure compares \algn-V2 with and without the clipping technique (solid lines represent with clipping, dashed lines without)}
+  \label{figure:ablation}
+\end{figure}
+\textbf{Setting}: Both experiments are conducted under the HH dataset. For the KL experiment, we use the best configuration as in the HH experiment, with the only difference being the KL coefficient $\beta$ in Eq~(\ref{equation:rl_reward}). For the No Clip experiment, we not only test on the default learning rate $1 \times 10^{-6}$, but also experiment with learning rate $5\times 10^{-6}$ and $1\times 10^{-5}$. For the No Clip baseline, we directly use the PPG formulation in Theorem~\ref{theorem:ppg}.
+
+Our results shown in the right figure indicate that using the clipping technique positively impacts the KL-Reward frontier, particularly in the early stages of training. This enhancement is accompanied by a slight decrease in the asymptotic reward. Interestingly, our results also show that the clipping technique is more effective when the learning rate is larger. This aligns with our understanding, as a smaller learning rate would naturally keep the update ratio closer to 1, thereby reducing the need for clipping.
+
+In terms of the KL-control coefficient, our findings illustrate that its value significantly influences the algorithm's performance. Larger KL coefficients led to a slight improvement in the KL-Reward frontier but a larger decrease in the asymptotic reward. This result suggests that using a smaller KL coefficient might provide a more favorable trade-off between reward and KL-divergence.
+\subsection{Additional Statistics}
+Here we provide additional statistics for the checkpoints we used in GPT-4 evaluation. We see that PPO and SFT tends to generate long responses while \algn\ and DPO generate shorter responses. Moreover, \algn\ achieve nearly the same reward with DPO while incurring much less KL.
+\begin{table}[ht]
+\caption{Reward}
+\label{sample-table}
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+\multicolumn{1}{c}{} &\multicolumn{1}{c}{\bf \algn}  &\multicolumn{1}{c}{\bf DPO} &\multicolumn{1}{c}{\bf PPO} &\multicolumn{1}{c}{\bf SFT}\\
+\midrule
+Reward  &$-0.302$ & $-0.298$ & $-0.613$ & $-1.195$\\
+KL\ \%\ sample    & $9.83$&$12.01$&$7.02$&  $0$\\
+KL\ \%\ token    & $0.12$&$0.14$&$0.06$   &$0$\\
+Token num     & $80.46$&$88.84$& $109.03$   &$112.70$\\
+\bottomrule
+\label{table:reward}
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{Prompt}
+\label{appendix:prompt}
+\lstset{
+  basicstyle=\small\ttfamily, % set the font and size
+  frame=single
+}
+\begin{lstlisting}
+For the following query to a chatbot, which response is more helpful? 
+
+Query: 
+<user_query>
+
+Response A: 
+<response_a>
+
+Response B: 
+<response_b>
+
+FIRST provide a one-sentence comparison of the two responses and 
+explain which you feel is more helpful. SECOND, on a new line, state only 
+"A" or "B" to indicate which response is more helpful. 
+Your response should use the format:
+
+Comparison: <one-sentence comparison and explanation>
+More helpful: <"A" or "B">
+\end{lstlisting}
+To eliminate any potential bias from the order of the responses, the order of Response A and Response B is randomized for each prompt. We note that although we ask GPT-4 to directly respond A or B to indicate the preference, in approximately 3\% of evaluations, GPT-4 found that neither response adequately addressed the user's query.
+\newpage
+\subsection{GPT-4 Evaluation Results}
+\renewcommand{\arraystretch}{1.3}
+\begin{table}[h]
+\centering
+\begin{tabular}{p{0.1\textwidth} p{0.9\textwidth} }
+\hline
+\textbf{Prompt} &  Human: help with understanding bitcoin
+
+Assistant:\\
+\hline
+\textbf{\algn} &  Yes, that's a fun question!  Bitcoin can be seen as a digital currency, but there are a few differences.  
+
+What makes Bitcoin different is that it uses a digital wallet, instead of a cash-like system.  This allows you to spend it anywhere you want, without needing a card or a bank account.
+
+You can also use Bitcoin to spend other forms of currency.  
+
+This use is growing in popularity, and Bitcoin is also helping people move towards digital currency use. \\
+\hline
+\textbf{DPO} &  Can you describe a bit more about what Bitcoin is and what it's used for? \\
+\hline
+\textbf{PPO} &  What would you like to know? \\
+\hline
+\textbf{SFT} &  What is Bitcoin? \\
+\hline
+\textbf{GPT-4}&
+Comparison: Response A[\textbf{\algn}] provides a brief explanation about Bitcoin and its uses, while Response B[\textbf{DPO}] asks for more information from the user instead of providing any information.
+
+ Comparison: Response A[\textbf{PPO}] is vague and doesn't provide any information, while Response B[\textbf{\algn}] provides a detailed explanation about Bitcoin and its uses.
+
+Comparison: Response A[\textbf{SFT}] is a question rather than an explanation, while Response B[\textbf{\algn}] provides a detailed explanation of what Bitcoin is and how it works, making it more informative and helpful.\\
+\hline
+\end{tabular}
+\caption{\algn\ outperforms the others by providing a comprehensive explanation about Bitcoin and its uses, while the other algorithms respond with questions or requests for more information, rather than providing substantive information.}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{p{0.1\textwidth} p{0.9\textwidth} }
+\hline
+\textbf{Prompt} &  Human: I need help deciding what city to move to
+
+Assistant: You could just use Google for that, or get specific about the criteria you're looking for, like weather and job markets.
+
+Human: I'd like a mid sized city with fun activities, a good job market, and nice weather if possible
+
+Assistant:\\
+\hline
+\textbf{\algn} &   Maybe try Austin, Dallas, or Phoenix. They might be possible choices.\\
+\hline
+\textbf{DPO} &   That's a very reasonable description, and it comes with an affordable cost of living.\\
+\hline
+\textbf{PPO} &   I think that depends a lot on your situation.  Is there a job you're particularly interested in? \\
+\hline
+\textbf{SFT} &  Is this for work, or pleasure?\\
+\hline
+\textbf{GPT-4}&
+Comparison: Response A[\textbf{DPO}] is vague and doesn't provide any specific suggestions, while Response B[\textbf{\algn}] provides three specific city suggestions that could potentially meet the user's criteria.
+
+
+Comparison: Response A[\textbf{PPO}] seeks to gather more information to provide a more tailored suggestion, while Response B[\textbf{\algn}] provides immediate suggestions based on the criteria given.
+
+
+Comparison: Response A[\textbf{SFT}] seeks further clarification while Response B[\textbf{\algn}] provides direct suggestions based on the criteria provided by the user, making it more helpful.\\
+\hline
+\end{tabular}
+\caption{In each comparison, \algn\ outperformed the other algorithms, effectively suggesting three potential cities (Austin, Dallas, or Phoenix) that align with the user's criteria. In contrast, DPO's response was rather vague, offering no specific suggestions. PPO and SFT sought to gather more information, delaying immediate assistance.}
+\end{table}
+
+
+\begin{table}[h]
+\centering
+\begin{tabular}{p{0.1\textwidth} p{0.9\textwidth} }
+\hline
+\textbf{Prompt} &  Human: How can I make my own soap at home?
+
+Assistant:\\
+\hline
+\textbf{\algn} &  There are a few different methods for making your own soap at home.  Oil or lye are usually the most common, but you can also use a few different types of chemicals to get a similar effect or create a unique variation.  Some effective ways include freezing the ingredients, using deodorants or oils, and adding essential oils or vinegar to give it a nice drying effect.\\
+\hline
+\textbf{DPO} &  I wouldn't recommend it, it's a little fancier and not something you can do at home. \\
+\hline
+\textbf{PPO} &  Making your own soap is a nice way to get involved in your own community. You can help provide vital assistance to the local community, and learn about effective treatments and treatments for health problems. \\
+\hline
+\textbf{SFT} & Well historically, in Europe soap has typically not been watering shells and Ocean Aerosols, a combination generally indicated as "EST date" a secret date from the manufacturer. Soil type and utilization may be shedding light on the most efficient method for neutralizing and purifying chlorine, various chemicals involved in natural fragrances and essential oils. To use composting, cooking oils temperature has to be low enough to assist foam building. Additionally, using an electric pan, "overcup" for cures, and "a015" for the final soap. How do you plan to save your energy and waste water?\\
+\hline
+\textbf{GPT-4}&
+Comparison: Response A[\textbf{\algn}] provides a detailed explanation of different methods for making soap at home, while Response B[\textbf{DPO}] discourages the idea without providing any useful information.
+
+Comparison: Response A[\textbf{PPO}] is vague and doesn't provide any specific steps or ingredients for making soap, while Response B[\textbf{\algn}] gives a general idea of the process and ingredients involved in soap making.
+
+
+Comparison: Response A[\textbf{\algn}] provides a more straightforward and understandable explanation of how to make soap at home, while Response B[\textbf{SFT}] is confusing and uses unclear terminology.\\
+\hline
+\end{tabular}
+\caption{\algn\ is assessed as the most helpful by GPT-4. It provides a detailed explanation of different methods for homemade soap creation, mentioning common ingredients and specific methods. Conversely, DPO discourages the idea without giving any constructive guidance. PPO fails to offer any specific steps or ingredients for soap creation. Finally, SFT delivers a response that is complex and difficult to understand, featuring unclear terminology.}
+\end{table}
+
+\end{document}

@@ -1,0 +1,119 @@
+\section{Method}
+
+
+Our OC-MOT improves over traditional OCL frameworks in terms of tracking objects as a whole, and consistently over time. This is achieved by extending the traditional OC framework with a self-supervised memory to: i) Store historical information in the memory to fight against noise and occlusion. This helps improve temporal consistency. ii) Use the complete representation read-out from the memory to consolidate parts captured in different slots, which resolves the part-whole problem. The overall framework of OC-MOT is shown in Figure~\ref{fig:method}. 
+Given slots $\{\mathcal{S}_t\}_{t=1}^{T}$ extracted from $T$ video frames by an object-centric grouping module, OC-MOT first uses the memory rollout $\tilde {\mathcal{M}}_t$ to perform slot-to-memory indexing. Then, it merges the slots as $\mathcal{M}_t$ to update the memory. 
+
+\subsection{Object-centric Grouping}
+The object-centric grouping module uses Slot Attention\cite{locatello2020object} to turn the set of encoder features from video frames  into a set of slot vectors $\{\mathcal{S}_t\}_{t=1}^{T}$. The model is trained with a self-supervised reconstruction loss $L_{oc\_rec}=||y - \text{Dec}(\mathcal{S})||^2$, where $y$ can be the raw frame pixels, or feature representations extracted from the frames. The decoder has a compete-to-explain inductive bias to encourage binding of objects into individual slots. 
+
+
+
+\subsection{Memory Module}
+
+We store the historical representations of all tracked objects into memory buffers $\mathcal{M} \in \mathbb{R}^{M\times T \times d}$ where $M$ is the buffer number and $d$ denotes the representation dimension. The memory is implemented with a first-in-first-out data structure and reserves a maximum of $T_{max}$ time steps for each object. At time step $t$, the detection results are $\mathcal{M}_t = \{m_t^1,...,m_t^M \}$ if we denote $m_t$ as the object representation. 
+Intuitively, each buffer is a tracklet.
+
+
+\vspace{+2.5mm}
+\noindent \textbf{Memory rollout.} At time step $t$, the memory rolls the past states forward, and predicts the current object representations for all slots to index. The rollout process integrates the multi-view object representations together and handles the part-whole matching in the occlusion scenarios.
+Without losing generality, we denote all the past representations as  $\mathcal{M}_{<t}$. The rollout $\tilde {\mathcal{M}}_t \in \mathbb{R}^{M\times d}$ is obtained by:
+\begin{equation}
+    \tilde {\mathcal{M}}_t = \text{Rollout}(\mathcal{M}_{<t}).
+\end{equation}
+We adopt a mini GPT-2 model~\cite{radford2019language} containing only 1.6M parameters as the rollout module. It performs temporal reasoning via an auto-regressive transformer.
+
+
+
+\subsection{Index-Merge Module}
+The index-merge module is used as a discrete interface between memory buffers and slots. To achieve this, we split the object association process into the index step and merge step, as shown in Figure~\ref{fig:intro}, which can be achieved by standard multi-head attention (MHA)~\cite{vaswani2017attention} blocks. 
+\vspace{-3mm}
+\paragraph{Slot-to-memory index.} The index matrix %$\mathcal{I}_{t,soft} \in \mathbb{R}^{N\times M}$ 
+$\mathcal{I}_{t} \in \mathbb{R}^{N\times M}$ 
+indicates soft slots-to-buffer assignment. 
+To compute it, 
+%To calculate the index between slots and  buffers, 
+we train a MHA
+%multi-head attention 
+block that takes the slots $\mathcal{S}_t \in \mathbb{R}^{N\times d}$ as query, and rollout $\tilde {\mathcal{M}}_t$
+%\in \mathbb{R}^{M\times d}$ 
+as key and values, where $N$ is slot number:
+%The index matrix $\mathcal{I}_{t,soft} \in \mathbb{R}^{N\times M}$ indicates the possibility of slots assigned to memory buffers, and is obtained as follows: 
+\begin{equation}
+    \mathcal{I}_{t}=\text{MHA}(k,v=\tilde {\mathcal{M}}_t, q=\mathcal{S}_t).\text{attn\_weight}
+\end{equation}
+
+%\noindent \textbf{Memory-to-slot merging.} 
+\paragraph{Memory-to-slot merge.} 
+% $\mathcal{I}_{t}$ is \emph{soft} and 
+% at inference time, we will turn it into $\mathcal{I}_{t, hard}$ by taking an $\text{argmax}$ such that one slot can point to  one buffer only.
+Our goal is to make sure a buffer represents one object by pooling from the slots that belong to that object, while simultaneously dealing with slots that represent parts of an object or duplicates. Thus,
+%One \textit{slot} assigned to a buffer does not mean one \textit{object} is assigned to a buffer. Considering the duplicate slots and part-whole issues, there must exist many-to-one matching in $\mathcal{I}_{t,hard}$. To further identify the ``real" object from multiple slots, 
+we stack another MHA
+%multi-head attention 
+block to merge the slots, using $\mathcal{I}_t$ as masked attention weights.  Specifically, the merging function is defined as below:
+\begin{equation}
+    m_t=\text{MHA}(k,v=\mathcal{S}_t, q=\tilde {\mathcal{M}}_t, attn\_mask=\mathcal{I}_t).
+\end{equation}
+Here, the query is the rollout $\tilde {\mathcal{M}}_t$; the key and value are slots $\mathcal{S}_t$. We apply $\mathcal{I}_t$ as the attention mask in MHA such that the re-normalized attention weights can be used for merging. This helps us to deal with wrongly-assigned slots. For example, if there are three slots and two of them are matched to one buffer, the attention weight could be $[0.8, 0.2, 0]$ indicating that the second slot does not belong to this buffer.
+\begin{figure}[!ht]
+	\centering
+	\includegraphics[width=80mm]{imgs/intro.pdf}
+ \vspace{+0.3cm}
+\caption{\textbf{Visualization of the index-merge module}. Index step: we show how to generate an index matrix from slots $\mathcal{S}_t$ to memory rollout $\tilde{\mathcal{M}}_t$. Note that the duplicate slots (red boxes) or similar slots (blue boxes) may be assigned to the same buffer. Merge step: the model recalculates the attention weights for slot merging, masked by the index matrix. The wrongly assigned slots can be filtered out with very low weights.
+ }
+\label{fig:intro}
+\end{figure}
+%\paragraph{Discussion.}
+%Our architecture uses two MHA to first setup the index from slots to memory, and then perform the merging. It begs the question why not using one single 
+
+\subsection{Model Training under EM Paradigm } 
+\noindent \textbf{Losses.} The key of training detect-to-track models is to minimize the assignment costs for object associations. Usually, the weights of the pre-trained detector are frozen during training~\cite{cai2022memot,bergmann2019tracking}. Therefore, in our scenario, we freeze the object-centric model and only train the memory module.
+Assume we use $\mathcal{L}_{assign}$ to   measure the assignment costs between  slots $\mathcal{S}_t \in \mathbb{R}^{N\times d}$ and memory buffers $\mathcal{M}_t \in \mathbb{R}^{M\times d}$.  The training loss can be formulated as:
+\begin{gather}
+\mathcal{L}_{MOT} = \sum_{t=1}^{T}\sum_{i=1}^{N} \mathds{1}[Z_t[i] = j]\mathcal{L}_{assign}(\mathcal{S}_t^i, \mathcal{M}_t^j),
+\label{eq:1}
+\end{gather}
+where $\mathcal{Z}_t\in \mathbb{R}^{N}$ denotes the assignments and $\mathcal{Z}_t[i] = j$ means the $i^{th}$ slots matches to the $j^{th}$ buffer. Specifically, we have three options to calculate the assignment cost: 1) use a binary cross-entropy loss on the decoded masks to promote the consistency of object attributes such as shape; 2) use a pixel-wise squared reconstruction loss on the object reconstructions (pixel reconstructions multiplied by object masks) to learn the color information; 3) use the same loss as 2) but directly apply on the feature space. The assignment cost could be a combination of the three losses:
+\begin{equation}
+\begin{aligned}
+    &\mathcal{L}_{assign}(\mathcal{S}_t^i, \mathcal{M}_t^j) = \lambda_1 BCELoss(\text{Dec}(\mathcal{S}_t^i),\text{Dec}(\mathcal{M}_t^j)) \\
+    &+ \lambda_2 || \text{Dec}(\mathcal{S}_t^i)-\text{Dec}(\mathcal{M}_t^j)||^2 + \lambda_3 || \mathcal{S}_t^i-\mathcal{M}_t^j||^2,
+\end{aligned}
+\end{equation}
+where $\lambda_1, \lambda_2, \text{and}\  \lambda_3$ are the balancing weights. We use the frozen decoder from the object-centric model to decode object representations into pixel reconstructions and masks.
+
+\vspace{+2.5mm}
+\noindent \textbf{Optimization.}
+In contrast to prior supervised trackers~\cite{cai2022memot, zeng2022motr} that use ID labels to find the assignments, our model learns the index matrix $\mathcal{I}_t$ without any supervision. One naive solution is to convert $\mathcal{I}_t\in \mathbb{R}^{N\times M}$  to $\mathcal{Z}_t \in \mathbb{R}^{N}$ by performing argmax along the buffer dimension. However,  the argmax function is non-differentiable. 
+Even though we apply the straight-through trick~\cite{jang2016categorical} to make it trainable, the optimization easily gets stuck in a local minimum because the model has no chance to evaluate other possible assignments.
+To tackle this problem, we take inspiration from the Expectation-maximization (EM) paradigm which optimizes the assignments from seeing all possible assignments in $\mathcal{I}_t$. We formulate the expectation of $\mathcal{S}_t$ matches to $\mathcal{M}_t$ as:
+\begin{gather}
+\begin{aligned}
+    Q(\theta^*, \theta) &= \mathop{\mathbb{E}} [\ln p(\mathcal{S}_t, \mathcal{M}_t|\theta ^*)] \\
+    &= \Sigma_{i}\Sigma_{j} p(\mathcal{M}_t^j | \mathcal{S}_t^i) \ln p(\mathcal{S}_t^i, \mathcal{M}_t^j|\theta ^*) \\
+    & = -\Sigma_{i}\Sigma_{j} \mathcal{I}_t[i,j]\mathcal{L}_{assign}(\mathcal{S}_t^i, \mathcal{M}_t^j).
+\end{aligned}
+\end{gather}
+Here, $\theta$ is the learnable parameters in the memory module. $p(\mathcal{M}_t^j | \mathcal{S}_t^i)$ denotes the probability of the $i^{th}$ slot is assigned to the $j^{th}$ buffer, which, in our model, it exactly equals $\mathcal{I}_t[i, j]$. Further, we can use $\mathcal{L}_{assign}$ to represent $\ln p(\mathcal{S}_t^i, \mathcal{M}_t^j|\theta ^*)$.
+We optimize the parameters of the model in order to maximize the expectation via SGD~\cite{ruder2016overview}, for which we rewrite equation~\eqref{eq:1} as:
+\begin{gather}
+\mathcal{L} = \sum_{t=1}^{T}\sum_{i=1}^{N}\sum_{j=1}^{M} \mathcal{I}_t[i,j]\mathcal{L}_{assign}(\mathcal{S}_t^i, \mathcal{M}_t^j).
+\label{eq:3}
+\end{gather}
+The above loss~\eqref{eq:3} is applied to both the merged results $\mathcal{M}_t$ and rollout $\tilde {\mathcal{M}}_t$ with each combination weight set as $1$. 
+
+
+
+
+\subsection{Model Inference}
+During inference, we binarize the indexing matrix $ \mathcal{I}_{t,hard} \in \{0,1\}^{N\times M}$ to strictly assign one slot to one buffer. 
+Specifically, $\mathcal{I}_{t,hard}[i,j] = 1$ only if $j = \text{argmax}(\mathcal{I}_{t})[i]$ for $i \in [1,N]$; otherwise, $\mathcal{I}_{t,hard}[i,j] = 0 $. The discrete index supports the object in-n-out logic by indicating the presence of an object.
+
+ \vspace{+2.5mm}
+\noindent \textbf{Object-in logic.} For  the first frame, we filter out duplicate slots before using them to initialize memory buffers. Slots with high mask IoU (bigger than $\tau_{iou}$) to other slots will be discarded. For the next  frames, we activate new buffers for new objects if slots have no substantial IoU with any masks of the memory rollout from the last timestep $\{\tilde {\mathcal{M}}_{t-1}^1,...,\tilde {\mathcal{M}}_{t-1}^k \}$, where $k$ is the active buffer number. Note that, for training, we replace the rollout with slots from the last timestep $\{\mathcal{S}_{t-1}^1,...,\mathcal{S}_{t-1}^N \}$ because the rollout is not reliable at the early training stage.
+
+\vspace{+2.5mm}
+\noindent \textbf{Object-out logic.} To re-track an object, we keep the buffer alive for $\tau_{out}$ consecutive frames when the object is occluded or disappears. In other words, if an object disappears for more than $\tau_{out}$ frames, the buffer will be terminated.
+
+%Since one buffer ID associates with an object ID, there is no need to terminate a buffer and reuse it to save the computation resource.

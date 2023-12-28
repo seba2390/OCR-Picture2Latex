@@ -1,0 +1,325 @@
+\section{Core \app\ Execution Techniques}
+\label{sec:executor}
+
+\textbf{Assumptions}.
+To keep the discussion focused on the core concepts, we make simplifying assumptions in Sections~\ref{sec:executor} and \ref{sec:runtime}. We drop them to extend \app\ to the broad class of trend aggregation queries (Definition~\ref{def:query}) in Section~\ref{sec:other}.
+These assumptions include:
+(1)~queries compute the number of trends per window $\mycount(*)$;
+(2)~query patterns do not contain disjunction, conjunction nor negation; and 
+(3)~Kleene plus operator is applied to an event type  and appears once per query.
+
+% \ear{Did we have those assumptions before;
+% or where they added through this revision?}
+% chuan - we had them before
+
+In Section~\ref{sec:tempalte}, we describe the workload and stream partitioning. We introduce strategies for processing  queries without sharing in Section~\ref{sec:non-shared-baseline} versus with \textit{shared} online trend aggregation in Section~\ref{sec:shared-approach}. In Section~\ref{sec:runtime}, we present the runtime optimizer that makes these sharing decisions.
+
+\input{sections/template}
+\input{sections/figure_greta_hamlet}
+
+%==================================================
+\subsection{Non-Shared Online Trend Aggregation}
+\label{sec:non-shared-baseline}
+
+For the  non-shared execution, we describe below how the \app\ executor leverages state-of-the-art online trend aggregation approach
+% \ear{I suggest we remove the name Greta here,
+% and keep it a bit more generic.}
+% chuan - fixed
+~\cite{PLRM18} to compute trend aggregates for each query {\it independently from all other queries}. Given a query $q$, it encodes all trends matched by $q$ in a query graph.
+% \ear{Why do we need to give
+% this graph a name. can we simply call it query graph here.}
+% chuan - fixed
+The nodes in the graph are events matched by $q$. Two events $e'$ and $e$ are connected by an edge if $e'$ and $e$ are adjacent in a trend matched by $q$. The event $e'$ is called a \textbf{\textit{predecessor event}} of $e$. At runtime, trend aggregates are propagated along the edges. In this way, 
+% \ear{Why can we not simply say ... In this way, we aggregate .... }
+% chuan - fixed
+we aggregate trends online, i.e., without actually constructing them.
+%{\color{blue} Why say this here! because we do not want to admit that greta already solved the main complexity issue}
+%Thus, it reduces the time complexity of trend aggregation from exponential to quadratic in the number of matched events compared to two-step approaches.
+
+Assume a query $q$ computes the number of trends $\mycount(*)$. 
+When an event $e$ is matched by $q$, $e$ is inserted in the graph for $q$ and the \textbf{\textit{intermediate trend count}} of $e$ (denoted $\mathit{count}(e,q)$) is computed. $\mathit{count}(e,q)$ corresponds to the number of trends that are matched by $q$ and end at $e$. 
+%
+If $e$ is of start type of $q$, $e$ starts a new trend. Thus, $\mathit{count}(e,q)$ is incremented by one (Equation~\ref{eq:start_event}).
+%
+In addition, $e$ extends all trends that were previously matched by $q$. Thus, $\mathit{count}(e,q)$ is incremented by the sum of the intermediate trend counts of the predecessor events of $e$ that were matched by $q$ (denoted $\textit{pe}(e,q)$) (Equation~\ref{eq:event_count}). 
+%
+The \textbf{\textit{final trend count}} of $q$ is the sum of intermediate trend counts of all matched events of end type of $q$ (Equation~\ref{eq:final_count}).
+%
+%\vspace*{-1mm}
+\begin{align}
+%
+\mathit{start}(e,q) &=
+    \begin{cases}
+      1, & \text{if}\ \mathit{e.type} \in \mathit{start}(q) \\
+      0, & \text{otherwise}
+    \end{cases}
+\label{eq:start_event}\\
+%
+\mathit{count}(e,q) &= 
+\mathit{start}(e,q) + 
+\sum_{e' \in \textit{pe}(e,q)}  \mathit{count}(e',q) 
+\label{eq:event_count}\\
+%
+\mathit{fcount}(q) &= 
+\sum_{\mathit{e.type} \in \textit{end}(q)}  \mathit{count}(e,q)
+%
+\label{eq:final_count}
+\end{align}
+\vspace{-5pt}
+
+
+\input{sections/figure_snapshots}
+\input{sections/table_of_snapshot_values}
+
+%--------------------
+\begin{example}
+Continuing Example~\ref{ex:running_example}, a graph is maintained per each query in the workload $Q=\{q_1,q_2\}$ in Figure~\ref{fig:not-shared}. 
+For readability, we sort all events by their types and timestamps. Events of types $A$, $B$, and $C$ are displayed as gray, white, and striped circles, respectively. We highlight the predecessor events of event $b_3$ by edges. All other edges are omitted for compactness. 
+When $b_3$ arrives, two trends $(a_1,b_3)$ and $(a_2,b_3)$ are matched by $q_1$. Thus, $count$($b_3$,$q_1$) = $count(a_1,q_1) + count(a_2,q_1) = 2$. However, only one trend $(c_1,b_3)$ is matched by $q_2$. Thus, $count(b_3,q_2) = count(c_1,q_2) = 1$.
+\end{example}
+
+%\begin{table}[!htb]
+%    \centering
+%    \begin{tabular}{|c|p{2.7cm}|p{2.5cm}|}
+%    \hline
+%        Event $e$ 
+%        & $count(e,q_1)$ 
+%        & $count(e,q_2)$ \\\hline\hline
+%        $a_1, a_2$ 
+%        & 1 
+%        & \\\hline
+%        $c_1$ 
+%        &  
+%        & 1 \\\hline
+%        $b_3$ 
+%        & $count(a_1,q_1) +$ $count(a_2,q_1) = 2$ 
+%        & $count(c_1,q_2) = 1$ \\\hline
+%        $b_4$ 
+%        & $count(a_1,q_1) +$ $count(a_2,q_1) +$ $count(b_3,q_1) = 4$ 
+%        & $count(c_1,q_2) +$ $count(b_3,q_2) = 2$ \\\hline
+%        $b_5$ 
+%        & $count(a_1,q_1) +$ $count(a_2,q_1) +$ $count(b_3,q_1) +$ $count(b_4,q_1) = 8$ 
+%        & $count(c_1,q_2) +$ $count(b_3,q_2) +$ $count(b_4,q_2) = 4$ \\\hline
+%    \end{tabular}
+%    \caption{Non-shared trend count propagation}
+%    \label{tab:counts}
+%\end{table}
+
+%---------------
+\textbf{Complexity Analysis}. 
+Figure~\ref{fig:not-shared} illustrates that each event of type $B$ is stored and processed once for each query in the workload $Q$, introducing significant re-computation and replication overhead. 
+Let $k$ denote the number of queries in the workload $Q$ and $n$  the number of events. Each query $q$ stores each matched event $e$ and computes the intermediate count of $e$ per Equation~\ref{eq:event_count}. All predecessor events of $e$ must be accessed, with $e$ having at most $n$ predecessor events.  
+Thus, the time complexity of non-shared online trend aggregation is computed as follows:
+\begin{equation}
+\mathit{NonShared}(Q) = k \times n^2
+\label{eq:nonshared-cost}
+\end{equation}
+\vspace{-3mm}
+
+Events that are matched by $k$ queries are replicated $k$ times (Figure~\ref{fig:not-shared}). Each event stores its intermediate trend count. In addition, one final result is stored per query. Thus, the space complexity is $O(k \times n + k) = O(k \times n)$.
+
+% \ear{Does it require connection edges from
+% one event to other events; if this is not done
+% well for certain semantics, could this not be
+% quadratic in space to keep all pairwise edges?}
+% chuan - i think here we are not storing these connection edges. only the raw input events ($n$) are stored.
+
+% When an event $e$ is matched by a query $q \in Q$, \greta\ performs the following steps:
+
+% (1)~To support expressive predicates of $q$, the events matched by $q$ are stored in a binary tree sorted by the attribute values that are accessed by the predicates of $q$~\cite{PLRM18}. Therefore, the time complexity of inserting $e$ into the tree is $O(\log_2(n))$.
+
+% (2)~All predecessor events of $e$ are accessed to compute the intermediate aggregate of $e$ according to Equation~\ref{eq:event_count}. In the worst case, all events previously matched by query $q$ are predecessor events of $e$. Thus, the time complexity of accessing all predecessors of $e$ is $O(n)$.
+
+
+%=======================
+\subsection{Shared Online Trend Aggregation}
+\label{sec:shared-approach}
+
+In Equation~\ref{eq:nonshared-cost}, the overhead of processing each event once per query in the workload $Q$ is represented by the multiplicative factor $k$. 
+Since the number of queries in a production workload may reach hundreds to thousands~\cite{ADLS, shared_clouds}, this re-computation overhead can be significant.
+Thus, we design an efficient shared online trend aggregation strategy that encapsulates bursts of events of the same type in a graphlet such that the propagation of trend aggregates  within these graphlets can be shared among several queries. 
+
+% In addition, graphlets enable sharing decisions at a finer granularity (Section~\ref{sec:runtime}). 
+
+\begin{definition}(\textbf{Graphlet})
+%
+Let $q \in Q$ be a query and $T$ be a set of event types that appear in the pattern of $q$. 
+%
+A \textit{graphlet} $G_E$ is a graph of events of type $E$, if no events of type $E' \in T,\ E' \neq E,$ are matched by $q$ during the time interval $(e_\mathit{f}.time, e_l.time)$, where $e_\mathit{f}.time$ and $e_l.time$ are the time\-stamps of the first and the last events in $G_E$, respectively.
+% Let $G_E$ be the graph of events of type $E$.
+% Let $e_\mathit{f}$ be the first (i.e., an event with minimal timestamp) and $e_l$ be the last event (i.e., an event with maximal timestamp) in $G_E$.
+% We call $G_E$ a graphlet if no events of type $E_1$ or $E_2$ are matched by the query $q$ during the time interval $(e_\mathit{f}.time, e_l.time)$.
+%
+If new events can be added to a graphlet $G_E$ without violating the constraints above, the graphlet $G_E$ is called \textit{active}. Otherwise, $G_E$ is called \textit{inactive}.
+%
+\label{def:graphlet}
+\end{definition}
+
+\begin{definition}(\textbf{Shared Graphlet, \app\ Graph})
+%
+Let $E+$ be a Kleene sub-pattern that is shareable by queries $Q_E \subseteq Q$ (Definition~\ref{def:shareable-sub-pattern}). 
+We call a graphlet $G_E$ of events of type $E$ a shared graphlet. 
+The set of all interconnected shared and non-shared graphlets for a workload $Q$ is called a \app\ graph.
+%
+\label{def:shared-graphlet}
+\end{definition}
+
+\begin{example}
+In Figure~\ref{fig:snapshot}, matched events are partitioned into six graphlets $A_1$--$B_6$ by their types and timestamps. For example, graphlets $B_3$ and $B_6$ are of type $B$. They are shared by queries $q_1$ and $q_2$.
+In contrast to the non-shared strategy in Figure~\ref{fig:not-shared}, each event is stored and processed once for the entire workload $Q$. 
+Events in $A_1$--$C_2$ are predecessors of events in $B_3$, while events in $A_1$--$C_5$ are predecessors of events in $B_6$. 
+For readability, only the predecessor events of $b_3$ are highlighted by edges in Figure~\ref{fig:snapshot}. All other edges are omitted. 
+$a_1$ and $a_2$ are predecessors of $b_3$ only for $q_1$, while $c_1$ is a predecessor of $b_3$ only for $q_2$. 
+\label{ex:three}
+\end{example}
+
+Example~\ref{ex:three} illustrates the following two challenges of online shared event trend aggregation.
+
+\textit{\textbf{Challenge 1}}. 
+Given that event $b_3$ has different predecessors for queries $q_1$ and $q_2$, the computation of the intermediate trend count of $b_3$ (and all other events in graphlets $B_3$ and $B_6$) cannot be directly shared by queries $q_1$ and $q_2$.
+
+\textit{\textbf{Challenge 2}}. 
+If queries $q_1$ or $q_2$ have predicates, then not all previously matched events are qualified to contribute to the trend count of a new event. Assume that the edge between events $b_4$ and $b_5$ holds for $q_1$ but not for $q_2$ due to predicates, and all other edges hold for both queries. Then $count(b_4,q_1)$ contributes to $count(b_5,q_1)$, but $count(b_4,q_2)$ does not contribute to $count(b_5,q_2)$.
+
+We tackle these challenges by introducing \textbf{\textit{snapshots}}.
+Intuitively, a snapshot is a variable that its value corresponds to an intermediate trend aggregate per query. 
+In Figure~\ref{fig:snapshot}, the propagation of a snapshot $x$ within graphlet $B_3$ is shared by queries $q_1$ and $q_2$. 
+We store the values of $x$ per query (e.g., $x=2$ for $q_1$ and $x=1$ for $q_2$).
+
+\begin{definition}(\textbf{Snapshot at Graphlet Level})
+%
+Let $E'$ and $E$ be distinct event types.
+Let $E+$ be a Kleene sub-pattern that is shared by queries $Q_E \subseteq Q$, $q \in Q_E$.
+Let $E' \in \mathit{pt}(E,q)$ and $G_{E'}$ and $G_E$ be graphlets of events of types $E'$ and $E$, respectively.
+Assume for any events $e' \in G_{E'}, e \in G_E$, $e'.time < e.time$ holds. 
+A snapshot $x$ of the graphlet $G_{E'}$ is a variable whose value is computed per query $q$ and corresponds to the intermediate trend count of the query $q$ at the end of the graphlet $G_{E'}$. 
+%
+\begin{equation}
+\mathit{value}(x,q) = \mathit{sum}(G_{E'},q) = \sum_{e' \in G_{E'}} \mathit{count}(e',q)
+\label{eq:snapshot}
+\end{equation}
+
+The propagation of snapshot $x$ through the graphlet $G_E$ follows Equation~\ref{eq:event_count} and is shared by queries $Q_E$.
+%
+\label{def:snapshot}
+\end{definition}
+
+
+
+% Connections between Snapshots and Graphlets
+\begin{example}
+When graphlet $B_3$ starts, a snapshot $x$ is created. $x$ captures the intermediate trend count of query $q_1$ ($q_2$) based on the intermediate trend counts of all events in graphlet $A_1$ ($C_2$). $x$ is propagated through graphlet $B_3$ as shown in Figure~\ref{fig:no-predicates} and Table~\ref{tab:snapshot}. 
+
+Analogously, when graphlet $B_6$ starts, a new snapshot $y$ is created. The value of $y$ is computed for queries $q_1$ ($q_2$) based on the value of $x$ for $q_1$ ($q_2$) and graphlets $B_3$ and $A_4$ ($C_5$). Figure~\ref{fig:snapshots} illustrates the connections between snapshots and graphlets. The edges from graphlets $A_1$ and $A_4$ ($C_2$ and $C_5$) hold only for query $q_1$ ($q_2$). Other edges hold for both queries $q_1$ and $q_2$.
+
+% Values of Snapshots
+Table~\ref{tab:snapshots} captures the values of snapshots $x$ and $y$ per query. For compactness, $sum(A_1,q_1)$ denotes the sum of intermediate trend counts of all events in $A_1$ that are matched by $q_1$ (Equation~\ref{eq:snapshot}). 
+When the snapshot $y$ is created, the value of $x$ per query is plugged in to obtain the value of $y$ per query. The propagation of $y$ through $B_6$ is shared by $q_1$ and $q_2$. In this way, only one snapshot is propagated at a time to keep the overhead of snapshot maintenance low.
+\end{example}
+
+To enable shared trend aggregation despite expressive predicates, we now introduce snapshots at the event level.
+
+
+\begin{definition}(\textbf{Snapshot at Event Level})
+%
+Let $G_E$ be a graphlet that is shared by queries $Q_E \subseteq Q$. Let $q_1,q_2 \in Q_E$ and $e_1, e_2 \in G_E$ be events such that the edge $(e_1,e_2)$ holds for $q_1$ but does not hold for $q_2$ due to predicates. 
+A snapshot $z$ is the intermediate trend count of $e_2$ that is 
+computed for $q_1$ and $q_2$ per Equation~\ref{eq:event_count} and propagated through the graphlet $G_E$ for all queries in $Q_E$.
+%
+\label{def:snapshot2}
+\end{definition}
+%
+% For simplicity in Figures~\ref{fig:not-shared}--\ref{fig:snapshots} and Tables~\ref{tab:counts}--\ref{tab:snapshots}, we assumed that no predicates on adjacent events are specified in the queries. Thus, when an event $e$ of type $E$ arrives, all previously matched events of predecessor types of $E$ contribute to the intermediate trend count of $e$. 
+% However, predicates may prevent some of the predecessor events of $e$ from passing their intermediate trend counts to $e$. To enable shared trend aggregation despite expressive predicates, we now introduce snapshots at the event level.
+
+% chuan - what was before? it is not clear to me this `any` thing.
+% olga - rephrased
+
+
+\begin{example}
+In Figure~\ref{fig:predicates}, assume that the edge between events $b_4$ and $b_5$ holds for query $q_1$ but not for query $q_2$ due to predicates. All other edges hold for both queries. Then, $count(b_4,q_1)$ contributes to $count(b_5,q_1)$, but $count(b_4,q_2)$ does not contribute to $count(b_5,q_2)$. To enable shared processing of graphlet $B_3$ despite predicates, we introduce a new snapshot $z$ as the intermediate trend count of $b_5$ and propagate both snapshots $x$ and $z$ within graphlet $B_3$. 
+Table~\ref{tab:snapshots2} summarizes the values of $z$ and $y$ per query. 
+\end{example}
+
+%-----------------
+\textbf{Shared Online Trend Aggregation Algorithm} computes the number of trends per query $q \in Q$ in the stream $I$. For simplicity, we assume that the stream $I$ contains events within one pane.
+%
+For each event $e \in I$ of type $E$, Algorithm~\ref{algo:snapshot-propagation} constructs the \app\ graph and computes the trend count as follows. 
+
+\textbf{\textit{\app\ graph construction}} (Lines~4--14).
+When an event $e$ of type $E$ is matched by a query $q \in Q$, $e$ is inserted into a graphlet $G_E$ that stores events of type $E$ (Line~14). 
+%
+if there is no active graphlet $G_E$ of events of type $E$, we create a new graphlet $G_E$, mark it as active and store it in the \app\ graph $G$ (Lines~7--8). If the graphlet $G_E$ is shared by queries $Q_E \subseteq Q$, then we create a snapshot $x$ at graphlet level (Line~9). $x$ captures the values of intermediate trend counts per query per Equation~\ref{eq:snapshot} at the end of graphlet $G_{E'}$ that stores events of type $E',\ E' \in pt(E,q)$. We save the value of $x$ per query in the table of snapshots $S$ (Lines~10--13).
+%
+Also, for each query $q \in Q$ with event types $T$, we mark all graphlets $G_{E'}$ of events of type $E' \in T,\ E' \neq E,$ as inactive (Lines~4--6). 
+
+\textbf{\textit{Trend count computation}} (Lines~16--24).
+If $G_E$ is shared by queries $Q_E \subseteq Q$ and the set of predecessor events of $e$ is identical for all queries $q \in Q_E$, then we compute $count(e,q)$ per Equation~\ref{eq:event_count} (Lines~16--18).
+%
+If $G_E$ is shared but the sets of predecessor events of $e$ differ among the different queries in $Q_E$ due to predicates, then we create a snapshot $y$ as the intermediate trend count of $e$ (Line~19). 
+We compute the value of $y$ for each query $q \in Q_E$ per Equation~\ref{eq:event_count} and save it in the table of snapshots $S$ (Line~20).
+%
+If $G_E$ is not shared, the algorithm defaults to the non-shared trend count propagation per Equation~\ref{eq:event_count} (Line~21).
+%
+If $E$ is an end type for a query $q \in Q$, we increment the final trend count of $q$ in the table of results $R$ by the intermediate trend count of $e$ for $q$ per Equation~\ref{eq:final_count} (Lines~22--23).
+%
+Lastly, we return the table of results $R$ (Line~24).
+
+%----------------
+\begin{theorem}
+Algorithm~\ref{algo:snapshot-propagation} returns correct event trend count for each query in the workload $Q$. 
+\end{theorem}
+
+\begin{proof}[Proof Sketch]
+%
+Correctness of the graph construction for a single query and the non-shared trend count propagation through the graph as defined in Equation~\ref{eq:event_count} are proven in~\cite{PLRM18}. 
+Correctness of the snapshot computation per query as defined in Equation~\ref{eq:snapshot} follows from Equation~\ref{eq:event_count}. 
+Algorithm~\ref{algo:snapshot-propagation} propagates snapshots through the \app\ graph analogously to trend count propagation through the \greta\ graph defined in~\cite{PLRM18}.
+%
+\end{proof}
+
+%------------------
+\textbf{Data Structures}.
+%
+Algorithm~\ref{algo:snapshot-propagation} utilizes the following physical data structures.
+
+(1) \textbf{\textit{\app\ graph}} $G$ is a set of all graphlets. Each graphlet has two metadata flags \textit{active} and \textit{shared} (Definitions~\ref{def:graphlet} and \ref{def:shared-graphlet}). 
+
+(2) \textbf{\textit{A hash table of snapshot coefficients}} per event $e$. The intermediate trend count of $e$ may be an expression composed of several snapshots. 
+In Figure~\ref{fig:predicates}, $count(b_6,Q) = 4x + z$. 
+Such composed expressions are stored in a hash table per event that maps a snapshot to its coefficient. In this example, $x \mapsto 4$ and $z \mapsto 1$ for $b_6$.
+
+(3) \textbf{\textit{A hash table of snapshots}} $S$ is a mapping from a snapshot $x$ and a query $q$ to the value of $x$ for $q$ (Tables~\ref{tab:snapshots} and \ref{tab:snapshots2}). 
+
+(4) \textbf{\textit{A hash table of trend count results}} $R$ is a mapping from a query $q$ to its corresponding trend count.
+
+\input{sections/algorithm}
+
+\textbf{Complexity Analysis}.
+%
+%{\color{blue}
+We use the notations in Table~\ref{tab:notation} and Algorithm~\ref{algo:snapshot-propagation}.  
+%
+For each event $e$ that is matched by a query $q \in Q$, Algorithm~\ref{algo:snapshot-propagation} computes the intermediate trend count of $e$ in an online fashion. This requires access to all predecessor events of $e$. In the worst case, $n$ previously matched events are the predecessor events of $e$. Since the intermediate trend count of $e$ can be an expression that is composed of $s$ snapshots, the intermediate trend count of $e$ is stored in the hash table that maps snapshots to their coefficients. Thus, the time complexity of intermediate trend count computation is $O(n \times s)$. In addition, the final trend count is updated per query $q$ if $E$ is an end type of $q$ in $O(k \times s)$ time. In summary, the time complexity of trend count computation is $O(n \times (n \times s + k \times s)) = O(n^2 \times s)$ since $n \geq k$.
+
+% \ear{why this one extra graphlet above? why do all events go into it, could some not be invalid due to  a predicate?}
+% olga: rephrased
+
+In addition, Algorithm~\ref{algo:snapshot-propagation} maintains snapshots to enable shared trend count computation.
+To compute the values of $s$ snapshots for each query $q$ in the workload of $k$ queries, the algorithm accesses $g$ events in $t$ graphlets $G_{E'}$ of events of type $E' \in T,\ E' \neq E$. Thus, the time complexity of snapshot maintenance is $O(s \times k \times g \times t)$. 
+%
+In summary,  time complexity of Algorithm~\ref{algo:snapshot-propagation} is computed as follows:
+%
+\begin{equation}
+\mathit{Shared}(Q) = n^2 \times s + s \times k \times g \times t
+\label{eq:shared-cost}
+\end{equation}
+%The trade-off between the cost of snapshot maintenance in the shared strategy versus the overhead of re-computations in the non-shared strategy determines the benefit of sharing (Section~\ref{sec:runtime}).
+
+Algorithm~\ref{algo:snapshot-propagation} stores each matched event in the \app\ graph once for the entire workload.
+Each shared event stores a hash table of snapshot coefficients.
+Each non-shared event stores its intermediate trend count.
+In addition, the algorithm stores snapshot values per query. 
+Lastly, the algorithm stores one final result per query.
+%
+Thus, the space complexity is $O(n + n \times s + s \times k + k) = O(n \times s + s \times k)$.

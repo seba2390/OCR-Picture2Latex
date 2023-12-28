@@ -1,0 +1,263 @@
+\section{Architecture}
+\label{sec:arch}
+Four goals guided our design:
+
+\begin{enumerate}
+    \item \emph{Discoverability}. Users should be able to use their pre-existing 
+        knowledge of Kubernetes to discover what their application is doing, how 
+        to modify it, and how Streams works in general. Streams applications 
+        should also be discoverable by other workloads on the same Kubernetes 
+        cluster, through standard Kubernetes mechanisms.
+    \item \emph{Composability}. By using Kubernetes first-class service
+        endpoints, cloud native Streams should interoperate with other applications
+        and middleware without further configuration. 
+    \item \emph{Application state preservation}. Stateless services are easy to
+        manage in Kubernetes, as simply restarting them is always an option.
+        But most Streams applications have state. We have an implicit contract
+        with users that once they deploy an application, they will not lose any
+        accumulated state---barring application failure and users taking
+        explicit action to restart it.
+    \item \emph{Backwards compatibility}. The cloud native version of Streams 
+        should run legacy Streams applications unchanged. This goal means that 
+        we cannot change any public APIs, and our task is to find the most 
+        Kubernetes-like way to express functionality originally designed 
+        for an on-premises cluster.
+\end{enumerate}
+
+We also have one anti-goal: we do not maintain API compatibility with the legacy
+platform. Trying to do so would force cloud native Streams to take on
+responsibilities that should belong to Kubernetes, which would end up
+conflicting with our stated goals. We want user's \emph{applications} to remain
+unchanged, but we are assuming that they are adopting cloud native Streams as
+part of an overall effort to consolidate and simplify management and
+administration.
+
+\subsection{Overview}
+
+All aspects of a Streams application exposed to users are represented as CRDs or
+existing Kubernetes resources. We apply the patterns described in
+\S~\ref{sec:patterns}: each resource is managed by a controller; when we
+need to monitor the status of multiple kinds of resources in order to take an
+action we use a conductor; and when multiple actors need to change the state for
+a particular resource, we use a coordinator.
+
+The CRD is the foundational unit in our design. CRDs are exposed to users in the
+same way as any other Kubernetes resource, which means that representing Streams
+concepts as CRDs gains not just native integration into the Kubernetes system,
+but also the user interfaces. Any state that we must maintain goes into a CRD;
+all state not in CRDs is ephemeral and can be lost without consequence.
+Kubernetes delivers reliable event notifications when CRDs and other resources
+are created, deleted and modified. Reacting to these notifications in
+controllers and conductors is the primary communication mechanism between all of
+the actors in our system.
+
+The CRDs in Figure~\ref{fig:actors} define the following resources:
+
+\begin{itemize}
+    \item \code{Job}: A single Streams job. The job 
+        controller initiates the job submission and tracks unique job identifiers. 
+        The job conductor manages the job submission process and update 
+        its status when completed.
+    \item \code{ProcessingElement}: A PE in a job. The 
+        PE controller tracks launch count and restores voluntarily deleted PEs.
+    \item \code{ParallelRegion}: A single parallel region in a job. It 
+        exposes a \code{width} attribute that can be directly altered by users using 
+        \code{kubectl edit} or the Kubernetes client API. The parallel region
+        controller handles width changes applied to parallel regions.
+   \item \code{HostPool}: A host pool in a job.
+   \item \code{Import}: An imported stream in a job. The import
+       controller monitors the addition and modification of these resources and 
+       matches them with export resources.
+   \item \code{Export}: An exported stream in a job. The export
+       controller monitors the addition and modification of these resources and 
+       matches them with import resources.
+    \item \code{ConsistentRegion}: A consistent region in a job. The 
+        consistent region controller coordinates application checkpoints and 
+        restarts for a single region.
+    \item \code{ConsistentRegionOperator}: tracks all consistent regions in a 
+        job. Created on-demand during a job submission with a consistent region.
+        Its controllers monitor the deployments used to create the operators.
+\end{itemize}
+
+
+We also leverage the following Kubernetes resources:
+
+\begin{itemize}
+    \item \code{ConfigMap}: Shares job specific configuration between controllers and pods, 
+        such as the graph metadata used by PEs to inform them of the operators they contain 
+        and how to connect to other PEs. 
+    \item \code{Deployment}: Manages the instance operator and the consistent region operator.
+    \item \code{Pod}: Executes PEs. We use a pod controller to monitor and 
+        manage the life cycle of pods within jobs. The pod conductor waits until all required
+        resources are available before starting a pod for a PE.
+    \item \code{Service}: Exports PE entrypoints as well as user-defined 
+        services within PEs.
+\end{itemize}
+
+Figure~\ref{fig:actors} shows how our actors interact with each other. There
+are four kinds of actions they can take:
+
+\begin{enumerate}
+    \item \emph{observes}: the actor either receives events from Kubernetes about that 
+        resource, or passively views its store.
+    \item \emph{creates}: the actor creates new instances of the resource through 
+        commands to Kubernetes.
+    \item \emph{deletes}: the actor deletes particular instances of a resource 
+        through commands to Kubernetes.
+    \item \emph{modifies}: the actor makes changes to an already created resource 
+        through that resource's coordinator.
+\end{enumerate}
+
+None of our actors communicate directly with each other; all communication happens 
+by creating, modifying or deleting Kubernetes resources.
+
+Figure~\ref{fig:streams_v4_v6} depicts the deployed artifacts of an instance of cloud
+native Streams.  The Streams \emph{instance operator} contains all the
+controllers, conductors and coordinators for a Streams instance. Each Kubernetes
+namespace can have one Streams instance operator. The instance operator maps to
+the legacy concept of an instance. The legacy concept of a Streams
+domain---management of Streams instances---is no longer needed as the Kubernetes
+cluster serves that role.
+
+In Streams, the PE is the vehicle for executing user code. PEs contain an
+arbitrary number of user operators and the application runtime.  In our design,
+we always assign one PE to a pod. This design decision is fundamental. It
+allows us to: tie a runtime PE's life cycle to that of the pod that contains
+it; fully offload PE scheduling to Kubernetes; rely on the Kubernetes DNS
+service for establishing direct TCP connections between our PEs.  Any other
+design would have required bespoke implementations of life cycle management,
+scheduling and network name resolution.
+
+\begin{figure}[t!]
+  \centering
+  \includegraphics[width=1\linewidth]{figures/streams_v4_v6}
+  \caption{Legacy and cloud native Streams deployments}
+  \label{fig:streams_v4_v6}
+\end{figure}
+
+While the PE runtime is unchanged, we had to implement a new translation layer
+between the PE and Kubernetes. It implements the platform abstraction for the PE
+runtime, as well as instantiates and initializes the PE. At runtime, it
+also: collects metrics from the PE using a pre-existing interface and exposes
+them to Prometheus~\cite{prometheus}; monitors and reports the status of all
+PE-to-PE connections; and monitors liveness and reports it to Kubernetes.
+
+\subsection{Loose Coupling}
+\label{sec:coupling}
+
+The legacy Streams platform was tightly coupled, which lead to operational
+difficulty and implementation complexity. Cloud native Streams applies the
+concept of loose coupling.
+
+\paragraph{Name resolution:} PEs communicate with each other over TCP
+connections. It is the platform's responsibility to define PE ports, give them
+names, and allow PEs to find each other's ports by those names.
+
+In legacy Streams, each PE port is assigned a \code{(peId, portId)} tuple called
+a \emph{port label} that uniquely identifies that port in the instance.
+At initialization, PEs must establish their remote connections to other PEs
+using their port labels. To that end, each PE first creates the socket receiver
+for each of its receiver ports, determines its local TCP port, and publishes to 
+ZooKeeper its mapping of port label to \code{(hostname, tcpPort)}. PEs already
+know the port label that each sending port needs to connect to through graph
+metadata that the platform provides at PE startup. After publishing its own
+receiver port labels, each PE then looks up the translation of the remote
+receiver port label in ZooKeeper for each of its own sender ports and
+establishes those connections.  Even with some caching (used to reestablish lost
+connections), the thundering herd aspect of this initialization process and the
+strain it applies to the ZooKeeper ensemble delays initial deployment times.
+
+Cloud native Streams relies on the Kubernetes name resolution system to resolve
+inter-PE connections. There are similarities with the legacy system name
+resolution system, as it relies on etcd to store its Service configurations, and
+it also has some currently unresolved latency issues~\cite{codacydns,machudns}.
+But from an application perspective, it is easier to use as name resolution is
+done using standard BSD functions such as \code{gethostbyname()}. Lastly, from
+an administration perspective, it is simpler to manage as it binds directly to
+the container's \code{/etc/resolv.conf} subsystem and can be easily superseded.
+
+\paragraph{Message bus:} The message bus in legacy Streams between the platform
+and PEs uses full-duplex, synchronous communication channels implemented with
+JMX~\cite{jmx}. All initiated communications must succeed. Failed
+communications are retried with increasing backoff delays before being
+escalated as more general system failures where it may restart a PE. As job
+count and PE size increases, communications tend to time out more frequently,
+leading to failure escalations reducing responsiveness. We have witnessed tens
+of minutes to list all the PEs in an overloaded instance.
+
+Cloud native Streams decouples the instance operator from the PEs by relying on
+the states stored in Kubernetes to achieve operational availability. The
+controller pattern (\S~\ref{sec:controller}) is used by all agents
+interested in keeping track of those states. Agents that need to notify the
+instance operator of internal state changes do so through Kubernetes events.  In
+turn, the instance operator synchronously applies those changes to the custom
+resources, preventing potential race conditions (\S~\ref{sec:coordinator}).
+
+The SPL runtime, including the PEs, are implemented in C++. As of this writing,
+no library capable of implementing our controller pattern is available in C/C++.
+As an alternative, we temporarily resort to a set of REST services hosted by the
+instance operator. State changes within agents other than the instance operator
+periodically send REST operations to those services to notify the operator of
+internal changes. In turn, the operator applies these changes to the related
+custom resources. Implementing the proper library and removing the REST layer is
+part of our future work.
+
+\subsection{Fault Tolerance and Rolling Upgrades}
+
+Fault tolerance and general high-availability is a primary goal in the design of
+Streams since streaming applications are expected to run for months without
+interruption. To that end, the legacy Streams platform was designed such that:
+
+\begin{enumerate}
+    \item All platform related state is persisted in ZooKeeper. Upon failure, 
+        platform services restart and retrieve their state from ZooKeeper.
+    \item Streaming applications continue to run during platform service
+        failures or upgrades.
+    \item Applications seamlessly resume operations after the loss of a
+        PE or a host.
+\end{enumerate}
+
+In cloud native Streams, we use Kubernetes to preserve
+these attributes.
+
+\paragraph{Persistent states:} Kubernetes exposes state persistence to users
+through CRDs. Cloud native Streams makes heavy use of CRDs 
+to maintain states critical for recovery. However, where the legacy
+platform implementation favored storing the state of the system as-is,
+cloud native Streams stores only what is necessary and sufficient
+to reach the current state of the system through recomputation. The reasons
+behind that radical shift in the computation versus space trade-off of
+our system are:
+
+\begin{enumerate}
+    \item We discovered through empirical measurements that the
+        amount of time required to perform state recomputation is negligible
+        compared to other operations in the system and appear instantaneous to
+        human users.
+    \item Minimizing the amount of data persisted drastically reduces the
+        pressure on the persistent ensemble.
+    \item Re-computing intermediate state simplifies the design of our system.
+\end{enumerate}
+
+\paragraph{Instance operator:} The Streams instance operator is designed to be
+resilient to its pod restarting.  All of the actors in the instance operator
+will receive the full history of Kubernetes events that they are subscribed to,
+allowing them to catch-up to the current state of the system.  The applications
+themselves do not need the instance operator for normal operation, so they can
+continue unharmed. Because of this resiliency, the instance operator can easily
+recover from failure. Upgrades are also trivial: change the image for the
+instance operator and restart the pod. The combination of how we defined our
+CRDs, the patterns we use to manage them and Kubernetes' reliable event delivery
+enable these capabilities.
+
+\paragraph{Applications:} We consider two types of application failures:
+voluntary failures, when a user deletes a resource; and involuntary failures,
+when a PE crashes or a node becomes unavailable. The voluntary deletion of job
+resources are caught by the \code{onDeletion()} callback in that resource's
+controller. In this situation, the deleted resource is recreated
+by the controller if the owning job exists and is in the \code{Submitted} state.
+
+Special care needs to be taken in the event of pod failure or PE deletion. To
+maintain Streams' application consistency logic
+(\S~\ref{sec:consistentregion}), restarting a pod needs to be coordinated with
+both the PE and pod controllers through a causal chain (\S~\ref{sec:causal}). 

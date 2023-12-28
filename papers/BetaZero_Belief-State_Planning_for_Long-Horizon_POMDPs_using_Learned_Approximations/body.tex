@@ -1,0 +1,482 @@
+\begin{abstract}
+Real-world planning problems, including autonomous driving and sustainable energy applications like carbon storage and resource exploration, have recently been modeled as partially observable Markov decision processes (POMDPs) and solved using approximate methods. To solve high-dimensional POMDPs in practice, state-of-the-art methods use online planning with problem-specific heuristics to reduce planning horizons and make the problems tractable. Algorithms that learn approximations to replace heuristics have recently found success in large-scale fully observable domains. The key insight is the combination of online Monte Carlo tree search with offline neural network approximations of the optimal policy and value function. In this work, we bring this insight to partially observed domains and propose \textit{BetaZero}, a belief-state planning algorithm for high-dimensional POMDPs. BetaZero learns offline approximations that replace heuristics to enable online decision making in long-horizon problems. We address several challenges inherent in large-scale partially observable domains; namely challenges of transitioning in stochastic environments, prioritizing action branching with a limited search budget, and representing beliefs as input to the network. To formalize the use of all limited search information we train against a novel $Q$-weighted policy vector target. We test BetaZero on various well-established benchmark POMDPs found in the literature and a real-world, high-dimensional problem of critical mineral exploration. Experiments show that BetaZero outperforms state-of-the-art POMDP solvers on a variety of tasks.\footnote{{Code:
+https://github.com/sisl/BetaZero.jl}}
+\end{abstract}
+
+\section{Introduction}
+Optimizing sequential decisions in real-world settings is challenging due to the inherent uncertainty about the true state of the environment.
+Modeling such problems as partially observable Markov decision processes (POMDPs) has shown recent success in autonomous driving \citep{wray2021pomdps}, robotics \citep{lauri2022partially}, and aircraft collision avoidance \citep{kochenderfer2012next}.
+Solving large or continuous POMDPs require approximations in the form of state-space discretizations or modeling assumptions, e.g., assuming full observability.
+Although these approximations are necessary when making fast decisions in a short time horizon, scaling these solutions to long-horizon problems is challenging \cite{shani2013survey}.
+Recently, POMDPs have been used to model large-scale information gathering problems such as carbon capture and storage (CCS) \citep{corso2022pomdp,wang2023optimizing}, remediation for groundwater contamination \cite{wang2022sequential}, and critical mineral exploration for battery metals \citep{mern2023intelligent} and are solved using online tree search methods such as DESPOT \cite{ye2017despot} and POMCPOW \citep{sunberg2018online}.
+The performance of these online methods rely on heuristics for action selection (to reduce search tree expansion) and heuristics to estimate the value function (to avoid expensive rollouts and reduce tree search depth).
+Without heuristics, online methods have difficulty planning for long-term information acquisition to reason about uncertain future events.
+Thus, algorithms to solve high-dimensional POMDPs need to be designed to learn heuristic approximations to enable decision making in long-horizon problems.
+
+\begin{figure}[t]
+    \centering
+    \resizebox{\linewidth}{!}{
+        \input{figures/diagrams/betazero-policy-iteration}
+    }
+    \caption{The \textit{BetaZero} POMDP policy iteration algorithm.}
+    \label{fig:betazero-alg}
+\end{figure}
+
+\begin{figure*}[t!]
+    \centering
+    \resizebox{0.65\textwidth}{!}{
+        \input{figures/diagrams/mcts-betazero}
+    }
+    \caption{The four stages of MCTS in \textit{BetaZero} using a value $V_\theta$ and policy $P_\theta$ network (the \textit{policy evaluation} step in \cref{fig:betazero-alg}).}
+    \label{fig:mcts-betazero}
+\end{figure*}
+
+\paragraph{Related work.}
+Algorithms to solve high-dimensional, fully observable Markov decision processes (MDPs) learn approximations to replace problem-specific heuristics.
+\citeauthor{silver2018general} introduced the \textit{AlphaZero} algorithm for large, deterministic MDPs and showed considerable success in games such as Go, chess, shogi, and Atari \cite{silver2018general, schrittwieser2020mastering}.
+The success is attributed to the combination of online Monte Carlo tree search (MCTS) and a neural network that approximates the optimal value function and the offline policy.
+Extensions of AlphaZero and the model-free variant \textit{MuZero} \cite{schrittwieser2020mastering} have already addressed several challenges when applying to broad classes of MDPs.
+For large or continuous action spaces, \citeauthor{hubert2021learning} introduced a policy improvement algorithm called \textit{Sampled MuZero} that samples an action set of an \textit{a priori} fixed size every time a node is expanded.
+\citeauthor{antonoglou2021planning} introduced \textit{Stochastic MuZero} that extends MuZero to games with stochastic transitions but assumes a finite set of possible next states so that each transition can be associated with a chance outcome.
+Applying these algorithms to large or continuous spaces remains challenging.
+
+To handle partial observability in stochastic games, \citeauthor{ozair2021vector} combine VQ-VAEs with MuZero to encode future discrete observations into latent variables.
+Other approaches incorporate partial observability by inputting action-observation histories directly into the network \cite{kimura2020development, vinyals2019grandmaster}.
+Similarly, \citeauthor{igl2018deep} introduce a method to learn a belief representation within the network when the agent is only given access to histories.
+Their work focuses on the \textit{reinforcement learning} (RL) domain and they show that a belief distribution can be represented as a latent state in the learned model.
+The FORBES algorithm \cite{chen2022flow} builds a normalizing flow-based belief and learns a policy through an actor-critic RL algorithm.
+Methods to learn the belief are necessary when a prior belief model is not available.
+When such models \textit{do} exist, as is the case with many geological applications, using the models can be valuable for long-term planning.
+\citeauthor{hoel2019combining} apply AlphaGo Zero \cite{silver2017mastering} to an autonomous driving POMDP using the most-likely state as the network input but overlook significant belief uncertainty information.
+Planning under uncertainty is crucial for learning effective POMDP policies.
+
+
+\paragraph{Planning vs. reinforcement learning.}
+In POMDP \textit{planning}, models of the transitions, rewards, and observations are known.
+In contrast, in the model-based \textit{reinforcement learning} (RL) domain, these models are learned along with a policy or value function \cite{sutton2018reinforcement}.
+A difference between these settings is that RL algorithms reset the agent and learn through experience, while planning algorithms, like MCTS, must consider future trajectories from any state.
+When RL problems have deterministic state transitions, they can be cast as a planning problem by replaying the full state trajectory along a tree path, which may be prohibitively expensive for long-horizon problems.
+Both settings are closely related and pose interesting research challenges.
+Specifically, sequential planning over given models in high-dimensional, long-horizon POMDPs remains challenging \cite{lauri2022partially}.
+
+
+\paragraph{Online POMDP planning.}
+Existing online POMDP planning algorithms rely on problem-specific heuristics for good performance.
+\citeauthor{sunberg2018online} introduced the POMCPOW planning algorithm that iteratively builds a particle set belief within the tree, designed for continuous observations.
+In practice, POMCPOW relies on heuristics for value function estimation and action selection (e.g., work from \citeauthor{mern2023intelligent}).
+\citeauthor{wu2021adaptive} introduced AdaOPS that adaptively approximates the belief through particle filtering and maintains value function bounds that are initialized with heuristics (e.g., solving the MDP or using expert policies).
+The major limitation of existing solvers is the reliance on heuristics to make long-horizon POMDPs tractable, which may not scale to high-dimensional problems.
+
+Our work avoids heuristics and uses the insight of combining online MCTS with offline neural network approximations to solve high-dimensional POMDPs.
+We propose the \textit{BetaZero} belief-state planning algorithm that plans in belief space 
+using no problem-specific heuristics, only using information from the search.
+We address partially observable challenges in large discrete action spaces and continuous state and observation spaces.
+In stochastic environments, BetaZero uses progressive widening \cite{couetoux2011continuous} to limit belief-state expansion---only using information available in the tree.
+When planning in belief space, computationally expensive belief updates limit the search budget in practice.
+Therefore, information from the policy network is used to prioritize branching on promising actions.
+We introduce a novel $Q$-weighted policy vector target that formalizes the use of all the information seen during the limited search.
+To capture state uncertainty, the network receives a parametric approximation of the belief $\tilde{b}$ as input.
+BetaZero uses the learned policy network $P_\theta$ to reduce search breadth and the learned value estimate $V_\theta$ to reduce search depth to enable long-horizon online planning (\cref{fig:mcts-betazero}).
+
+
+
+\section{Background}
+
+A partially observable Markov decision process (POMDP) is a model for sequential decision making problems where the true state is unobservable.
+Defined by the tuple $\langle \mathcal{S}, \mathcal{A}, \mathcal{O}, T, R, O, \gamma \rangle$, 
+POMDPs are an extension to the Markov decision process (MDP) used in reinforcement learning and planning with the addition of an observation space $\mathcal{O}$ (where $o \in \mathcal{O}$) and observation model $O(o \mid a, s')$.
+Given a current state $s \in \mathcal{S}$ and taking an action $a \in \mathcal{A}$, the agent transitions to a new state $s'$ using the transition model $s' \sim T(\cdot \mid s, a)$.
+Without access to the true state, an observation is received $o \sim O(\cdot \mid a, s')$ and used to update the belief $b$ over the possible next states $s'$ to get the posterior
+\begin{equation}    
+    b'(s') \propto O(o \mid a, s')\int_{s \in \mathrlap{\mathcal{S}}} T(s' \mid s, a)b(s) \,ds.
+\end{equation}
+The non-parametric \textit{particle set} belief can represent a broad range of distributions \cite{thrun2005probabilistic} and \citeauthor{lim2023optimality} show that optimality guarantees exist in finite-sample particle-based POMDP approximations.
+Despite choosing to study particle-based beliefs, our work generalizes well to problems with parametric beliefs.
+
+A stochastic POMDP policy $\pi(a \mid b)$ is defined as the distribution over actions given the current belief $b$.
+After taking an action $a \sim \pi(\cdot \mid b)$, the agent receives a reward $r$ from the environment according to the reward function $R: \mathcal{S} \times \mathcal{A} \to \mathbb{R}$ or $R: \mathcal{S} \times \mathcal{A} \times \mathcal{S} \to \mathbb{R}$ using the next state.
+
+\paragraph{Belief-state MDPs.}
+In \textit{belief-state} MDPs, the POMDP is converted to an MDP by treating the belief as a state \cite{dmbook}. % TODO: \cite{kaelbling1998planning}
+The reward function then becomes a weighted sum of the state-based reward:
+\begin{align}
+    R_b(b,a) &= \int_{s \in \mathrlap{\mathcal{S}}} b(s)R(s,a) \,ds \label{eq:reward} \\
+             &\approx \sum_{s \in b} b(s)R(s,a)
+\end{align}
+The belief-state MDP shares the same action space as the POMDP and operates over a belief space $\mathcal{B}$ that is the simplex over the state space $\mathcal{S}$. The belief-MDP defines a new belief-state transition function $b' \sim T_b(\cdot \mid b, a)$ as:
+\begin{align}
+    s &\sim b(\cdot)            \qquad &&s' \sim T(\cdot \mid s, a) \label{eq:tb_update} \\
+    o &\sim O(\cdot \mid a, s') \qquad &&b' \leftarrow \textsc{Update}(b, a, o) \nonumber
+\end{align}
+where the belief update can be done using a particle filter \cite{gordon1993novel}.
+Therefore, the belief-state MDP is defined by the tuple $\langle \mathcal{B}, \mathcal{A}, T_b, R_b, \gamma \rangle$ with the finite-horizon discount factor $\gamma \in [0,1)$ that controls the effect that future rewards have on the current action.
+
+The objective to solve belief-MDPs is to find a policy $\pi$ that maximizes the \textit{value function} from an initial belief $b_0$:
+\begin{equation}
+    V^\pi(b_0) = \mathbb{E}_\pi \left[\sum_{t=1}^T \gamma^t R_b(b_t,a_t) \bigmid\mid b_t \sim T_b, a_t \sim \pi \right]
+\end{equation}
+Instead of explicitly constructing a policy over all beliefs,
+online planning algorithms estimate the next best action through a planning procedure, often a best-first tree search.
+
+
+\subsection{Monte Carlo tree search (MCTS)}
+Monte Carlo tree search \cite{coulom2007efficient,browne2012survey} is an online, recursive, best-first tree search algorithm to determine the approximately optimal action to take from a given root state of an MDP.
+Extensions to MCTS have been applied to POMDPs through several algorithms: \textit{partially observable Monte Carlo planning} (POMCP) treats the state nodes as histories $h$ of action-observation trajectories \cite{silver2010pomcp}, \textit{POMCP with observation widening} (POMCPOW) construct weighted particle sets at the state nodes and extends POMCP to fully continuous domains \cite{sunberg2018online}, and \textit{particle filter trees} (PFT) and \textit{information particle filter trees} (IPFT) treat the POMDP as a belief-state MDP and plan directly over the belief-state nodes using a particle filter \cite{ fischer2020information}.
+All variants of MCTS execute the following four key steps.
+In this section we use $s$ to represent the state, the history $h$, and the belief state $b$ and refer to them as ``the state''.
+
+
+\begin{enumerate}
+    \item \textbf{Selection.}\quad 
+    During \textit{selection}, an action is selected from the children of a state node based on criteria that balances exploration and exploitation and is considered a multi-armed bandit problem \cite{munos2014bandits}.
+    The \textit{upper-confidence tree} algorithm (UCT) \cite{kocsis2006bandit} is a commonly used criterion that selects an action that maximizes the upper-confidence bound
+    \begin{equation}
+        Q(s, a) + c\sqrt{\frac{\log N(s)}{N(s,a)}} \label{eq:uct}
+    \end{equation}
+    where $Q(s,a)$ is the $Q$-value estimate for state-action pair $(s,a)$, the visit count for that state-action pair is $N(s,a)$, the total visit count is $N(s) = \sum_a N(s,a)$ for the children $a \in A(s)$, and $c \ge 0$ is an exploration constant.
+    \citeauthor{rosin2011multi} introduced the \textit{upper-confidence tree with predictor} algorithm (PUCT), modified by \citeauthor{silver2017mastering}, where a predictor $P(s,a)$ guides the exploration towards promising branches and selects an action that maximizes
+    \begin{equation}
+        Q(s,a) + c\left(P(s,a)\frac{\sqrt{N(s)}}{1 + N(s,a)}\right). \label{eq:puct}
+    \end{equation}
+
+    When dealing with a small discrete action space, the selection step often first branches on all actions and then selects based on some criterion; as is the case for AlphaZero that first expands on all legal moves \cite{silver2016mastering, silver2018general}.
+    For large or continuous action spaces, algorithms attempt to balance branching and selection.
+   
+    
+    \item \textbf{Expansion.}\quad 
+    In the \textit{expansion} step, the selected action is taken in simulation and the transition model $T(s' \mid s, a)$ is sampled to determine the next state $s'$.
+    When the transitions are deterministic, the child node is always a single state.
+    If the transition dynamics are stochastic, techniques to balance the branching factor such as progressive widening \cite{couetoux2011continuous} and state abstraction refinement \cite{sokota2021monte} have been proposed.
+    
+    
+    \item \textbf{Rollout/Simulation.}\quad 
+    In the \textit{rollout} step, also called the \textit{simulation} step due to recursively simulating the MCTS tree expansion, the value is estimated through the execution of a rollout policy until termination or using heuristics to approximate the value function from the given state $s'$.
+    \citeauthor{silver2017mastering} replace the expensive rollouts done by AlphaGo with a value network lookup in AlphaGo Zero and AlphaZero \cite{silver2016mastering, silver2017mastering, silver2018general}.
+    
+    
+    \item \textbf{Backpropagation.}\quad 
+    Finally, during the \textit{backpropagation} step, the $Q$-value estimate from the rollout is propagated up the path in the tree as a running average.
+\end{enumerate}
+
+
+\paragraph{Root node action selection.}\label{par:root_selection}
+After repeating the four steps of MCTS, the final action is selected from the children $a \in A(s)$ of the root state $s$ and executed in the environment.
+One way to select the best root node action, referred to as the \textit{robust child} \cite{schadd2009monte, browne2012survey}, selects the action with the highest visit count as $\argmax_a N(s,a)$.
+Sampling from the normalized counts, exponentiated by an exploratory temperature $\tau$, is also common \cite{silver2017mastering}.
+Another method uses the highest estimated $Q$-value as $\argmax_a Q(s,a)$.
+Both criteria have been shown to have problem-based trade-offs \cite{browne2012survey}.
+
+
+\paragraph{Double progressive widening.}\label{sec:dpw}
+To handle stochastic state transitions and large or continuous state and action spaces, double progressive widening (DPW) balances between sampling new nodes to expand on or selecting from existing nodes already in the tree \cite{couetoux2011continuous}.
+Two hyperparameters $\alpha \in [0,1]$ and $k \ge 0$ control the branching factor.
+If the number of actions tried from state $s$ is less than $kN(s)^\alpha$, then a new action is sampled from the action space and added as a child of node $s$.
+Likewise, if the number of expanded states from state-action node $(s,a)$ is less than $kN(s,a)^\alpha$, then a new state is sampled from the transition function $s' \sim T(\cdot \mid s, a)$ and added as a child of that state-action node.
+If the state widening condition is not met, then a next state is sampled from the existing children.
+To encouraging widening, let $k \to \infty$ and $\alpha \to 1$, e.g., in highly stochastic problems \cite{sokota2021monte}, and to discourage widening let $k \to 1$ and $\alpha \to 0$ \cite{moss2020adaptive}.
+
+Note that in the following sections we will refer to the belief state as $b$ and the true (hidden) state as $s$.
+
+
+
+\section{Proposed Algorithm: BetaZero}\label{sec:betazero}
+
+We introduce the \textit{BetaZero} POMDP planning algorithm that replaces heuristics with learned approximations of the optimal policy and value function.
+BetaZero is a belief-space policy iteration algorithm with two offline steps:
+\begin{enumerate}
+    \item \textbf{Policy evaluation}: Evaluate the current value and policy network through $n$ parallel episodes of MCTS and collect training data: $\mathcal{D} = \left\{\{(b_t, \pi_t, g_t)\}_{t=1}^T\right\}_{i=1}^n$
+    \item \textbf{Policy improvement}: Improve the estimated value function and policy by retraining the neural network parameters $\theta$ with data from the most recent MCTS simulations.
+\end{enumerate}
+The policy vector over actions $\vect{p} = P_\theta(\tilde{b}, \cdot)$ and the value $v = V_\theta(\tilde{b})$ are combined into a single network with two output heads $(\vect{p}, v) = f_\theta(\tilde{b})$; we refer to $P_\theta$ and $V_\theta$ separately.
+
+During \textit{policy evaluation}, training data is collected from the outer POMDP loop.
+The belief $b_t$ and the tree policy $\pi_t$ are collected for each time step $t$.
+At the end of each episode, the returns
+$g_t = \sum_{i=t}^T \gamma^{(i-t)} r_i$
+are computed from the set of observed rewards for all time steps up to a terminal horizon $T$.
+Traditionally, MCTS algorithms use a tree policy $\pi_t$ that is proportional to the root node visit counts of its children actions
+\(
+    \pi_t(b_t, a) \propto N(b_t,a)^{1/\tau}\label{eq:policy_counts}
+\).
+The counts are sampled after exponentiating with a temperature $\tau$ to encourage exploration but evaluated online with $\tau \to 0$ to return the maximizing action \cite{silver2017mastering}.
+In certain settings, relying solely on visit counts may overlook crucial information.
+
+
+\paragraph{Policy vector as $Q$-weighted counts.}
+When planning over belief states, expensive belief updates occur in the tree search and thus a limited MCTS budget may be used.
+Therefore, the visit counts may not converge towards an optimal strategy as the budget may be spent on exploration.
+\citeauthor{danihelka2022policy} and \citeauthor{czech2021improving} suggest using knowledge of the $Q$-values from search in MCTS action selection.
+Using only tree information, we incorporate $Q$-values and train against the policy $\pi_t(b_t, a)$ proportional to
+\begin{equation}
+    \Biggl(\biggl(\frac{\exp Q(b_t, a)}{\sum_{a'} \exp Q(b_t, a')}\biggr)^{z_q}\biggl(\frac{N(b_t,a)}{\sum_{a'} N(b_t,a')}\biggr)^{z_n}\Biggr)^{1/\tau}\label{eq:policy_q_weight}
+\end{equation}
+which is then normalized to get a valid probability distribution.
+\Cref{eq:policy_q_weight} simply weights the visit counts by the softmax $Q$-value distribution with parameters $z_q \in [0,1]$ and $z_n \in [0,1]$ defining the influence of the values and the visit counts, respectively.
+If $z_q=z_n=1$, then the influence is equal and if $z_q=z_n=0$, then the policy becomes uniform.
+Once the tree search finishes, the final action is selected as $a \sim \pi_t(b_t, \cdot)$ and returns the $\argmax$ when $\tau \to 0$.
+
+\begin{figure}[h!]
+    \centering
+    \resizebox{\linewidth}{!}{
+        \input{figures/q-weighting/q-weighting-diagram}
+    }
+    \caption{An illustrative example of when using a small MCTS budget with high exploration and collecting policy data based purely on visit counts (left) would perform worse than weighting the counts based on $Q$-values (right).
+    In this example, MCTS had a budget of $30$ iterations and visited each action $10$ times.
+    When training on the visit-counts, we miss useful $Q$-value information and select the worst performing action $a_1$.
+    When using both the $Q$-values and visit counts, we incorporate both what the tree search \textit{focused on} and the \textit{values it found}.
+    This also accounts for uncertainty by weighting the $Q$-value by the number of samples in the estimate.
+    An ablation study in the appendix tests this idea.}
+    \label{fig:q-weighting}
+\end{figure}
+
+
+\paragraph{Loss function.}
+Using the latest collected data, the \textit{policy improvement} step retrains the policy network head using the cross-entropy loss $\mathcal{L}_{P_\theta}(\pi_t, \vect{p}_t) = -\pi_t^\top \log \vect{p}_t$.
+The value network head is simultaneously trained to fit the returns $g_t$ using mean-squared error (MSE) or mean-absolute error (MAE) to predict the value of the belief $b_t$.
+The choice of value loss function $\mathcal{L}_{V_\theta}$ depends on the characteristics of the return distribution.
+In sparse reward problems,
+MAE is a better choice as the distribution is closer to Laplacian \cite{hodson2022root}.
+When the reward is distributed closer to Gaussian, then MSE is more suitable \cite{chai2014root}.
+The final loss function combines the value and policy losses with added $L_2$-regularization scaled by $\lambda$:
+\begin{equation}
+    \ell_{\beta_0} = \mathcal{L}_{V_\theta}(g_t, v_t) + \mathcal{L}_{P_\theta}(\pi_t, \vect{p}_t) + \lambda\norm{\theta}^2
+\end{equation}
+
+
+\paragraph{Prioritized action widening.}
+Planning in belief space explicitly handles state uncertainty but may incur computational overhead when performing belief updates, therefore we avoid trying all actions at every belief-state node.
+Action progressive widening has been used successfully in the context of continuous action spaces \cite{moerland2018a0c} and large discrete action spaces \cite{yee2016monte}. 
+\citeauthor{mern2021improved} show that prioritizing actions can improve MCTS performance in large discrete action spaces and \citeauthor{browne2012survey} found action progressive widening to be effective in cases where favorable actions were tried first.
+
+In BetaZero, we use \cref{alg:betazero-action-pw} to select actions through progressive widening and use information from the learned policy network $P_\theta$ to sample new actions.
+This way, we can first focus the expansion on promising actions, then make the final selection based on PUCT.
+In the appendix, we perform an ablation to measure the effect of using the policy $P_\theta$ to prioritize actions when widening the tree.
+
+
+\begin{figure}[t!]
+    \input{algorithms/action_selection_betazero_tight}
+\end{figure}
+
+
+\begin{figure}[b!]
+    \input{algorithms/state_expansion_betazero}
+\end{figure}
+
+\paragraph{Stochastic belief-state transitions.}
+A challenge with~partially observable domains is handling non-deterministic belief-state transitions in the tree search.
+The belief-state transition function $T_b$ consists of several stochastic components and the belief---which is a probability distribution over states---is continuous.
+To address this, we use progressive widening from \citeauthor{couetoux2011continuous} (\cref{alg:betazero-state-pw}).
+Other methods for state expansion, like state abstraction refinement from \citeauthor{sokota2021monte}, rely on problem-specific distance metrics between states to perform a nearest neighbor search.
+Progressive widening avoids problem-specific heuristics and uses only the information in the search tree to provide artificially limited belief-state branching which
+is important as the belief updates can be computationally expensive, thus limiting the MCTS search budget in practice.
+
+
+\paragraph{Parametric belief representation.}
+Although a particle set belief is not parametrically defined, approximating the belief as summary statistics (e.g., mean and std of the state particles) may capture enough information for value and policy estimation to be used during planning (further analyzed in the appendix).
+Approximating the particle set parametrically is easy to implement and computationally inexpensive.
+We show that the approximation works well across various problems and, unsurprisingly, using only the mean state is inadequate. 
+We represent the particle set $b$ parametrically as:
+\begin{equation}
+    \phi(b) \defeq \big[\mu(b), \sigma(b)\big] \label{eq:belief_rep}
+\end{equation}
+BetaZero plans over the full belief $b$ in the tree and only converts to the belief representation $\tilde{b} = \phi(b)$ for network evaluations.
+Other algorithms (e.g., FORBES from \citeauthor{chen2022flow}) could instead be used to learn this belief representation.
+
+\paragraph{Bootstrapping initial $Q$-values.} When a new state-action node is added to the tree, initial $Q$-values can be bootstrapped using the estimate from the value network $V_\theta$:
+\begin{equation}
+    \small
+    Q_0(b, a) \defeq R_b(b, a) + \gamma V_\theta(\phi(b')) \,\, \text{where} \,\, b' \sim T_b(\cdot \mid b, a)
+\end{equation}
+Bootstrapping occurs in \cref{alg:betazero-action-pw} (line \ref{line:init_q}) and incurs an additional belief update through the belief-state transition $T_b$ and may be opted only during online execution.
+The bootstrapped estimate is more robust \cite{kumar2019stabilizing} and can be useful to initialize online search.
+Note that MuZero also uses bootstrapping \cite{schrittwieser2020mastering}.
+
+\Cref{alg:betazero-mcts} details MCTS for BetaZero and the full BetaZero algorithm is in the appendix (algorithms \ref{alg:betazero}--\ref{alg:mcts-top-lvl}).
+
+\begin{figure}[b!]
+    \input{algorithms/mcts}
+\end{figure}
+
+\begin{figure*}[hb!]
+    \centering
+    \includegraphics[width=0.8\textwidth]{figures/results/value_and_policy_plots_lightdark_betazero.pdf}
+    \caption{\textsc{LightDark}$(10)$ value and policy plots: BetaZero (top) and value iteration (bottom) over belief mean and std. High uncertainty (horizontal axis) makes the agent localize \texttt{up} near $y=10$, then moves \texttt{down} and \texttt{stops} at the origin.}
+    \label{fig:lightdark_value_policy}
+\end{figure*}
+
+\section{Experiments}\label{sec:experiments}
+
+Three benchmark problems were chosen to evaluate the performance of BetaZero.
+Appendices further describe the POMDPs, network architectures, and experiment design.
+
+
+\begin{table}[ht]
+    \centering
+    \begin{threeparttable}
+        \begin{small}
+        \begin{tabular}{@{}lrrr@{}}
+            \toprule
+                                                   &  $|\mathcal{S}|$              &  $|\mathcal{A}|$  &  $|\mathcal{O}|$  \\
+            \midrule
+            $\text{LightDark}(5 \text{ and } 10)$  &  $|\mathbb{R}|$               &  $3$              &  $|\mathbb{R}|$  \\
+            $\text{RockSample}(15,15)$             &  $7{,}372{,}800$              &  $20$             &  $3$  \\
+            $\text{RockSample}(20,20)$             &  $419{,}430{,}400$            &  $25$             &  $3$  \\
+            Mineral Exploration                    &  $|\mathbb{R}^{32\times32}|$  &  $38$             &  $|\mathbb{R}_{\ge 0}|$  \\
+            \bottomrule
+        \end{tabular}
+        \end{small}
+    \end{threeparttable}
+    \caption{POMDP state, action, and observation spaces.}\label{tab:spaces}
+\end{table}
+
+In \textsc{LightDark$(y)$} \cite{platt2010belief}, the goal of the agent is to execute a \texttt{stop} action at the origin while receiving noisy observations of its true location.
+The noise is minimized in the ``light'' region ${y=5}$.
+We also benchmark against a harder version with the light region at ${y=10}$ from \citeauthor{sunberg2018online} and restrict the agent to only three actions: move \texttt{up} or \texttt{down} by one, or \texttt{stop} (removing actions of moving ten units).
+The modified problem requires information gathering over longer horizons.
+ 
+\textsc{RockSample$(n,k)$} \cite{smith2012heuristic} is a scalable information gathering problem where an agent moves in an $n \times n$ grid to observe $k$ rocks to sample only the ``good'' rocks.
+Well-established POMDP benchmarks go up to $n=15$ and $k=15$; we also test a harder version with $n=20$ and $k=20$ to show the scalability of BetaZero, noting that \citeauthor{cai2021hyp} evaluated this in the multi-agent case.
+
+In the real-world \textsc{Mineral Exploration} problem \cite{mern2023intelligent} the agent drills over a $32\times32$ region to determine if a subsurface ore body should be mined or abandoned. % (where $50\%$ of cases are economical to mine).
+The agent receives a continuous ore quality observation at the drill locations to build its belief.
+Drilling incurs a penalty and if chosen to mine then the agent is rewarded or penalized  based on an economic threshold of the extracted ore mass.
+The problem is challenging due to reasoning over limited observations with sparse rewards.
+
+We baseline BetaZero against several online POMDP algorithms, namely AdaOPS \cite{wu2021adaptive}, POMCPOW \cite{sunberg2018online}, and DESPOT \cite{ye2017despot}.
+In LightDark, we solve for an approximately optimal policy using \textit{local approximation value iteration} (LAVI) \cite{dmubook} over a discretized parametric belief space.
+For a fair comparison, parameters were set to roughly match the total number of simulations experienced.
+
+
+\section{Results and Discussion}
+\Cref{fig:lightdark_value_policy} compares the raw BetaZero value and policy network with \textit{value iteration} for \textsc{LightDark}$(10)$.
+Qualitatively, BetaZero learns an accurate optimal policy and value function in areas where training data was collected.
+Despite unrepresented value function regions (gray), BetaZero remains nearly optimal as those beliefs don't occur during execution.
+Out-of-distribution methods could quantify this uncertainty, e.g., an ensemble of networks \cite{salehi2022unified}.
+
+
+\begin{figure}[t!]
+    \centering
+    \resizebox{\linewidth}{!}{
+        \input{figures/results/plot_online_performance}
+    }
+    \caption{Performance of POMCPOW with heuristics up to $10$ million online iterations plateaus, indicating that extending online searches alone misses valuable offline experience.}
+    \label{fig:online}
+\end{figure}
+
+
+\begin{table*}[t!]
+    \centering
+    \begin{threeparttable}
+        \begin{adjustbox}{max width=\textwidth}
+        \begin{tabular}{@{}lrrrrrrrrrr@{}}
+            \arrayrulecolor{black} % revert
+            \toprule
+                &  \multicolumn{2}{c}{$\text{LightDark}(5)$}  &  \multicolumn{2}{c}{$\text{LightDark}(10)$}  &  \multicolumn{2}{c}{$\text{RockSample}(15,15)$}  &  \multicolumn{2}{c}{$\text{RockSample}({20,20})$}  &  \multicolumn{2}{c}{Mineral Exploration} \\
+            \arrayrulecolor{lightgray}
+            \cmidrule{2-11}
+            \arrayrulecolor{black} % revert
+                &  returns  &  time [s]  &  returns  &  time [s]  &  returns  &  time [s]  &  returns  &  time [s]  &  returns  &  time [s] \\
+            \midrule
+            \arrayrulecolor{white}
+            BetaZero  &  $\mathBF{4.47 \pm 0.28}$  &  \tcolor{$[\num{2274},\,\num{0.014}]$}  &  $\mathBF{16.77 \pm 1.28}$  &  \tcolor{$[\num{2740},\,\num{0.331}]$}  &  $\num{20.15 \pm 0.71}$  &  \tcolor{$[\num{5701},\,\num{0.477}]$}  &  $\mathBF{13.09 \pm 0.55}$  &  \tcolor{$[\num{7081},\,\num{1.109}]$}  &  $\mathBF{10.67 \pm 2.25}$  &  \tcolor{$[\num{22505},\,\num{5.126}]$}  \\
+            \midrule
+            Raw Policy $P_\theta$  &  $\num{4.44 \pm 0.28}$  &  \tcolor{$[\num{2274},\,\num{0.004}]$}  &  $\num{13.74 \pm 1.33}$  &  \tcolor{$[\num{2740},\,\num{0.004}]$}  &  $\num{10.96 \pm 0.98}$  &  \tcolor{$[\num{5701},\,\num{0.018}]$}  &  $\num{2.03 \pm 0.34}$  &  \tcolor{$[\num{7081},\,\num{0.084}]$}  &  $\num{8.67 \pm 2.52}$  &  \tcolor{$[\num{22505},\,\num{0.533}]$}  \\
+            \midrule
+            Raw Value $V_\theta$\tnote{*}  &  $\num{3.16 \pm 0.4}$  &  \tcolor{$[\num{2274},\,\num{0.008}]$}  &  $\num{12.7 \pm 1.46}$  &  \tcolor{$[\num{2740},\,\num{0.009}]$}  &  $\num{9.96 \pm 0.65}$  &  \tcolor{$[\num{5701},\,\num{0.158}]$}  &  $\num{3.57 \pm 0.40}$  &  \tcolor{$[\num{7081},\,\num{0.204}]$}  &  $\num{9.75 \pm 2.42}$  &  \tcolor{$[\num{22505},\,\num{1.420}]$}  \\
+            % 
+            \arrayrulecolor{black}\midrule
+            % 
+            \tworow{AdaOPS}  &  $\num{3.78 \pm 0.27}$  &  \tworow{\tcolor{$[\num{68},\,\num{0.089}]$}}  &  \tworow{$\num{5.22 \pm 1.77}$}  &  \tworow{\tcolor{$[\num{81},\,\num{0.510}]$}}  &  $\mathBF{20.67 \pm 0.72}$  &  \tworow{\tcolor{$[\num{7},\,\num{2.768}]$}}  &  \tworow{---}  &  \tworow{---}  &  \tworow{$\num{3.33 \pm 1.95}$}  &  \tworow{\tcolor{$[\num{5},\,\num{0.112}]$}}  \\
+                             &  \lit{$\num{3.79 \pm 0.07}$}  &  &  &  & \lit{$\num{17.16 \pm 0.21}$}  &  &  &  &  &  \\
+            \arrayrulecolor{white}\midrule
+            AdaOPS (fixed bounds)  &  $\num{3.7 \pm 0.25}$  &  \tcolor{$[\num{0},\,\num{0.039}]$}  &  $\num{4.98 \pm 2.01}$  &  \tcolor{$[\num{0},\,\num{0.573}]$}  &  $\num{13.37 \pm 0.71}$  &  \tcolor{$[\num{0},\,\num{1.349}]$}  &  $\num{11.66 \pm 0.49}$  &  \tcolor{$[\num{1},\,\num{1.458}]$}  &  \sameresults  &  \sameresults  \\
+            % 
+            \arrayrulecolor{grays1}\midrule
+            % 
+            \tworow{POMCPOW}  &  $\num{3.21 \pm 0.38}$  &  \tworow{\tcolor{$[\num{59},\,\num{0.189}]$}}  &  \tworow{$\num{0.68 \pm 0.41}$}  &  \tworow{\tcolor{$[\num{70},\,\num{1.261}]$}}  &  $\num{11.14 \pm 0.59}$  &  \tworow{\tcolor{$[\num{0},\,\num{0.929}]$}}  &  \tworow{$\num{10.22 \pm 0.47}$}  &  \tworow{\tcolor{$[\num{0},\,\num{1.480}]$}}  &  \tworow{$\num{9.43 \pm 2.19}$}  &  \tworow{\tcolor{$[\num{0},\,\num{6.728}]$}}  \\
+                              &  \lit{$\num{3.23 \pm 0.11}$}  &  &  &  &  \lit{$\num{10.40 \pm 0.18}$}  &  &  &  &  &  \\
+            \arrayrulecolor{white}\midrule
+            POMCPOW (no heuristics)  &  $\num{1.96 \pm 0.58}$  &  \tcolor{$[\num{0},\,\num{0.099}]$}  &  $\num{-5.9 \pm 5.78}$  &  \tcolor{$[\num{0},\,\num{0.742}]$}  &  $\num{10.17 \pm 0.61}$  &  \tcolor{$[\num{0},\,\num{1.485}]$}  &  $\num{4.03 \pm 0.44}$  &  \tcolor{$[\num{0},\,\num{5.173}]$}  &  $\num{5.38 \pm 2.15}$  &  \tcolor{$[\num{0},\,\num{5.915}]$}  \\
+            % 
+            \arrayrulecolor{grays1}\midrule
+            % 
+            \tworow{DESPOT}  &  $\num{2.37 \pm 0.37}$  &  \tworow{\tcolor{$[\num{0},\,\num{0.008}]$}}  &  \tworow{$\num{0.43 \pm 0.36}$}  &  \tworow{\tcolor{$[\num{0},\,\num{0.046}]$}}  &  $\num{18.44 \pm 0.69}$  &  \tworow{\tcolor{$[\num{7},\,\num{3.822}]$}}  &  \tworow{---}  &  \tworow{---}  &  \tworow{$\num{5.29 \pm 2.17}$}  &  \tworow{\tcolor{$[\num{5},\,\num{0.283}]$}}  \\
+                             &  \lit{$\num{2.50 \pm 0.10}$}  &  &  &  &  \lit{$\num{15.67 \pm 0.20}$}  &  &  &  &  &  \\
+            \arrayrulecolor{white}\midrule
+            DESPOT (fixed bounds)  &  $\num{2.70 \pm 0.50}$  &  \tcolor{$[\num{0},\,\num{0.008}]$}  &  $\num{0.49 \pm 0.30}$  &  \tcolor{$[\num{0},\,\num{0.025}]$}  &  $\num{4.29 \pm 0.45}$  &  \tcolor{$[\num{0},\,\num{5.091}]$}  &  $\num{0.00 \pm 0.00}$  &  \tcolor{$[\num{0},\,\num{5.179}]$}  &  \sameresults  &  \sameresults \\
+            % 
+            \arrayrulecolor{black}\midrule
+            % \tnote{$\dagger$}
+            Approx. Optimal  &  $\num{4.09 \pm 0.33}$  &  \tcolor{$[\num{267},\,\num{0.037}]$}  &  $\num{14.16 \pm 1.39}$  &  \tcolor{$[\num{260},\,\num{0.025}]$}  &  ---  &  ---  &  ---  &  ---  &  $\num{11.9 \pm 0.18}$  &  N/A  \\
+            \arrayrulecolor{black} % revert
+            \bottomrule
+        \end{tabular}
+        \end{adjustbox}
+        \begin{scriptsize}
+            \begin{tablenotes}
+                \item[*] {One-step look-ahead over all actions using only the value network with $5$ observations per action. All results report the mean return $\pm$ standard error over $100$ seeds.}
+                \item[\phantom{$\dagger$}] {Entries with ``---'' indicate they failed to run on that domain, entries with \textdoublequotes{} are the same as the ones above, and entries in \litdesc{parentheses} are from the literature.}
+            \end{tablenotes}
+        \end{scriptsize}
+    \end{threeparttable}
+    \caption{Results comparing \textit{BetaZero} to various state-of-the-art POMDP solvers (reporting returns and [\textit{offline}, \textit{online}] timing).}\label{tab:results}
+\end{table*}
+    
+
+\Cref{tab:results} shows that BetaZero outperforms state-of-the-art algorithms in most cases, with larger improvements when baseline algorithms do not rely on heuristics.
+Timing results show BetaZero incurs a significant offline penalty, further elaborated in the limitations section below.
+
+
+\newcommand*{\SHOWPLOTS}{}
+\ifdefined\SHOWPLOTS
+    \begin{figure}[b!]
+        \centering
+        \input{data/minex_data}% load minex data files (BetaZero)
+        \renewcommand*{\algcaption}{BetaZero}
+        \resizebox{\linewidth}{!}{%
+            \input{figures/diagrams/minex}
+        }
+        \hfill
+        \input{data/minex_data_pomcpow}% load minex data files (POMCPOW)
+        \renewcommand*{\algcaption}{POMCPOW}
+        \resizebox{\linewidth}{!}{%
+            \input{figures/diagrams/minex}
+        }
+        \renewcommand*{\algcaption}{} % reset
+        \caption{Mineral exploration policies: BetaZero prioritizes uncertainty, matching heuristics from \citeauthor{mern2023intelligent}.}
+        \label{fig:minex}
+    \end{figure}
+\fi
+
+In \textsc{RockSample}$(n,k)$, BetaZero is comparable to AdaOPS and DESPOT which compute an upper bound using QMDP.
+QMDP computes the optimal utility of the fully observable MDP over all $k-1$ rock combinations, which scales exponentially in $n$.
+For larger state spaces, like \textsc{RockSample}$(20,20)$, the QMDP solution is intractable.
+Thus, fixed bounds are used assuming an optimistic $V_\text{max}$ \cite{adaops2021review}
+while BetaZero scales well to these higher dimensional problems. % and learn approximations to replace heuristics.
+Indicated in \cref{tab:results}, the raw networks alone perform well but outperform when combined with online planning, enabling reasoning with current information.
+
+
+If online algorithms ran for a large number of iterations, one might expect to see convergence to the optimal policy.
+In practice, this may be an intractable number as \cref{fig:online} shows POMCPOW has not reached the required number of iterations for RockSample.
+The advantage of BetaZero is that it can generalize from a more diverse set of experiences.
+
+
+The inability of existing online algorithms to plan over long horizons is also evident in the mineral exploration POMDP (\cref{fig:minex}).
+POMCPOW ran for one million online iterations without a value estimator heuristic and BetaZero ran online for $100$ iterations (using about $850{,}000$ offline simulations).
+In the figure, the probability of selecting a drilling location is shown as vertical bars for each action, overlaid on the initial belief uncertainty (i.e., the standard deviation of the belief in subsurface ore quality).
+BetaZero learned to take actions in areas of the belief space with high uncertainty (which matches the domain-specific heuristic developed for the mineral exploration problem from \citeauthor{mern2023intelligent}), while POMCPOW fails to distinguish between the actions and resembles a uniform policy.
+
+\paragraph{Limitations.}
+It is standard for POMDP planning algorithms to assume known models but this may limit the applicability to certain problems where reinforcement learning may be better suited.
+We chose a simplified belief representation to allow for further research innovations in using other parametric and non-parametric representations.
+Other limitations include compute resource requirements for training neural networks and parallelizing MCTS simulations.
+We designed BetaZero to use a single GPU for training and to scale based on available CPUs.
+Certain POMDPs may not require the training burden, especially when known heuristics perform well.
+BetaZero is useful for long-horizon, high-dimensional continuous POMDPs but may be unnecessary when offline training is computationally limited.
+BetaZero is designed for problems where the simulation cost is the dominating factor compared to offline training time.
+
+\section{Conclusions}
+We propose the \textit{BetaZero} belief-state planning algorithm for POMDPs; designed to learn from offline experience to inform online decisions.
+Planning in belief space explicitly handles state uncertainty and learning offline approximations to replace heuristics enables effective online planning in long-horizon POMDPs.
+BetaZero can also scale to larger problems where certain heuristics break down.
+Results suggest that BetaZero can solve large-scale POMDPs and learns to plan in belief space using zero heuristics.

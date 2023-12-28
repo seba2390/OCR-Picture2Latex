@@ -1,0 +1,356 @@
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\section{Method}
+%
+\label{sec:method}
+%
+Our method solves an efficient approximation of the rendering equation for generating soft shadows for diffuse surface meshes.
+%
+Traditional graphics rendering is extremely time-consuming, mainly due to the expensive sampling process used in ray tracing for computing global illumination. 
+%
+To approach this problem, we represent the geometry surface with a collection of sphere blockers and compute the global visibility as a combination of the visibility function for each sphere blocker (also referred to as blocker function) in the spherical harmonics (SH) space, see Fig.~\ref{fig:overview}. 
+%
+This computation in the SH space is efficient and differentiable, enabling fast rendering as well as optimization of the scene parameters. 
+%
+Our approach is closely related to the work of Ren~\etal~\cite{ren2006real} which uses a similar formulation. 
+%
+However, we provide a novel algorithmic formulation, which allows differentiating through the rendering process.
+%
+Importantly, we show, for the first time, solutions of inverse problems with global effects using an efficient differentiable renderer. 
+%
+In the following, we will first introduce the rendering equation (Sec.~\ref{render_equ}) and its spherical harmonics approximations (Sec.~\ref{sec:methodSphericalHarmonics}) as our method builds up on these concepts.
+%
+We will then describe the rendering process of our approach (Sec.~\ref{sec:SH_compute}-\ref{diffuse_shading}) and the optimization of the scene properties with our differentiable renderer (Sec.~\ref{sec:IBO}). 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\subsection{Rendering Equation}
+%
+\label{render_equ}
+%
+The rendering equation~\cite{10.1145/15886.15902} with only diffuse non-emitting surfaces in the scene is defined as:
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\label{eq:renderingEquation}
+B(\mathbf{x})=a(\mathbf{x}) \int_{\Omega} L(\omega,\mathbf{x}) max((\omega\cdot\mathbf{n}(\mathbf{x})),0) d\omega\,,
+\end{equation}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+where $B(\mathbf{x})$ is the outgoing radiance at point $\mathbf{x}$, $L(\omega,\mathbf{x})$ is the incoming radiance at this point from direction $\omega$, $\Omega$ represents the sphere of directions, $a(\mathbf{x})$ is the diffuse albedo, and $\mathbf{n}(\mathbf{x})$ is the normal at point $\mathbf{x}$.
+%
+Assuming no inter-reflectance, the incoming radiance $L(\omega,\mathbf{x})$ at point $x$ can be decomposed into the static environment lighting $L(\omega)$ and the visibility $V(\omega,\mathbf{x})$ at point $x$. 
+%
+Note that the environment light is only a function of the light direction while the visibility depends on both the light direction and the point location, since it is a global illumination property. 
+%
+Given this, we can rewrite the rendering equation as:
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\label{eq:render}
+\begin{split}
+B(\mathbf{x})&= a(\mathbf{x})\int_{\Omega} L(\omega) V(\omega,\mathbf{x}) H(\omega, \mathbf{x}) d\omega \enspace{,} 
+\end{split}
+\end{equation}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+where $H(\omega, \mathbf{x}) = max((\omega\cdot\mathbf{n}(\mathbf{x})),0)$.
+%
+One way to compute $B(\mathbf{x})$ is with Monte Carlo integration, which is computationally expensive as lots of samples have to be acquired to approximately evaluate the integral.
+%
+Instead, we estimate a fast approximation of this integration by using spherical harmonics as introduced next. 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\subsection{Spherical Harmonics Approximation}
+%
+\label{sec:methodSphericalHarmonics}
+%
+A spherical function can be projected into spherical harmonics space and reconstructed back using the spherical harmonics bases. 
+%
+We will write variables corresponding to SH coefficients in bold letters in the following. 
+%
+When representing a function with a subset of basis functions within a limited bandwidth, we obtain a low frequency approximation of the original function. 
+%
+In detail, given a spherical function $f(\omega)$, its corresponding SH vector $\boldsymbol{f}$ (with all SH coefficients stacked) is defined as
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\label{eq:coes}
+\boldsymbol{f}_i=\int_{\Omega} f(\omega) y_i(\omega) d \omega ,
+\end{equation} 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+where $y_i(\omega)$ are the SH basis functions.
+%
+The indices are linearized, with $i$ = ${l^{2}+l+m}$, where $l$ is the index of the SH band, and $m$, $-l\leq m \leq l$ is the index within the band. 
+%
+Computing Eq.~\ref{eq:coes} requires solving the integral which is usually achieved by Monte Carlo integration. 
+%
+For an inverse problem, this can be very expensive for both forward and backward computations.
+%
+As a remedy, we precompute several terms which allows for efficient and differentiable computation as we show later. 
+%
+Given the SH coefficients and the basis functions, the original signal can be approximated as 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\Tilde{f}(\omega) = \sum_{i=1}^{n^2} \boldsymbol{f}_i y_i(\omega) ,
+\end{equation}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+where $i$ is the linearized index explained above, and $n$ is the number of bands chosen to approximate the signal. 
+%
+The accuracy of reconstruction increases with the number of bands. 
+%
+In our case, we choose a bandwidth of $n$ = 8, which we found to be good for low-frequency approximations.
+%
+The integral of a multiplication of two SH functions can be simply computed as a dot product of their coefficients, 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\int_{\Omega} \tilde{a}(\omega) \tilde{b}(\omega) d\omega = \mathbf{a} \cdot \mathbf{b} \,.
+\end{equation}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+The SH projection of this multiplication is computed as 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{align}
+\label{eq:SH_mult}
+\mathbf{a} * \mathbf{b} = \int_{\Omega} \tilde{a}(\omega) \tilde{b}(\omega) y(\omega) d\omega , \\
+(\mathbf{a} * \mathbf{b})_i = \sum_{j=1}^{n} \sum_{k=1}^{n} C_{ijk} \mathbf{a_j} \mathbf{b_k} , 
+\end{align}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+where $C_{ijk} = \int_{\Omega} y_i(\omega) y_j(\omega) y_k(\omega)$ is a transfer matrix which can be precomputed. 
+%
+Please refer to Green~\cite{green2003spherical} for the \emph{gritty details}.
+%
+In our case, we first compute the SH coefficients for $L$, $V$ and $H$ in Eq.~\ref{eq:render}. 
+%
+With that, the solution of $B(\mathbf{x})$ can be analytically computed as 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+B(\mathbf{x}) = a(\mathbf{x}) \Big(\boldsymbol{L} \cdot (\boldsymbol{V}(\mathbf{x}) * \boldsymbol{H}(\mathbf{x})) \Big) \enspace{.}
+\end{equation}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+This way of computing the outgoing radiance does not require inefficient sampling-based integration, which can also be sensitive to the sampling strategy used. 
+%
+Next, the efficient computation of these SH coefficients is explained. 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\subsection{Spherical Harmonics Computations}
+%
+\label{sec:SH_compute}
+%
+We first compute $\boldsymbol{L}$ and $\boldsymbol{H(\mathbf{x})}$ as 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\label{eq:light_SH}
+\boldsymbol{L}= \int_{\Omega} L(\omega) {y}(\omega) d \omega \,,
+\end{equation} 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\label{eq:SH_H}
+\boldsymbol{H(\mathbf{x})}= \int_{\Omega} max((\mathbf{n(\mathbf{x})} \cdot \omega),0) {y}(\omega) d \omega \,.
+\end{equation} 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+We solve Eq.~\ref{eq:light_SH} using numerical integration at initialization. 
+%
+This equation does not have to be differentiable, since we only want to update the SH coefficients of the environment map.
+%
+For Eq.~\ref{eq:SH_H}, we formulate the computation of $max((\mathbf{n(\mathbf{x})} \cdot \omega),0)$ as 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\label{eq:reparameterize}
+\boldsymbol{H(\mathbf{x})}= \phi_\text{SH}(\mathbf{n(x)}) \int_{\Omega} max(i_\mathrm{z} \cdot \omega,0) \boldsymbol{y}(\omega) d \omega \,.
+\end{equation} 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+Here, $\phi_\text{SH}(\mathbf{x})(\cdot)$ is a linear function which defines the rotation of spherical harmonic functions~\cite{kautz2002fast} and $i_\mathrm{z}=(0,0,1)^\top$. 
+%
+This reformulation has several advantages. 
+%
+First, this makes the equation differentiable with respect to $\mathbf{n(x)}$.
+%
+Second, spherical harmonics projections of functions which are symmetric along the z-axis can be computed analytically and efficiently. 
+%
+This leaves us with the visibility term.
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\subsubsection{Sphere Fitting and Geometry Deformation}
+%
+\label{spherefitting}
+%
+Our method approximates the geometry of the non-deformed initial mesh with a set of spheres for computing the visibility, see Fig.~\ref{fig:overview}.
+%
+The mesh can then be deformed by translating and rotating these spheres. 
+%
+We can thus also update the geometry of the mesh using our renderer.
+%
+Visibility related rendering effects like shadows will supervise the sphere parameters and therefore the underlying geometry. 
+%
+To determine the initial position and radius of each sphere for a given geometry, we minimize the total volume occupied by the sphere set which is outside the mesh, referred to as sphere outside volume ~\cite{wang2006variational} along with a term encouraging the sphere set to cover as much of the mesh surface as possible. 
+%
+This objective is optimized using gradient descent. 
+%
+Please refer to the supplemental document for more details.
+%
+We then connect the sphere centers as an embedded graph to drive the deformation of the mesh geometry~\cite{sumner2007embedded} where each sphere is connected to its K-nearest vertices on the template. 
+%
+The mesh deformation is parameterized by the rotation and translation of each sphere. 
+%
+Later, the inverse problems optimize the rotation and translation of the spheres using the rendering loss (see Eq.~\ref{eq:render_loss}).
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\subsubsection{Visibility in Spherical Harmonics Space}
+%
+Similar to Zhou~\etal~\cite{zhou2005precomputed}, we calculate $\mathbf{V}(\mathbf{x})$ as the product of the SH vectors of all the sphere blockers:
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+\label{eq:visibility_multiplication}
+\boldsymbol{V}(\mathbf{x})=\boldsymbol{V}_{1}(\mathbf{x}) * \boldsymbol{V}_{2} (\mathbf{x})* \ldots * \boldsymbol{V}_{n}(\mathbf{x}) \,.
+\end{equation}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+where $\boldsymbol{V}_{i}(\mathbf{x})$ is the SH vector of the blocker function of the sphere $S_{i}$, which measures the blocking effect of a sphere:
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+$$
+V_{i}(\omega,\mathbf{x})=\left\{\begin{array}{ll}
+0 \text {,} & \text{ if } S_i \text { blocks light in direction } \omega \text{;} \\
+1 \text{,} & \text{ otherwise. }
+\end{array}\right. \,.
+$$
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+Similar to Eq.~\ref{eq:reparameterize}, the computation of $\boldsymbol{V}_i(\mathbf{x})$ can be reparameterized to be differentiable with respect to $\mathbf{x}$.
+%
+The higher-order product in Eq.~\ref{eq:visibility_multiplication} can be computed using a series of SH multiplications as defined in Eq.~\ref{eq:SH_mult}. 
+%
+However, this can be computationally expensive. 
+%
+To accelerate this computation, we adopt the method proposed by Ren~\etal~\cite{ren2006real}, where the exponential of logarithm of SH functions are computed instead. 
+%
+The logarithm of the product leads to a summation, which can be computed efficiently. 
+%
+We follow their scaling, squaring, and optimal linear approximation setting.
+%
+Ren~\etal~\cite{ren2006real} compute the logarithm of the SH functions based on a lookup table which is not differentiable with respect to the sphere orientations.
+%
+Instead, we propose a differentiable approach which works well for our setting. 
+%
+We first approximate $V_i$ as $V^{'}_{i}(\omega,\mathbf{x})$: 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+V^{'}_{i}(\omega,\mathbf{x})=\left\{\begin{array}{ll}
+e^{-\epsilon} \text {,} & \text{ if } S_i \text { blocks in direction } \omega \text{:} \\
+1 \text {,} & \text{ otherwise. }
+\end{array}\right. 
+\end{equation}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+$\epsilon$ is set to $3$ such that $e^{-3} \approx 0.05$. 
+%
+This avoids the infinite logarithm for 0. 
+%
+We orient $\log (V^{'}_{i}(\omega,\mathbf{x}))$, the logarithm of this approximated function for each sphere, to the $z$ axis and project it to SH space. 
+%
+This computation has an analytical form with respect to the distance to the sphere and its radius.
+%
+Then, we apply the SH rotation as in Eq.~\ref{eq:reparameterize} with the vector pointing to the sphere center from $\mathbf{x}$. 
+%
+Finally, we add them and exponentiate the result to compute $\boldsymbol{V}(\mathbf{x})$.
+%
+Please refer to the supplemental for more details. 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\subsection{Rendering}
+%
+\label{diffuse_shading}
+%
+Combined with a rasterizer, we can render an image as
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{equation}
+I_R=R( B(\mathbf{x}_{0}),\dots,B(\mathbf{x}_{i}),\dots,B(\mathbf{x}_{n}), P)
+\end{equation}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+where $I_R$ is the image intensity, $B(\mathbf{x}_{i})$ is the radiance of vertex $\mathbf{x}_{i}$ as computed in Eq.~\ref{eq:render}, $P$ is a projection matrix implementing the camera using its intrinsics and extrinsics and $R$ is the rasterization function. 
+%
+The radiance $B(\cdot)$ includes shadows as well as diffuse shading of the surface. 
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\subsection{Image-Based Optimization}
+%
+\label{sec:IBO}
+%
+We optimize the different scene properties, such as geometry, albedo, and illumination by comparing the rendered image to the reference image. 
+%
+In all experiments, we use the $\ell_2$ loss function between the rendered and reference image for optimization. 
+%
+The objective function can be written as:
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+\begin{align}
+\label{eq:render_loss}
+& \mathcal{L}(\theta, \boldsymbol{L}, a_{0,\dots,n}) = || I_R(\theta, \boldsymbol{L}, a_{0,\dots,n}) - I||^2_2 \,, \\
+& I_R(\theta, \boldsymbol{L}, a_{0,\dots,n}) = R(B(\theta \mathbf{x_0}), \dots, B(\theta \mathbf{x_n}), P) \,.
+\end{align}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+Here, $\theta$ includes the global rigid pose and embedded deformation \cite{sumner2007embedded} of an object in the scene and $I$ is the reference image.
+%
+We can also optimize for a texture map by re-parameterizing $a$ in 2D as a pre-process. 
+%
+If there are multiple objects in the scene, they can have different rigid poses.
+%
+This loss function is differentiable since we use a differentiable rasterizer~\cite{ravi2020pytorch3d} as $R(\cdot)$, and our radiance computation $B(\mathbf{x})$ is differentiable with respect to $\theta$, $\boldsymbol{L}$ and $a_{0,..,n}$ .
+%
+We use gradient descent with a step size of ${10^{-2}}$ for optimization with $200-1000$ iterations.
+%

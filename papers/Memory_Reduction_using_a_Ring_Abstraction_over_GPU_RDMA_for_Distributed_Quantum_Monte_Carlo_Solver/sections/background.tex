@@ -1,0 +1,150 @@
+\section{Background}
+\label{sec:background}
+
+QMC solver applications are widely used and are mission-critical across the US Department
+of Energy's (DOE's) application landscape. For the purpose of this paper, the authors chose to use one of the
+primary QMC applications,
+the DCA++ code.
+A production-scale scientific
+problem runs on DOE's fastest supercomputer, Summit, at the Oak Ridge Leadership Computing Facility on all 4,600
+nodes; each node contains six NVIDIA Volta V100 GPUs, attaining a peak performance of 73.5 PFLOPS with a mixed
+precision implementation~\cite{dca2019}.
+
+Monte Carlo simulations are embarrassingly parallel, and the authors exploited this on distributed systems with a two-level
+(MPI + threading) parallelization scheme (Figure~\ref{fig:dca_overview}). Although DCA++ has 
+been highly optimized and is scalable on existing hardware, this is the first effort to focus on 
+solving the memory-bound issue described in Section \ref{sec:intro} and further take advantage 
+of Summit's GPU RDMA capability. 
+
+\begin{figure}[h]
+	\centering
+	\includegraphics[width=\columnwidth]{images/dca_overview.pdf}
+	\caption{Workflow of the QMC DCA++ solver.}%
+	\label{fig:dca_overview}
+\end{figure}
+
+
+Figure~\ref{fig:dca_overview} shows the parallelism
+hierarchy in one iteration of the QMC solver (MPI
+distribution + on-node threading parallelism). 
+%
+For example, each rank $\{R0,\ldots,RN\}$ 
+is assigned a Markov Chain and the initial input (two particle
+Green's function, $G_{t,i}$, where \textit{t} means ``two-particle,'' 
+and \textit{i} is rank index).  Each rank spawns multiple independent
+worker threads (i.e., walkers and accumulators). 
+%
+Most work and computation are performed on the GPU. 
+%
+Each walker thread generates a measurement
+result ($G_{\sigma, i}$ array, where \textit{i} is thread ID) by performing 
+nonuniform Fourier transform implemented by matrix-matrix multiplication.
+%
+Each walker passes its $G_{\sigma, i}$ to its corresponding accumulator
+thread. 
+%
+In other words, each thread has its own $G_{\sigma, i}$ array,
+and each rank will have $k$ different $G_{\sigma, i}$ arrays, where $k$
+is the number of walker threads per rank. 
+%
+Each accumulator thread then updates $G_{t,i}$ via the formula in Eq.~(\ref{eq:G4})
+to compute and update rank-local
+$G_{t,i}$ to $G^{\prime}_{t,i}$.  
+%
+The updated partial $G^{\prime}_{t,i}$ is then fed
+into the coarse-graining step for the next measurement. At the end
+of all measurements, an \texttt{MPI\_Reduce} operation will be
+performed on $G_t$ across all ranks to produce a final and complete
+$G_{t}$ in the root rank. 
+%
+$G_t$ is allocated before all measurements start and has a life that spans
+until the end of the DCA++ program.
+%
+
+%%% Note: if the Fourier transform is on a uniform grid, then the classical Fast Fourier Transform (FFT) can be used. However, if the data is not on a uniform grid, then this can be more complicated
+
+\subsection{Memory-Bound Issue in DCA++}
+The results from Balduzzi et al. \cite{dca2019} show that although storing a $G_t$ on the accelerator device allows condensed matter scientists
+to explore larger and more complex (i.e., higher fidelity) physics
+cases, the problem size is limited to the device memory size.
+Updating the device array $G_t$ is the most time-consuming and memory-intensive process throughout DCA++ computation. A distributed $G_t$ approach is needed to reduce memory allocation and operation in the device.
+
+In the original DCA++ algorithm, $G_t$ is 
+updated by a product of two smaller
+matrices (single-particle Green's function, or $G_{\sigma}$). This computation update is 
+in the particle-particle channel and is accumulated according to Eq.~(\ref{eq:G4}).
+\begin{equation}
+\label{eq:G4}
+    G_t (K_1, K_2, K_3)  \pluseq 
+      \sum_{\sigma} G_\sigma (K_3 - K_2, K_3 - K_1) \, G_{-\sigma} (K_2, K_1)\,, 
+\end{equation}
+where $K_i$ is a combined index that represents a particular point in the momentum and frequency space, 
+and $\sigma= {+1} \mbox{ or } {-1} $ specifies the electron spin value. $G_{\sigma}$ is the single-particle Green's function that
+describes the configuration of single electrons.
+
+
+
+% Generally, larger $G_t$ means that we can access larger problem
+% sizes, which allows us to significantly increase the accuracy/fidelity
+% of a simulation of a certain material. In terms of physics, this
+% means that we can solve more realistic models of materials that
+% include more details of the actual materials. For example, with the
+% previous design, we have been able to calculate a single-orbital
+% Hubbard model which is the simplest and a very generic model of a
+% correlated quantum material. It is a coarse-grained model that
+% allows us to study generic behavior arising from electronic
+% correlations in materials, but it cannot distinguish between different
+% materials. Materials specific modeling requires more complex models
+% that include more orbital (and other) degrees of freedom, and this
+% in turn requires much larger $G_t$. Having larger $G_t$ enables us
+% to study these more complex and materials specific models, and thus
+% address questions that are specific to certain materials.
+% 
+% Another benefit is that we can now compute the full $G_t$ tensor
+% in a single computation. With the previous design, we were limited
+% to computing certain slices of $G_t$, and this required physical
+% insight or prior knowledge to decide which slices contain the
+% important physics. This approach worked well for the simple
+% single-orbital model, for which we have a good idea which slices
+% to look at. For the more complex multi-orbital models, we don’t
+% necessarily know which slices are important, so being able to compute
+% the full $G_t$ means that we won't miss important physics.
+
+The ability to handle a larger $G_t$  allows simulations of complex materials to significantly increase the details, accuracy, and fidelity.
+%
+In the previous design that kept $G_t$ within one GPU, only a
+sub-slice of $G_t$ could be computed in a single computation.
+%
+For the simple single-orbital coarse-grained Hubbard model, physics insights or prior
+knowledge can be used to decide which sub-slices in $G_t$
+contain the important physics and thus avoid the generation of full $G_t$.
+%
+This simple model allows the generic behavior that comes
+from electronic corrections in materials to be studied, but it cannot distinguish between
+different specific materials.
+%
+Material-specific modeling requires more complex models
+that include more orbital---and other---degrees of freedom, and
+this requires a much larger $G_t$. 
+%
+This new distributed ring implementation enables the full large $G_t$
+array to be computed in a single computation, even for more
+complex multi-orbital models, to ensure that no important 
+physics cases are overlooked.
+%
+
+
+
+\subsection{GPU RDMA Technology}
+GPU RDMA allows direct peer access to multi-GPU memory through a high-speed network. 
+%
+For NVIDIA GPUs, GPUDirect is a technology that allows for the direct transfer of data in GPU device memory to other GPUs on the same node by using the NVLINK2 interconnect and/or between GPUs on different nodes by using RDMA support that can bypass buffers on host memory. 
+
+A CUDA-aware MPI\footnote{\url{https://developer.nvidia.com/blog/introduction-cuda-aware-mpi/}} implementation can directly pass the GPU buffer pointer to MPI calls. Acceleration support, such as GPUDirect, can be used by the MPI library 
+and allows buffers being sent from the kernel memory to a network without 
+staging through host memory. There are various CUDA-aware MPI implementations, such as OpenMPI, MVAPICH2, and 
+IBM Spectrum MPI\footnote{IBM Spectrum MPI is supported on
+the Summit supercomputer, and is also the CUDA-aware MPI implementation used by the authors in this paper.}.
+% the need to stage data through CPU memory.  
+% how do we verify the H2D and D2H?  
+% \url{https://docs.olcf.ornl.gov/systems/summit_user_guide.html#cuda-aware-mpi}

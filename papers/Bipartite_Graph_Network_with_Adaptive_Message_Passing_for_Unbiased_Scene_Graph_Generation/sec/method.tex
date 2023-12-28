@@ -1,0 +1,793 @@
+\section{Our Approach}  %present our approach to the SGG task. 
+
+%outline
+
+We aim to tackle scene graph generation, which parses an input image into a structural graph representation of object entities and their visual relationship in the scene.  In particular, we focus on addressing the challenge of biased scene graph prediction, mainly caused by the intrinsic long-tail distribution of visual relationship in a typical training dataset and the large intra-class variation of predicate categories. 
+To this end, we introduce an adaptive scene graph generation strategy, which simultaneously learns a robust entity/predicate representation and a calibrated classifier for better balanced performance.  
+
+In this section, we first present the problem setting of scene graph generation and an overview of our method in Sec.~\ref{subsec:problem}. We then introduce the details of our predicate representation in Sec.~\ref{subsec:model}, followed by our learning strategy on the predicate classifier and representation in Sec.~\ref{subsec:learning}. 
+
+
+
+%Our main idea is to develop an effective context modeling strategy for learning a robust predicate representation, and an efficient predicate-level re-sampling strategy to learn a more balanced predicate classifier.   
+
+%that utilizes and effective context modeling strategy to learn a robust predicate representation and a two-level data sampling method to learn a class decision boundary less susceptible to imbalanced classes.  
+
+
+
+\subsection{Problem Setting and Overview}\label{subsec:problem}
+
+\paragraph{Problem Setting} 
+Given an image $\mathbf{I}$, %\in\mathbb{R}^{3\times h\times w}$($h$ and $w$ is the height and weight, respectively), 
+the task of scene graph generation (SGG) aims to parse the input $\mathbf{I}$ into a scene graph $\mathcal{G}_{scene}=\{\mathcal{V}_o,\mathcal{E}_r\}$, where $\mathcal{V}_o$ is the node set encoding object entities and $\mathcal{E}_r$ is the edge set that represents predicate between an ordered pair of entities. 
+Typically, each node $v_i\in \mathcal{V}_o$ has a category label from a set of entity classes $\mathcal{C}_e$ and a corresponding image location represented by a bounding box, while each edge  
+$e_{i\to j} \in \mathcal{E}_r $ between a pair of nodes $v_i$ and $v_j$ is associated with a predicate label from a set of predicate classes $\mathcal{C}_p$ in this task.
+
+%Denote , and the scene graph has the following form, 
+%\begin{align}
+%\mathcal{V}_o&=\{(c_i,b_i)\}^{N_e}_{i=1}, c_i\in\mathcal{C}_e, b_i\in\mathbb{R}^4\\
+%\mathcal{E}_r&=\{t_{i\to j}\}^{N_e}_{i,j=1}, t_{i\to j}\in \mathcal{C}_p
+%\end{align}
+%where $b_i$ is a 2D bounding box for the image location of the $i$-th entity, and $N_e$ is the number of valid entities in the scene. 
+%
+\vspace{-4mm}
+\paragraph{Method Overview}
+In this work, we adopt a hypothesize-and-classify strategy for the unbiased scene graph generation. Our approach first generates a set of entity and predicate proposals and then computes their context-aware representations, followed by predicting their categories.
+
+Concretely, we introduce a bipartite graph network that explicitly models the interactions between entities and their predicates in order to cope with unreliable contextual information from the noisy proposals. Based on the graph network, we develop an adaptive message passing scheme capable of actively controlling the information flows to reduce the noise impact in the graph and generate a robust context-aware representation for each relationship proposal.  
+
+
+Taking this representation, we then learn predicate and entity classifiers to predict the categories of predicate and entity within relationship proposals.
+To alleviate the bias effect of the imbalanced data, we also design an efficient bi-level data resampling strategy for the model training, which enables us to achieve a better trade-off between the head and tail categories.
+%Finally, we also develop an hybrid-level data sampling strategy(in Sec.\ref{subsec:learning}) to handle the imbalanced data distribution and achieve the better trade-off between the head and tail categories.
+An overview of our method is illustrated in Fig.~\ref{pipeline_overview}, and we will start from a detailed description of our model architecture below.  
+
+
+%In this section, we first present the problem setting of scene graph generation(Sec.\ref{subsec:problem}). Then an empirical study of the message propagation is detailed to motivate our approach(Sec.\ref{subsec:motivation}).
+ 
+%\subsection{Problem Setting and Overview}% problem formulations
+
+%\subsection{Empirical Study and Analysis}\label{subsec:empirical}
+%% Current Message Propagation Strategies
+%A widely used bottom-up pipeline, a hypothesize-and-classify framework in which the system first generates a set of subject-object proposals and then predicts their relationship types, is adopted in many previous works. 
+%To alleviating the error propagation during the message passing,
+%many previous works typically remove a large number of relation proposals according its entity classification score.
+%Nevertheless, with the \textit{not reliable detection results}, this heuristic solution still keep a considerable number of unfaithful relation proposals for the following context modeling and relation classification. 
+%
+%
+%% Empirical Experiment 
+%Thus we investigate whether the noise in the context modeling is restrictive for the unbiased scene graph generation.
+%To this end, we adopt MSDN~\cite{li_scene_2017} as the baseline for empirical upper bound analysis.
+%For simplicity, we train baseline with ResNet101-FPN backbone on Stanford split~\cite{xu_scene_2017} of Visual Genome~\cite{krishna2017visual}, in which the message propagation is conducted between the entity proposals and predicate proposals. 
+%For \textit{empirical context modeling upper-bound}, the message passing from negative predicate proposal to entity proposal will be ignored in our experiment, based on the true label of each predicate proposal, which reduces the noise in the message propagation.
+%\begin{figure}
+%    \centering
+%    \includegraphics[width=0.95\linewidth]{imgs/empirical_study}
+%    \caption{\textbf{mRecall on Visual Genome validation set.} For Baseline, we implement two recent works: GPS-Net\cite{} and MSDN\cite{}, for analysis.}
+%    \label{fig:empirical}
+%\end{figure}
+%
+%% Analysis
+%As shown in Figure \ref{fig:empirical}, the empirical study on 
+%the strategy of noise reduction for message propagation can significantly outperform the baseline methods with \textit{a large margin}, especially on the body and tail classes, which indicates \textit{severe noise induced by the subject-object associations seems to be the performance bottleneck of the existing methods}.
+% Consequently, a better strategy to address this problem would further improve the feature representation learning for unbiased scene graph generation.
+
+
+
+
+\subsection{Model Architecture}\label{subsec:model}
+
+Our scene graph generation model is a modular deep network consisting of three main submodules: 1) a \textit{proposal generation network} to generate entity and relationship proposals and compute their initial representation (Sec.~\ref{subsec:proposal}); 2) a \textit{bipartite graph neural network} to encode the scene context with adaptive message propagation and multi-stage iterative refinement (Sec.~\ref{subsec:bgnn}); and 3) a \textit{scene graph predictor} to decode the scene graph from the context-aware representations of relationship proposals (Sec.~\ref{subsec:predictor}).
+
+
+%\paragraph{Overview of Our Method.} 
+%Based on the findings in Sec.\ref{subsec:empirical} and our proposed bipartite graph, to further reduce the noise in message passing and incorporate the context effectively, we propose a \textit{bipartite graph neural network}, in which we are able to control the information flow during the message propagation by explicitly incorporating the relationship prior for discriminative representation learning especially on the tail categories.
+
+
+%, in which the scene-level relation reasoning is conducted to generate a precise relation-aware scene graph. 
+%Based on the above analysis and findings, to further alleviate the error propagation and incorporate the context effectively, we propose a bipartite graph neural network, referred to as DRBG-Net, incorporated with explicit relationship prior, to control the information flow during the message propagation, in which the scene-level relation reasoning is conducted to generate a precise relation-aware scene graph. 
+%Moreover, we also develop an hybrid-level data sampling strategy to handle the imbalanced data distribution and achieve the better trade-off between the head and tail categories.
+
+% Overview of our model.
+%Our model instantiates a dynamic relation reasoning with the following structure: a) a \textit{proposal generation} module to computes the visual feature and linguistic feature for each entity and relation proposal, b) a \textit{relation-aware bipartite graph neural network} conducts dynamic relation reasoning with iterative graph refinement, c) a \textit{scene graph predictor} to decode the scene graph from the enhanced relation proposals and entities proposals. An overview of our method is illustrated in Figure.\ref{pipeline_overview}.
+
+
+
+%Our goal is to parse a precise structural description of the objects and their relationships for a given scene. The large intra-class variances\rev{(accurate or not ?)} induced by the subject-object associations make this task significantly challenging on the rare categories, especially when the annotated data is limited for the infrequent relationship categories. 
+%Our goal is to parse a precise structural description of the objects and their relationships for a given scene. The large intra-class variances\rev{(accurate or not ?)} induced by the subject-object associations make this task significantly challenging on the rare categories, especially when the annotated data is limited for the infrequent relationship categories. Based on the above analysis and findings, we propose a dynamic relation-aware bipartite graph neural network, referred to as DRBG-Net, incorporated with explicit relation prior, in which the scene-level relation reasoning is conducted to generate a precise relation-aware scene graph. Moreover, we also develop an instance-level data sampling strategy to handle the data deficiency issue for this task.
+
+%Below we first present the proposal generate network in Sec.\ref{subsec:proposal}, followed by the detailed description of our proposed bipartite graph neural network in Sec.\ref{subsec:bgnn}. Then, we will present the scene graph predictor in Sec.\ref{subsec:predictor} Finally, Sec.\ref{subsec:learning} outlines the learning procedure based on our proposed hybrid-level re-sampling method.
+
+
+\subsubsection{Proposal Generation Network}
+\label{subsec:proposal}
+% \noindent \textbf{3.2.1~Proposal Generation Network}
+
+Following~\cite{zellers_neural_2017, zhang_graphical_2019}, we utilize an object detector network (e.g., Faster R-CNN~\cite{ren_faster_2015}) to generate a set of entity and relationship proposals. 
+The entity proposals are taken directly from the detection output with their categories and classification scores, while the relationship proposals are generated by forming ordered pairs of all the entity proposals.
+%We first detail the representation for each entity node in our bipartite graph, followed by the introduction of how to construct relation proposal representation.
+
+Given the relationship proposals, we then compute an initial representation for both entities and predicates. Specifically, for the $i$-th entity proposal, we denote its convolution feature as $\mathbf{v}_i$, its bounding box as $b_i$ and its detected class as $c_i$. The entity representation $\mathbf{e}_i$ uses a fully-connected network $f_e$ to integrate its visual, geometric and semantic features as,   
+\begin{align}
+    \mathbf{e}_i = f_e(\mathbf{v}_i\oplus \mathbf{g}_i\oplus \mathbf{w}_i)
+\end{align}
+where $\mathbf{g}_i$ is a geometric feature based on its bounding box $b_i$, $\mathbf{w}_i$ is a semantic feature based on a word embedding of its class $c_i$, and $\oplus$ is the concatenation operation. 
+
+For the relationship proposal from entity $i$ to $j$, we combines the entity representations $\mathbf{e}_i\oplus\mathbf{e}_j$ with the convolutional feature of their union region (denoted as $\mathbf{u}^p_{i,j}$). Formally, we compute the predicate representation $\mathbf{r}_{i\to  j}$ as 
+\begin{align}
+    \mathbf{r}_{i\to  j}=f_{u}(\mathbf{u}^p_{i,j}) + f_{p}(\mathbf{e}_i\oplus\mathbf{e}_j)
+\end{align}
+where $f_u$ and $f_p$ are two fully-connected networks.
+
+
+\subsubsection{Bipartite Graph Neural Network}
+\label{subsec:bgnn}
+% \noindent \textbf{3.2.2~Bipartite Graph Neural Network}
+
+
+Given the relationship proposals, we build a graph structure to capture the dependency between entities and predicates. To this end, we introduce a bipartite graph $\mathcal{G}_b$ with directed edges, which enables us to model the different information flow directions between entity and predicate representations.
+Specifically, the graph consists of two groups of nodes $\mathcal{V}_e,\mathcal{V}_p$, which correspond to entity representations and predicate representations respectively. Those two groups of nodes are connected by two sets of directed edges $\mathcal{E}_{e\to  p}$ and $\mathcal{E}_{p\to  e}$ representing information flows from the entities to predicates and vice versa. Hence the bipartite graph has a form as $\mathcal{G}_b=\{\mathcal{V}_e,\mathcal{V}_p, \mathcal{E}_{e\to  p}, \mathcal{E}_{p\to  e}\}$. 
+
+%\paragraph{Bipartite Graph.}
+%Different with the previous methods\cite{}, which typically model the scene context on the directed scene graph(node for entity, edge for predication) directly.
+%%We argue that the predicates feature is also important for aggregating representation. 
+%However, this kind of graph structure is difficult to represent the information flow
+%in the context modeling sufficiently.
+%%message propagations process sufficiently in the representation learning.
+%%Inspired by previous work\cite{li_scene_2017}, we develop a \textit{\textbf{bipartite graph neural network}} to reformulate the entity-predicate context modeling based ideas. 
+%Thus, we develop a \textit{\textbf{bipartite graph}} to re-formulate the context modeling based ideas in a more flexible way. 
+%%Our proposed bipartite graph is able to model the message passing process in a fine-grained level, in which t
+%
+%%incorporate the scene context and semantic cues into the predicates proposal and entities via message propagation effectively. And it's also convenient to convert the \textit{bipartite graph} into the \textit{directed scene graph} for the final prediction during the inference stage.
+%
+%Formally, the bipartite graph (denoted as $\mathcal{G}_b=\{\mathcal{V}_e,\mathcal{V}_p, \mathcal{E}_{e\to  p}, \mathcal{E}_{p\to  e}\}$) is designed with directed edges to model the different information flow directions between entity proposal and relation proposal.  which enable us to model the message passing process in a fine-grained level. We denote both  as the nodes of the bipartite graph. We have
+%\begin{align}
+%&\mathcal{V}_e= \{\mathbf{e}_i\}, & \mathcal{E}_{e\to  p}:\mathcal{N}_e\times\mathcal{N}_p\in\mathbb{R}^{N_e\times N_p}\\
+%&\mathcal{V}_p=\{\mathbf{r}_{i\to  j}\}, &\mathcal{E}_{p\to  e}:\mathcal{N}_e\times\mathcal{N}_p\in\mathbb{R}^{N_e\times N_p}
+%\end{align}
+%where we have $N_p$ different relation proposals in $\mathcal{V}_p, N_p=N_e(N_e-1)$, the initial predicate proposals are produced by fully connected pairing the entities(two identical proposals will not be grouped). And it's also convenient to convert the \textit{bipartite graph} into the \textit{directed scene graph} for the final prediction during the inference stage.
+%
+
+To effectively model the context of the entity and predicate proposals, we develop a Bipartite Graph Neural Network (BGNN) on the graph $\mathcal{G}_b$.   
+Our BGNN conducts a multi-stage message propagation and each stage consists of 1) a \textit{relationship confidence estimation} module to provide a confidence estimate on relationship; 2) a \textit{confidence-aware message propagation} to incorporate scene context and semantic cues into the entity/predicate proposals.
+% effectively. 
+%Moreover, the iterative refinement is introduced to improve the performance further. 
+The overview of our BGNN is illustrated in Fig.~\ref{pipeline_overview}. We will focus on a single stage of our network in the rest of this section.
+ 
+%% \begin{minipage}{0.8\linewidth}
+%\begin{algorithm}[t]
+%\caption{Bipartite GNN Message Propagation}
+%\begin{algorithmic}[1]\label{algo:b_gnn}
+%\REQUIRE 
+%    Entity proposals $\mathcal{N}_e=\{\mathbf{e}_i\}$, relation proposals $\mathcal{N}_r=\{\mathbf{r}_{i\to j}\}$, entity-to-predicate edges $\mathcal{E}_{e\to p}$, predicate-to-entity edges $\mathcal{E}_{p\to e}$.
+%\ENSURE
+%\FOR{all context encoding stage}
+%        \STATE Estimate the relation confidence for each $\mathbf{r}_{i\to j}$
+%%		\STATE Update the topology of the \textit{Bipartite GNN}
+%        \FOR{all adaptive message passing iterations}
+%                \STATE \textit{Entity-to-predicate}  message propagation. % with $\mathcal{E}_{e\to p}$
+%%				Measure the similarity of $\mathbf{e}_i$ and $\mathbf{r}_i$
+%                \STATE  Input-aware gating score estiamtion.
+%                \STATE  \textit{Predicate-to-entity} message propagation.
+%            \ENDFOR
+%    \ENDFOR
+%\end{algorithmic}
+%\end{algorithm}
+%%\end{minipage}
+
+% Relation Confidence Estimation Module
+\vspace{-4mm}
+\paragraph{Relationship Confidence Estimation (RCE) Module}\label{subsubsec:rce}
+In order to reduce the noise in context modeling, we introduce a relationship confidence estimation (RCE) module. It predicts a confidence score for each relationship proposal to control the information flow in the message propagation.  
+
+Concretely, for a predicate node from entity $i$ to $j$, the RCE module takes as input the predicate proposal features $\mathbf{r}_{i\to  j}$ and its associated entities' class scores, and predicts a confidence score for each predicate class as below, 
+\begin{align}
+\mathbf{s}^m_{i\to  j}=g_x(\mathbf{r}_{i\to  j}\oplus\mathbf{p}_i\oplus \mathbf{p}_j)\in\mathbb{R}^{|\mathcal{C}_p|}
+\end{align}
+where $\mathbf{p}_i,\mathbf{p}_j\in \mathbb{R}^{|\mathcal{C}_e|}$ are the class probabilities for entity $\mathbf{e}_i$ and $\mathbf{e}_j$ from the detection, and $ g_x$ is a multilayer fully-connected network. 
+We then fuse those confidence scores into a global confidence score for the predicate node as
+\begin{align}
+s^b_{i\to  j}= \sigma (\mathbf{w}_b^\intercal\mathbf{s}^m_{i\to  j}), \quad \mathbf{w}_b\in\mathbb{R}^{|\mathcal{C}_p|}
+\end{align}
+where $\sigma$ is the sigmoid activation function and $\mathbf{w}_b$ are the parameters for the fusion. 
+
+
+%$\mathbf{x}_r=\{\mathbf{r}_i,c_{\mathbf{e}_s},c_{\mathbf{e}_o}\}$. 
+
+%Due to the large class invariance on the rare categories, it's not sufficient to estimate relation confidence with only one binary classifier\cite{yang_graph_2018} accurately. Thus a multi-template classifier is designed to make the RCE module learning easily. Concretely, we have: 
+
+%\rev{(why design like this?)}
+%The motivation of module design are: 
+%For the multiple-class classification design, our relationship estimation module takes visual representations of predicates, compare with the similar module from \cite{yang_graph_2018} only takes the distributions of entities pair . 
+%Due to the large variation of visual appearance between different categories, it is more hard to estimate the relationship only with single decision boundary.
+%The multiple-class design provides a strong discriminative ability to estimate the relationship confidence.
+%Besides, since the different category of relationship may contributes differently for relationship confidence, such learnable linear transformation is potentially learn a better relationship confidence estimation results.
+%The ablative comparison between different design will shown in supplementary.
+
+% Adaptive Message Propagation 
+\vspace{-4mm}
+\paragraph{Confidence-aware Message Propagation}%\label{subsubsec:msg}
+%In order to achieve a precise scene structural description parsing,
+We now introduce our adaptive message propagation for capturing the scene context. Specifically, we design two types of message passing update, including an \textit{entity-to-predicate} message and a \textit{predict-to-entity} message according to the edge directions, as illustrated in Fig.~\ref{fig:confidence_aware_msp}. Below we consider an iteration from $l$ to $l+1$ in the message passing.
+\begin{figure}
+    \centering
+    \includegraphics[width=7.6cm]{imgs/confidence-aware_msp_notation.pdf}
+    \caption{\textbf{Two kinds of message propagation with confidence gating of bipartite graph neural network.}
+    The dashed arrows mean information flow is blocked when the source is uncertain.
+    The different alpha value stands for different aggregation weights for rest connections.
+%    The message propagation of predicates-to-entities and entities-to-predicates is shown at left and right respectively. 
+%    The arrows show the direction of message propagation, the color of arrows show the type of connection.
+%    The learnable confidence gating function will control the weight of message propagation, the connection can be disconnected(dashed line arrows) or set as low connectivity(transparent arrows).
+    }
+    \label{fig:confidence_aware_msp} 
+    \vspace{-4mm}
+\end{figure}
+
+\paragraph{}{1) Entity-to-predicate Message Propgation:}
+We update the representation of a predicate node $\mathbf{r}_{i\to  j}$ by fusing its neighboring entity nodes:
+%\begin{align}
+%    \mathbf{r}_{i\to  j}^{(l+1)} = \mathbf{r}_{i\to  j}^{(l)} + 
+%        \frac{1}{2}\phi&\left(
+%                d( \mathbf{r}_{i\to j}^{(l)}, \mathbf{e}_i^{(l)},\theta_{s\to p}) \mathbf{W}_r^\intercal \mathbf{r}_{i\to j}^{(l)}\right.\\
+%                &\left.+d( \mathbf{r}_{i\to j}^{(l)}, \mathbf{e}_j^{(l)},\theta_{o\to  p}) \mathbf{W}_r^\intercal \mathbf{r}_{i\to  j}^{(l)}
+%        \right)
+%\end{align}
+\begin{align}
+    &\mathbf{r}_{i\to  j}^{(l+1)} = \mathbf{r}_{i\to  j}^{(l)} + 
+        \phi (
+                d_{s} \mathbf{W}_{r}^\intercal \mathbf{e}_{i}^{(l)}+d_{o} \mathbf{W}_{r}^\intercal \mathbf{e}_{j}^{(l)}
+        )\\
+       &d_{s}= \sigma(\mathbf{w}_{s}^\intercal[\mathbf{r}_{i\to  j}^{(l)}\oplus\mathbf{e}_i^{(l)}]), \;
+       d_{o}= \sigma(\mathbf{w}_{o}^\intercal[\mathbf{r}_{i\to  j}^{(l)}\oplus\mathbf{e}_j^{(l)}])
+\end{align}
+where $\mathbf{W}_r$ is a linear transformation, $\phi$ is an activation function (\textit{e.g.} ReLU).\, and $d_s, d_o$ are learnable affinity functions of entity and predicate, where $\mathbf{w}_{s}$ and $\mathbf{w}_{o}$ are their parameters.
+%% $d_{s\to p}=d( \mathbf{r}_{i\to j}^{(l)}, \mathbf{e}_i^{(l)},\theta_{s\to p})$ and $ d_{o\to p} =d( \mathbf{r}_{i\to j}^{(l)}, \mathbf{e}_j^{(l)},\theta_{o\to  p})$, 
+% $\theta_{s\to p}$ and $\theta_{o\to p}$ are the parameter of distance function  for subject $\mathbf{e}_i$ and object $\mathbf{e}_j$ .
+%% $\mathbf{e}_i$ andis the subject entity and object entity for predicate proposal $\mathbf{r}_{i\to j}$.  
+% , $l$ is the index of the message propagation iteration.
+
+\noindent \textit{2) Predicate-to-entity Message Propagation:}
+As the predicate node set $\mathcal{V}_{p}$ typically includes a considerable amount of false positive predicate proposals, 
+we develop a \textit{confidence-aware} adaptive message propagation for entity nodes update to alleviate such noise effect.
+Specifically, we first introduce a confidence gating function to control the information flow from an entity's neighbor $\mathbf{r}_{i\rightarrow j}$ as:
+\begin{align}
+       \gamma_{i\to j} = \mathcal{T}(s^b_{i\to j}), \; \mathcal{T}(x) 
+        =\left\{
+        \begin{array}{cc}
+        0       & x \leq \beta \\
+        \alpha  x-\alpha  \beta & \beta<x<1 / \alpha +\beta \\
+        1       & x \geq 1 / \alpha +\beta
+        \end{array}
+        \right. \label{2_stage_gating}
+\end{align}
+where $\alpha$ and $\beta$ is learnable threshold parameters. 
+The gating function $\mathcal{T}(x)$ is designed for achieving a hard control for the predicate proposals with high or low scores (confidently positive or negative), and a soft control for the predicates with intermediate scores.
+
+%\rev{(why design like this?)}
+%1) Recalibrate the numerical of relationship confidence by a adaptive learnable scaling for additional messages passing gating. 
+%Due to the uncertainty of the visual relationship, the estimated relationship confidences are prone to lower numerical values (smaller than 0.3), and less  discriminative. If we directly use the such small values as gating, the magnitude of message representation will be suppress too much. 
+%To this end, we recalibrate the relationship confidence score with the linear scaling function with learnable to obtain the more stable numerical values for downstream messages passing gating. 
+%The learnable scaling parameter also provides adaptive ability for the recalibrating model. For different datasets, it can adaptively adjust only need us set a proper coarse initial values rather than tuning as a hyperparameter.
+%2) A hard threshold by a approximated learnable parameter for filtering the low relationship confidence.
+%Due to the sparsity of scene graph, there a most of relationship proposals are negative, those connections is no use for aggregating the context. 
+%For more effective and efficient messages passing, we can directly filter out those connections by threshold simply.
+%However the threshold could be a another hyperparameter, here we use the shared parameter with the scaling function to let this threshold approximated differentiable. In this way, it can also adaptively adjust rather tricky hyperparameter tuning for different datasets.
+
+For each entity node $\mathbf{e}_i$, we divide its neighboring predicates into two sets: $\mathcal{B}_s(i)$ for $\mathbf{e}_i$ as the \textit{subject} and $\mathcal{B}_o(i)$ for $\mathbf{e}_i$ as the \textit{object}.
+%With such refinement, we can recalibrate the adjacency matrix of message passing between the predicate and entities representation. 
+%Along the assumption, we can get the cleaner and smaller proposals spaces, which provides the better training efficacy with the smaller space space for optimization, and less noise during the inference phrase. 
+We update the entity representation $\mathbf{e}_i$ by aggregating its neighbors' messages:
+%\begin{align}
+%    \mathbf{e}_i^{(l+1)} = \mathbf{e}_i^{(l)} \\
+%     +	\phi & \left( \frac{1}{Z_e^{p\to  o}}\sum_{k\in\mathcal{B}(i)} \gamma_{k}\cdot d(\mathbf{e}_i^{(l)},\mathbf{r}^{(l)}_{k}, \theta^{p\to  o})\cdot  \mathbf{W}_e^\intercal\mathbf{r}^{(l)}_{k} \right.\\
+%    &\left. + \frac{1}{Z_e^{p\to  s}}\sum_{k\in\mathcal{B}(i)} \gamma_{k}\cdot d(\mathbf{e}_i^{(l)},\mathbf{r}^{(l)}_{k}, \theta^{p\to  s})\cdot  \mathbf{W}_e^\intercal\mathbf{r}^{(l)}_{k} \right) \\
+%    &Z_{e_i}^{p\to *} = \sum_{k\in\mathcal{B}(i)} d(\mathbf{e}_i^{(l)},\mathbf{r}^{(l)}_{k}, \theta^{p\to *})
+%\end{align}
+\begin{align}
+    \mathbf{e}_i^{(l+1)} = \mathbf{e}_i^{(l)}  +\phi & \left( \frac{1}{|\mathcal{B}_s(i)|}\sum_{k\in\mathcal{B}_{s}(i)} \gamma_{k}  d_{s} \mathbf{W}_e^\intercal\mathbf{r}^{(l)}_{k} \right.\\
+     + &\left. \frac{1}{|\mathcal{B}_o(i)|}\sum_{k\in\mathcal{B}_{o}(i)} \gamma_{k}  d_{o}   \mathbf{W}_e^\intercal\mathbf{r}^{(l)}_{k} \right)     
+%      \mathbf{e}_i^{(l+1)} = \mathbf{e}_i^{(l)}  +\phi & \left( \frac{1}{Z_e^{p\to  s}}\sum_{k\in\mathcal{B}_{s}(i)} \gamma_{k}  d_{p\to s} \mathbf{W}_e^\intercal\mathbf{r}^{(l)}_{k} \right.\\
+%     + &\left. \frac{1}{Z_e^{p\to  o}}\sum_{k\in\mathcal{B}_{o}(i)} \gamma_{k}  d_{p\to o}   \mathbf{W}_e^\intercal\mathbf{r}^{(l)}_{k} \right)\\     
+% d_{p\to s} = &d(\mathbf{e}_i^{(l)},\mathbf{r}^{(l)}_{k}, \theta_{p\to  s})\\
+%  d_{p\to o} = &d(\mathbf{e}_i^{(l)},\mathbf{r}^{(l)}_{k}, \theta_{p\to  o})
+\end{align}
+%  d(\mathbf{e}_i^{(l)},\mathbf{r}^{(l)}_{k}, \theta^{p\to  o})
+% d(\mathbf{e}_i^{(l)},\mathbf{r}^{(l)}_{k}, \theta^{p\to  s})
+%where $d(\cdot)$ is the learnable distance metric with parameter $\theta_{p\to s}$ and $\theta_{p\to o}$ subject and objects.
+%for estimate the distance between the predicates and entities by subject role$\theta^{p\to s}$ or object role $\theta^{p\to o}$, 
+where $\mathbf{W}_e$ is the parameter of a linear transformation.
+% $Z_{e}$ is the normalization factor. 
+
+In each stage, we typically perform $N_i$ iterations of the above two message propagations to capture context in a sufficiently large scope.
+
+    
+%% Multiple Stage Graph Refinement.
+%\textit{3) Multi-stage Graph Refinement}
+%
+%After one-stage context encoding, the initial representations for each predicate nodes and entity nodes have been updated with contextual information. 
+%%In this way, the RCE module can improve the proposal confidence estimation from the updated predicate nodes. 
+%To further alleviate the relation proposal noise during the context modeling, we introduce a multi-stage refinement strategy for our bipartite graph.
+%Formally, we have $m$ stages graph refinement. For each stage, first we estimate the relation confidence with a stage-wise RCE module as discussed in Sec.\ref{subsubsec:rce}. Then the confidence-aware message propagation are conducted for $l$ times in one stage like Sec.\ref{subsubsec:msg}. %The overall process is illustrated in Algorithm.\ref{algo:b_gnn}.
+
+
+\subsubsection{Scene Graph Prediction} 
+\label{subsec:predictor}
+% \noindent \textbf{3.2.3~Scene Graph Prediction}
+
+To generate the scene graph of the given image, we introduce two linear classifiers to predict the class of the entities and predicates based on their refined representations. Concretely, for each relationship proposal, our classifier integrates the final representation of predicates proposal from our BGNN, denoted as $\hat{\mathbf{r}}_{i\to j}$, and a class frequency prior~\cite{zellers_neural_2017}, $\hat{\mathbf{p}}_{\mathbf{r}_{i\rightarrow j}}$, for classification:
+\begin{align}
+    \mathbf{p}_{\mathbf{r}_{i\rightarrow j}} &= \text{softmax}\left(\mathbf{W}_{rel}^\intercal \hat{\mathbf{r}}_{i\rightarrow j} + \text{log}(\hat{\mathbf{p}}_{\mathbf{r}_{i\rightarrow j}}) \right)\in\mathbb{R}^{\mathcal{C}_p}
+%        \mathbf{p}_{i\rightarrow j} &= \frac{\end{}{(\mathbf{W}_{rel}^\intercal \hat{\mathbf{r}}_{i\rightarrow j} + \rho \cdot  \text{log}(\hat{\mathbf{p}}_{i \rightarrow j}) ) \\
+%    r_{i \rightarrow j} &= \text{argmax}(\mathbf{p}_{i\rightarrow j})
+\end{align}
+
+% prediction, we follow the classifier with frequency bias proposed by \cite{zellers_neural_2017}.
+%Although, the frequency bias can provide a strong prior for classification, by it still biased to head categories.
+%To this end, we add a learnable parameter  $\epsilon$ for fusing the frequency bais $\hat{\mathbf{p}}_{i \rightarrow j}$ with the logits predict from visual features $\mathbf{r}^{(t)}_{i\rightarrow j}$, for a flexibility to preserve our model is limited to such naive bias.
+%\begin{align}
+%    \mathbf{p}_{i\rightarrow j} &= \text{softmax}(\mathbf{W}_{rc}^T \mathbf{r}^{(t)}_{i\rightarrow j} + \rho \cdot  \text{log}(\hat{\mathbf{p}}_{i \rightarrow j}) ) \\
+%    r_{i \rightarrow j} &= \text{argmax}(\mathbf{p}_{i\rightarrow j})
+%\end{align}
+
+For each entity, we introduce a learnable weight to fuse the initial visual features $\mathbf{v}_i$ and enhanced features $\hat{\mathbf{e}}_i$ output by our BGNN. The final entity classification is computed as:
+%due to the the initial features extracted from the detection background is also implemented for entities representation, we design the skip-connections with learnable weights $a$ with sigmoid $\sigma(\cdot)$ for normalization, between the initial entities features and graph refined entities features.
+\begin{align}
+    \mathbf{p}_{\mathbf{e}_i} &= \text{softmax}(\mathbf{W}_{ent}^\intercal ( \rho\hat{\mathbf{e}}_i + (1-\rho)  \mathbf{v}_i )\in\mathbb{R}^{\mathcal{C}_e} %\\
+%    e_{i} &= \text{argmax}(\mathbf{p}_{i})
+\end{align}
+where $\rho$ is a weight in $[0,1]$, and $\mathbf{W}_{rel}$ and $\mathbf{W}_{ent}$ are the parameters of two classifiers.
+
+
+\begin{table*}[!ht]
+    \begin{center}
+        \resizebox{0.9\textwidth}{!}{
+            \begin{tabular}{c|l|cc|cc|cc}
+                \toprule
+                 \multirow{2}{*}{\textbf{B }} & \multirow{2}{*}{\textbf{Models}}& \multicolumn{2}{c|}{\textbf{PredCls}}       & \multicolumn{2}{c|}{\textbf{SGCls}}     & \multicolumn{2}{c}{\textbf{SGGen}} \\% \midrule
+                	\cmidrule{3-8}
+                 &   & \textbf{mR@50}~/~\textbf{100} & \textbf{R@50}~/~\textbf{100} & \textbf{mR@50~/~100} & \textbf{R@50}~/~\textbf{100} & \textbf{mR@50}~/~\textbf{100}  & \textbf{R@50}~/~\textbf{100}    \\ \hline
+                \multirow{7}{*}{\begin{tabular}[c]{@{}c@{}} \rotatebox{90}{ VGG16 } \end{tabular}}  & 
+                	  Motifs\cite{zellers_neural_2017,tang_learning_2018}& 14.0~/~15.3 & 65.2~/~67.1  &  7.7~/~8.2  & 35.8~/~36.5 & 5.7~/~6.6 & 27.2~/~30.3 \\  % VGG16 results
+                & FREQ \cite{zellers_neural_2017,tang_learning_2018} & 13.0~/~16.0 & 60.6~/~62.2 & 7.2~/~8.5 & 32.3~/~32.9 & 6.1~/~ 7.1 & 26.2~/~30.1  \\              
+                & G-RCNN \cite{yang_graph_2018}                      & ~~-~~/~~-~~ & 54.2~/~59.1 &  ~~-~~/~~-~~ & 31.6~/~29.6 & ~~-~~/~~-~~ &  11.4~/~13.7  \\
+                &  VCTree\cite{tang_learning_2018}                   & 17.9~/~19.4 & 66.4~/~68.1 &  10.1~/~10.8 &  38.1~/~38.8 & 6.9~/~8.0  & 27.9~/~31.3 \\
+                & RelDN\cite{zhang_graphical_2019}                   & ~~-~~/~~-~~ & 68.4~/~68.4 & ~~-~~ /~~-~~ & 36.8~/~36.8 & ~~-~~ /~~-~~ & 28.3~/~32.7  \\
+                & KERN \cite{chen_knowledge-embedded_2019}           & 17.7~/~19.2 & 67.6~/~65.8 &  ~9.4~/~10.0 & 36.7~/~37.4  & 6.4~/~7.3  &  29.8~/~27.1    \\
+                & GPS-Net\cite{lin_gps-net_2020}                     & ~~-~~ /~22.8& 66.9~/~68.8 & ~~-~~ /~12.6 & 39.2~/~40.1 & ~~-~~ /~ 9.8 & 28.4~/~31.7  \\ 
+                & PCPL\cite{yan_pcpl_2020}        & ~35.2~ /~37.8& 50.8~/~52.6 & ~18.6~ /~19.6 & 27.6~/~28.4 & ~9.5~ /~ 11.7 & 14.6~/~18.6  \\ 
+                \midrule
+                	% R-101
+                \multirow{11}{*}{\begin{tabular}[c]{@{}c@{}}\rotatebox{90}{ X-101-FPN } \end{tabular}}  
+                & RelDN$^\dagger$                                           & 15.8~/~17.2 & 64.8~/~66.7  & 9.3~/~9.6  & 38.1~/~39.3  & 6.0~/~7.3   & 31.4~/~35.9     \\ % Res101 results
+                & Motifs\cite{tang_unbiased_2020}                    & 14.6~/~15.8 & 66.0~/~67.9 & 8.0~/~8.5  & 39.1~/~39.9  & 5.5~/~6.8 &  32.1~/~36.9     \\
+                &  Motifs$^{*}$\cite{tang_unbiased_2020}             & 18.5~/~20.0 & 64.6~/~66.7 & 11.1~/~11.8 & 37.9~/~38.8 & 8.2~/~9.7 & 30.5~/~35.4    \\ 
+                & VCTree\cite{tang_unbiased_2020}                    & 15.4~/~16.6 & 65.5~/~67.4 & 7.4~/~7.9 & 38.9~/~39.8 & 6.6~/~7.7 &   31.8~/~36.1    \\    
+                &  G-RCNN$^\dagger$                                  & 16.4~/~17.2 & 65.4~/~67.2 & 9.0~/~9.5  & 38.5~/~37.0  & 5.8~/~6.6 &  29.7~/~32.8     \\
+                &  MSDN$^\dagger$ \cite{li_scene_2017}               & 15.9~/~17.5 & 64.6~/~66.6 & 9.3~/~9.7  & 38.4~/~39.8  & 6.1~/~7.2 &  31.9~/~36.6  \\   
+                &  Unbiased\cite{tang_unbiased_2020}                 & 25.4~/~28.7 & 47.2~/~51.6 & 12.2~/~14.0 & 25.4~/~27.9 & 9.3~/~11.1 &  19.4~/~23.2   \\
+                & GPS-Net$^\dagger$                                  & 15.2~/~16.6 & 65.2~/~67.1 & 8.5~/~9.1  & 39.2~/~37.8  & 6.7~/~8.6 &   31.1~/~35.9    \\
+                &  GPS-Net$^{\dagger *}$                             & 19.2~/~21.4 & 64.4~/~66.7 & 11.7~/~12.5 & 37.5~/~38.6 & 7.4~/~9.5 &  27.8~/~32.1  \\          
+                % &  Unbiased$^*$                 & 25.4 & 28.7 & 12.2  & 14.0 & 9.3 &  11.1    \\
+                \cmidrule{2-8} 
+            %    &  \textbf{BGNN}(w/o BLS)      &  17.4~/~18.8 & 65.4~/~67.2 &  10.2~/~11.5 & 38.5~/~ 39.9 & 8.3~/~9.7 & 31.3~/~ 36.1   \\  % 这边需要区别对比一下我们有没有resampling和加了sampling的性能的区别吗？
+                &  \textbf{BGNN}          & \textbf{30.4}~/~\textbf{32.9} & 59.2~/~61.3 & \textbf{14.3}~/~\textbf{16.5} & 37.4~/~38.5  & \textbf{10.7}~/~\textbf{12.6} & 31.0~/~35.8   \\ 
+            \bottomrule
+            \end{tabular}
+        }
+    \end{center}
+\caption{\textbf{The SGG performance of three tasks with graph constraints setting}. $\dagger$ denote results reproduced with the authors' code. $*$ denotes the resampling \cite{gupta_lvis:_2019} is applied for this model.} 
+\label{overall_table} 
+\vspace{-0.4cm}
+\end{table*}
+
+
+
+
+%  backup table, only have the mean recall
+% \begin{table*}[!ht]
+%     \begin{center}
+%         \resizebox{0.9\textwidth}{!}{
+%             \begin{tabular}{c|l|ll|ll|ll}
+%                 \toprule
+%                  \multirow{2}{*}{\textbf{B }} & \multirow{2}{*}{\textbf{Models}}& \multicolumn{2}{c|}{\textbf{Pred Cls}}       & \multicolumn{2}{c|}{\textbf{SG Cls}}     & \multicolumn{2}{c}{\textbf{SG Det}} \\% \midrule
+%                 	\cmidrule{3-8}
+%                  &   & mR@50 & \multicolumn{1}{c|}{mR@100} & mR@50 & \multicolumn{1}{c|}{mR@100}  & mR@50    & mR@100    \\ \hline
+%                 \multirow{5}{*}{\begin{tabular}[c]{@{}c@{}} \rotatebox{0}{ VGG16 } \end{tabular}}  & 
+%                 	  Motifs\cite{zellers_neural_2017,tang_learning_2018}& 14.0 &  15.3 &  7.7  & 8.2 & 5.7  &  6.6     \\  % VGG16 results
+%                 & FREQ \cite{zellers_neural_2017,tang_learning_2018} & 13.0 &  16.0 &  7.2 & 8.5 & 6.1 & 7.1   \\              
+%                 & G-RCNN \cite{yang_graph_2018}                      & 13.0 &  16.0 &  7.2 & 8.5 & 6.1 & 7.1   \\
+%                 &  VCTree\cite{tang_learning_2018}                   & 17.9 &  19.4 &  10.1 & 10.8  & 6.9  &  8.0     \\
+%                 & KERN \cite{chen_knowledge-embedded_2019}           & 17.7 &  19.2 &  9.40 & 10.0  & 6.4  &  7.3     \\
+%                 & GPS-Net\cite{lin_gps-net_2020}                     &  -   &  22.8 &   -   &  12.6&  -   &  9.8     \\ \midrule
+%                 	% R-101
+%                 \multirow{10}{*}{\begin{tabular}[c]{@{}c@{}}\rotatebox{0}{ X-101-FPN } \end{tabular}}  
+%                 & Baseline                                           &15.8  & 17.2 & 9.3  & 9.6  & 6.0   & 7.3     \\ % Res101 results
+%                 & Motifs\cite{tang_unbiased_2020}                    & 14.6 & 15.8 & 8.0  &  8.5 & 5.5 &  6.8     \\
+%                 &  Motifs$^{*}$\cite{tang_unbiased_2020}             & 18.5 & 20.0 & 11.1 & 11.8 & 8.2 &  9.7     \\ 
+%                 & VCTree\cite{tang_unbiased_2020}                    & 15.4 & 16.6 &  7.4 & 7.9 & 6.6 &  7.7     \\    
+%                 &  G-RCNN$^\dagger$                                  & 16.4 & 17.2 & 9.0  & 9.5  & 5.8 &  6.6     \\
+%                 &  MSDN$^\dagger$ \cite{li_scene_2017}               & 15.9 & 17.5 & 9.3  &  9.7 & 6.5 &  7.9  \\   
+%                 &  Unbiased\cite{tang_unbiased_2020}                 & 25.4 & 28.7 & 12.2  & 14.0 & 9.3 &  11.1    \\
+%                 & GPS-Net$^\dagger$                                  & 15.2 & 16.6 & 8.5  & 9.1 & 6.7 &  8.3     \\
+%                 &  GPS-Net$^{\dagger *}$                             & 19.2 & 21.4 & 11.7 & 12.5 & 7.4 &  9.5  \\          
+%                 % &  Unbiased$^*$                 & 25.4 & 28.7 & 12.2  & 14.0 & 9.3 &  11.1    \\ \cmidrule{2-8}
+%                 \cmidrule{2-8} 
+% %                &  \textbf{BGNN}(w/o RS)                                        & 19.1 & 20.7&  10.2 & 11.5 & 8.3 &  9.7     \\  % 这边想要区别对比一下我们没resampling和加了sampling的性能的区别
+%                 &  \textbf{BGNN}                                     & 30.4\more{(+5.0)} & 32.9\more{(+4.2)}& 14.3 \more{(+2.1)}& 16.5\more{(+2.5)}   & 10.7 \more{(+1.4)}&  12.6\more{(+1.5)}   \\ \midrule
+%             \bottomrule
+%             \end{tabular}
+%         }
+%     \end{center}
+% \caption{The SGG performance of three tasks on mRecall@K metric with graph constraints setting, $\dagger$ denote results reproduced with the authors' code. $*$ denotes the resampling is applied for this model.} 
+% \label{overall_table}
+% \end{table*}
+
+\subsection{Learning with Bi-level Data Sampling}\label{subsec:learning}
+
+We now present our learning strategy for unbiased scene graph generation. We will first develop a bi-level data sampling strategy to balance the data distribution of entities and predicates, and then describe a multitask loss for learning the adaptive BGNN. 
+
+
+\begin{figure}
+	\centering
+	\includegraphics[width=7.6cm]{imgs/resampling.pdf}
+	\caption{
+        \textbf{Illustration of bi-level data sampling for one image.} The top row is the instance frequency of head(H), body(B), and tail(T) categories in the image.
+        The middle row shows image-level oversampling with repeat factor $N$. The bottom row shows the instance-level under-sampling for instances of different categories. 
+		%    The running example of comparison between different resampling strategies.
+		% The red, green and blue boxes represent the head, body and tail categories instance of images. 
+		% The categories frequency distribution is shows at right part.
+		%    The top row shows the initial data distribution without any resampling.
+		%    The middle row shows the classical resampling strategy, the frequency of head categories maintain the dominated ratio.
+		%    The bottom row shows instance-based resampling strategy proposed by us, with the proper instance under-sampling, the data distribution is more balanced.
+	} 
+	\label{data_sampling}
+    \vspace{-4mm}
+\end{figure}
+
+\vspace{-4mm}
+\paragraph{Bi-level Data Resampling}
+Unlike in other vision tasks, the scene graph annotations have varying structures, which makes it non-trivial to adopt either the instance-level replay strategy~\cite{hu_learning_2020} or images-level resampling method ~LVIS\cite{gupta_lvis:_2019}.
+To tackle the intrinsic long-tail data distribution of entity and relation, we design a two-level data sampling strategy that integrates the above two ideas on rebalancing.  
+Specifically, our data sampling strategy consists of two steps: 
+%\textit{1)} image-level resampling with repeat factor calculation like~\cite{gupta_lvis:_2019}, \textit{2)} instance-level under sampling within each image.
+
+\noindent\textit{1) Image-level over-sampling:} We adopt the {repeat factor sampling} in~\cite{gupta_lvis:_2019} to sample images first. We start from a class-specific repeat number, $r^c=\max(1,\sqrt{t/f^c})$, where $c$ is the category, $f^c$ is its frequency on the entire dataset and $t$ is a hyper-parameter that controls when oversampling starts. 
+For $i$-th image, we set $r_i = \max_{c \in i} r^c$, where $\{c \in i\}$ are the categories labeled in $i$.
+
+% instance whose categories is $c$ by: 
+%
+%nd repeat factor $T$, 
+%
+%calculate the repeat times for each instance of image.
+%For categories $c$, according to its frequency $f^c$ across whole dataset, and hyperparameter repeat factor $T$, we can calculate a repeat times $r^c$ for instance whose categories is $c$ by: 
+%$$
+%r^c = max(1, \sqrt{T/f^c})
+%$$
+%For each image $i$, it repeat times $r_i$ is decision by 
+%$$r_i = max_{c\in C(i)} r^c$$
+%where the $C(i)$ are the categories labeled in image $i$.
+
+\noindent\textit{2) Instance-level under-sampling:}  
+Given the sampled images, we further design an instance-level sampling strategy for predicates.
+Concretely, we compute a drop-out probability for instances of different predicate classes in each image. The drop-out rate $d^c_i$ for instances in $i$-th image, with category label $c$ is calculated by $d^c_i=\max((r_i - r^c) / r_i * \gamma_d, 1.0)$,  and $\gamma_d$ is the hyper-parameter for adjusting the drop-out rate.
+With this strategy, our two-level data resampling can achieve an effective trade-off between the head and tail categories.
+
+
+%During the training stage, we first sample an image based on the repeat factor discussed in \textit{step-1}. Then the supervision signal of each instance will be ignored or not is determined with a Bernoulli distribution $p = d^c_i$, which means for the ignored instances, its loss is also ignored during the final loss calculation. With this strategy, our hyper-level data resampling can achieve an effective trade-off between the head and tail categories, quantitive results in Sec.\ref{} also demonstrate our novel resampling method.
+
+%
+%From the the expectation of Bernoulli distribution, we can know that the categories whose frequency is not reach the threshold point $t$ that let oversampling kicks in, will be maintain initial instance amount in statistical, and the other categories will be oversampled properly.
+%To this end, we can set a more higher repeat factor for the low frequency categories and less care about overfitting on high frequency categories.
+%Furthermore, we observed that the high frequency categories relationship is important for encoding contexts, such strict drop-out rate could destroy the context structure of scene graph. 
+
+
+%, means the instance will be ignored during . 
+
+%For the ignored annotations, all loss of predication who match with this annotation will be ignored and not sum into to total loss.
+%
+%From the the expectation of Bernoulli distribution, we can know that the categories whose frequency is not reach the threshold point $T$ that let oversampling kicks in, will be maintain initial instance amount in statistical, and the other categories will be oversampled properly.
+%To this end, we can set a more higher repeat factor for the low frequency categories and less care about overfitting on high frequency categories.
+%Furthermore, we observed that the high frequency categories relationship is important for encoding contexts, such strict drop-out rate could destroy the context structure of scene graph. 
+%To this end, we further add the additional hyperparameter $\gamma_d$ for adjusting the drop-out rate.
+\vspace{-4mm}
+\paragraph{Training Losses}
+To train our BGNN model, we design a multitaks loss that consists of three components, including $\mathcal{L}_{rce}$ for relation confidence estimation module (RCE), $\mathcal{L}_{p}$ for predicate proposal classification and $\mathcal{L}_{e}$ for entity proposal classification. Formally, 
+\begin{align}
+    \mathcal{L}_{total} =\mathcal{L}_{p}  + \lambda_{rce} \mathcal{L}_{rce} +\lambda_{e} \mathcal{L}_{e}
+\end{align}
+%loss for relationship confidence estimation module,the predicates classification module, $ loss for the entity classification.
+where $\lambda_{rce}, \lambda_{e}$ are weight parameters for calibrating the supervision from each sub-task. 
+
+Here $\mathcal{L}_{p}, \mathcal{L}_{e}$ are the standard cross entropy loss for multi-class classification (foreground categories plus background). The loss of RCE $\mathcal{L}_{rce}$ is composed by two terms:
+%\begin{align}
+$\mathcal{L}_{rce} = \mathcal{L}_{m}+\lambda \cdot \mathcal{L}_{b}$,
+%\end{align}
+where $\lambda$ is a weight parameter, and $\mathcal{L}_{m}$ and $\mathcal{L}_{b}$ are losses for the class-specific and overall relation confidence estimation $\mathbf{s}^m,s^b$ respectively. 
+Both predictions have explicit supervision as in the training of relationship predictor in the graph refinement stage.
+%Due to the large amount of negative pairs in relationship proposals, which lead to strong , 
+We adopt the focal loss~\cite{lin_focal_2017} to alleviate positive-negative imbalance in the relationship confidence estimation. 
+
+%The coefficient  can be fine-tuned as hyperparameter for calibration the supervision between each two heads for better performance.
+
+%In loss of multi-templates estimation head $\mathcal{L}_{mul}$, we have
+%\begin{align}
+%L_{mul} = -\frac{1}{D_x}\sum_k^{D_x}\sum_i^{|C_{p}|} y_{k,i} \alpha (1- \mathbf{s}_{k,i}) \cdot log(\mathbf{s}_{k,i})
+%\end{align}
+%The $y_{k}\in\{0,1\}^{C_rel}$ is the one-hot vector that represents the category number of each relationship proposed.
+%For the $M$ relationship proposals, there are $C_rel$ templates for estimation the relationship confidence of categories separately.
+%
+%In the loss multi-templates estimation head $\mathcal{L}_{est}$, we have
+%\begin{align}
+%	L_{est} = - \frac{1}{D_x}\sum_k^{D_x} y^'_{k} \alpha (1- s_{k}) \cdot log(s_{k})
+%\end{align}
+%The $y^'_{k} \in\{0,1\}$, $y^'_{k} = 1$ if the $k$-th proposal match the GT.
+%
+
+
+%With the better relatedness prediction, we can also get better topology refinement during the message passing. 
+%Hence, two models can iteratively refine as a close-loop system. So we use formulate such iterative refinement between the relatedness model and the message passing model, the topology of message passing will refine according to the features augmented in last stage.
+
+%In this section, we introduce the iterative refinement process between the relatedness module and message passing module. 
+%After the message passing, the initial representation has been refined. In this way, the predictor can take more discriminative features for better prediction performance. 
+%With the better relatedness prediction, we can also get better topology refinement during the message passing. 
+%Hence, two models can iteratively refine as a close-loop system. So we use formulate such iterative refinement between the relatedness model and the message passing model, the topology of message passing will refine according to the features augmented in last stage.
+%\begin{align}
+%    \mathbf{\hat{X}},~ \mathbf{\hat{U}}  &= \mathcal{M}(\mathbf{X},~ \mathbf{U}, \hat{G}^t) \\
+%    \mathbf{P}^{t+1} &= \mathcal{P}(G, \mathbf{\hat{X}},~ \mathbf{\hat{U}}) \\
+%    \hat{G}^{t+1} &= \mathcal{F}(G, \mathbf{P}^{t+1})
+%\label{rel_GMSP_relness2} 
+%\end{align}
+%
+
+%Our goal is to parse a precise structural description of the objects and their relationships for a given scene. 
+%\subsubsection{Relation-aware Graph Construction}
+%In stage one, a filtering process is applied on $G$ by $F$, with the relatedness score  $s_{k}$ of each relationships proposals.
+%The goal of this filtering process is to reduce the negative connections from the initial topology $\mathcal{E}$, for a more clean graph.
+%% ranking
+%For each proposal relationships, we can get a scaler $s_{k}$ that represents the relatedness confidence of $k$th relationship proposal.
+%% The For the $s_{k}$, we take the max probability from the distribution as the relatedness score.
+%% $$
+%% s_{k} = max_{i\in C_{rel}}(\mathbf{p}^{prop}_{k,i})
+%% $$
+%% Intuitively, we have multiple templates to match with the input feature, if one of template matched, we can say this relationship proposal is "related".
+%
+%For the $N_r$ relationships proposal, we can get a set of relatedness score $\mathbf{s} \in \mathbb{R}^{M}$ for each relationship proposal $r_k$. 
+%Those relationships can be the edges for GMSP $\mathcal{E}_{p\to  e}$ predicates to entities, $\mathcal{E}_{e\to  p}$ predicates to entities.
+%The first stage filtering function $F$ ranks the relationships proposal according relatedness scores $\mathbf{s}$. 
+%With such ranking results, we remove the incontinence edges from the $\mathcal{E}_{p\to  e}$, which introduce massive noise into the GMSP system.
+%
+%represent this process in formal ways, the $\mathcal{E}_{p\to  e}$ is represented as adjacency matrix $\mathbf{E}_{p\to  e} \in \{0,1\}^{M \times N}$, $F$ produces the $\mathbf{\hat{E}}_{p\to  e} $ after filtering. The 1st filtering $F$ actually is a gating function the suppress connection that below the threshold $\tau$ as a learnable parameter.
+%
+%
+%The goal of this the relatedness-aware graph construction is to reduce the negative connections from the initial topology $\mathcal{E}$, for a more clean graph.
+%Specifically, we proposed a multi-stage graph topology refinements by utilizing the relatedness information of relationship proposals.
+%
+%In formally, the topology and gating weighting is control by the function $d(\cdot)$ which generate the aggregation weight matrix $\mathbf{A}_r$.
+%As previous introducing, we proposed a function that refine the topology of the graph $\mathbf{G}$ to $\hat{\mathbf{G}}$. 
+%Here we implement such process by produce the adjacency matrix $\mathbf{A}_{relness}$ and multiply to initial aggregation weight matrix from graph nodes feature $\mathbf{A}_{feat}$ as shown in below formulas.
+% =======
+% stage one
+% \paragraph{Dynamic Relation-aware Graph(RAG) Construction}
+% The goal of this the relatedness-aware graph construction is to reduce the negative connections from the initial topology $\mathcal{E}$, for a more clean graph.
+% Specifically, we proposed a multi-stage graph topology refinements by utilizing the relatedness information of relationship proposals.
+
+% In formally, the topology and gating weighting is control by the function $d(\cdot)$ which generate the aggregation weight matrix $\mathbf{A}_r$.
+% As previous introducing, we proposed a function that refine the topology of the graph $\mathbf{G}$ to $\hat{\mathbf{G}}$. 
+% Here we implement such process by produce the adjacency matrix $\mathbf{A}_{relness}$ and multiply to initial aggregation weight matrix from graph nodes feature $\mathbf{A}_{feat}$ as shown in below formulas.
+
+%\textcolor{red}{TODO: maybe to intorduce how the $\mathbf{A}$ been used for message passing since the top level definition of graph message passing is missed.}
+%
+%
+%\begin{align}
+%    \mathbf{A}^r &=  \mathbf{A}^{feat}\cdot\mathbf{A}^{relness}   \\
+%    \mathbf{A}^{feat} &= \delta_{feat}^{p \to  e}(\mathbf{G}, \mathbf{X}^t, \mathbf{U}) \\
+%    \mathbf{A}^{relness} & = \delta_{relness}(\mathbf{G},\mathbf{c}^{rel})
+%\end{align}
+%
+%The topology refinement are two stage, which are: hard threshold stage and soft weighting stage.
+%As the introducing above, the quality of relationship proposals are continuos distribution. Our goal is to as clear as possible to enable connection of good quality relationship pairs, and disable the connection from the un-confidence relationship proposals.
+%
+%For the hard threshold stage, we prune the connection that from the low relatedness relationship proposals. For the soft weighting, we recalibrate the relatedness score as a weight that indicates the soft adjacency between the node.
+%
+%
+%%The each connection of adjacency matrix are corresponded to the $N_r$ relationships proposal between the entities.
+%%The connection weight of adjacency matrix $\mathbf{A}_{relness}^{ij}$ is computed from the relatedness score $\mathbf{p}_{relness}^{ij} \in \mathbb{R}^{M}$ of each relationship proposal $r_k$. 
+%%Here we design a single learnable gating function $\mathcal{T}$ for those two stage relatedness adjustment as shown in eq.\ref{2_stage_gating}. 
+%%The function takes the relatedness score as the input, and works as the hard-sigmoid function, with the two learnable parameters $\alpha, \beta$.
+%%With the such clip and linear transformation, we can obtain the adjacency matrix with the soft connection weight. 
+%%The connection weights are generated from the the relatedness information.
+%
+%\begin{align}
+%        \mathbf{A}^{relness}_{ij} &= \mathcal{T}(\mathbf{c}^{rel}_{ij})\\
+%        \mathcal{T}(x) 
+%        &=\left\{
+%        \begin{array}{cc}
+%        0       & x \leq \beta \\
+%        \alpha  x-\alpha  \beta & \beta<x<1 / \alpha +\beta \\
+%        1       & x \geq 1 / \alpha +\beta
+%        \end{array}
+%        \right. \label{2_stage_gating}
+%\end{align}
+%
+%With such learnable gating function, we can automatically learn the parameters for both hard threshold and soft weighting of adjacency matrix.
+%With such refinement, we can recalibrate the adjacency matrix of message passing between the predicate and entities representation. 
+%Along the assumption, we can get the cleaner and smaller proposals spaces, which provides the better training efficacy with the smaller space space for optimization, and less noise during the inference phrase. 
+
+%Based on the new topology filtered by the first stage, we design a new message passing model that takes the relatedness information as additional input to compute the aggregation matrix $A_{rel}$. 
+%In each connection in $\mathcal{E}$, we can use the distance function $\delta(\cdot)$ to compute a aggregation weight. 
+%As shown in eq.\ref{relness_gating}, this is an example of the gating weight $\alpha_{k\to  i}^{gating}$ between the $k$th connection between the $i$th entities from the aggregation matrix $A_{rel}$. 
+%
+%In our proposed method, the distance/gating values is compute from multiple information source.
+%As shown in eq.\ref{relness_gating}, besides the gating values $d_{ki}$ computed by visual representation of $k$th predicate and $i$th entity representation, the weight computed from relatedness probability score set $d_{ki}^{rel\_prob}$ and relatedness score $s^{relness}_{k}$, as summarized by the learnable weight $\gamma, \beta$ as a linear combination for more flexibility. 
+
+%The detail of how those weights compute from the initial input. The $\sigma$ is the non-linear function sigmoid.
+%
+%\begin{align}
+%    \mathbf{A}_{k}^{feat} 
+%    &= \mathbf{a}^{feat} \\ 
+%    &= \delta_{feat}^{p \to  e}(\hat{\mathcal{E}}^{p \to  e}_{k}, \mathbf{X}, \mathbf{u}_k) \\
+%\end{align}
+%
+%\begin{align}
+%    a^{feat}_{i} 
+%    &= \frac{ \sigma (d^{feat}_{i}) } { \sum_{j \in \mathcal{N}(\mathcal{E}^{p \to  e}_{k})} \sigma (d^{feat}_{j})} \\
+%    d_{j}^{feat} &= \mathbf{W}_{\delta^{p \to  e}}(\hat{\mathbf{x}_j}  + \hat{\mathbf{u}_k} ) + \mathbf{b}_{\delta^{p \to  e}}\\
+%    \hat{\mathbf{u}_k} &= ReLU(\mathbf{W}_u \cdot \mathbf{u}_{k} + \mathbf{b}_u) \\
+%    \hat{\mathbf{x}_j} &= ReLU(\mathbf{W}_x \cdot \mathbf{x}_j + \mathbf{b}_x)
+%    \label{relness_gating}
+%\end{align}
+
+
+
+%\subsection{Dynamic Relation-aware Graph Neural Network}\label{subsec:our_approach}
+%\subsection{General Graph Neural Network for Scene Graph Generation}
+%
+%We start from the generic graph message passing pipeline for scene graph generation based on the previous works to introduce our method. 
+%First, we obtain the $N$ entities proposal by the off-the-shelf object detection model(Faster-RCNN, ResNet101-FPN) for each entity $o_i$, and extract its representation $\mathbf{x}_i \in \mathbb{R}^{D_e}$ (or $\mathbf{X} \in \mathbb{R}^{N \times D_e}$ for whole all entities) including visual, semantic and geometry following the baseline of Motifs\cite{zellers_neural_2017}.
+%Based on the entities, the $M$ relationship proposals $\mathcal{R}'$ are produced by fully connected pairing the entities $r_k = <\mathbf{e}_i, \mathbf{e}_j>$. 
+%The representation for relationship proposals $\mathbf{u}_k \in \mathbb{R}^{D_u}$(or $\mathbf{U} \in \mathbb{R}^{M \times D_r}$ for all predicates proposals of image) to represent the visual and geometry features. 
+%Those features for the relationship proposals are input for our proposed method. Below we will describe the details of our model architecture.
+
+%After obtain the the feature of relationship proposals, the next step is to use the GNN aggregate the context information for feature augmentation.
+%The high-level definition of the the this feature aggregating model is shown in eq. \ref{gen_GMPS_refine}. The model is a GNN, work as a non-linear function $\mathcal{M}$ that takes the relationship proposals features $\mathbf{X},~ \mathbf{U}$, and refine along the graph topology $G$.
+%The $\mathbf{\hat{X}},~ \mathbf{\hat{U}}$ is the refined features,
+%\begin{align}
+%    \mathbf{\hat{X}},~ \mathbf{\hat{U}}  &= \mathcal{M}(\mathbf{X},~ \mathbf{U}, G) 
+%    \label{gen_GMPS_refine} 
+%\end{align}
+%
+%Specifically, the GNN model is a message passing/aggregating process.
+%The general message passing of graph neural network can be formulated as eq.\ref{gen_GMSP1}, \ref{gen_GMSP2}. We aggregate the representation from the neighbor nodes $\mathbf{S} \in \mathbb{R}^{N \times D_2}$ after a non-linear transformation with weight $\mathbf{W}_x \in \mathbb{R}^{D_2 \times D_1}$ to target nodes, by the adjacency matrix $\mathbf{A} \in \mathbb{R}^{N \times M}$.
+%The $\mathbf{A}$ is generated according to the graph topology $G=\{\mathcal{E}, \mathcal{V}\}$ and feature representations $\mathbf{T}^{t}, \mathbf{S}$ by a distance function $d(\cdot)$ as shown in eq.\ref{gen_GMSP1}
+%The initial representation $\mathbf{T}^{t} \in \mathbb{R}^{M \times D_1}$ is updated by the weighted aggregation with the weight matrix $\mathbf{A}$ as shown in eq.\ref{gen_GMSP2}.
+%The aggregation weight matrix $\mathbf{A} \in \mathcal{R}^{M \times N}$ is calculated by the distance function $d(\cdot)$ along the adjacency of $\mathcal{E}$. 
+%
+%\begin{align}
+%    \mathbf{T}^{t+1} &= \mathbf{T}^{t} + \mathbf{A} \cdot \sigma (\mathbf{S} \cdot  \mathbf{W_s}  + \mathbf{b_s}) \label{gen_GMSP1} \\
+%    \mathbf{A} &= d(\mathcal{E}, \mathbf{X}^{t}, \mathbf{S}) \label{gen_GMSP2}
+%\end{align}
+%
+%In message passing process of the scene graph generation, there could be different nodes types as the $\mathbf{S}$ and $\mathbf{T}^{t}$. Different nodes types can lead to different information flow of message passing.
+%From a general GMPS model on scene graph generation, the information flow of message passing on proposal scene graph could have 3 types: (1)predicates to entities, (2)entities to predicates, (3)entities to entities. (predicate to predicate without condition on entities is quite of non-sence). 
+%
+%This message passing process is applied on the proposal scene graph $G=\{\mathcal{E}, \mathcal{V}\}$. 
+%In the proposal scene graph, there have multiple nodes and topology connections during the message passing. 
+%Specifically, there are two types of nodes(representation):$\mathcal{V}_e$ entities representation, $\mathcal{V}_p$ predicates representation; three types of edges: $\mathcal{E}_{p\to  e}$ predicates to entities, $\mathcal{E}_{e\to  p}$ predicates to entities, $\mathcal{E}_{e\to  e}$ predicates to entities.
+%The message passing process will be applied to nodes, according to the the topology defined by three kinds of edges between them. The eq.\ref{gen_GMSP_pe1, gen_GMSP_pe2} shows the one of topology that aggregate the predicate features $\mathbf{U}$ to entities features $\mathbf{X}$, with connections edges $E_{p\to  e}$.
+%\begin{align}
+%    \mathbf{X}^{t+1} &= \mathbf{X}^{t} + \mathbf{A} \cdot \sigma (\mathbf{U} \cdot  \mathbf{W}_{p\to  e}  + \mathbf{b}_{p\to  e}) \label{gen_GMSP_pe1} \\
+%    \mathbf{A} &= d(\mathcal{E}_{p\to  e}, \mathbf{X}^{t}, \mathbf{U})
+%\label{gen_GMSP_pe2}
+%\end{align}
+%
+
+
+
+% stage one
+%\paragraph{Dynamic Relation-aware Graph(RAG) Construction}
+%\paragraph{Message Propagation overt RAG}
+
+% For (1) information flow, the initial MSP process is:
+% \begin{align}
+%     h_{u \to  i} &=  \sum_{r_{im} \in \mathcal{R'},  } \alpha^{gating}_{im \to  i} * \mathbf{u_{im}} \\
+%     & + \sum_{r_{ni} \in \mathcal{R'}, } \alpha^{gating}_{ni \to  i} * \mathbf{u_{ni}}  \\
+%     \alpha^{gating}_{ni \to  i} &= sigmoid(FC_{u2e}(FC_e(\mathbf{e}_i) * FC_u(\mathbf{u}_{ni}))) \\
+%     \mathbf{e}_i^{t+1} &= \mathbf{e}_pi^{t} + \lambda h_{u \to  i}
+% \end{align}
+
+
+% proposal relationships $\mathcal{R'}$ to proposal relationships $\mathcal{R'}_{vaild}$
+% Second, the the relatedness prediction prob $\mathbf{p}^{prop}_{ij}$ will be the auxiliary input for calculate the $\alpha^{gating}_{ij \to  i}$
+% Third, the relatedness score $s_{ij}$ will be the additional gating weight with the $\alpha^{gating}_{ij \to  i}$ with the learnable weight $\gamma, \beta$
+
+
+
+% detail of obtain the entities and predicates features
+
+% In this module, our goal is to provide the proposal relationships $\mathcal{R'}$ and scene graph proposal $\mathcal{G'}$ build on it. 
+% , we can get its bounding box $\mathbf{b}_i, \mathbf{b}_i = [x_1, y_1, x_2, y_2]$, categories $c_{i}^{ent}$ from $C_{ent}$ entities categories, and categories probability distribution $\mathbf{p}^e_i \in \mathbb{R}^{C_{ent}}$ predict by classifier.
+% From those $N$ entities, we can pair them by a fully connected manner to get the relationships proposal $\mathcal{R'}$.
+% Then we extract the feature representation from the relationship proposals, it mainly composed by three parts, visual feature of entities and predicates, geometry and semantic features of entities pairs, similar to the previous work \cite{zhang_graphical_2019,zellers_neural_2017, tang_learning_2018}.
+
+% Specifically, the features for proposal relationships are entities features $\mathbf{x}_i \in \mathbb{R}^{2048}$ and predicates features $\mathbf{u}_i \in \mathbb{R}^{4096}$ for each relationship proposals triplets. 
+% For the entities feature is generated from the its visual feature $\mathbf{v}_i$ from the ROI-align on visual feature of image, and it bounding box information $\mathbf{b}_i$, with the semantic feature by weighted sum of pre-trained word embedding by classification distribution $\mathbf{e}_i = \mathbf{E} \cdot \mathbf{p}^e_i$. To represent this process in formal ways, is shown at eq.\ref{entities_feature}, the $[\cdot ;\cdot ;\cdot]$ is concatenating operation.
+% \begin{equation}
+% \label{entities_feature}
+% \mathbf{x}_i = F_{en}([\mathbf{v}_i;F_{geo}(\mathbf{b}_i);\mathbf{e}_i])
+% \end{equation}
+
+% For the predicates features$\mathbf{u}_{ij}$, are generated for the visual feature $\mathbf{v}^u_{ij}$ is ROI-aligned from the feature of image by the union box of two entities bounding boxes, the geometry features: $[\mathbf{b}_i;\mathbf{b}_j]$ of two entities boxes coordination. As shown in eq.\ref{predicate_feature}
+% \begin{equation}
+% \label{predicate_feature}
+% \mathbf{u}_{k} = F_{pre}([\mathbf{v}^u_k;F_{geo}([\mathbf{b}_i;\mathbf{b}_j])])
+% \end{equation}
+
+% Hence it is a massive number of relationships, we will filter them in the first stage by ranking according to their quality. The quality of relationship proposals is defined by the multiplication of two entities classification scores and relatedness score predict by the 1st stage relatedness module. This quality score represents the confidence of two entities and how they related to each other.
+% In this way, for each relationship proposals $R'$, we can have such a representation $<\mathbf{e}_i, \mathbf{u}_{k}, \mathbf{e}_j>$, this representation will be input for following relatedness module and GMSP module. 
+
+
+
+
+% Old Version----------------------------------------------
+
+% which is a set of visual relationships over the entity instances within this scene.(\rev{difference with visual relation detection?})
+%The entity instances of $\mathbf{I}$ are denoted as  a set $\mathbf{B}=\{\mathbf{b}_1,\cdots,\mathbf{b}_n\}, \mathbf{b}_i\in\mathbb{R}^4$ of bounding boxes, and a corresponding label set $\mathbf{C}=\{c_1,\cdots,c_n\}$ of objects, as assigning a class label $c_i\in \mathcal{L}_C$ to each $\mathbf{b}_i$, where $\mathcal{L}_C$ is the set of all entity classes. We formulate the scene graph as a set of subject-object relationship tuples, $\mathbf{R}=\{<\mathbf{x}_i,\mathbf{x}_j, r_{i\to  j}>\}$, where the entity $\mathbf{x}_i=\{\mathbf{b}_i, c_i\}\in \mathbf{B}\times \mathbf{C}$, $r_{i\to  j} \in \mathcal{L}_R$. The $\mathcal{L}_R$ is the set of all predicate types, including the "background" predicate, which indicates there is no visual relationship between one entity pair.
+
+%We formulate the scene graph as $\mathcal{G}=\{\mathcal{O}, \mathcal{R}\}$, $\mathcal{O} = \{o_i\}_{i=1}^{N}$ is the set of objects in the images, and a set of relationships $\mathcal{R}$ between them. 
+%Here we formulate the scene graph as $\mathcal{G}=\{\mathcal{O}, \mathcal{R}\}$, $\mathcal{O} = \{o_i\}_{i=1}^{N}$ is the set of objects in the images, and a set of relationships $\mathcal{R}$ between them. 
+%The relationship $\mathcal{R} = \{r_k\}_{k=1}^{M}$ is the triplet $<o_i, p_{k}, o_j>$. 
+%Specifically, it is composed by subject entities $o_i$, object entities $o_j$ and the predicate $p_k$ between them. The categories of entities and predicates are in the $C_{ent}$ and $C_{rel}$ respectively.
+
+% how we do, big modules and pipeline
+
+% 目前这部分先放到method里面了，以保证notation比较易懂一些
+% \section{Preliminary}
+% We first introduce the visual relation detection task with 
+% \subsection{Problem Definition}
+% \subsection{Graph Neural Network}
+
+
+%We are aiming to leverage the relation prior to effectively incorporate the scene context and semantic cues into the relation proposal and entities, thus a novel \textit{\textbf{bipartite graph neural network}} is developed for context modeling, and its also convenient to convert the bipartite graph into the directed scene graph as the final prediction during the inference stage.
+
+
+%Our goal is to learn a relation-aware feature representation for a relationship triplet 
+%In this work, we proposed a dynamic GNN message passing model, that explicitly utilize the relatedness information as proxy, and iteratively refine the optimize the topology of message passing. 
+%Specifically, the model perceive the relatedness information for modify topology of message passing dynamically, by reduce the un-necessary connections by adjust the topology of graph by a course to fine manner(hard to soft). 
+%In this way, the less search space during the training can provide more efficient parameters learning. In inference time, it also reduce the noise of system, which lead to more effective features augmenting. 
+%Further more, the model is works iteratively as a closed loop system, the model will iteratively produce the better relatedness information on refined features. 
+
+% how we introduce our method 
+%In Section 3.1 Overview, we formally introduce the input and output of SGG task and our new proposed model, and the pipeline of our method at module level.
+%Then we introduce the model we proposed, called relatedness-aware GMSP in section 3.2.
+%In section 3.3, we introduce the iterative mechanism between the relatedness aware module and GMSP module. 
+%In section 3.4, we introduce the design of the relatedness module.
+
+
+
+
+
+%In order to model the scene context over this initial bipartite graph, the naive message passing is conducted with the complexity of $O(N_e^3)$, such a huge complexity make it prohibitive in the realistic applications.  
+%However, the previous methods typically model the scene context on the directed scene graph(node for entity, edge for predication) directly
+
+
+
+%Thus, to further alleviate the error propagation and incorporate the context effectively, we introduce relation prior into the graph pruning and message passing. First we design a relation confidence estimation module to predict relation score for each relation proposal, with the explicit supervision in the learning stage. Based on the relation score prediction, an adaptive gating mechanism is proposed to remove the negative relation proposals and control the mass of information during the message propagation. Furthermore, the iterative refinement is developed to achieve the dynamic graph pruning.
+
+
+
+%Our method follows a widely used bottom-up pipeline, a hypothesize-and-classify framework in which we first generate a set of subject-object proposals and then predict their relationship types. 
+
+
+%Our dynamic consists of three main components: 1) entity node extraction; 2) dynamic graph topology generation; 3) contextual representation aggregation.
+%Our method follows the wildly used bottom-up scene graph generation pipeline. 
+%The main focus of our work is to build a more efficient feature refined model for scene graph generation utilizes the relatedness information.
+%As shown in fig.\ref{pipeline_overview}, our method can be summarized as the following steps: 
+%(1) Build up the proposal scene graph: detect and pair the entities, and extract the relationship features according to the proposal scene graph.
+%(3) Compute the "relatedness" for relationship proposals by Relatedness module.
+%(4) Feature augmentation by relatedness aware message passing on proposal scene graph.
+%(5) Predict the relatedness score on feature refined by graph, and iteratively apply message passing according to the refined relatedness score.
+
+
+
+
+

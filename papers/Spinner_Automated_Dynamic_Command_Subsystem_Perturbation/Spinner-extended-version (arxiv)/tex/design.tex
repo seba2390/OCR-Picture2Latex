@@ -1,0 +1,587 @@
+
+%\vspace{1em}
+\section{Design}
+\label{sec:design}
+\autoref{fig:overview} shows the workflow of \sysname with two phases. %: Instrumentation (Section~\ref{subsec:instrumentation_phase}) and Runtime (Section~\ref{subsec:runtime_phase}).
+%There are two phases: Instrumentation and Runtime phases. 
+
+%\vspace{-1em}
+\subsection{Instrumentation Phase}
+\label{subsec:instrumentation_phase}
+\sysname takes a target program to protect and specification of trusted commands as input. It \updated{then}{} analyzes the target program to identify intended commands to instrument randomization primitives. % to \updated{the identified commands}{them}. %(e.g., shell/SQL commands that can be trusted and should be executed according to the provided specification). 
+%Details of our static analysis based instrumentation are described in Section~\ref{subsubsec:composition}. 
+%The outcome of this phase is a program with all trusted (or intended) commands instrumented.
+
+%
+%To this end, the runtime support returns the correctly randomized command to the instrumented program, ensuring the trusted command's execution. Untrusted commands are not instrumented and will not be randomized.
+%, preventing injected commands from being executed.
+%
+%We use different methods to implement a runtime randomization module for different command interfaces. 
+%Specifically, for the OS/shell command interface, we leverage the library hooking technique~\cite{ld_preload_github} to implement OS/shell command randomization. For database engines, we modify source code of a SQL engine, specifically SQLite~\cite{sqlite}, to create a shim database front-end 
+%to randomize keywords used in SQL statements (e.g., {\tt select} and {\tt update}).
+
+
+
+
+% \subsubsection{Instrumentation Component}
+% \label{subsec:instrumentation_comp}
+% We analyze a target program to identify variables used to compose commands. We check their origins and determine whether they can be trusted (Section~\ref{subsubsec:composition}), then we instrument the trusted variables (Section~\ref{subsubsec:instrumenation}). 
+
+\noindent
+{\bf Target Program.}
+\sysname analyzes and instruments target programs' source code. Hence, it requires the target program's source code. 
+Note that we do not require source code of the subsystems (e.g., shell process and database engines). 
+
+\revised{
+\noindent
+{\bf Trusted Command Specification.}
+Another input that \sysname takes is the trusted command specification which is a list of trusted source \emph{definitions} as shown in \autoref{fig:spec_example}. 
+We provide a semi-automated tool to derive the trusted command specification as well (Details can be found in Appendix~\ref{appendix:tcstool}).
+There are four types of trusted source definitions: (1) a constant string containing known command names such as hard-coded command (Lines 1, 4, and 6), (2) a path of a configuration file that contains definitions of trusted commands (Line 2), (3) a path of a folder where all the files in that folder are trusted (Line 7), and (4) APIs that read and return values from trusted sources (Lines 3 and 5).
+
+
+The first type represents a command in a constant string. We consider a hard-coded command is \emph{an intended command by the developer}. 
+%Note that constant strings that do not contain command names do not belong to this type. We obtain the known command names using a list of known internal Linux commands~\cite{manpages_ubuntu_com} and enumerating executable binaries on the target system (e.g., executables in `\code{/usr/bin/}'). Since available commands are not frequently updated, obtaining the list is mostly a one-time effort. 
+The second type is to handle a command defined in the program's configuration file. 
+For example, a PHP interpreter can execute other applications (e.g., \code{sendmail} for \code{mail()}) which is defined in \code{php.ini}. We include the \code{php.ini} file in our analysis as shown in \autoref{fig:spec_example} at line 2.
+%a PHP program using a PHP file path defined in its configuration file. 
+%We consider the PHP file path as trusted as we trust the content in the configuration file.
+The third type is a folder. It is to define all files under the folder to be trusted. For instance, a web-server may trust all the CGI (Common Gateway Interface) programs found at the time of offline analysis with a configuration shown in \autoref{fig:spec_example} at line 7.
+The fourth type describes APIs that read trusted sources. For instance, \code{getenv()} returns values of local environment variables. If a user assumes that the local environment variables cannot be modified at runtime, it can add the API to the trusted sources.
+
+For most applications, specifying the first type (i.e., hard-coded commands) as a trusted source is sufficient.
+For some applications, configuration files may define trusted commands. In such a case, the command specification should include the trusted configuration files' file paths so that, at runtime, commands originated from the configuration file are trusted.
+\updated{}{Note that \sysname checks whether a trusted source (e.g., configuration file) can be modified by remote users. If there is any data flow between untrusted sources and trusted sources, \sysname notifies the users to redefine the trusted command specification. 
+Similar to the values from configuration files, values from databases are trusted, only if there is no data-flow from untrusted sources to the database.
+We define \emph{untrusted sources} as any sources \emph{controlled by remote users (i.e., potential attackers)}.
+Further, to prevent modifications of trusted sources, we hook APIs that can change the trusted sources (e.g., \code{setenv()}) to make them read-only and detect attempts to modify during our evaluation. %We did not observe any read attempts to the trusted sources.
+}
+%\YK{@cj, please check where are SUNDR and additional discussion mentioned in meng's comment.}
+%
+%For the third type, if a directory is specified to be trusted, we enumerate all the files in the folder and specify them to be trusted.
+%The third type is mostly used for XXE injection prevention, where inclusion of an untrusted file needs to be prevented.
+%
+%\updated{}{In Appendix~\ref{appendix:tcs_examples}, we provide examples of the trusted command specification.}
+%%%%
+%\updated{}{\mw{Note that  there might be data flow from the remote user to the configuration file so there is the risk that the configuration file can be corrupted. We will warn the user when we detect such flow and do not take the configuration file as a trusted source in this case. To prevent the trusted sources outside the applications from being corrupted by other programs or remote users, we hook the \code{setenv()} function to deny operations on the environment variables recognized as trusted sources in the static analysis. We also use a secure file system like SUNDR~\cite{li2004secure} which can detect unauthorized attempts to change files to store our configuration files. In Appendix~\ref{xxx} we discuss the trusted sources of the selected applications.}%}
+}
+
+\subsubsection{Command Composition Analysis}
+\label{subsubsec:composition}
+%In this subsection, we describe how \sysname analyzes a target program to identify intended commands passing to command execution APIs. 
+Analyzing data-flows from the trusted command definitions (i.e., sources) to command execution APIs (i.e., sinks) is a challenging task, particularly for complex real-world applications.
+A naive approach that uses forward analysis (e.g., taint analysis) from trusted sources to sinks often leads to the over-approximation (i.e., over-tainting),  resulting in instrumenting variables that are not relevant to the commands (i.e., false positives) hence breaking benign functionalities. % If we instrument them, it will break the target program's benign functionalities.
+On the other hand, backward data-flow analysis from the sinks (i.e., tracing back the origins of variables from arguments of command execution APIs) to trusted sources is also difficult due to the complicated data dependencies.
+After analyzing challenging cases from both analyses, we realize that combining two analyses can significantly reduce their limitations (i.e., over and under-approximations).
+
+%we observe that complex data dependencies are mostly observed on the variables that do not hold commands, hence does not need to be instrumented. 
+%We use backward slicing and data-flow analysis to identify program statements that are relevant to composing commands.  
+
+%Note that this can be automatically obtained with little manual effort. 
+%For most cases, we can specify that all shell commands originating from constants can be trusted. 
+%Note that \sysname needs a list of commands that can be obtained by statically analyzing the shell process's source code~\cite{bashsource} (for internal commands) and scanning files in the folders containing executable binaries (for external commands), e.g., `/usr/bin'.
+%For programs using databases, \sysname does not require any known SQL keywords. Typically, configuring to trust all constant terms (i.e., tokens) is sufficient.
+%For XML files, the specification is automatically derived by analyzing the target program to identify trusted XML files. 
+
+
+%to identify how a program composes commands and where to instrument the program to ensure their intended execution. Specifically, we use backward slicing and data-flow analysis to identify program statements that are relevant to composing commands. 
+
+\begin{figure}[!tp]
+    \centering
+    \vspace{0.5em}
+    \includegraphics[width=0.95\columnwidth]{fig/analysis_example.pdf}
+    \vspace{-1em}
+    \caption{Bidrectional Analysis on GNU-Patch~\cite{Patch}}
+    \vspace{-1.5em}
+    \label{fig:Code_Patch}
+\end{figure}
+
+\noindent
+{\bf Bidirectional Command Composition Analysis.}
+We propose a bidirectional analysis, which is the key enabling technique that makes \sysname effective in analyzing complex data-flow in real-world applications.
+Specifically, we conduct forward data flow analyses (1) from trusted sources to identify variables holding trusted commands and \updated{also}{} (2) from untrusted sources to identify variables that are not relevant to commands. \sysname \emph{automatically} derives the definitions of untrusted sources: (a) return values of APIs that are not included in the trusted command specifications (e.g., \updated{return value of}{}\code{gets()}) and (b) constant strings that do not contain command names. 
+From the forward data flow analysis, we obtain two sets of variables: a set of trusted variables and another set of untrusted variables.
+
+\updated{With the results}{Next}, we conduct a backward data flow analysis from the arguments passed to command execution APIs (e.g., \code{system()}). While we analyze the program to trace back the origin of the arguments, if we encounter a node \updated{that is}{}originated from a variable in the trusted variable set, we conclude the argument is an intended command hence instrumented. If it meets a node \updated{that is}{}originated from a variable from the other set, untrusted variable set, we stop the backward analysis and conclude that the argument is not relevant to the command. % hence no instrumentation is needed.
+
+%Our analysis quickly concludes without tracing back arguments that are not relevant to commands. 
+%In the next few paragraphs, we will demonstrate the analysis with an example.
+
+\noindent
+\textbf{Running Example.}
+%We use a real-world program GNU-Patch~\cite{Patch}'s code snippet to show how the command composition analysis works.
+\autoref{fig:Code_Patch}-(a) shows a real-world program GNU-Patch~\cite{Patch}'s code snippet consisting of 4 functions. 
+At line 19, it calls \code{popen()} which executes a shell command composed at line 18. The \code{buf} variable contains the composed command from \code{editor\_program} and \code{TMPOUTNAME} via \code{sprintf()}. 
+First, \code{editor\_} \code{program} is defined as a constant string containing a known binary program path in line 17, meaning that it is an intended command and hence instrumented. 
+Second, \code{TMPOUTNAME} is defined through multiple functions. It is used as an argument of \code{make\_tempfile()} function (line 13). Inside the function, it is defined by \code{sprintf()} where its value is originated from the \code{dir\_name()} function. 
+As described, there are multiple functions involved to define the value \code{TMPOUTNAME}, making it difficult to trace back the origin. 
+
+{\it 1) Forward Analysis:}
+\autoref{fig:Code_Patch}-(b) shows the results of our forward data flow analysis from the trusted/untrusted sources. \blkcc{A} shows the data flow graph from the trusted source. It shows the \code{/bin/ed} command is propagated to \code{buf}.
+\blkcc{B} and \blkcc{C} show two graphs from untrusted sources. Specifically, \blkcc{B} shows that the return value of \code{dir\_name()} (line 7) is propagated to \code{*name} (line 9), affecting the first argument of the \code{make\_tempfile()}. As a result, the graph include the \code{make\_tempfile()} as a node, meaning that the function's return values are untrusted and not intended commands.
+\blkcc{C} also shows that the values from untrusted source \code{pget\_line()} (reading inputs from the standard input) are propagated to \code{outname}.
+
+{\it 2) Backward Analysis:}
+\autoref{fig:Code_Patch}-(c) shows our backward analysis from the sink function: \code{popen()}. \autoref{table:sinkfunctions} shows sink functions (i.e., Command Execution APIs) for each command subsystem.
+From the argument of \code{popen()}, \code{buf}, we analyze how the argument is composed. 
+First, it identifies \code{editor\_program[]} is concatenated via \code{sprintf()} at line 18. 
+Second, it finds out that \code{TMPOUTNAME} is a part of the command and it is defined by \code{make\_tempfile()}, which can be found in the forward data flow analysis result \blkcc{B}.
+
+{\it 3) Connecting Forward and Backward Analysis Results:}
+The bidirectional analysis merges results from forward and backward analysis together as shown in \blkcc{D} and \blkcc{E}. %It essentially connect the backward analysis results from sink functions to the forward analysis results from the trusted/untrusted sources. 
+Note that our backward analysis will terminate when it reaches any nodes in the forward data flow analysis results. 
+This effectively reduces the complexity of the data flow analysis. 
+Typically, the forward analysis is mostly localized and the backward analysis quickly reaches nodes in the forward analysis results.
+Note that \sysname conducts inter-procedural analysis if function arguments (e.g., \code{name} at line 9) or global variables (e.g., \code{TMPOUTNAME} at line 18) are affected.
+
+
+\input{tex/table_sink_functions}
+
+
+\input{tex/alg_composition}
+
+
+
+\smallskip
+\noindent
+{\bf Algorithm.} 
+Alg.~\ref{alg:composition} shows our bidirectional data flow analysis algorithm for identifying variables used to create commands. 
+
+\noindent
+{\it -- Step 1. Bidirectional Analysis:} 
+\textsc{BidirectionalAnalysis} takes a set of functions of a target program $F_\mathit{set}$ as input. 
+%
+\updated{First}{Then}, it conducts the forward analysis (lines 3-8). Specifically, for each variable (lines 3-4), if a variable is from a trusted source (line 5), it creates a tree that describes dependencies between variables as shown in \autoref{fig:Code_Patch}-(b)-\blkcc{A}. The return value is the root node of the tree and it is passed to \textsc{ForwardAnalysis} (line 6).
+Similarly, we also build trees for untrusted sources (lines 7-8) as shown in \autoref{fig:Code_Patch}-(b)-\blkcc{B} and \blkcc{C}.
+%
+\updated{Second}{Next}, it starts the backward analysis (lines 9-14). 
+In each function and each statement (lines 9-10), it searches for invocations of sink functions (line 11). For each identified sink function, we obtain variables used as arguments of the function (line 12).
+For each argument $V_i$, we call the \textsc{BackwardAnalysis} \updated{procedure}{} (line 14) that identifies the commands that need to be instrumented.
+
+\noindent
+{\it -- Step 2. Forward Analysis:}
+Given a variable $V$, it enumerates all the statements that use $V$ via the \textsc{GetUses} function, which returns the results of the standard def-use analysis~\cite{defusechain, defuse2}.
+For each statement that uses $V$, if it is used as an argument $x$ of a function call $F$ (line 18), we add the function as a node to the tree ($T_\textit{cur}$) via \textsc{AppendNode} which returns a subtree where the added node is the root of the subtree. It continues the analysis by recursively calling \textsc{ForwardAnalysis} with the subtree and the variable $x$ (line 19).
+If $V$ is used in an assignment statement `$x = \textit{expression}$', where \textit{expression} contains $V$, it adds the node $x$ to the tree, and call \textsc{ForwardAnalysis} with the subtree and $x$ (lines 20--21).
+
+\noindent
+{\it -- Step 3. Backward Analysis:}
+From a variable $V$ and a function $F$ containing $V$, \textsc{BackwardAnalysis} identifies variables that are used to compute the value of $V$ recursively (lines 23--39). For the identified variables, it checks whether the variable is a command and is from a trusted source (i.e., it is found during the trusted forward analysis results) (line 23). If so, the variable is added to $\textit{Ins}_\textit{out}$, which is a set that contains variables to be instrumented.
+If the variable can be found in the untrusted results, it terminates (lines 25--26).
+
+If $V$ is also computed from other variables (e.g., $V$=$V_x$+$V_y$), we also find origins of the contribution variables (e.g., $V_x$ and $V_y$) (line 28). Specifically, \textsc{GetDefVars}($V$) returns such contributing variables at the last definition of the variable $V$ (e.g., $V_x$ and $V_y$). The contributing variables are stored in $V_\textit{defs}$. 
+%Note that our analysis is based on the SSA (Single Static Assignment) form~\cite{ssa_form} to handle different definitions under multiple predicates.
+%
+We check the variable's type of each variable $V_i$ in $V_\textit{defs}$. If it is an argument of the current function, we extend our analysis into the caller function. \textsc{GetCallers} returns all of them. To find out the corresponding variable passed to the function in the caller, we use \textsc{GetCallerArg}($V_i$). Then, we continue the analysis in the caller function $F_i$ (lines 32--33). 
+If $V_i$ is a global variable, it searches all statements that define the variable, then get rvalues of the statements via \textsc{GetGlobalDefVars} (line 35). It recursively calls \textsc{BackwardAnalysis} to extend the analysis on the functions defining the global variable via {GetContainingFunc} (line 37). 
+%\textsc{GetContainingFunc} returns a function that includes a variable.
+%
+Lastly, if $V_i$ is a local variable (line 38), it recursively conducts backward analysis (line 39).
+
+%Note that the algorithm omits details of how corner cases are handled. In the next few paragraphs, we elaborate on how we handle challenging corner cases. 
+
+
+
+\noindent
+{\bf Inter-procedural Analysis.} 
+We build a call graph~\cite{callgraph} of a target program for inter-procedural analysis. In Alg.~\ref{alg:composition}, \textsc{GetCallers} uses the call graph.
+%For each statement that calls a function, a new node that represents a callee function is created. Then, it creates an edge between the caller and the callee. 
+After our intra-procedural analysis, we leverage the call graph to identify callers and obtain backward slices from them. We repeat the analysis until there are no more callers to analyze.
+
+\noindent
+{\bf Indirect Calls.} 
+Call targets of indirect function calls are determined at runtime. As \updated{those indirect calls}{they} are not included in the call graphs we generate, they may cause inaccurate results\updated{ later}{}.
+To handle this problem, given an indirect call, we conservatively assume that the call target can be any functions in the program that have the same function signature (e.g., number of arguments and types).
+%Note that if a function signature is too simple (e.g., very few arguments), there can be many candidates for caller functions. 
+%This is particularly problematic in weakly typed languages such as PHP, because their variables are not explicitly typed, resulting in functions with the same number of arguments having the same function signature. 
+%
+However, as this is a conservative approximation, we may include more callers. 
+%, eventually adding incorrect instrumentations. At runtime, those instrumentations may randomize strings that are not relevant to commands. %, leading to runtime errors. 
+%
+To mitigate this, we check the origins of the variables passed to callee functions. If the origins are not relevant to commands (i.e., they are not passed to command execution APIs), we prune out the caller. 
+%In practice, we find that many callers included by our conservative analysis can be pruned out by this method. 
+%During our experiments, we observe that this effectively mitigate the problem. We manually checked all instrumentations, and did not observe the over instrumentation problem. %Note that under/over-instrumentation will likely cause runtime errors. 
+%when the instrumented program executes commands. 
+%During our evaluation, we did not encounter runtime errors caused by instrumentation (Details in Section~\ref{sec:eval}).
+%We have tested instrumented programs on various workloads and have not encountered any errors of both types (Details in Section~\ref{sec:eval}). 
+%\MA{So far, you mentioned two types of runtime errors: over-instrumentation and under-instrumentation. Are you saying you did not encounter runtime errors of any kind? Or just one? Please, specify on this sentence.}
+
+%\updated{}{{\noindent \mw{\bf Avoiding False Positives}}}
+%\updated{}{\mw{When we manually analyze the data flows from trusted sources and untrusted sources to the sink functions, we observed that data flows from trusted sources to the sink functions where we need to find instrumentation place are much less complex than the flows from untrusted sources to the sink functions. So we applied strict inference rules for our flow analysis to avoid false positives in practice. \CJ{Strict inference rules mean above contents?} There will be false negative cases in our analysis when the length of the flow becomes larger. In the bi-direction analysis, forward-flow analysis and backward-flow analysis will discover the false negative cases for each other. It is hard to fundamentally improve the quality of static analysis, so we choose to leverage the information from both kind of flow analysis. One cases study is in Appendix~\ref{xxxx}.}}
+
+\subsubsection{Program Instrumentation}
+\label{subsubsec:instrumenation}
+We instrument the variables identified in the previous section (Section~\ref{subsubsec:composition}).
+%
+
+\begin{figure}[ht]
+    \centering
+    %\vspace{-0.5em}
+    \includegraphics[width=1.0\columnwidth]{fig/instrumentation.pdf}
+    \vspace{-2em}
+     \caption{Command used in Multiple Places}
+     \vspace{-1em}
+     \label{fig:instrumentation_example}
+\end{figure}
+
+
+\noindent
+{\bf Avoiding Instrumenting Non-command Strings.}  
+If an instrumented variable is used in other contexts that do not execute commands, it could break the benign execution.
+\autoref{fig:instrumentation_example} shows an example. The sink function, {\tt system()}, executes {\tt \$cmdline}, which is composed by concatenating {\tt \$bin} and {\tt \$options} (line 11) where {\tt \$bin} at line 2. 
+%Recall that we identify variables that are used to compose commands from the sink functions in a backward direction, then there can be cases of instrumented variables used in functions that were not properly randomized. 
+%
+Our analysis described in Section~\ref{subsubsec:composition} will attempt to instrument {\tt "ls"} at line 2, adding a randomization primitive to the definition of the command: ``{\tt \$bin = rand("ls")}''. 
+In an original execution, ``{\tt ls.log}'' file is created at line 5 and unlinked at line 8.
+However, the instrumentation at line 2 will change the file name to a randomized name. 
+For instance, if the randomized name is ``{\tt mt}''  (e.g., \code{ls} $\mapsto$ \code{\color{red}mt}), the instrumented program will create and unlink ``{\tt mt.log}'', which is different from the original program. 
+%to an execution at lines 5 and 8 because \sysname does not randomize non command execution APIs (e.g., \code{fopen()} and \code{unlink()}). 
+%those APIs are not relevant to command execution, hence \sysname does not randomize them.
+
+To solve this problem, we leverage dependency analysis to find a place to instrument that does not affect the other non-command execution APIs (e.g., {\tt fopen()} and {\tt unlink()} at lines 5 and 8).
+%instead of instrumenting line 3, we instrument {\tt \$bin} at line 15 so that it does not affect {\tt fopen()} and {\tt unlink()} functions at lines 7 and 11. 
+Specifically, we obtain a data-dependency graph, as shown in \autoref{fig:instrumentation_example}-(b). Nodes are statements in line numbers, and edges between the nodes represent the direction of data flow. From a target variable for instrumentation (\code{\$bin}), we identify statements that use the target variable.
+If we instrument at the root node ({\tt \$bin}), it affects all the child nodes, including those with non-randomized functions (lines 5 and 8).
+Hence, among the nodes between the root node and the node including the \code{system()} function (line 12), we pick the node line 11 to instrument.
+This is because instrumenting at line 11 only affects the command execution API \code{system()}.
+%. The sink function (\blkcc{5}) is a child of node \blkcc{4}. 
+%Since the first node \blkcc{1} affects all of its children (i.e., the yellow shaded area) containing the non-randomized functions, we pick a child node where none of its children does not have non-randomized functions (i.e., the green shaded area), which is \blkcc{4}. 
+%As a result, we choose to instrument \code{\$bin} at line 11. 
+Essentially, from the root node, we pick a child node along the path to the sink function. We move toward the sink function until the picked node's children do not include any non-randomized functions.
+% 15 does not affect non-randomized other functions. % in the program will not be affected. 
+%As the problem of the original instrumentation (in Line 4, \blkcc{1}) is that it is affecting all of its children nodes, we postpone the instrumentation when there is only a child, essentially \redcc{4} in Fig.~\ref{fig:forward_analysis}.
+%We finally choose to instrument \code{\$bin} in line 18. % as follows: ``{\tt \$cmdline = rand(\$bin).\$options}''.
+
+
+% \begin{figure}[ht]
+%     \centering
+%     \vspace{-0.5em}
+%     \includegraphics[width=0.9\columnwidth]{fig/forward_analysis.pdf}
+%     \vspace{-0.5em}
+%      \caption{Data-dependency Graph for {\tt \$bin} from \autoref{fig:instrumentation_example}}
+%      \label{fig:forward_analysis}
+%      \vspace{-1em}
+% \end{figure}
+
+\begin{comment}
+\noindent
+{\bf Calling Context-Sensitive Instrumentation.}
+A variable that holds a command may have different values depending on the calling context.
+If a variable used in the command execution functions are also used in non-command execution functions in a different context, it may break the benign execution of the program. To handle this, we selectively apply our randomization when the variable is in the context that holds commands. Specifically, we obtain a call graph and use it to identify calling contexts that the program assigns commands to the variable.
+%\MA{How do you check for that? Is this a trivial task? Disregard this comment if it's common knowledge...}.
+At runtime, we obtain a call stack inside the randomization primitive function to check whether the current execution has the correct calling context to randomize. If not, the randomization function simply returns the original argument.
+\end{comment}
+
+
+%\YK{Challenges: (1) If we simply instrument the identified variables, some variables might be used in other functions. We identify them and randomize them too. (2) Some function calls are context sensitive and we use call stack to differentiate them.}
+
+
+
+\subsection{Runtime Phase}
+\label{subsec:runtime_phase}
+%An instrumented program is running with command target subsystems (e.g., OS/shell and database) with our subsystem randomization component (\blkcc{A}), which randomizes the commands inside the subsystems (e.g., commands and SQL keywords).
+%To support 
+%Given an instrumented program and randomized subsystems (e.g., randomized file system and database engines), 
+%we run the instrumented program with our runtime support that bridges randomized subsystems and the instrumented program.
+%
+%For those instrumented commands, 
+%\sysname runtime support randomizes commands in the subsystems\updated{ properly}{} so that the instrumented intended commands can be executed.
+%
+\updated{The runtime support component is synchronized with the command target randomization component, meaning that it keeps track of the current one-time pad for randomization.}{}
+
+%\subsubsection{Command Target Randomization}
+%\label{subsec:subsysrand}
+%An instrumented program by \sysname calls command executing functions (e.g., {\tt system()}) with randomized commands if the commands are intended.
+%
+%To prevent the execution of non-randomized commands (i.e., injected commands by attackers), 
+%We randomize OS/shell command processor (Section~\ref{subsubsec:shellcommand_rand}) and database engines (Section~\ref{subsubsec:database_random}). 
+%In this subsection, we describe how we randomize different subsystems in detail.
+
+\subsubsection{OS/Shell Command Processor Randomization}
+\label{subsubsec:shellcommand_rand}
+We randomize the OS/shell command processor by hooking two critical paths of the command execution: (1) the creation of the shell process and (2) file I/O and shell APIs that access external binary files in the shell process.
+%
+Recall that there are two types of OS/shell commands: internal and external~\cite{linux_commands_external_internal}. 
+For all commands, a program spawns a shell process (e.g., `\code{/bin/sh}'). 
+The shell process, which contains the implementation of internal commands, directly executes internal commands (e.g., \code{cd}).
+External commands are executed by further calling APIs (e.g., \code{execve}) that run an external program.
+
+\autoref{fig:command_randomizer} shows how \sysname randomizes internal and external commands, following the typical execution flows.
+To execute an OS/shell command, the program often composes a command via string operations. 
+If a command is composed of trusted inputs, the command names are randomized via the instrumentation (\blkcc{1}). Commands originated from the untrusted inputs are not randomized (\blkcc{2}).
+The composed command is then passed to the command execution APIs such as \code{system()}.
+In the following paragraphs, we explain how \sysname works after the command execution APIs are called depending on whether the command is internal or external.
+%hooking command interface functions (shown in Table~\ref{table:sinkfunctions}).
+%Additional sinks are in the Appendix (Table~\ref{table:xmlsinkfunctions}).
+%\autoref{fig:command_randomizer} shows the structure of our randomization module. Specifically, we hook APIs to only accept randomized commands. Note that there are two types of commands: internal and external commands~\cite{linux_commands_external_internal}. Internal commands are directly implemented by the OS/shell, while external commands are delegated to external binary programs where the OS/shell executes them.
+
+
+
+\begin{figure}[ht]
+    \centering
+    %\vspace{-0.5em}
+    \includegraphics[width=0.88\columnwidth]{fig/os_command_rand.pdf}
+    \vspace{-1em}
+     \caption{OS/Shell Command Processor Randomizer}
+     \vspace{-1em}
+     \label{fig:command_randomizer}
+\end{figure}
+
+\noindent
+{\bf Internal Commands.}
+To execute an internal command, an application calls a command execution API, which spawns a shell process (\blkcc{3}) and passes the command to the spawned process.
+As the internal commands are implemented within the shell process, it does not make further API calls to access external binary files.
+%
+\updated{
+To randomize the internal commands, \sysname intercepts the entrypoint (i.e., \code{\_start()}) of the shell process. On the entrypoint, \sysname examines the command name (\blkcc{4}) via \code{getopt()} and only allows the command if properly randomized. Note that the shell process also uses \code{getopt()} to parse commands, meaning that it does not break benign functionalities regarding command parsing.}
+%Note that we infer a list of internal commands by analyzing the shell process~\cite{bashsource}. 
+%The command that is not randomized will fail.
+%For internal commands, we reject a command that is not randomized properly.
+%The hook module a list of randomized commands and their corresponding original commands. We only allow randomized commands to be accepted. %\MA{Consider describing (here or at 4.3) how the hook module maintains that list of commands -- I haven't read much discussion about how the derandomization takes place.}
+
+\noindent
+{\bf External Commands.}
+After the shell process is spawned (\blkcc{3}), if the command is an external command (\blkcc{5}), the shell process calls a few files I/O APIs such as \code{stat()} to check whether the binary file for the command exists or not (\blkcc{6}). 
+If the binary exists, it will execute the binary (\blkcc{7}). 
+%
+We provide a randomized view of the underlying file system by hooking file I/O and shell APIs and only allowing access with properly randomized file paths. 
+%Specifically, we hook the APIs and only allow access to the invocations with properly randomized file paths. 
+If the command is not randomized, API calls such as \code{stat()} will fail, preventing the execution of the command.
+A randomized command is derandomized and executed via APIs such as \code{execve()} (\blkcc{7}).
+\updated{Unlike the internal commands, \sysname does not require a list of external commands for randomizing the shell process. It is only required for instrumentation (Section~\ref{subsubsec:composition}).}{}
+
+%Specifically, if OS/shell processors recognize an external command execution request, they first look for a binary file for the external command using file API functions such as \code{stat()} (\blkcc{2}).
+%Hence, we hook those file API functions (\blkcc{B}) called on behalf of the command interface functions (e.g., \code{system()}, denoted as \blkcc{3}) to randomize file paths they access (\blkcc{4}). 
+%Note that we do not randomize file paths if it is not called within the command executing APIs. %We check a call stack within our API hook module to determine whether it is called within command interface functions. 
+
+
+
+%\noindent
+%{\bf Impact of the Completeness of the Parser.}
+%The parser we use might be incomplete; hence, it might fail to handle tricky (often malicious) inputs. It is important to mention that, unlike techniques that use parsers to analyze malicious inputs, failing to handle tricky and malicious inputs in \sysname does not break the protection. If it fails to recognize a malicious command, the command will not be executed. As intended inputs {\it are not encoded in a complex way} (intuitively, developers do not have any motivation to make the command tricky to parse while attackers often have such motivation), we do not observe any intended commands that fail to be parsed.
+
+
+
+\revised{
+%\vspace{-1em}
+\subsubsection{Database Engine Randomization}
+\label{subsubsec:database_random}
+Database engines are complicated and some are \updated{closed sourced}{proprietary (i.e., closed source)}, meaning that it is difficult to randomize them in practice. % Moreover, some engines are   has a largely different design and implementation, including APIs and internal data/program structures.
+%Hence, it is challenging to find a universal approach to randomize database engines. 
+As a result, previous approaches (e.g., \cite{sqlrand}) leverage a database proxy to parse a randomized query and rewrite it to a standard (i.e., derandomized) query. Implementing a robust parser for multiple database engines is challenging as shown in Section~\ref{subsubsec:advanced_sql_injection}.
+Moreover, they rely on a list of known SQL keywords to randomize and derandomize, failing to prevent sophisticated attacks presented in Section~\ref{subsec:comparison_existing}.
+%Unfortunately, such approaches are not able to prevent SQL queries leveraging SQL keywords that are not included in their list. % (Examples in Appendix~\ref{appendix:sqlrand-llvm}).
+
+%For example, some SQL engines such as SQLite provide various ways to hook key operations (e.g., commit/update hooks~\cite{xxx}) while others do not have such interfaces.
+%For example, in PHP, \code{mysql\_query()} sends SQL queries to a MySQL database while \code{sqlite\_query()} is used to access a SQLite database. 
+%Specifically, different database engines have different APIs and internal structures. %, and execution points that can be intercepted (e.g., callback event handlers). %\MA{and therefore hooked by another call}.
+%PDO: https://www.php.net/manual/en/class.pdo.php
+%As a result, it is challenging to develop a generic module that can randomize diverse SQL engines. 
+
+
+\begin{figure}[h]
+    \centering
+    %\vspace{-0.5em}
+    \includegraphics[width=1\columnwidth]{fig/escape_sql.pdf}
+    \vspace{-2em}
+    \caption{\revised{\updated{}{Scanner Recognizing Words for Randomization}}}
+    \vspace{-1em}
+    \label{fig:escape_string}
+\end{figure}
+
+\noindent
+\updated{}{\textbf{Bidirectional Randomization with Scanner.}}
+We propose a \emph{bidirectional randomization approach} that applies the randomization scheme twice, one for randomization and another for reverse-randomization. 
+\updated{}{Unlike existing techniques requiring knowledge of known SQL keywords and grammar, \sysname uses a scanner that works without such knowledge. As shown in \autoref{fig:escape_string}, \sysname only needs patterns of words, special characters, and strings.}
+\updated{By doing so}{For each identified word}, it (1) derandomizes randomized intended queries and (2) randomizes (and breaks) injected malicious queries at the same time. 
+\updated{It does not require a SQL parser or a list of known SQL keywords.}{} % deploy it on the SQL APIs. 
+%a database front-end to randomize the database engines.
+%The front-end sits between the user application and the actual database engine, like the proxies in other techniques such SQLRand~\cite{sqlrand}. 
+%However, \sysname differs from existing techniques because it leverages our \emph{dual randomization approach}, which randomizes the input twice to completely prevent injected SQL queries bypass the randomization scheme. 
+%Note that we present a detailed case study in Section~\ref{xxx} to demonstrate how \sysname prevents sophisticated attacks that existing randomization techniques fail to prevent.
+%
+Specifically, in a program that accesses a database, \sysname instruments strings that are used to compose a SQL query as shown in \autoref{fig:database_rand} \updated{}{(\blkcc{1})}. \updated{We use a scanner to identify terms in a query and then apply our randomization scheme (\blkcc{1}).}{} 
+Note that untrusted inputs are not randomized \updated{}{by this instrumentation} (\blkcc{2}).
+Finally, randomized trusted inputs and untrusted inputs are combined to compose a query and then passed to a SQL API such as \code{mysql\_query()}.
+We hook such SQL APIs to apply our reverse-randomization (or derandomization) scheme before the query is passed to the database engine (\blkcc{3}).
+\updated{Note that w}{W}e apply it for every recognized term (\emph{not only for the SQL keywords}\updated{}{ because our scanner does not have the notion of known SQL keywords}), resulting in derandomizing all the randomized terms as well as randomizing (with the reverse-randomization scheme) SQL queries from untrusted inputs.
+%The second XOR cipher essentially derandomizes the keywords randomized before (at \blkcc{1}) while randomizes (and breaking) the keywords from untrusted input that are not randomized. 
+To this end, if all terms in a SQL query are from the trusted sources, the resulting query can be successfully executed.
+However, if some terms are from the untrusted inputs, they are randomized (via the reverse-randomization) and cannot be executed, preventing injection attacks.
+%Given a mixture of randomized and standard SQL statements, it derandomizes randomized statements while randomizes standard statements. %Then, for the remaining statements (e.g., standard statements) that were not processed, we randomizes them. %and  add a randomization layer to the application. 
+%Specifically, it consists of two layers. The first layer derandomizes randomized SQL statements. 
+%and translates them to the original SQL statements that can be executed by an existing database engine. 
+%To prevent injected (malicious) SQL statements from being executed, it also randomizes standard SQL statements. 
+
+
+%We use SQLite~\cite{sqlite} to implement the dual layer randomizer.
+%SQLite is one of the smallest database engines, and it is relatively easy to directly randomize the SQL grammar. 
+%Specifically, we extract a SQL processor in SQLite, and create both derandomizer and randomizer.
+%simply search constant strigs that define SQL keywords and replace them with randomized keywords.
+%It is modified in a way that it can parse two different SQL grammar: the standard SQL grammar and our randomized grammar.
+%The shim database front-end processes an input SQL statement and generates the {\it two-way translated statements} (i.e.,  standard SQL keywords $\leftrightarrow$ randomized SQL keywords). 
+
+
+\updated{Note that \sysname recognizes keywords \emph{without a list of known SQL keywords}. It identifies terms with different patterns in a query, such as strings, numbers, and keywords, in a SQL grammar agnostic way. As a result, unlike existing techniques, \sysname does not fail when a new SQL keyword is added.}{
+    \textit{-- Handling Escaping String Constant:}
+    Note that \autoref{fig:escape_string} shows an example of PostgreSQL's unique feature of escape string constant, which is a special way of defining a string with a capital letter `E' before a string. Since it is a unique grammar for PostgreSQL, many parsers~\cite{andialbrecht/sqlparse,xwb1989/sqlparser,node-sql-parser,greenlion/PHP-SQL-Parser,moz-sql-parser} do not support it, resulting in a parsing error. \sysname considers the `E' as a word, and randomize/derandomize correctly, preserving content in the string. 
+}
+}
+
+
+% (Details in Appendix~\ref{appendix:sqlrand-llvm}).
+
+%First, the derandomization layer processes randomized statements, generating standard SQL statements. After the derandomization layer, all the derandomized statements are marked so that it would not be randomized again by the randomization layer.
+%Next, the randomization layer transforms  standard statements to randomized statements.
+%Otherwise, if the token is not randomized (i.e., standard token), the reverse process takes place. 
+%To this end, intended SQL statements are randomized by applications and then derandomized by the front-end.
+%By the same fashion, malicious (injected) SQL statements are not randomized by our hook module, preventing their execution.
+
+%\YK{We hook API like mysql\_query(), and put the parser. We replace keywords in sqlite, and it works well.}
+
+\begin{figure}[ht]
+    \centering
+    %\vspace{-1em}
+    \includegraphics[width=0.88\columnwidth]{fig/database_rand.pdf}
+    \vspace{-1em}
+     \caption{Randomization for Database Engines}
+     \vspace{-1em}
+     \label{fig:database_rand}
+\end{figure}
+
+%\autoref{fig:database_rand}-(a) shows the dual layer randomizer is placed between an application and a database engine. The instrumentations are applied to API functions that execute SQL statements (e.g., \code{mysql\_query()}). 
+
+\noindent
+{\bf Execution of Intended SQL Queries.}
+\autoref{fig:dual_rand}-(a) shows examples of how a benign SQL query is processed by \sysname with a randomization scheme shown in \autoref{fig:dual_rand}-(c), along the execution path of \autoref{fig:database_rand}.
+Specifically, when an intended SQL statement is executed, it goes through the instrumentation (\blkcc{1}) hence randomized and then is passed to a SQL API. 
+The randomized query is shown in the second row of \autoref{fig:dual_rand}-(a). All recognized terms, including the table name `\code{users}', are randomized.
+%Assume that the dual layer randomizer uses the randomization rule shown in \autoref{fig:database_rand}-(b). An example of a randomized SQL statement is shown on the left side of \redcc{1}.
+Then, in our hook function of the SQL API, we apply our reverse-randomization for all terms. Since there are no terms from untrusted input, every term is derandomized (\blkcc{3}), as shown in the third row.
+The last column of \autoref{fig:dual_rand}-(a) shows whether the query can be executed without errors or not. The query after \blkcc{3} is executable.
+%For example, given a query, \code{select * from table}, from trusted sources, \code{select} and \code{from} are randomized to \code{xxxxxx} and \code{yyyy} respectively.
+%Then, in the API hook function, they will be derandomized back to \code{select} and \code{from}, before the query is passed to a database engine.
+%To this end, the query is successfully executed.
+%derandomization layer applies the randomization rule, resulting in a standard SQL statement shown next to \blkcc{2}, which is passed to the SQL engine.
+
+\begin{figure}[!t]
+    \centering
+    %\vspace{-0.5em}
+    \includegraphics[width=0.85\columnwidth]{fig/dualrand_example.pdf}
+    \vspace{-1em}
+    \caption{\revised{Example of Benign and Injected Query Execution}}
+    \vspace{-2em}
+    \label{fig:dual_rand}
+\end{figure}
+
+\noindent
+{\bf Execution of Injected SQL Queries.}
+An injected SQL query is not randomized because it is not instrumented (\blkcc{1}). 
+\autoref{fig:dual_rand}-(b) shows an example query with an injected query highlighted in red.
+Specifically, assume that \code{select * from users where id=`\$id'} is the vulnerable SQL query, and an attacker injects a query by providing a value highlighted in \autoref{fig:dual_rand}-(b) to \code{\$id}.
+%
+% MA: $id corresponds to 1' and delete from users (remember that 1' is not derandomized, but the rest is)
+When the \updated{SQL}{query} is passed to the SQL APIs, the beginning part of the query (from trusted inputs up until the single quote) is randomized, but the later part outside the quotes (i.e., the injected query) is not.
+On the hooked API, \sysname applies the reverse-randomization in every term we recognize. %\textcolor{red}{except in tokens that are not considered from user input, determined by the system's scanner. } 
+% MA: the below sentence is redundant
+As a result, it effectively \emph{derandomizes} the (trusted) beginning part of the query while \emph{randomizing} the later part of the query from untrusted inputs. 
+Note that the reverse-randomization applies the substitution rule in the reverse order (i.e., \textsf{\color{red}  Randomized} $\mapsto$ \textsf{Original}). For example, `\code{a} $\mapsto$ \code{\color{red} f}' is a randomization rule\updated{, where}{ of a reverse-randomization} `\code{\color{red} f} $\mapsto$ \code{a}'\updated{ is a corresponding reverse-randomization}{}.
+%
+After \blkcc{3}, \updated{due to the later part of the query that is randomized, the injected query is prevented.}{the injected query is prevented as it is reverse-randomized.}
+
+
+\noindent
+{\bf Randomized Table Name Translator.} 
+The bidirectional randomization scheme randomizes all terms that are not originated from trusted sources. As a result, we observe that if a table name in a SQL query is originated from untrusted sources without quotes (e.g., `\code{select * from \$input}'), the table name can be randomized, resulting in a wrong query.
+While using input as a table name is \updated{a bad (i.e., insecure)}{a poor} programming practice, there exist programs composing queries in that way. 
+To this end, we additionally instrument \code{tbl\_derand()} to the variables that are not quoted. At runtime, it will check whether the instrumented string contains a randomized table name. \emph{If and only if it contains a single table name}, we derandomize it to the original table name. Note that it does not derandomize if the instrumented string contains multiple terms (i.e., words) to prevent injection attacks targeting the instrumented variables.
+% the query will fail due to the randomized table name. 
+%\YK{SQL table names can be randomized. (1) this is an insecure programming practice. (2) we handle this by translating the table back to the original.}
+
+%\vspace{-1em}
+\subsubsection{XML Processor Randomization}
+An XML processor is a program or module that \updated{processes}{parses} an input XML file \updated{by parsing and executing the actions annotated in the input XML file}{and executes the annotated actions in parsed XML elements described via tags}.
+%\updated{Essentially, in an XML file, each tag (i.e., entity) is an individual task to be processed.}{}
+
+\noindent
+{\bf XML External Entity (XXE) Attack.}
+Among the entities, there is an XML External Entity (XXE) which refers to data from external sources (e.g., other files or networks).
+The entity can refer to a sensitive password file using the following entity: ``\code{<!ENTITY xxe SYSTEM "file://FILE">}''.
+An XML processor parses the entity, then it reads to include the content of `\code{FILE}' in the output. \updated{If the `\code{FILE}' is a secret file, an information leak can happen.}{}
+
+
+% \begin{figure}[ht]
+%     \centering
+%     \includegraphics[width=0.9\columnwidth]{fig/xml_rand.pdf}
+%     \vspace{-1em}
+%      \caption{Randomization for XML Processors}
+%      \label{fig:xmlrand}
+% \end{figure}
+
+\noindent
+{\bf XML Processor Randomization.}
+We randomize {\it external resources' namespaces} such as file names and network addresses at APIs that access them (e.g., file I/O APIs and network APIs). With the randomization, only the API calls with randomized file names, paths, IPs, and URLs will succeed. 
+To ensure benign requests are properly handled, we analyze a target program to identify all intended XML files. 
+Specifically, we identify XML files and data passed to the XML sink functions shown in \autoref{table:sinkfunctions}. If they are originated from trusted sources (e.g., constants or from configuration files), we mark them to be randomized at runtime. 
+% to identify XML files and contents that can be trusted. % Hardcoded XML contents, XML file names and paths constructed through trusted sources (e.g., configuration files) are trusted. 
+%In trusted XML files, we identify all entities that refer to external resources (e.g., the xxe entities). 
+At runtime, when a trusted XML file is loaded, we randomize resource names/paths of XXEs in the file. 
+As we randomized the namespaces in the application through APIs, intended accesses through the randomized XXEs will be successful.
+For untrusted XMLs, file names, paths, and URLs in XXEs are not randomized and passed to the file I/O and network APIs, resulting in errors and preventing injection attacks.
+%As our randomization scheme can only understand randomized namespaces, the access will fail (\blkcc{6}).
+%Injected entities will not be randomized, failing to access the underlying file systems or network servers.
+%
+%
+Note that when \sysname analyzes the program to identify trustable XML files, we assume all the local XML files during the offline analysis are not compromised. 
+%This is because we randomize all identified XXEs from trusted sources. 
+\sysname's goal is to prevent future XXE injection after the analysis. 
+%If the system under analysis is already compromised before \sysname's static analysis is applied, we cannot distinguish whether an XXE entity is compromised or benign.
+
+
+
+%remains unprocessed. The randomization layer recognizes standard statements and applies randomization (i.e., standard SQL keywords $\mapsto$ randomized SQL keywords). %\MA{Consider removing these two next sentences if you accept previous sentence: In our hook module, our parser can handle both randomized and original SQL grammars. For any observed original SQL keywords, we randomize them. }
+%Finally, the randomized SQL statements are passed to a database engine (\redcc{4}), which will raise execution errors.
+
+
+%\noindent
+%{\bf Impact of the Completeness of the Parser.}
+%The SQL parser we use might be incomplete, failing to handle complicated SQL statements.
+%However, we verified that the parser is able to handle all intended (hence benign) SQL statements. For complex SQL statements that the SQL parser is not able to process correctly, we do not pass it to database engines. Hence, if a malicious SQL statement is too complex to be parsed, it will be dropped. Note that we only use the SQL parser to tokenize and recognize keywords. We do not use it to understand the complicated semantics of a SQL statement. A common mistake that existing techniques made is using the parser to understand the semantics of SQL statements. We observe that such techniques often fail to recognize benign statements and are unable to filter many malicious statements.
+%More discussions regarding this can be found in Section~\ref{sec:discussion}.
+
+
+\subsection{\sysname Runtime Support}
+\label{subsec:runtimesupport}
+
+\subsubsection{Dynamic Randomization Support}
+\sysname randomizes commands in the subsystems at runtime dynamically. We change \updated{the one-time pad}{our randomization scheme (or table)} on every command execution function invocation \updated{}{(or per input)} so that knowing previously used randomization schemes will not help subsequent attacks.
+\updated{Note that \sysname's instrumentations dynamically randomize intended commands before it is passed to command execution APIs. Then, after a command execution API is called, the used one-time pad is discarded. By doing so, we minimize the possibility of attacks reusing the previously used one-time pad.}{}
+
+
+\subsubsection{Randomization Primitives}
+The runtime support provides two primitives: randomization and derandomization primitives.
+
+\noindent
+{\it -- Randomization Primitive} is a function that takes a string as input and returns a randomized string via a mapping between each byte in the input and randomized byte(s). 
+To mitigate brute-force attacks against the randomized commands, the mapping is created per input. 
+It also supports multiple randomization schemes that convert 1 byte to 2 bytes (\optmap{x}{ab}), 4 bytes (\optmap{x}{cdef}), and 8 bytes (\optmap{x}{ghijklmn}).
+Details can be found in Appendix~\ref{appendix:bruteforce_attack}.
+
+    %\sysname can extend the substitution cipher space so the search space of the possible randomized commands is large. One single character can be randomized to multiple characters while the number of length can be configured by the administrator. For example, a command \code{`kc'} can be randomized to \code{`afvycm'}, if \sysname is configured to randomize one character to four characters or other schemes as shown in \autoref{fig:brute force}-(b). \sysname will generate a new randomization table on every sink function invocation. Hence the randomization table will be different for each request.}\CJ{2)[3.2] (\#D) Explain the algorithms used to randomize variables.
+
+%
+\updated{When it randomizes,}{At runtime,} we maintain a pair of a randomized string and its \updated{one-time pad}{randomization table}, which we call {\it randomization record}. The record is later used in the derandomization function.
+Note that two different strings can be randomized into the same string with two different one-time pads. For example, a one-time pad `\code{a} $\mapsto$ \code{\color{red} c}' and another one-time pad `\code{b} $\mapsto$ \code{\color{red} c}' will randomize both `\code{a}' and `\code{b}' to `\code{\color{red} c}', leading to the ambiguity in derandomization. %Specifically, when \sysname derandomizes, it looks up the randomization record with a randomized string as a key. If there are multiple records with the same randomized string, it cannot determine which one to derandomize.
+To solve this problem, when it randomizes, it checks whether the \updated{new}{}randomized string exists in the existing randomization records. If it exists, it randomizes the input string again until there are no matching strings in the records.
+
+\updated{Note that information disclosure attacks might be used to leak the stored one-time pads. However, as we always use the different one-time pads, knowing previously randomized commands does not help to launch subsequent attacks.
+Also, when the randomized command is passed to command execution APIs, its corresponding one-time pad is removed. Hence, even if the attacker injects a randomized command with the previous one-time pad, the attack will not succeed.
+More details can be found in Section~\ref{sec:discussion}. 
+}{}
+
+%In addition, existing memory region protection techniques, or even secure process extensions such as SGX~\cite{intel-sgx} can be used to protect the memory containing randomization records. 
+
+\noindent
+{\it -- Derandomization Primitive} takes a randomized string as input and returns the original value of the string. Given a list of randomization records, it finds a record that has a matching randomized string. Then, it leverages the record's \updated{one-time pad}{randomization scheme} to derandomize the input string. 
+
+

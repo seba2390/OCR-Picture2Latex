@@ -1,0 +1,131 @@
+\section{Methods}
+\label{sec:methods}
+
+
+We propose architecture changes based on these insights.
+Our code is available at {\small\url{https://github.com/ChicagoHAI/learning-from-rationales}}.
+
+\subsection{Background and Baseline Models}
+
+
+Our training data include input tokens, their corresponding rationales, and labels.
+Formally, an instance is denoted as $(\vecx, \vecalpha, y)$, where $\vecx = (\vecx_1, \ldots, \vecx_L)$ is a text sequence of length $L$ and human rationale $\vecalpha$ of the same length.
+$\vecalpha_i=1$ indicates that token $\vecx_i$ is part of the rationale (and relevant for the prediction), $\vecalpha_i=0$ otherwise.
+
+We use HuggingFace's BERT-base-uncased \citep{devlin_bert:_2018,wolf_huggingfaces_2020} as the basis for our experiments and analysis. Used in the standard way, BERT ignores $\vecalpha$ and is fine-tuned on tuples of $(\vecx, y)$. This is our simplest baseline.
+
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.95\columnwidth]{illustration.pdf}
+    \caption{Illustration of our multi-task framework. Our main innovation lies in how we define rationale loss for the supervised case and the masking function $m$.}
+    \label{fig:model}
+\end{figure}
+
+\para{Rationale model.}
+We use the rationale model of \citet{lei_rationalizing_2016} for both supervised and unsupervised rationale generation, in its updated BERT-to-BERT form \cite{deyoung_eraser_2019}. 
+This model consists of two 
+BERT modules: a rationale extractor $g$ that generates a binary attention mask $\hat{\vecalpha}$ as the rationale, and a predictor $f$ which makes a prediction using the \rationalizedinput via a masking function $m$ on $\vecx$ and $\hat{\vecalpha}$ (\figref{fig:model}):
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+\begin{displaymath}
+\begin{aligned}
+&g(\vecx) \rightarrow \hat{\vecalpha}, \\
+&f(m(\vecx, \hat{\vecalpha})) \rightarrow \hat{y}.
+\end{aligned}
+\end{displaymath}
+\endgroup
+
+
+The two components are trained in tandem. In the unsupervised scenario, the joint objective function consists of a prediction loss term and a rationale sparsity term, encouraging the model to retain only those tokens in $\vecx$ that are necessary for accurate prediction:
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+$$\mathcal{L}_u=\mathcal{L}_p(y,\hat{y}) + \lambda_{sp}||\hat{\vecalpha}||,$$
+\endgroup
+where $\mathcal{L}_p$ is typically cross entropy. 
+
+In the supervised scenario, given a human rationale $\vecalpha$, we replace the sparsity objective with a rationale supervision objective:
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+$$\mathcal{L}_{su}=\mathcal{L}_p(y,\hat{y}) + \frac{\lambda_{su}}{L}\sum_{i=1}^L \mathcal{L}_p(\vecalpha_i, \hat{\vecalpha}_i),$$
+\endgroup
+where $\lambda_{su}$ is a hyperparameter that controls the weight of rationale loss compared to label loss.
+
+
+Each of these scenarios represents a baseline for our experiment. 
+We refer to the unsupervised version as {\em unsupervised rationale model}, and the supervised version as {\em supervised rationale model}.
+
+
+\para{Implementation details.}
+The original \citet{lei_rationalizing_2016} model generates binary rationales by 
+Bernoulli sampling from continuous probability values produced by the generator, 
+and uses the REINFORCE algorithm \citep{williams_simple_1992} to propagate approximate gradients through this non-differentiable operation. 
+
+We instead use Gumbel Softmax \citep{jang_categorical_2017} to generate differentiable approximate binary rationale masks. In this framework,
+the generator produces logits $\vect{z_i}$ 
+to which are added random noise $G \sim Gumbel(0,1)$, before applying a softmax
+to produce 
+class probabilities $\vect{c_i}$. This approximates 
+a discrete distribution parameterized by $e^{\vect{z_i}}$. We then use the positive class probability $\vect{c}_i^1$ as the rationale value $\hat{\vecalpha}_i$.
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+$$\vect{c}_i = \operatorname{softmax}(\vect{z_i}+\vect{G} \sim Gumbel(0,1)); \hat{\vecalpha}_i = \vect{c}_i^1 $$
+\endgroup
+
+
+\para{Generating stable rationales.}
+We find it helpful as an engineering trick to pre-train the predictor layer of this model on the full input before co-training the predictor and extractor on the joint objective. This step appears to mitigate some of the issues this model has with rationale collapse, noted for example by \citet{deyoung_eraser_2019}. 
+
+Given $\hat{\vecalpha}_i$,
+we mask non-rationale tokens by multiplicatively substituting the [MASK] token vector across their vector representations, analogously to what is done during the MASK-LM pretraining of the BERT model:
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+$$m_s(\vecx_i, \hat{\vecalpha}_i) = \hat{\vecalpha}_i \cdot \vect{e}_i + (1- \hat{\vecalpha}_i) \cdot \vect{e}_{\text{[MASK]}},$$
+\endgroup
+where $\vect{e}_i$ represents the embedding associated with $\vecx_i$ and $\vect{e}_{\text{[MASK]}}$ is the embedding for the [MASK] token.
+We never mask special tokens [CLS] or [SEP], and we set $\hat{\vecalpha}_i=1$ for the query in \multirc and \fever as well because the query is always part of human rationales in these two datasets.
+
+
+
+\subsection{Learning from Human Rationales}
+
+
+Inspired by the analysis in \secref{sec:analysis}, we propose four strategies for improving the efficacy of \learningfromexplanation: 1) tuning class weights for rationale supervision; 2) enforcing sentence-level rationalization; 3) using non-occluding ``importance embeddings''; 
+and 4) selectively supervising only rationales with high sufficiency-accuracy. 
+The first three are designed to loosen the supervision's dependence on flat tokenwise accuracy, while the last tries to operationalize our observations about helpful versus non-helpful rationales.
+
+\para{Class weights.}
+Rationales may become more effective enablers of model prediction accuracy at different balances of precision and recall. We can adjust this balance simply by using differing weights to positive and negative classes in rationale supervision:
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+$$\mathcal{L}_w=\mathcal{L}_p(y,\hat{y}) + \frac{1}{L}\sum_{i=1}^L (1 + \lambda_{su}^1\alpha_i) \mathcal{L}_p(\alpha_i, \hat{\alpha}_i),$$
+\endgroup
+where $\lambda_{su}^1$ controls the relative weight of rationale vs. non-rationale tokens.
+In particular, as we will discuss in \secref{sec:analysis}, we find that 
+increased recall is associated with increased model accuracy. Thus, we explore several values for $\lambda_{su}^1$ in our experiment to encourage higher recall.
+
+
+\para{Sentence-level rationalization.}
+Another divergence from strict token-wise accuracy is to rationalize at the sentence rather than the token level. 
+Given a function $sent$ mapping a token $x_i$ to its corresponding sentence $s$ consisting of tokens $\{...,x_i,...\}$, 
+we average token-level logits $\vect{z}_i$ across each sentence to produce a binary mask at the sentence level and then propagate that mask value to all sentence tokens:
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+$$\hat{\vect{\alpha}}_i = \hat{\vect{\alpha}}^{s}_{sent(i)},$$
+\endgroup
+where $\vect{z}^s = \frac{1}{|\{i | sent(i) = s\}|}\sum_{\{i | sent(i) = s\}}{\vect{z}_i}$ is used to generate $\hat{\vect{\alpha}}^{s}_{sent(i)}$.
+
+
+\para{Importance embeddings.}
+Another way to mitigate the impact of false negatives in predicted rationales is for these negatives to still remain visible to the predictor. This variant uses additive embeddings for rationalization rather than occluding masks,
+using a two-element embedding layer $\vect{e}$ constituting one embedding for rationale tokens and one for nonrationale tokens, added to the input vectors according to the predicted rationale. This way, input tokens are tagged as important or unimportant, but the predictor $f$ has the freedom to learn how to engage with these tags for maximum label accuracy, rather than being fully blinded to ``unimportant'' tokens. 
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+$${\scriptstyle m_e(\vecx_i,\hat{\vecalpha}_i) = \vect{e}_i + (1-\hat{\vecalpha}_i) \cdot \vect{e}_{\operatorname{non-rationale}} + \hat{\vecalpha}_i\cdot \vect{e}_{\operatorname{rationale}}}.$$
+\endgroup
+An important drawback of this approach is that the predictor now has access to the full input instead of only the \rationalizedinput, so these rationales provide a weak guarantee that important tokens are actually used to make predictions. This method also represents a large distribution shift from full text, so we find it necessary to calibrate the predictor using human rationales, as described in \figref{fig:combined_adapted_sufficiency_accuracy}. 
+
+\para{Selective supervision.}
+Our fourth modification attempts to improve rationale prediction performance on high-sufficiency-accuracy rationales by selectively supervising only on human rationales with this property, ignoring those where human rationales do not allow a correct prediction. 
+
+Specifically, for every training batch, we use the true human rationales $\vecalpha$ as an input mask for the BERT predictor to get the HSA for each document.
+HSA then serves as a weight on the human rationale supervision during the main training batch: 
+\begingroup\abovedisplayskip=4pt \belowdisplayskip=4pt
+$${\scriptstyle \mathcal{L}_{ss}=\mathcal{L}_p(y,\hat{y}) + I(y = f(m(\vecx, \vecalpha)))\frac{\lambda_{su}}{L}\sum_{i=1}^L \mathcal{L}_p(\vecalpha_i, \hat{\vecalpha}_i)}.$$
+\endgroup
+
+By weighting supervision this way, we hope to ignore 
+low-quality
+human rationales during training and focus instead on those that enable good accuracy. 

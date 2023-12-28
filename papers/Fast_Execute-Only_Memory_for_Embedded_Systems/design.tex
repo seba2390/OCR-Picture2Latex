@@ -1,0 +1,198 @@
+%==============================================================================
+\section{Design}
+\label{sec:design}
+%==============================================================================
+
+\begin{figure}[tb]
+  \centering
+  \resizebox{0.8\columnwidth}{!}{%
+    \includegraphics{figs/arch}
+  }
+  \caption{{\System} Workflow.  {\System} components are shown in blue.}
+  \label{fig:arch}
+\end{figure}
+
+Figure~\ref{fig:arch} shows {\System}'s overall design.
+{\System} consists of three components that together implement a strong and
+efficient XOM on ARM embedded devices.  First, {\System} uses a
+specially-configured DWT configuration to detect read accesses to
+program code.  Second, it utilizes a special MPU configuration that
+prevents write access to the code region and prevents writeable memory
+from being executable.  Third, it employs a small change to the LLVM
+compiler~\cite{LLVM:CGO04} to eliminate constant data embedded within
+the code region.
+
+To use {\System}, embedded application developers merely compile
+their code with the {\System} compiler and install it on their embedded
+ARM device.  On boot, the {\System} run-time configures MPU regions and
+DWT comparators using {\System}'s MPU and DWT configurations and
+then passes control to the compiled embedded software.
+
+%------------------------------------------------------------------------------
+\subsection{W{\XOR}X with MPU}
+\label{sec:design:mpu}
+%------------------------------------------------------------------------------
+
+{\System} requires that memory either be writeable or executable but
+not both i.e., the W{\XOR}X policy~\cite{NoExec:PaX00}; otherwise,
+an attacker could simply inject code or overwrite code to achieve
+arbitrary code execution.
+To enforce W{\XOR}X, {\System}
+configures the MPU regions at device boot time so that the
+code region is readable and executable, read-only data is read-only,
+and RAM regions are readable and writable.  Note that the MPU
+\emph{cannot} configure memory to be executable but unreadable;
+the MPU can configure a memory region as executable only if it is also
+configured as readable~\cite{ARMv7-M:Manual,ARMv8-M:Manual}.
+
+{\System} runs application code in privileged mode and configures
+a background MPU region to
+allow read and write access to the remainder of the address space such
+as peripherals.  This, however, leaves critical memory-mapped system
+registers in the PPB (such as MPU configuration registers and
+{\tt VTOR}) open to modifications, which can be
+leveraged by an attacker to turn off MPU protections or, even worse,
+implant a custom exception handler.  Section~\ref{sec:design:dwt}
+discusses how {\System} prevents such cases.
+
+%------------------------------------------------------------------------------
+\subsection{R{\XOR}X with DWT}
+\label{sec:design:dwt}
+%------------------------------------------------------------------------------
+
+{\System} leverages ARM's DWT comparators to watch over the whole
+code region for read accesses.  As Section~\ref{sec:bg:dwt} states,
+each (pair) of DWT comparators available on an ARM microcontroller
+can be configured to generate a debug monitor exception when a
+memory access of a specified type to an address within a specified
+range occurs.  {\System} therefore uses one (pair) of the available DWT
+comparators as follows:
+
+\begin{enumerate}
+\item
+  At device boot time, {\System} configures a DWT comparator register
+  (say {\tt DWT\_COMP<n>}) to hold the lower bound of the code region.
+\item
+  {\System} then sets the address-matching range by either writing the
+  upper bound of the code region to the next DWT comparator register
+  {\tt DWT\_COMP<n+1>} (for ARMv8-M) or writing the correct mask to the
+  corresponding DWT mask register {\tt DWT\_MASK<n>} (for ARMv7-M).
+\item
+  {\System} enables the DWT comparator (pair) by configuring the DWT function
+  register {\tt DWT\_FUNC<n>} for data address reads.  For ARMv8-M
+  devices, {\tt DWT\_FUNC<n+1>} is also configured in order to form address
+  range matching.
+\item
+  Finally, {\System} enables the debug monitor exception by setting the
+  {\tt MON\_EN} bit (bit 16) of the Debug Exception and Monitor Control
+  Register {\tt DEMCR}.
+\end{enumerate}
+
+With a DWT comparator (pair) set up for monitoring read accesses to the code
+region, R{\XOR}X is effectively enforced.  However, as
+Section~\ref{sec:design:mpu}
+stated, the DWT registers and {\tt DEMCR} are also memory-mapped system
+registers which could be modified by vulnerable application code.  An
+attacker could leverage a buffer overflow vulnerability to
+reconfigure the debug registers to neutralize {\System}.
+
+We can address the issue in two ways.  One approach is to break
+the assumption that {\System} runs everything in privileged mode.  As
+code running in unprivileged mode has no access to the PPB region
+regardless of the MPU configuration, the system registers that
+{\System} must protect (e.g., MPU configuration registers, DWT
+registers, {\tt DEMCR}, and {\tt VTOR}) are
+all in the PPB region and therefore inherently safe from unprivileged
+tampering.  However, this approach requires {\System} to implement
+system calls that support privileged operations which application code
+could previously perform, incurring expensive context switching
+between privilege modes.  The other approach is to use extra (pairs of) DWT
+comparators to prevent writes to critical system registers.  For
+example, on ARMv7-M, we can configure one DWT comparator to
+write-protect the
+System Control Block SCB ({\tt 0xE000ED00} -- {\tt 0xE000ED8F}) and
+{\tt DEMCR} ({\tt 0xE000EDFC}) by setting the lower bound and the size to
+{\tt 0xE000ED00} and 256 bytes, respectively.  Since MPU
+configuration registers are in the SCB, they are protected as well.  DWT
+registers on ARMv7-M reside in a separate range ({\tt 0xE0001000} --
+{\tt 0xE0001FFF}), so we can use another DWT comparator to
+write-protect that range.
+
+%------------------------------------------------------------------------------
+\subsection{Constant Island Removal}
+\label{sec:design:xo}
+%------------------------------------------------------------------------------
+
+\begin{figure}[tb]
+  \begin{minipage}{0.44\columnwidth}
+    \lstinputlisting[language={[Arm]Assembler},framexleftmargin=-2.4em]{code/ldr-pc.s}
+  \end{minipage}
+  \begin{minipage}{0.08\columnwidth}
+    \hfill
+    \resizebox{0.8\columnwidth}{!}{%
+      \includegraphics{figs/arrow}
+    }
+  \end{minipage}
+  \begin{minipage}{0.44\columnwidth}
+    \lstinputlisting[language={[Arm]Assembler}]{code/no-ldr-pc.s}
+  \end{minipage}
+  \caption{Constant Island Removal of a Load Constant}
+  \label{fig:ldr-pc}
+\end{figure}
+
+\begin{figure}[tb]
+  \begin{minipage}{0.36\columnwidth}
+    \lstinputlisting[language={[Arm]Assembler},framexleftmargin=-2.4em]{code/tbb.s}
+  \end{minipage}
+  \begin{minipage}{0.08\columnwidth}
+    \hfill
+    \resizebox{0.8\columnwidth}{!}{%
+      \includegraphics{figs/arrow}
+    }
+  \end{minipage}
+  \begin{minipage}{0.52\columnwidth}
+    \lstinputlisting[language={[Arm]Assembler},framexleftmargin=-2.4em]{code/no-tbb.s}
+  \end{minipage}
+  \caption{Constant Island Removal of a Jump-Table Jump}
+  \label{fig:tbb}
+\end{figure}
+
+By default, ARM compilers generate code that has constant data
+embedded in the code region (so-called ``constant islands'').
+Since {\System} prevents the code from reading these constant islands,
+these programs will fail to execute when used with {\System}.
+{\System} therefore transforms these programs so that all data within
+the program is stored outside of the code region.
+
+We have identified two cases of constant islands generated by
+LLVM's ARM code generator: \emph{load constants} and \emph{jump-table jumps}.
+Figures~\ref{fig:ldr-pc} and~\ref{fig:tbb} show examples of the two
+cases, respectively, as well as their corresponding execute-only
+versions to which {\System} transforms them.  Specifically, in the left part of
+Figure~\ref{fig:ldr-pc}, a load constant instruction loads a constant
+from a PC-relative memory location {\tt L} into register {\tt r0}.
+Such instructions are
+usually generated to quickly load an irregular constant in light of the
+limited immediate encoding scheme of the Thumb instruction
+set~\cite{ARMv7-M:Manual,ARMv8-M:Manual}.
+{\System}
+transforms such load constants into {\tt MOVW} and
+{\tt MOVT} instructions that encode the 32-bit constant in two 16-bit
+immediates, as the right part of
+Figure~\ref{fig:ldr-pc} shows.  Jump-table jump instructions ({\tt TBB} and
+{\tt TBH})~\cite{ARMv7-M:Manual,ARMv8-M:Manual} are used to implement
+large switch statements; the second
+register operand ({\tt r2} in Figure~\ref{fig:tbb}) serves as an index
+into a jump table pointed to by the first register operand ({\tt pc} in
+Figure~\ref{fig:tbb}), and a byte/half-word offset is loaded from the
+jump table to add to the program counter ({\tt pc}) to calculate the
+target of the jump.
+Optimizing compilers like GCC and LLVM usually select {\tt pc} as the
+first register operand in order to reduce register pressure, forcing
+the jump table
+to be located next to the jump-table jump itself.  {\System}
+transforms such jump-table jumps into instruction sequences like that shown
+in the right part of Figure~\ref{fig:tbb}; it encodes the original
+jump table's contents into a sequence of branch instructions and expands
+the jump-table jump into a few explicit instructions that calculate
+which branch instruction to jump to and perform an indirect jump.

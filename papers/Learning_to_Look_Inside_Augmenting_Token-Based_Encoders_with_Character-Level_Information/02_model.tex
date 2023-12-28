@@ -1,0 +1,68 @@
+\section{\tokdetok}
+\label{sec:model}
+
+We focus on character-informed representations for \llm{}s which use the transformer architecture~\cite{vaswani2017attention}, such as BERT~\cite{devlin-etal-2019-bert}, RoBERTa~\cite{liu2019roberta}, 
+and GPT~\cite{radford2018improving}.
+A Transformer \llm{} is composed around a core module \mmod{} parameterized as multi-head self-attention layers, which accepts a sequence $\{\ve_1, \dots, \ve_l\}$ of embedding vectors corresponding to a list of token indices $\{t_1, \dots, t_l\}$ from a vocabulary $\mathcal{V}$,
+and outputs a sequence of contextualized vectors $\{\vh_1, \dots, \vh_l\}$, of which a subset $\{\vh_i\}_{i\in\mathcal{I}}$ correspond to masked tokens in positions $\mathcal{I}\subseteq [l]$ selected by a boolean masking operator $m$.\footnote{In the case of an autoregressive \llm{} like GPT, $\mathcal{I} = [l]$ but each vector $\vh_i$ is only dependent on the tokens preceding its position, $\{t_1, \dots, t_{i-1}\}$, and token-wise prediction is performed for each position assuming no knowledge of future tokens.}
+The token index list supplied to \mmod{} is the output of a tokenization function $\tau$ operating on a sequence $X$ followed by lookup in an embedding table $\vE$,
+while its output vectors $\{\vh_1, \dots, \vh_l\}$ serve as input to a prediction module \gen{}, which outputs a distribution $D_i$ over $\mathcal{V}$ for each masked position $i$.
+All embeddings $\{\ve_i\},\{\vh_i\}$ live in a shared space $\mathds{R}^d$.
+Together, the components described so far operate in the following manner:
+
+\begin{equation}
+    \{D_i(\mathcal{V})\}_{i\in\{\mathcal{I}\}} = 
+    \text{\gen{}}\left( \text{\mmod{}} \left( \vE\left[ \tau(X) \right] \right) \right),
+\end{equation}
+where square bracketing denotes elementwise table lookup.
+
+In the considered \llm{} architectures, the input $X$, which is atomically made up of a sequence of characters $\{c_1, \dots, c_n\}\in\Sigma^{n}$, is broken down by $\tau$ to provide the tokenization of length $l\leq n$,
+and the prediction/generation operator \gen{} accepts the contextualized outputs $\{\vh_1, \dots, \vh_l\}$ and implements prediction by means of a softmax distribution which is based on scores obtained via dot-product against an output embedding table, which is usually the same as $\vE$.
+
+The \tokdetok{} model makes no adjustments to \mmod{} itself, and only offers conditional replacements for $\tau$ and \gen{}.
+An \textbf{encoding policy} $\pi^t$ selects a subset of tokens from the original sequence $\mathcal{J}^t\subseteq [l]$ to be represented by \tok{} instead of $\vE \circ \tau$.
+\tok{} has access to the part of the character sequence $X$ which underly the tokens selected by $\pi^t$, and produces input embeddings directly from the character level.
+These alternate embeddings must agree in dimension with those of each $\ve$, but a single embedding may be used to replace multiple base tokens (usually when all tokens corresponding to a single out-of-$\vE$ word are replaced), resulting in a shorter input sequence for \mmod{}.
+A separate \textbf{generation policy} $\pi^g$ selects a subset of the original sequence $\mathcal{J}^g\subseteq [l]$ to be generated from the output vectors $\vh$ by \detok{} instead of \gen{}.
+A high-level schematic depicting this framework is presented in \autoref{fig:algo}.
+
+\input{tab_policies}
+
+The specific policies in a given application may be defined based on the model's use case.
+For example, in text classification no generation is required, and so $\pi^g$ will return $\emptyset$ for all sequences; $\pi^t$ can be tuned for a task based on known features of the base model (BERT/GPT etc.) and of the domain text, some examples including:
+tokens corresponding to all words that are not in a pre-determined vocabulary;
+all words in the sequence;
+all words assigned more than one token by the base tokenizer $\tau$;
+a random sample of words in the sequence;
+or all words including characters that are not lowercase English characters.
+One particular policy we hypothesize could be useful is one that affords the tokenizer slack in detecting a single simple derivational or inflectional suffix: all words which are single-token or whose second-and-final token is in the list \textsc{Suffixes} are left for $\vE \circ \tau$; the rest are represented using \tok.\footnote{\textsc{Suffixes}, compiled by manually examining a list of most common second-and-final tokens in a large corpus under GPT-2's tokenization, = $\{$\emph{s}, \emph{ed}, \emph{es}, \emph{ing}, \emph{ly}, \emph{al}, \emph{ally}, \emph{'m}, \emph{'re}, \emph{'ve}, \emph{y}, \emph{ive}, \emph{er}, \emph{'t}, \emph{'ll}, \emph{an}, \emph{ers}$\}$.
+Similar policies can be hand-crafted for different languages, based on learner-level knowledge of the language and minimal preliminary analysis of sample tokenizations. Our results show they are not strictly necessary.}
+Different policies may be applied in training settings as well, for example in order to \say{familiarize} the heavily-parametrized \mmod{} with the inputs from \tok{}.
+Three example policies are illustrated in~\autoref{tab:policies}.
+
+
+
+\subsection{Second Pre-training}
+\label{ssec:pretr}
+
+A typical \llm{} is initiated through a computationally-intensive pre-training step, iterating over a large corpus in batches of sequences and backpropagating a cross-entropy loss calculated over the prediction layer's output into all of its components, through \gen{} to \mmod{} to $\vE$.
+In order to train \tokdetok{}, we introduce a second pre-training step we term \ppt{}, where the \llm{} continues to update its parameters for a (possibly different) corpus, but is supplemented with the \tokdetok{} elements in order to \say{acclimatize} the \mmod{} components to outputs from \tok{}.\footnote{Within the taxonomy of phases between pre-training and task training~\cite{ruder2021lmfinetuning}, this is closest to \textbf{Adaptive Fine-Tuning}. However, due to our added modules we opt to assign it a new name.}
+In addition, \tok{} is also trained through a lower-level objective requiring it to approximate the outputs of $\vE \circ \tau$ which it is replacing, and \detok{} is trained to sequentially produce the correct character sequence from \mmod{}'s outputs.
+Together, a batch of text sequences in a \ppt{} step produces the following loss elements which are backpropagated into the unified model:
+\begin{itemize}
+    \item A \textbf{language modeling loss} from the softmax operation over masked tokens, updating \mmod{}'s and $\vE$'s parameters, as well as \tok{}'s for tokens selected by a usage policy $\pi^t_{(u)}$ to be used in \mmod{}'s input;
+    \item An \textbf{embedding loss} for the \tok{} component, computed against $\vE \circ \tau$'s token embeddings, over a set selected by a policy $\pi^t_{(l)}$ which may or may not equal $\pi^t_{(u)}$.
+    This loss can be computed, e.g., as the euclidean distance between the output and the target.
+    When the target corresponds to multiple token counts, an aggregation pooling function $\agg:\mathds{R}^{d \times \mathds{N}^{+}}\rightarrow\mathds{R}^d$ needs to be defined over the embeddings, for example taking their dimension-wise mean, taking the leftmost token's embedding, or taking the dimension-wise $\max$;
+    \item A \textbf{generation loss} for words generated by \detok{} from \mmod{}'s output vectors, according to a $\pi^g$ policy.
+    This loss is the character-level cross-entropy for autoregressive sequence generation.
+    Note that in order to only generate full words, $\pi^g$ must align with $\pi^t_{(u)}$ so that no multi-token words left as input to \mmod{} are also selected for generation.
+\end{itemize}
+
+As a form of regularization within the \tokdetok{} components, we introduce additional training batches we call \textbf{cycle dependency loops}.
+In such a batch, \tok{} and \detok{} act in succession, starting from one of the spaces they operate in, with the goal of arriving at the same point after cycling through both components.
+An \textbf{\tdloop} loop thus starts at a character sequence $\vc\in{\Sigma^*}$, runs it through \tok{} to obtain a vector $\ve=\tok(\vc)$, and runs \detok{} in an attempt to return to the original sequence $\hat{\vc}=\detok(\tok(\vc))\approx \vc$.
+Analogously, a \textbf{\dtloop} loop starts at a vector $\tilde{\ve}\in\mathds{R}^{d}$ and targets $\hat{\ve}=\tok(\detok(\tilde{\ve}))\approx \tilde{\ve}$.
+In this loop, loss is only backpropagated as far as \tok{}, since backpropagating through a generative model's decision component introduces discrete steps which must be smoothed or approximated (see discussion in \newcite{peng-etal-2018-backpropagating}).
+
+

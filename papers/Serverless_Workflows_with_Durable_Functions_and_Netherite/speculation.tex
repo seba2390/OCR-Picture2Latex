@@ -1,0 +1,38 @@
+\section{Optimizations}\label{sec:optimizations}
+
+The baseline \sys implementation is conservative: the messages produced by a work item execution are first persisted to storage before being propagated. As explained in \S\ref{sec:defspeculation}, speculation can improve performance by moving this storage access off the critical path. This does not compromise the CCC guarantee, because we take care to properly propagate aborts along causal dependencies. We now describe two levels of speculation that are supported as optional optimizations in \sys.
+\hide{
+\kk{I wouldn't call them optional optimizations. But rather *the* optimized \sys implementation. There are two reasons for this: (1) the optimizations only give benefits in our evaluation, (2)I have had experience in the past where calling an optimization optional made reviewers ask for support by the system to choose which optimizations to enable and which not too.}
+}
+
+\paragraph{Local Speculation.} 
+
+With local speculation, we allow messages to be processed immediately (before the work item is persisted) as long as the message stays within the same partition. 
+%This moves the write to the log off the critical path, allowing it to happen concurrently while also enabling batching, since pending log writes could be grouped together and completed with one storage access. 
+Messages headed for different partitions are held up in the outbox $O$ until after their work item is persisted.
+\hide{
+\kk{I feel that we are not adequately motivating the benefits of speculation and the issue with the conservative solution. The explanation of the speculation therefore feels a little too dry and not that exciting, simply explaining how it works. I am not exactly sure how to address it though.}
+}
+
+Thus, we never need to propagate aborts to other partitions. Locally, within a single partition, aborts "automatically" respect causality because we use a single, causally consistent commit log to persist the partition state. After a crash, the partition state reverts to the persisted prefix of the commit log, which implicitly aborts all non-persisted work items.
+
+% Local speculation is simple to implement and provides significant benefits for workflows that stay within a partition. 
+% \kk{I removed: is simple to implement, since it doesn't help the narrative.}
+Local speculation provides significant benefits for independent workflows that do not communicate with other stateful instances, therefore staying within a single partition during their execution. 
+That includes the common case of orchestration workflows that only use a single instance and compose multiple tasks, such as the examples in Fig.~\ref{fig:simplesequence} and Fig.~\ref{fig:orchestration}. 
+
+%For workflows involving multiple instances, such as Fig.~\ref{fig:transfer}, however, the latency leaves something to be desired, as it is lower-bounded by the latency of a log access times the messages that go across partition boundaries. We can further improve performance by allowing speculative messages to be sent to other partitions.
+
+\paragraph{Global Speculation.} 
+
+With global speculation enabled, messages destined to remote partitions are also sent immediately. 
+%This allows other partitions to process these messages and complete their transitions without waiting for persistence of the work item that produced the message. 
+Global speculation essentially moves all commit log updates out of critical path. It is particularly beneficial for workflows involving many hops between partitions. However, it requires a more involved protocol to ensure aborts are propagated correctly.
+
+The sending partition keeps a record of the completed work items and the messages they have sent. When a work item is persisted, for each message sent before, it sends a confirmation message. The receiving partition knows that a message it receives is speculative until it receives that confirmation message; and the partition avoids persisting any work items that depend on such a speculative message until a confirmation is received.
+
+But how are crashes handled? Note that when a partition crashes and recovers, it may no longer remember the work items it completed before the crash, so it cannot simply send abort messages for individual work items. Our current solution thus relies on using the commit log positions of partitions. Each speculative message is tagged with the commit log position of the work item that produces it. When a partition crashes and recovers, it broadcasts a recovery message to all partitions, which contains the recovered commit log position. When a partition receives a recovery message, it then "rewinds" its own commit log, by recovering from the closest preceding checkpoint, to a position that does not causally depend on aborted work items. It then broadcasts recovery messages of its own, to propagate aborts recursively. 
+% \hide{
+% \seb{Not sure if this is accurate to how it actually works right now.}
+% \kk{It is not accurate to how it works now, but it is accurate to what we discussed as a solution. :)}
+% }

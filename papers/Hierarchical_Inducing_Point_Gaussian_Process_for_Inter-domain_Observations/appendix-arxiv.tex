@@ -1,0 +1,340 @@
+\onecolumn
+\aistatstitle{Supplementary Materials:
+Hierarchical Inducing Point Gaussian Processes for Inter-domain Observations}
+
+\section{The HIP-GP Algorithm}
+
+We describe two algorithms that are core to the  acceleration techniques we develop in Section 3.2. 
+Algorithm~\ref{alg:toeplitz-mvm} computes a fast MVM
+with a hierarchical Toeplitz matrix using the circulant embedding
+described in Algorithm~\ref{alg:circulant-embedding}. 
+Note that we can similarly compute the MVM $\bR^\top \bv$ simply by adapting Algorithm~\ref{alg:toeplitz-mvm} to perform FFT on $\bC^{1/2}$ instead of on $\bC$. Together these algorithms are sufficient for use within PCG to efficiently compute $\bk_n$.
+
+\begin{algorithm}[!h]
+  \KwData{
+    $T$ ($N_1 \times ... \times N_D$ representation of hierarchical Toeplitz matrix);
+  }
+  \KwResult{$C$ (circulant embedding of $T$)}
+  $C \leftarrow T$ \tcp*{copy}
+  \For{$d\gets1$ \KwTo $D$}{
+    $C_r \leftarrow \texttt{reverse-dim}(C, \text{dim}=d)$ \\ %\tcp*{reverse dim $d$}
+    $C_r \leftarrow \texttt{chop-single-dim}(C_r, \text{dim}=d)$ \\ %\tcp*{remove first element}
+    $C_r \leftarrow \texttt{binary-zero-pad}(C_r)$ \tcp*{front pad}
+    $C \leftarrow \texttt{concat}(C, C_r, \text{dim}=d)$ \\
+  }
+  return $C$
+\caption{Hierarchical circulant embedding.}
+\label{alg:circulant-embedding}
+\end{algorithm}
+
+\begin{algorithm}[!h]
+  \KwData{
+    $\bk_0$ (first row of $\bK$ in $C$-order);
+    $\bv$ (vector, also in $C$-order);
+    $N_1, \dots, N_D$ (grid dimensions)
+  }
+  \KwResult{$\bK \bv$ (matrix-vector product)}
+  $T \leftarrow \texttt{reshape}(\bk_0, N_{1:D})$ \tcp*{to $N_1 \times \dots \times N_D$}
+  $V \leftarrow \texttt{reshape}(\bv, N_{1:D})$ \tcp*{to $N_1 \times \dots \times N_D$}
+  $C \leftarrow \texttt{Circ-Embed}(T, N_{1:D})$ \tcp*{} % \\ %\tcp*{hierarchical circulant embedding}
+  $V \leftarrow \texttt{Zero-Embed}(V, N_{1:D})$ \tcp*{match $C$}
+  $res \leftarrow \texttt{ifft}( \texttt{fft}(C) \cdot \texttt{fft}(V) )$ \tcp*{$D$-dim \texttt{fft}}
+  return \texttt{flatten}(res) \tcp*{flatten in \texttt{C}-order}
+\caption{Matrix-vector multiplication $\bK \bv$ for a symmetric
+  hierarchical Toeplitz matrix $\bK$ and vector $\bv$.
+  %  Here, the \texttt{fft} calls are mult-dimensional fast fourier transforms. 
+}
+\label{alg:toeplitz-mvm}
+\end{algorithm}
+
+
+
+
+\section{Optimization Details}
+In this section, we derive the gradients for structured variational parameters and kernel hyperparameters.
+\subsection{Variational parameters}
+The structured variational posterior is characterized by $N(\bm, \bS)=\prod_{i=1}^B \mathcal{N}(\bm_i, \bS_i)$,
+where we decompose the $M\times M$ matrix $\bS$  into $B$ block-independent covariance matrices of block size $M_b$:
+\begin{align}
+  \bS = \begin{pmatrix}
+& \bS_1 \\
+& & \bS_2 \\
+&&&\cdots \\
+&&&& \bS_B
+\end{pmatrix},
+\end{align}
+and the vector $\bm$ into corresponding $B$ blocks: $\bm_1, \bm_2, \cdots, \bm_B$.
+
+\subsubsection{Direct solves}
+We first consider directly solving the optimal $\bm$ and $\bS$.
+
+Taking the derivatives of the HIP-GP objective w.r.t. $\bm$ and $\bS$, we obtain
+\begin{align}
+  \frac{\partial \mathcal{L}}{\partial \bS_i}
+  &= -\frac{1}{2} \underbrace{\left((\sum_n \frac{1}{\sigma_n^2} \bk_{n,i} \bk_{n,i}^\top) + \bI_{M_b} \right)}_{\triangleq \bLambda_i} + \frac{1}{2} \bS_i^{-1}
+  \,, \qquad \textrm{for } i = 1:B \\
+  %&= -\frac{1}{2} \Lambda_i + \frac{1}{2}S_i^{-1} \\
+\frac{\partial \mathcal{L}}{ \partial \bm} &= \underbrace{ \sum_n \frac{1}{\sigma_n^2} y_n \bk_n}_{\triangleq \bb}
+    - \underbrace{\left(\sum_n \frac{1}{\sigma_n^2}\bk_n \bk_n^\top + \bI_M \right)}_{\triangleq \bLambda} \bm
+%&= b-\Lambda m \\
+\end{align}
+where a vector or a matrix with subscript $i$, denotes its $i$-th block.
+
+The optimum can be solved in closed form by setting the gradients equal to zero, i. e.
+\begin{align}
+  \frac{\partial \mathcal{L}}{\partial \bS_i} = 0 \qquad  \Rightarrow  \qquad &\bS_i = \bLambda_i^{-1}, \qquad \textrm{for } b=1:B \\
+  \frac{\partial \mathcal{L}}{ \partial \bm} = 0 \qquad  \Rightarrow   \qquad &\bm   = \bLambda^{-1} \bb .
+\end{align}
+
+ If $M$ is very large, this direct solve will be infeasible.
+But note that $\bLambda_i, \bb$ and $\bLambda$ are all summations over some data terms,
+hence we can compute an unbiased gradient estimate using a small number of samples which is more efficient. We will use natural gradient descent (NGD) to perform optimization. 
+
+\subsubsection{Natural gradient updates}
+To derive the NGD updates, we need the other two paramterizations of $N(\bm, \bS)$, namely,
+\begin{itemize}
+  \item the \textit{canonical parameterization}: $ \{\btheta_{1, i}\}_{i=1}^B, \{\btheta_{2,i} \}_{i=1}^B$
+  where $\btheta_{1,i}= \bS_i^{-1} \bm_i$ and $\btheta_{2,i} = -\frac{1}{2} \bS_i^{-1}$, $i=1:B$; and
+  \item the \textit{expectation parameterization}: $\{\etab_{1,i} \}_{i=1}^B, \{\etab_{2,i} \}_{i=1}^B$
+  where $\etab_{1,i} = \bm_i$ and $\etab_{2,i} = \bm_i \bm_i^\top + \bS_i$, $i=1:B$.
+\end{itemize}
+
+In Gaussian graphical models, the natural gradient for the \textit{canonical parameterization} corresponds to
+the standard gradient for the \textit{expectation parameterization}. That is,
+\begin{align}
+  \frac{\partial}{\partial \etab} \mathcal{L} &= \tilde{\nabla}_{\btheta} \mathcal{L},
+\end{align}
+where $\tilde{\nabla}_\theta$ denotes the natural gradient w.r.t. $\theta$.
+
+%Then it suffices to compute $\frac{\partial}{\partial \etab} \mathcal{L}$
+%in order to perform natural gradient descent on $\btheta$.
+By the chain rule, we have
+
+\begin{align}
+  \frac{\partial \mathcal{L}}{ \partial \etab_{1,i}}
+&= \frac{\partial \mathcal{L}}{\partial{\bm_i}} \frac{\partial \bm_i}{\partial \etab_{1,i}}
+  + \frac{\partial \mathcal{L}}{\partial \bS_i}\frac{\partial \bS_i}{ \partial \etab_{1,i}} \\
+%&= (\bb-\bLambda \bm)_i + (-\frac{1}{2} \bLambda_i + \frac{1}{2} \bS_i^{-1}) (-2 \bm_i) \\
+&= \bb_i -\bS_i^{-1}\bm_i - [(\bLambda \bm )_i - \bLambda_i \bm_i ], \\
+\frac{\partial \mathcal{L}}{\partial \etab_{2,i}}
+&= \frac{\partial \mathcal{L}}{\partial{\bm_i}} \frac{\partial \bm_i}{\partial \etab_{2,i}}
+   + \frac{\partial \mathcal{L}}{\partial \bS_i}\frac{\partial \bS_i}{ \partial \etab_{2,i}} \\
+%&= \frac{\partial \mathcal{L}}{\partial \bS_i}
+&= -\frac{1}{2}\bLambda_i + \frac{1}{2}\bS_i^{-1}.
+\end{align}
+
+Therefore, the natural gradient updates for $\btheta$ are as follows:
+\begin{align}
+  \btheta_{1,i} &\leftarrow \btheta_{1,i} + l \frac{\partial \mathcal{L}}{ \partial \etab_{1,i}}
+   = \btheta_{1,i} + l \left( \bb_i -\bS_i^{-1}\bm_i - [(\bLambda \bm )_i - \bLambda_i \bm_i ] \right)   \\
+  \btheta_{2,i} & \leftarrow \btheta_{2,i} + l \frac{\partial \mathcal{L}}{\partial \etab_{2,i}}
+  = \btheta_{2,i} + l \left(  -\frac{1}{2}\bLambda_i + \frac{1}{2}\bS_i^{-1} \right),
+\end{align}
+where $l$ is a positive step size.
+%\vfill
+
+\subsection{Kernel hyperparameters}
+We now consider learning the kernel hyperparameters $\btheta$ with gradient descent.
+
+For the convenience of notation, we denote the gram matrix $\bK_{\bu, \bu}$ as $\bK$.
+HIP-GP computes $\bK^{-1} \bv$ by PCG. 
+%which involes a series of MVMs of the form $\bK \bp$.
+Directly auto-differentiating through PCG may be numerically instable.
+Therefore, we derive the analytical gradient for this part.
+Denote $\bc$ as the first row of $\bK$ --- $\bc$ fully characterizes the symmetric Toeplitz matrix $\bK$.
+It suffices to manually compute the derivative w.r.t. $\bc$, i.e.
+ $\frac{\partial \br^\top \bK^{-1} \bv }{ \partial \bc}$,
+since by the following term $\frac{\partial \bc}{\partial \btheta}$ can be taken care of with auto-differentiation.
+
+
+We note the following equality
+\begin{align}
+ \frac{\partial \br^\top \bK^{-1} \bv }{ \partial \bc}
+  &= -  (\bK^{-1} \br)^\top \frac{\partial \bK}{ \partial \bc} \bK^{-1} \bv.
+\end{align}
+
+The computation of $\bb = \bK^{-1}v$ is done in the forward pass and therefore can be cached for the backward pass.
+Additional computations in the backward pass are (1) $\ba = \bK^{-1} \br$ and
+ (2) $\frac{ \partial \ba^\top  \bK \bb}{ \partial \bc }$. (1) can be computed efficiently
+ using the techniques developed in HIP-GP.
+Now we present the procedure to compute (2):
+\begin{align}
+  \frac{\partial \ba^\top \bK \bb}{\partial \bc}  &= \sum_{ij} a_i b_j \frac{\partial K_{ij}}{\partial \bc} \\
+  &= \sum_{ij} a_i b_j  \be_{|i-j|+1} \\
+&= \textrm{toeplitz-mm} (b_1 \be_1, \bb, \ba) + \textrm{toeplitz-mm} (a_1\be_1, \ba, \bb) - (\ba^\top \bb) \be_1,
+\end{align}
+where $\be_{i}$ denotes the vector with a 1 in the $i$-th coordinate and 0's elsewhere,
+and $\textrm{toeplitz-mm}(\bx,\by,\bz)$ denotes the Toeplitz MVM $\bT \bz$, with the
+Toeplitz matrix $\bT$ characterized by its first column vector $\bx$ and first row vector $\by$
+--- this Toeplitz MVM can be also efficiently computed via its circulant embedding.
+
+
+\section{Additional Experiment Results}
+
+\subsection{Empirical analysis on preconditioner}
+
+\begin{figure}[t!]
+\centering
+\begin{subfigure}{0.8\columnwidth}
+  \includegraphics[width=\textwidth]{figures/appendix/kernel-comparison-sig2=1-ell5e-2-M10.png}
+  \caption{Inducing point kernel matrix $\bK_{\bu, \bu}$ with $M=10$}
+	\label{fig:ell5e-2-M10}
+  \vspace{0.25cm}
+\end{subfigure}
+\begin{subfigure}{0.8\columnwidth}
+  \includegraphics[width=\textwidth]{figures/appendix/kernel-comparison-sig2=1-ell5e-2-M500.png}
+  \caption{Inducing point kernel matrix $\bK_{\bu, \bu}$ with $M=500$}
+	\label{fig:ell5e-2-M500}
+  \vspace{0.25cm}
+\end{subfigure}
+\begin{subfigure}{0.8\columnwidth}
+  \includegraphics[width=\textwidth]{figures/appendix/num-iters-vs-M-sig2=1ell=5e-2.png}
+  \caption{$r_{pcg}$ v.s. $M$ for different kernels. }
+	\label{fig:ell5e-2-convergence}
+  \vspace{0.25cm}
+\end{subfigure}
+\caption{Empirical analysis for preconditioner. The kernel lengthscale is 0.05. }
+\label{fig:preconditioner-ell=5e-2}
+\end{figure}
+
+In this section, we present an empirical analysis on the preconditioner developed in Section~\ref{sec:toeplitz-preconditioner}.
+Specifically, we investigate our intuition
+on the ``banded property" that makes the preconditioner effective:
+when the number of inducing points $M$ is large enough,
+the inducing point Gram matrix $\bK_{\bu, \bu}$ is increasingly sparse,
+and therefore the upper left block of $\bC^{-1}$ will be close to $\bK_{\bu, \bu}^{-1}$.
+
+We note that the sparsity of the kernel matrix $\bK_{\bu, \bu}$ depends on three factors
+(1) $M$, the number of inducing points, (2) $l$, the lengthscale of the kernel,
+and (3) the property of the kernel function itself such as smoothness. 
+To verify our intuition, we conduct the PCG convergence experiment
+by varying the combinations of these three factors.
+We evenly place $M$ inducing points in the $[0,2]$ interval that form the Gram matrix $\bK_{\bu, \bu}$,
+and randomly generate 25 vectors $\bv$ of length $M$. We vary $M$ ranges from 10 to 500, and experiment with 4 types of kernel function: squared exponential kernel,
+Matérn (2.5), Matérn (1.5) and Matérn (0.5) kernels.
+For all kernels, we fix the signal variance $\sigma^2$ to  1
+and the lengthscale $l$ to 0.05 and 0.5 in two separate settings.
+We run CG and PCG to solve $\bK_{\bu, \bu}^{-1} \bv$
+up to convergence with tolerance rate at 1e-10.
+We compare the fraction of \# PCG iterations required for convergence over
+\# CG iterations required for convergence, denoted as $r_{pcg}$.
+The results are displayed in Figure~\ref{fig:preconditioner-ell=5e-2} (for $l=0.05$)
+and Figure~\ref{fig:preconditioner-ell=5e-1} (for $l=0.5$).
+
+
+
+\begin{figure}[t!]
+\centering
+\begin{subfigure}{0.8\columnwidth}
+  \includegraphics[width=\textwidth]{figures/appendix/kernel-comparison-sig2=1-ell5e-1-M10.png}
+  \caption{Inducing point kernel matrix $\bK_{\bu, \bu}$ with $M=10$}
+	\label{fig:ell5e-1-M10}
+  \vspace{0.25cm}
+\end{subfigure}
+\begin{subfigure}{0.8\columnwidth}
+  \includegraphics[width=\textwidth]{figures/appendix/kernel-comparison-sig2=1-ell5e-1-M500.png}
+  \caption{Inducing point kernel matrix $\bK_{\bu, \bu}$ with $M=500$}
+	\label{fig:ell5e-1-M500}
+  \vspace{0.25cm}
+\end{subfigure}
+\begin{subfigure}{0.8\columnwidth}
+  \includegraphics[width=\textwidth]{figures/appendix/num-iters-vs-M-sig2=1ell=5e-1.png}
+  \caption{$r_{pcg}$ v.s. $M$ for different kernels. }
+	\label{fig:ell5e-1-convergence}
+  \vspace{0.25cm}
+\end{subfigure}
+\caption{Empirical analysis for preconditioner. The kernel lengthscale is 0.5. }
+\label{fig:preconditioner-ell=5e-1}
+\end{figure}
+
+Figure~\ref{fig:ell5e-2-M10} - \ref{fig:ell5e-2-M500}
+and Figure~\ref{fig:ell5e-1-M10} - \ref{fig:ell5e-1-M500}
+depict the kernel matrix $\bK_{\bu, \bu}$ for $M=10$ and $M=500$
+with $l=0.05$ and $0.5$, respectively.
+Figure~\ref{fig:ell5e-2-convergence} and \ref{fig:ell5e-1-convergence}
+plot $r_{pcg}$ over $M$ for different kernels and lengthscales.
+From these plots, we make the following observations:
+
+\begin{enumerate}[(1)]
+
+
+   \item $r_{pcg}$ are consistently smaller than 1,
+   which verifies the effectiveness of the preconditioner.
+
+   \item In most cases, PCG converges faster when the system size $M$ is bigger. For example, $r_{pcg}$ decreases as $M$ increases in Figure~\ref{fig:ell5e-2-convergence} where $l=0.05$.  However, we note that 
+     PCG convergence can be slowed down when the system size $M$ exceeds certain threshold in some cases (e.g.first three plots of Figure~\ref{fig:ell5e-1-convergence} where $l=0.5$). 
+    To see why this happens, we compare the plots of kernel matrices with $l=0.5$ 
+    for $M=10$ and $M=500$ in Figure~\ref{fig:ell5e-1-M10} and \ref{fig:ell5e-1-M500}.
+    Since the lengthscale $l=0.5$ is relatively large
+    with respect to the input domain range, the resulting $\bK_{\bu, \bu}$ for $M=10$ is sparse enough to approach a diagonal matrix. 
+    However, when we increase $M$ to 500,
+    1 lengthscale unit covers too many inducing points, 
+    making $\bK_{\bu, \bu}$ less ``banded" and the preconditioner less effective. 
+    This observation is also consistent with our intuition.
+    
+      \item For kernels that are less smooth, the PCG convergence
+   speed-ups over CG are bigger given the same $M$,
+   e.g.  Matérn (0.5) kernel has smaller $r_{pcg}$
+   than squared exponential kernel does under the same configuration.
+   We also observe that $\bK_{\bu, \bu}$ with Matérn (0.5) kernel is more diagonal-like
+   than $\bK_{\bu, \bu}$ with squared exponential kernel from the kernel matrix plots.
+   Together with (2),
+   these results show that when the kernel matrix is more banded, the PCG convergence is accelerated more.
+\end{enumerate}
+
+In conclusion, the PCG convergence speed depends
+on the ``banded" property of the inducing point kernel matrix $\bK_{\bu, \bu}$,
+which further depends on $M$ and the smoothness of the kernel. As $\bK_{\bu, \bu}$ approaches a banded matrix,
+the preconditioner speeds up convergence drastically. 
+%However, when $M$ is too large than the function lengthscale ``suggests",
+%the convergence may be slowed down;
+%but in the meantime, this inducing point representation may be inefficient.
+
+\subsection{Additional experiment results for Section 5.2}
+We include additional experiment results on the other 3 kernels for Section~\ref{sec:experiments-whitened}, in Table~\ref{tab:whitened-time-mat12}- \ref{tab:whitened-time-sqexp}. 
+These results are consistent to our conclusion in the paper.
+\begin{table}[!h]%{\columnwidth}
+  \centering
+  \scalebox{.8}{\input{figures/whitening/Mat12-wallclock.tex}}
+  \caption{Whitening time comparison (second) of HIP-GP v.s. SVGP with Matérn($0.5$) kernel.}
+  \label{tab:whitened-time-mat12}
+\end{table}
+
+\begin{table}[!h]%{\columnwidth}
+  \centering
+  \scalebox{.8}{\input{figures/whitening/Mat32-wallclock.tex}}
+  \caption{Whitening time comparison (second) of HIP-GP v.s. SVGP with Matérn($1.5$) kernel.}
+  \label{tab:whitened-time-mat32}
+\end{table}
+
+\begin{table}[!h]%{\columnwidth}
+  \centering
+  \scalebox{.8}{\input{figures/whitening/SqExp-wallclock.tex}}
+  \caption{Whitening time comparison (second) of HIP-GP v.s. SVGP with squared exponential kernel.}
+  \label{tab:whitened-time-sqexp}
+\end{table}
+
+\vspace{5cm}
+
+
+
+%\subsection{Time comparison results for Section 5.3}
+
+%\begin{table}[!ht]
+%\centering 
+%\scalebox{.8}{\input{HIP-GPs-2021/figures/appendix/uk-time-comparison}}
+%\caption{UK-housing experiment. Top: Predictive RMSE. Bottom: average training time (seconds)
+%  per epoch.}
+%\end{table}
+
+\subsection{UCI benchmark dataset}
+
+We include another experiment on the UCI 3D Road dataset ($N= 278,319, D=3$).  Following the same setup as Wang et al., 2019, we train HIP-GP with $M= 36{,}000$ and a mean-field variational family, and compare to their reported results of Exact GP, SGPR ($M= 512$) and SVGP ($M= 1,024$) (Table~\ref{uci}). With the large $M$, HIP-GP achieves the smallest NLL, and the second-smallest RMSE (only beaten by exact GPs).
+
+\begin{table}[!ht]
+\centering
+\scalebox{.8}{\input{figures/appendix/3droad-result}}
+\caption{UCI 3D Road experiment ($N=278{,}319$). Results are averaged over 3 random splits.}
+\label{uci}
+\end{table}
+

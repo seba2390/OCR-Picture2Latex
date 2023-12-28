@@ -1,0 +1,107 @@
+\section{\sys}
+\label{sec:netherite}
+
+In this section we introduce \sys, an execution engine that efficiently implements the computation model from \S\ref{sec:model}. We first give an overview of the \sys architecture and then explain how partitions are persisted in more detail.
+
+The computation model from \S\ref{sec:model} uses fine-grained instances and tasks. A reliable tracking of messages and states for a large number of such instances creates significant overhead, however. To address this issue, \sys maps instances to partitions based on their identifier and then uses partitions as the unit of distribution and recovery. Using coarse-grained partitions, as opposed to fine-grained instances, also mitigates I/O bottlenecks by aggregating communication and storage accesses. 
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\columnwidth]{images/partitions}
+    \caption{Illustration of the \sys architecture.}
+    \label{fig:partitions}
+\end{figure}
+For an overview of the architecture, see Fig.~\ref{fig:partitions}. Partitions communicate via a persistent queue service; each partition has its own, ordered queue. The state of each partition is continuously saved to persistent storage, using an incremental commit log and occasional checkpoints. Storage leases are used to ensure that a partition is loaded on at most one compute node at a time.
+%
+This architecture addresses the following challenges:
+
+\begin{description}
+
+\item{\textbf{Partition recovery.}}  All messages are stored in a persistent queue; and all partition states are stored in persistent storage. If a partition crashes, we can recover it on a different compute node and resume processing at the correct input queue position (which is stored as part of the partition state).
+
+\item{\textbf{Partition mobility.}}  Similarly, we can move a partition between compute nodes by shutting it down and then recovering it on a different node. 
+
+\item{\textbf{Elasticity}} is a critical requirement in the serverless setting: we must support the addition and removal of compute nodes. This is achieved by using a sufficiently large number of partitions (32 by default), and re-balancing the partitions across compute nodes as needed. 
+
+\item{\textbf{Batch commit.}} As explained in the introduction, the large number of storage writes can easily become a throughput bottleneck of a workflow processing system. We solve this problem by using a commit log, which makes it possible for partitions to persist state changes using a batch-append to the commit log. This reduces the number of I/O operations and can support high throughput, especially if backed by SSD storage.
+
+%\item{\textbf{Message deduplication.}}  When a partition recovers after a crash, it may resend the last messages sent right before the crash (this is deterministic because by default, we do not send messages without first persisting the work item). Since messages between partitions are delivered in order, we can easily detect and remove such duplicates.
+
+\end{description}
+
+%% Obsolete
+% \hide
+% {
+% be added and removed depending on load. , since the user should not have to worry about load fluctuations which should be managed by the execution engine.
+% Elasticity therefore requires that the execution engine can perform load balancing, i.e. that instances are able to migrate to a different node during their execution. Normally, this would require moving the state and pending messages of the instance, while also redirecting new messages, to the new node in a single atomic step. \sys avoids this complexity by using cloud storage and queue services, effectively decoupling computation and storage, allowing for processing of an instance anywhere.
+
+
+% % \subsection{Challenges}
+
+% % \kk{At the moment there is no structure here, just paragraphs with challenges and solutions.}
+
+% \paragraph{Instance Granularity}
+% % 
+% The computation model presented above describes the execution of fine-grained instances, each of which consumes its input messages and steps updating its state. 
+% While this significantly improves the complexity of the model, in a typical application the number of instances can easily reach thousands, or even millions\str,
+% %% \kk{If we have such a statement here, we should have millions of instances in one of the experiments in the evaluation.}
+% which could severely impede persistence and load balancing if implemented naively. First, persisting the state and messages of each individual instance, which is a necessary due to reliability, would lead to a very high number of fine-grained storage accesses which would lead to performance overheads. Second, achieving load balancing requires managing the execution location of each different instance, which is exacerbated by the constant creation of new instances and termination of old ones. To address this issue, \sys maps instances to partitions based on their identifier and then uses partitions as the unit of distribution and recovery. Coarse-grained partitions can mitigate I/O bottlenecks by aggregating communication among them as well as storage accesses. In addition, load balancing now happens at the level of partitions, which are far fewer than instances, improving management costs.\str
+% % The partition number is fixed and known up front, allowing constant mapping of instances to partitions by hashing their identifier. 
+
+% \paragraph{Partition State Persistence}
+% %
+
+% % The only requirement that \sys has to satisfy for this to be correct is that the log is always ahead of the latest snapshot. 
+% A side-benefit of event sourcing is that its deterministic replay capability allows the users to inspect execution states from the past, allowing time-travel debugging.
+
+% % Note that this is separate state from the state of the instances and includes bookkeeping information for the execution and scheduling of the instances.
+% }
+
+\begin{figure}
+    \centering
+    \includegraphics[width=.65\columnwidth, viewport=2 17 196 240]{images/partitionstate-simple}
+    \caption{Illustration of the partition-internal state.\hide{\dajusto{I found this Figure and section to be quite confusing. I'm hoping we can either walk through an example in the text or work to clarify the technical description.}\seb{I have updated this section with an overview of the architecture and a figure, hope that helps.}}}
+    \label{fig:partitionstate}
+\end{figure}
+
+\subsection{Partition State Persistence}\label{sec:espstate}
+
+Efficiently saving the partition state to storage is a critical requirement for \sys. 
+%S
+\hide{In general, there are many options to achieve this. We now describe the design choices.
+%Fundamentally, we face a tradeoff between three metrics: (1) the persistence overhead on standard execution, (2) the cost of partition recovery, and (3) the "freshness" of the state that a partition recovers from. 
+%In order to achieve a balance between these three, 
+}
+To this end, \sys employs \emph{event sourcing}, a dual persistence model using a flexible combination of a commit log and checkpoints. With event sourcing, the partition state is a deterministic function of the sequence of events stored in the commit log. Changes to the partition state can thus be efficiently persisted by appending batches of events to the commit log, and the partition state can be recovered by replaying the events in the log. Additionally, partitions periodically take a checkpoint of their state, to reduce the number of events that have to be replayed on recovery.
+
+\paragraph{State components. }Each partition must keep track of the state of all its instances, must send and receive messages, and must execute tasks and steps. To this end, the state of a partition includes these components (Fig.~\ref{fig:partitionstate}):
+\begin{itemize}
+    \item[I.] A map from instance IDs to instance states.  
+    \item[P.] The queue position of the last processed input, and a deduplication vector.
+    \item[S.] Buffers for incoming messages, by instance ID.
+    \item[O.] A buffer for outgoing messages.
+    \item[T.] A list of pending tasks.
+\end{itemize}
+%
+Introducing buffers decouples the work for sending and receiving of messages, processing steps, and processing tasks, which in turn increases pipeline parallelism and enables batching. As required by the event sourcing paradigm, execution progress is recorded as a sequence of atomic events that update the partition state deterministically. There are 4 event types:
+\hide{\csm{Minor readability point: this list might be improved if the message types were italicized or something.}\seb{ok}}
+\begin{itemize}
+    \item \textsl{MessagesReceived}. Updates P (advances position and deduplication vector) and S (enqueues messages).
+    \item \textsl{MessagesSent}. This updates O (removes messages).
+    \item \textsl{TaskCompleted}. This updates S (enqueues response) and T (removes completed task).
+    \item \textsl{StepCompleted}. This updates I (updates instance state), S (removes consumed messages), O (adds produced messages), and T (adds produced tasks).
+\end{itemize}
+
+\paragraph{Instance State Caching.}
+%
+Keeping the state of all instances of a partition in memory is expensive and not always possible. Also, loading that state into memory on partition recovery is slow. Thus, it is important to have a caching  mechanism that keeps only the most recently used instances in memory, while the rest remains in storage. \sys achieves that by leveraging FASTER~\cite{chandramouli2018faster}, a hybrid key-value store that coexists in memory and storage. FASTER exploits temporal access patterns to keep "hot" keys in memory while evicting the rest in storage. It is implemented on top of a hybrid log, which allows it to perform fewer batched storage accesses.
+%
+\hide{
+
+\seb{I am removing this because I think it is redundant with the description in the speculation section}
+
+\paragraph{Distributed Reliable Execution}
+A fundamental requirement of the engine, due to its serverless nature, is that it is resilient to node failures. More precisely, the engine must guarantee causally consistent commit. This means that the instances should be executed consistently, processing their input messages according to the computation model, even if a node crashes. In the case of a single partition, this is simple to achieve, since the partition persists its transitions and in the case of a crash, it can recover from the latest persisted point and continue executing; re-reading input messages from the point that it was left in the queue, and reissuing pending work items for execution. Reliable execution however becomes more challenging in the presence of multiple distributed partitions.
+
+Consider the case where an instance in partition $P_1$ sends a message to an instance residing in partition $P_2$ and immediately after sending the message, the node that hosts partition $P_1$ crashes. Then partition $P_1$ would be restarted, repeating the message sending to $P_2$ even though partition $P_2$ might have already processed the previously received message producing new messages etc. To avoid this inconsistency, in the baseline \sys implementation each partition contains an outbox component. The outbox retains outbound messages until the \hl{steps} that have produced them are persisted for the partition. After the \hl{step} that produced an outbound message is persisted, this message can be safely sent to the queue. The outbox is part of the partition state, so if the node of a partition crashed after persisting the step but before sending the message from the outbox, the message sending will be repeated after the next recovery.
+}

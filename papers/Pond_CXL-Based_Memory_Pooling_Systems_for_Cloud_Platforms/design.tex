@@ -1,0 +1,371 @@
+\section{\sys Design}
+\label{sec-des}
+
+% We first present \sys's design goals and overview, and then describe the
+% details of its individual components.
+
+Our measurements and observations at \azure (\sec\ref{sec-bg}--\ref{sec:measurements}) lead us to define the following design goals.
+\begin{description}
+\item[G1] Performance comparable to NUMA-local DRAM
+\item[G2] Compatibility with virtualization accelerators
+\item[G3] Compatibility with opaque VMs and unchanged guest OSes\slash applications
+\item[G4] Low host resource overhead
+\end{description}
+  %Additionally, VMs are opaque to the platform~\cite{fuerst2022memory,shahrad2021provisioning,chen2020alita}.
+
+To quantify (G1), we define a \emph{performance degradation margin} (\pdm) for a given workload as the allowable slowdown relative to running the workload entirely on NUMA-local DRAM.
+\sys seeks to achieve a configurable \pdm, \eg, 1\%, for a configurable tail-percentage (\tp) of VMs, \eg, 98\% (\sec\ref{sec-strand}).
+To achieve this high performance, \sys uses a small but fast CXL pool (\sec\ref{sec:design:hw}).
+As \sys's memory savings come from pooling instead of oversubscription, \sys must minimize pool fragmentation and wastage in its system software layer (\sec\ref{sec:design:systemsw}).
+To achieve (G2), \sys preallocates local and pool memory at VM start.
+\sys decides this allocation in its allocation, performance monitoring, and mitigation pipeline (\sec\ref{sec:design:distributedsw}).
+This pipeline uses novel prediction models to achieve the \pdm (\sec\ref{sec:design:ml}).
+Finally, \sys overcomes VM-opaqueness (G3) and host-overheads (G4) using lightweight hardware counter telemetry.
+
+
+
+% cut for length
+%\myparagraph{PG2: Resource efficiency} Providers seek low overheads
+%within the platform software and hardware.
+%For example, CPU cores lost to virtualization
+%overhead cannot be rented out to users~\cite{intelvtd.web20,
+%  leapio.asplos20, sriov}.
+%Another constraint is the number of available memory decoder entries (\sec\ref{sec-bg}).
+
+%\myparagraph{PG3: Small blast radius} Providers seek to offer
+%their VMs high availability while minimizing capacity that cannot be
+%used due to component failure. We thus need to minimize the impact
+%(\emph{blast radius}) of failures for additional components introduced
+%for memory disaggregation.
+
+
+
+
+
+\input{fig-analysis-overheads}
+
+
+\subsection{Hardware Layer}\label{sec:design:hw}
+
+%% The hardware for disaggregated memory pools requires a protocol
+%% that surfaces pool memory as a load/store device to the CPU. This model
+%% facilitates adding pooled memory to existing applications in a way that
+%% does not require software modifications, satisfying the inertia
+%% requirement (FR1) discussed above. The CXL
+%% standard (\sec\ref{sec-bg}) defines an interface that accomplishes this
+%% goal, and is gaining wide adoption.
+
+%\vni\myparagraph{\sys memory pool design}
+% We propose a novel device and
+% system architecture that uses CXL to implement disaggregated memory pooling that meets
+% the design goals outlined above. The disaggregated architecture is built
+
+\newtxt{Hosts within a \sys pool have separate cache coherency domains and run separate hypervisors.
+\sys uses an ownership model where pool memory is explicitly moved among hosts.
+A new external memory controller (EMC) ASIC implements the pool using multiple DDR5 channels accessed through a collection of CXL ports running at PCIe 5 speeds.}
+
+%HDM decoder resources on current-generation hosts limit tracking online\slash offline status to 1GB granularity.
+%Thus, CXL poses fragmentation challenges similar to huge pages~\cite{kwon2016coordinated,panwar2018making}.
+
+\myparagraph{\newtxt{EMC memory management}}
+\newtxt{The EMC offers multiple CXL ports and appears to each host as a single logical memory device~\cite{cxl2spec.web20,cxl2whitepaper.web21}.
+In CXL 3.0~\cite{debendra2022fms,cxl3spec}, this configuration is standardized as multi-headed device (MHD)~\cite[\S2.5]{cxl3spec}.
+The EMC exposes its entire capacity on each port (\eg, to hosts) via a Host-managed Device Memory (HDM) decoder.
+Hosts program each EMC's address range but treat them initially as offline.
+\sys dynamically assigns memory at the granularity of 1GB memory slices.
+Each slice is assigned to at most one host at a given time and hosts are explicitly notified about changes (\S\ref{sec:design:systemsw}).
+Tracking 1024 slices (1TB) and 64 hosts (6 bits) requires 768B of EMC state.
+The EMC implements dynamic slice assignment by checking permission of each memory access, \ie, whether requestor and owner of the cacheline's slice match.
+Disallowed accesses result in fatal memory errors.}
+
+
+\input{fig-poollatency}
+
+
+{\myparagraph{\newtxt{EMC ASIC design}}
+\newtxt{The EMC offers multiple \tms{8}-CXL ports, which communicate with DDR5 memory controllers (MC) via an on-chip network (NOC).
+The MCs must offer the same reliability, availability, and serviceability capabilities~\cite{intelras,amdras} as server-grade memory controllers including memory error correction, management, and isolation.
+A key design parameter of \sys's EMC is the pool size, which defines the number of CPU sockets able to use pool memory.
+We first observe that the EMC's IO, (De)Serializer, and MC requirements resemble AMD Genoa's $397mm^2$ IO-die (IOD)~\cite{amdgenoa,genoa2021leak}.
+Figure~\ref{fig-contactcount-revised} shows that EMC requirements for a 16-socket \sys parallel the IOD's requirements, with a small 8-socket \sys paralleling half an IOD.
+Thus, up to 16-sockets can directly connect to an EMC.
+Pool sizes of 32-64 would combine CXL switches with \sys's multi-headed EMC.
+The optimal design point balances the potential pool savings for larger pool sizes (\S\ref{sec-eval}) with the added cost of larger EMCs and switches.}
+
+
+%We remark that Using switches in the pool architecture adds significant additional cost, power, and latency.
+%The EMC uses a 512b data path to process cachelines as is the IP
+
+\myparagraph{\newtxt{EMC Latency}}
+\newtxt{
+While latency is affected by propagation delays, it is dominated by CXL port latency, and any use of CXL retimers and CXL switches.
+Port latencies are discussed in \sec\ref{sec-bg} and~\cite{debendra2022hoti}.
+Retimers are devices used to maintain CXL/PCIe signal integrity over longer distances and add about 10ns of latency in each direction~\cite{microchipretimer,asteraretimer}.
+In datacenter conditions, signal integrity simulations~\cite{cxlretimers} indicate that CXL could require retimers above 500mm.
+Switches add at least 70ns of latency due to ports/arbitration/NOC with estimates above 100ns~\cite{cxlswitchlatency}.}
+%As we know from emulation experiments (\sec\ref{sec:measurements}), even moderate increases in memory access latency significantly degrade performance for many workloads, and so switched CXL pools are unable to reach acceptable performance levels.
+
+\newtxt{Figure~\ref{fig-analysis-overheads} breaks down \sys's latency for different pool sizes.
+Figure~\ref{fig-poollatency} compares \sys's latency to a design that relies only on switches instead of a multi-headed EMC.
+We find that \sys reduces latencies by 1/3 with 8-and 16-socket pools adding only 70-90ns relative to NUMA-local DRAM.
+In practice, we expect \sys to be deployed primarily with small 8/16-socket pools, given the latency and cost overheads, and diminishing returns of larger pools (\sec\ref{sec:measurements}).
+Modern CPUs can connect to multiple EMCs which allows scaling to meet bandwidth and capacity goals for different clusters.}
+
+
+\input{fig-poolmngsketch}
+
+\subsection{System Software Layer}
+%
+\label{sec:design:systemsw}
+
+% domains
+\sys's system software involves multiple components.
+
+\myparagraph{Pool memory ownership}
+Pool management involves assigning \sys's memory slices to hosts and reclaiming them for the pool (Figure~\ref{fig-poolmng}).
+It involves 1) implementing the control paths for pool-level memory assignment and 2) preventing pool memory fragmentation.
+
+\newtxt{Hosts discover local and pool capacity through CXL device discovery and map them to their address space. % through. % \ts{ACPI\slash SRAT} tables~\cite{acpi}.
+Once mapped, the pool address range is marked hot-pluggable and ``not enabled.''}
+\newtxt{Slice assignment is controlled at runtime via a Pool Manager (PM) that is colocated on the same blade as the EMCs (Figure~\ref{fig-analysis-overheads}).
+%via the fabric manager protocol~\cite{cxl2whitepaper.web21}.
+In \sys's current design, the PM is connected to EMCs and CPU sockets via a low-power management bus
+(\eg,~\cite{i3c}).
+To allocate pool memory, the Pool Manager triggers two types of interrupts at the EMC and host driver.
+\ts{Add\_capacity(host, slice)} interrupts the host driver which reads the address range to be hot-plugged.
+The driver then communicates with the OS memory manager to bring the memory online.
+The EMC adds the host id to its permission table at the slice offset.
+\ts{Release\_capacity(host, slice)} works similarly by offlining the slice on the host and resetting the slice's permission table entry on the EMC.
+An alternative to this design would be inband-communication using the Dynamic Capacity Device (DCD) feature in CXL 3.0~\cite[\S9.13]{cxl3spec}.
+This change would maintain the same functionality for \sys.}
+
+
+%\newtxt{Software flow
+%Disable Caching
+%Initiate WB and Inval
+%Device must send CacheFlushed message to the host per CXL protocol
+%Poll for completion (timeout derived from cache size)
+%Re-enable caching.} \hcl{What are these?}
+
+\sys must avoid fragmenting its online pool memory as the contiguous 1GB address range must be free before it can be offlined for reassignment to another host.
+Pool memory is allocated to VMs in 1GB-aligned increments (\sec\ref{sec:design:distributedsw}).
+While this prevents fragmentation due to VM starts and completions, our experience has shown that host agents and drivers can allocate pool memory and cause fragmentation.
+\sys thus uses a special-purpose memory partition that is only available to the hypervisor.
+Host agents and drivers allocate memory in host-local memory partition, which effectively contains fragmentation.
+
+With these optimizations, offlining 1GB slices empirically takes 10-100 milliseconds\slash GB.
+Onlining memory is near instantaneous with microseconds\slash GB.
+These observations are reflected in \sys's asynchronous release strategy (\sec\ref{sec:design:distributedsw}).
+%This means that shifting memory after a 128GB VM is completed would require tens of seconds, which is insufficient for VM-start SLOs at \azure.
+
+
+
+%Offlining multiple slices can thus take multiple seconds.
+
+
+\myparagraph{Failure management}
+Hosts only interleave across local memory.
+This minimizes the EMCs' blast radius and facilitate memory hot-plugging.
+EMC failures affect only VMs with memory on that EMC, while VMs with memory on other EMCs continue normally.
+CPU\slash host failures are isolated and associated pool memory is reallocated to other
+hosts.
+Pool Manager failures prevent reallocating pool memory but do not affect the datapath.
+
+%%LH - I don't think the following is vital for the paper.  Commenting out for now.
+%Memory onlining and offlining requires multiple changes to the proprietary hypervisor stack used at \azure.
+%First, fragmentation of host memory prevents offlining a page.
+%Fragmentation can occur as host memory allocations do not always happen at the 1GB granularity of \sys slices.
+%For example, there are multiple small VM types that demand memory in 0.25 and 0.5GB increments.
+%Further, the host runs multiple management agents which each use a small amount of memory.
+%The host thus implements a memory partition that contains all these small memory allocation pieces.
+%This memory partition can span local and pool memory, but is permanently allocated to this specific host.
+
+\input{fig-vnuma}
+
+
+\myparagraph{Exposing pool memory to VMs}
+VMs that use both NUMA-local and pool memory see pool memory as a \cvn node.
+The hypervisor creates a \cvn node by adding a memory block (\texttt{node\_memblk}) without
+an entry in the \texttt{node\_cpuid} in the
+\ts{SLIT\slash SRAT} tables~\cite{acpi}.
+We later show the guest-OS preferentially allocates memory from the local NUMA node before going to \cvn (\sec\ref{sec-eval}).
+Thus, if \cvn is sized to the amount of untouched memory, it is never going to be used.
+Figure~\ref{fig-vnuma} shows the view of a Linux VM which includes
+the correct latency in the NUMA distance
+matrix (\texttt{numa\_slit}).
+This facilitates guest-OS NUMA-aware memory management~\cite{nimblepage.asplos19, autonuma.web19} for the rare case that the \cvn is used (\sec\ref{sec:design:ml}).
+
+
+\input{fig-workflow}
+
+
+\myparagraph{Reconfiguration of memory allocation}
+To remain compatible with ({\bf G2}), local and pool memory mapping generally remain static during a VM's lifetime.
+There are two exceptions that are implemented today.
+When live-migrating a VM or when remapping a page with a memory fault, the hypervisor temporarily disables virtualization acceleration
+and the VM falls back to a slower I/O path~\cite{ruprecht2018vm}.
+Both events are quick and transient and typically only happen once during a VM's lifetime.
+We implement a third variant which allows \sys a one-time correction to a suboptimal memory allocation.
+Specifically, if the host has local memory available, \sys disables the accelerator, copies all of the VM's memory to local memory, and enables the accelerator again.
+This takes about 50ms for every GB of pool memory that \sys allocated to the VM.
+
+
+\myparagraph{Telemetry for opaque VMs}
+\sys requires two types of telemetry for VMs.
+First, we use the core-performance-measurement-unit (PMU) to gather hardware counters related to memory performance.
+Specifically, we use the top-down-method for analysis
+(TMA)~\cite{topdownanalysis.ispass14,tmam.web21}.
+TMA characterizes how the core pipeline slots are used.
+For example, we use the ``memory-bound'' metric, which
+is defined as pipeline stalls due to memory loads and stores.
+Figure~\ref{ml-training1} lists these metrics.
+While TMA was developed for Intel, its relevant parts are available on AMD and
+ARM as well~\cite{jarus2016top}.
+We modify \azure's production hypervisor to associate these metrics with individual
+VMs (\sec\ref{sec-impl}) and record VM counter samples in a distributed database.
+All our core-PMU-metrics use simple counters and induce negligible overhead (unlike event-based sampling~\cite{akiyama2017quantitative,hemem.sosp21}).
+
+Second, we use hypervisor telemetry to track a VM's untouched pages.
+We use an existing hypervisor counter that tracks guest-committed memory, which overestimates used memory.
+This counter is available for 98\% of \azure VMs.
+We also scan access bits in the hypervisor page table (\sec\ref{sec-impl}).
+Since we only seek untouched pages, frequently access bits reset is not required. This minimizes overhead.
+% , as used by prior work on working set estimation~\cite{vmwss.cloud13, harby2019more}
+
+\subsection{Distributed Control Plane Layer}
+%
+\label{sec:design:distributedsw}
+
+Figure~\ref{fig-workflow} shows the two tasks performed by \sys's control plane:
+(A) predictions to allocate memory during VM scheduling
+and (B) QoS monitoring and resolution.
+
+\myparagraph{Predictions and VM scheduling (A)}
+\sys uses ML-based prediction models (\sec\ref{sec:design:ml})
+to decide how much pool memory
+to allocate for a VM during scheduling.
+After a VM request arrives (A1), the scheduler queries the
+distributed ML serving system (A2) for a prediction on how much local memory
+to allocate for the VM. The scheduler
+then informs the Pool Manager about the target host and associated pool memory
+needs (A3).
+The Pool Manager triggers a memory onlining workflow using the configuration
+bus to the EMCs and host (A4).
+Memory onlining is fast enough to not block a VM's start time (\sec\ref{sec:design:systemsw}).
+The scheduler informs the hypervisor
+to start the VM on a \cvn node matching the onlined memory amount.
+
+Memory offlining is slow and cannot happen on the critical path of VM starts (\sec\ref{sec:design:systemsw}).
+\sys resolves this by always keeping a buffer of unallocated pool memory.
+This buffer is replenished when VMs terminate and hosts asynchronously release associated slices.
+% and communicates to that host's virtualization stack.
+
+
+
+\input{fig-training1}
+
+\myparagraph{QoS monitoring (B)} \sys
+continuously inspects the performance of all running VMs via its QoS monitor.
+The monitor queries hypervisor and hardware performance counters (B1) and
+uses an ML model of latency sensitivity (\sec\ref{sec:design:ml})
+to decide whether the VM's performance impact exceeds the \pdm.
+In this case, the monitor asks its mitigation manager (B2) to
+trigger a memory reconfiguration (\sec\ref{sec:design:systemsw}) through the hypervisor (B3).
+After this reconfiguration, the VM uses only local memory.
+
+% for Disaggregated Memory
+\subsection{Prediction Models}
+%
+\label{sec:design:ml}
+
+\sys's VM scheduling (A) and QoS monitoring (B) algorithms rely on two
+prediction models (in Figure~\ref{fig-premodels}).
+
+\myparagraph{Predictions for VM scheduling (A)} For scheduling, we first
+check if we can correlate a workload history with the VM requested.
+This works by checking if there have been previous VMs with the same
+metadata as the request VM, \eg, the customer-id, VM type, and location.
+This is based on the observation that
+VMs from the same customer tend to exhibit similar
+behavior~\cite{resourcecentral.sosp17}.
+
+If we have prior workload history, we make a prediction on whether this
+VM is likely to be memory latency insensitive, \ie, its performance would be
+within the \pdm while using only pool memory. (Model details appear below.)
+Latency-insensitive VMs are allocated entirely on pool DRAM.
+
+\input{fig-algo}
+
+
+
+
+If the VM has no workload history or is predicted to be latency-sensitive,
+we predict untouched memory ($\texttt{UM}$) over its
+lifetime.  Interestingly, $\texttt{UM}$ predictions with only generic VM metadata such as customer history, VM type, guest OS,
+and location are accurate (\sec\ref{sec-eval}).  VMs without untouched memory ($\texttt{UM}=0$) are allocated
+entirely with local DRAM.  VMs with a $\texttt{UM}>0$ are allocated with a rounded-down GB-aligned percentage of pool
+%$\lfloor\texttt{UM}\rfloor_{GB}$
+memory and a corresponding \cvn node;
+the remaining memory is allocated on local DRAM.
+
+If we underpredict $\texttt{UM}$, the VM will not touch the slower pool
+memory as the guest OS prioritizes allocating local DRAM.
+If we overpredict $\texttt{UM}$, we rely on the QoS monitor for mitigation.
+Importantly, \sys always keeps a VM's memory mapped in hypervisor page
+tables at all times. This means that even if our predictions happen to
+be incorrect, performance does not fall off a cliff.
+
+
+\myparagraph{QoS monitoring (B)}
+For \cvn VMs, \sys monitors if it overpredicted
+the amount of untouched memory during scheduling.
+For pool-backed VMs and \cvn VMs with
+less untouched memory than predicted, we use the sensitivity model to
+determine whether the VM workload is suffering excessive performance loss.
+If not, the QoS monitor initiates a live VM migration to a configuration
+allocated entirely on local DRAM.
+
+\myparagraph{Model details}
+\sys's two ML prediction models consume telemetry that is available for opaque VMs from \sys's system software layer
+(\sec\ref{sec:design:systemsw}).
+Figure~\ref{ml-training1} shows features, labels, and the training procedure for the
+latency insensitivity model.
+The model uses supervised learning (\S\ref{sec-impl}) with core-PMU metrics as features
+and the slowdown of pool memory relative to NUMA-local memory as labels.
+\sys gets samples of slowdowns from offline test runs and A\slash B tests of internal
+workloads which make their performance numbers available.
+These feature-label-pairs are used to retrain the model daily.
+As the core-PMU is lightweight (\sec\ref{sec-impl}),
+\sys continuously measures core-PMU metrics at VM runtime.
+This enable the QoS monitor to react quickly and enables retaining
+a history of VMs that have been latency sensitive.
+
+\newtxt{Figure~\ref{ml-training2} shows the inputs and training procedure for the
+untouched-memory model.
+The model uses supervised learning (details in \S\ref{sec-impl}) with VM metadata as features and the minimum untouched memory over each VM's lifetime as labels.
+Its most important feature is a range of percentiles (\eg, 80\th--99\th) of the recorded untouched memory by a customer's VMs in the last week.}
+
+%\input{tab-models} % prediction model table
+
+\input{fig-training2}
+
+\myparagraph{Parameterization of prediction models}
+\sys's latency insensitivity model is parameterized to stay below a \emph{target rate of false positives} (\texttt{FP}), \ie, workloads it incorrectly specifies as latency insensitive but which are actually sensitive to memory latency.
+This parameter enforces a tradeoff as the percentage of workloads that are labeled as latency insensitive (\texttt{LI}) is a function of \texttt{FP}.
+For example, a rate of 0.1\% \texttt{FP} may force the model to 5\% of \texttt{LI}.
+
+Similarly, \sys's untouched memory model is parameterized to stay below a \emph{target rate of overpredictions} (\texttt{OP}), \ie, workloads that touch more memory than predicted and thus would use memory pages on the \cvn node.
+This parameter enforces a tradeoff as the percentage of untouched memory (\texttt{UM}) is a function of \texttt{OP}.
+For example, a rate of 0.1\% \texttt{OP} may force the model to 3\% of \texttt{UM}.
+
+With two models and their respective parameters, \sys needs to decide how to balance \texttt{FP} and \texttt{OP} between the two models.
+This balance is done by solving an optimization problem based on the given performance degradation margin (\pdm) and the target percentage of VMs that meet this margin (\tp).
+Specifically, \sys seeks to maximize the average amount of memory that is allocated on the CXL pool, which is defined by \texttt{LI} and \texttt{UM}, while keeping the percentage of false positives (\texttt{FP}) and untouched overpredictions (\texttt{OP}) below the \tp.
+\begin{align}
+\nonumber  \text{maximize} & \quad (\texttt{LI}_\pdm) + (\texttt{UM})\\
+\label{eq:optimization}  \text{subject to} & \thinspace (\texttt{FP}_\pdm) + (\texttt{OP}) \leq (100 - \tp)
+\end{align}
+Note that \tp essentially defines how often the QoS monitor has to engage and initiate memory reconfigurations.
+
+Besides \pdm and \tp, \sys has no other parameters as it automatically solves the optimization problem from Eq.\eqref{eq:optimization}.
+The models rely on their respective framework's default hyperparameters (\sec\ref{sec-impl}).

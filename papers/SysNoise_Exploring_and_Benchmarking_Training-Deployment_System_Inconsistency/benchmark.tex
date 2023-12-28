@@ -1,0 +1,186 @@
+\begin{figure*}[t]
+    %\vspace{-0.25in}
+    \centering
+    \includegraphics[width=\linewidth]{figure/system_noise_overview.pdf}
+    \caption{\textbf{Overview of SysNoise}. SysNoise is caused by an inconsistent implementation between the training system and deployment system, consisting of three parts, namely pre-processing noise, model inference noise, and post-processing noise. }
+    \label{fig_overview}
+    %\vspace{-0.2in}
+\end{figure*}
+
+\section{System Noise Benchmark}
+
+In this section, we introduce the benchmark for system noise. First, we summarize the three stages in SysNoise, namely pre-processing noise, model inference noise, and post-processing noise as shown in~\autoref{fig_overview}. Then, we introduce these three stages SysNoise in detail. Note that we only give the basic principles, a more rigorous mathematical difference of SysNoise is provided in \autoref{appendix_math}. 
+%Then, we introduce benchmark tool to evaluate model robustness against SysNoise. 
+
+
+\subsection{Pre-processing Noise}
+\label{sec_prep}
+Pre-processing means the preparation of the input tensor of the neural network. Concretely, in computer vision tasks, the pre-processing will convert an image raw file to a 3-dimension tensor (width, height, and RGB channels). To fulfill this conversion, two steps are required. First, the raw file (JEPG) will be decoded to a tensor with the image's original shape. Then, the tensor will be resized to a certain shape. %\footnote{Sometimes a centered crop is followed but we omit this operation in the paper, focusing only on decode and resize.}.
+To decode the image from the JEPG file to an RGB tensor, it is required to perform the inverse Discrete Cosine Transform (iDCT) operation. 
+In theory, the principle of iDCT is fixed, but we find decoding one image file in different third-party libraries (\eg, OpenCV~\cite{opencv_library}, Pillow~\cite{umesh2012image}, FFmpeg~\cite{tomar2006converting}) will output different RGB tensors. This is because some libraries prefer to use Fast iDCT~\cite{chen1977fast} instead of the vanilla one, which may sacrifice the image quality for the decoding speed. 
+Furthermore, there would be some minor errors in the decoding implementation, such as the cosine function. These minor errors can cause a shift in the pixel values of the final RGB image tensor.
+As a result, when changing the decoding tools used in training to another one in inference, we observe a drop in accuracy.
+
+% \begin{table}[t]
+%   \caption{\textbf{List of image resize interpolation methods and the supporting Python packages.}}
+%   \label{tab:tools}
+%   \resizebox{1\linewidth}{!}{
+%       \begin{tabular}{lccccccc}
+%         \toprule
+%          & Nearest & Bilinear & Cubic & Lanczos & Area & Box & Hamming \\
+%         \midrule
+%         OpenCV & \ding{51} & \ding{51} & \ding{51} & \ding{51} & \ding{51} & \ding{55} & \ding{55} \\
+%         \midrule
+%         Pillow & \ding{51} & \ding{51} & \ding{51} & \ding{51} & \ding{55} & \ding{51} & \ding{51} \\
+%         \bottomrule
+%       \end{tabular}
+%   }
+% \end{table}
+
+
+The second cause of pre-processing noise is image resize. Resize is a simple scaling operation that adjusts resolution to a different size, either up (increase resolution) or down~(decrease resolution). In a resize operation, one needs to predict the pixel value at an unseen position. This is often performed by different \textit{interpolation} algorithms. 
+For example, nearest-neighbor interpolation directly selects the value of its nearest know pixel. While bilinear interpolation predicts the unknown pixel by computing the distance-based weight average of the existing neighbor 4 pixels, \ie~top, bottom, left, and right, which has a rather continuous interpolation effect. 
+%The bicubic interpolation takes 16 pixels ($4\times 4$). This method is even more smoothed since it considers more neighbors. The prediction function is obtained by solving a system of linear equations. Therefore, bicubic interpolation yields the best performance than the previous two algorithms, however, it also requires more computational resources to solve the linear equations to find optimal coefficients for each pixel.
+Besides, there are many other interpolation methods. In Appendix, we provide the detailed mathematical explanation of these interpolation algorithms as well as the supporting package in computer vision. Note that the difference in interpolation may even occur at the package level, \ie~even the same interpolation algorithm might differ in different supporting packages.
+% To demonstrate that, we give a simple example where we generate a $6\times6$ synthetic image consisting of black-and-white rows. As shown in \autoref{Fig:Resize_Example}, resizing it to half size results in significantly different images. In Pillow nearest interpolation mode the image is whole black while in OpenCV nearest interpolation mode the image is whole white. In such extreme cases, the neural network can have completely different inference results. 
+
+% \begin{figure}[t]
+% \centering
+% \subfigure[Original]{\includegraphics[width = 0.24\linewidth]{figure/resize_method_or.png}} 
+% \subfigure[P-nearest]{\includegraphics[width = 0.24\linewidth]{figure/resize_pilnearest.png}}
+% \subfigure[P-bilnear]{\includegraphics[width = 0.24\linewidth]{figure/resize_pilbilinear.png}}
+% \subfigure[P-cubic]{\includegraphics[width = 0.24\linewidth]{figure/resize_pil_cubic.png}} \\
+% \subfigure[O-area]{\includegraphics[width = 0.24\linewidth]{figure/resize_method_cvarea.png}}
+% \subfigure[O-nearest]{\includegraphics[width = 0.24\linewidth]{figure/resize_method_cvnearest.png}}
+% \subfigure[O-bilinear]{\includegraphics[width = 0.24\linewidth]{figure/resize_method_cvbilnear.png}}
+% \subfigure[O-cubic]{\includegraphics[width = 0.24\linewidth]{figure/resize_method_cubic.png}} 
+
+% \caption{\textbf{Illustration of a synthetic example}. (a) the original $6\times 6$ synthetic image. When resized to $3\times3$, (b-d) show different resize interpolation methods in Pillow; (e-h) show different resize interpolation methods in OpenCV. We observe the difference not only at the algorithm level but also at the package level.}
+% \label{Fig:Resize_Example}
+% \vspace{-1.5em}
+% \end{figure}
+
+
+
+
+The third source of inconsistency during the pre-processing stage comes from the conversion of color space. In the practical application, there are various representation formats for videos and images, \eg, RGB and YUV. The RGB format defines the color space with the value of red, green, and blue channels while the YUV format separates the brightness information (Y) from the color information (U and V), which is the format native to TV broadcast and composite video signals. To save the required storage, different variants of the YUV format are devised. Among them, the NV12 format can encode one pixel with only 12bits, enjoying a low memory consumption and high efficiency. Therefore, many decoder accelerators such as Microsoft DirectX Video Acceleration and Ascend 310 adopt this format. However, for the training of most neural networks, input images are fed with the RGB format. Decoding images to YUV and then converting it to RGB is difficult to output the same direct RGB decoded images. 
+
+
+% \subsection{Visualization of Resize Algorithms}
+% Apart from our mentioned algorithms, many more exists. Here we do not introduce them one by one. To provide an intuitive understanding of the difference, we visualize the results of various resize methods in \autoref{Fig:Resize_Example}. We use a special $6 \times 6$ synthetic image as the original image to magnify the effect of resize. All images are resized to $3\times 3$ resolution. Other interpolation methods like \textit{lanczos, area} are also visualized. 
+
+% Due to the specific characteristics of this synthetic image, we observe a huge disparity between these resize methods. 
+% Take the nearest neighbor as an example, this method results in pure color resized images, either whole black (Pillow) or whole white (OpenCV), which---as expected---reduces half information. Another major difference comes from the third-party resize libraries. As shown in Fig. 2b and 2g, Pillow and OpenCV have different rounding mechanisms. As a result, they output totally different reversed images. In bicubic interpolation, Pillow and OpenCV also share opposed directions of gradients in color. In practice, the effect of resize operation on real-world images is not as obvious as our example here, however, it is enough to cause wrong predictions for a trained neural network. 
+
+
+\newcommand{\mypm}[1]{{~(#1)}}
+
+
+
+\subsection{Model Inference Noise}
+Model inference noise accounts for the difference that happens during the inference process. This is primarily due to the implementation of various operations. For example, the convolution can be implemented in many ways (GEMM, Img2Col, Winograd, etc). 
+We primarily discover 3 three types of model inference noise that cause a performance drop. 
+The first one is the ceiling mode for max-pooling layers. Ceiling mode means how to compute the output spatial shape. Setting ceiling mode to true will allow the sliding windows to go off-bounds if they start within the left padding. Hardware vendors usually support different ceiling modes, causing an inevitable mismatch. % This tiny difference can bring huge accuracy degradation.
+
+
+%deconve upsample
+Another important type of model inference noise is the upsampling method. It is widely used in segmentation task. And in the detection task, the widely used feature pyramid networks~\cite{lin2017feature} integrate the features from different stages within the network. These features have an uneven resolution, requiring an upsampling operation to match feature resolution. Same as the resize operation we discussed in~\autoref{sec_prep}, the choice of the interpolation in upsampling layers can play an important role and lead to different predictions. We find that the FPN is quite sensitive to interpolation. 
+
+Finally, the precision of data representation can also be viewed as a type of model inference noise. Generally, the input data and the parameters in the model are stored with 32-bit floating-point numbers. 
+However, some hardware systems may restrict the precision, \eg, only 16-bit floating-point numbers or 8-bit integers are allowed. 
+Low-bit numbers unavoidably preserve less information than the full-precision numbers, causing accuracy degradation. 
+Note that in the field of quantization research, some training methods could alleviate this problem~\cite{jacob2018quantization}. We do not use such a training-compensated method here, in order to evaluate how much the deep learning model can resist under low data precision and how a single type interacts with other types of SysNoise, even though there are contingency methods. 
+
+
+\subsection{Post-Processing Noise}
+
+Post-processing is used to convert the network output to the prediction results. In image classification, this refers to the $\mathrm{Softmax}$ function which applies the exponential function to normalize the output to $(0, 1)$. In object detection, the predicted output of the network needs to be calculated to the final bounding box. During this process, there are rounding operations to get integer resolution coordinates. Then, all the candidate bounding boxes will be sorted with the predicted confidence and filtered with non-maximum suppression. This procedure is easy to introduce noises in detail, \eg, the rounding up or rounding down choice, \etc. Many hardware vendors provide black-box implementations of these operations to accelerate the deployment. Unfortunately, we find that they often fail to produce the same results, causing an impact on the final performance.
+
+
+% TODO换成setting
+\subsection{Benchmarking SysNoise}
+\label{benchmark_sysnoise}
+
+%We have introduced all kinds of SysNoise and the causes to them. To sum up, SysNoise exists in every stage of the inference pipeline. 
+%Also, each type has its own occurrence frequency (see \autoref{tab_sysnoise_type}) and influence intensity on final accuracy (see \autoref{sec_eval}), which demonstrates the versatility and the intricate nature of SysNoise. In addition, the SysNoise may be extended to robotics and language processing.
+
+%In \autoref{tab_sysnoise_type}, we briefly summarize the types of SysNoise in each stage, as well as their applied task~(we narrow our discussion in image classification and object detection tasks), dependence to input data, and the occurrence frequency in the real-world application. 
+
+\newcommand{\cmark}{\color{ForestGreen}\ding{51}}%
+\newcommand{\xmark}{\color{Red}\ding{55}}%
+\newcommand{\clsdet}{$\mathrm{Cls/Det/Seg}$}
+\begin{table*}[htbp]
+%\vspace{-0.2in}
+\caption{\textbf{List of our discerned system noise,} including 3 stages (pre-processing, model inference, post-processing). Affected tasks consists of image classification~($\mathrm{Cls}$), object detection~($\mathrm{Det}$), semantic segmentation~($\mathrm{Seg}$) } and natural language processing~($\mathrm{NLP}$)% We divide 3 levels of noise influence on final task performance, with 1 representing least influential and 3 representing most influential.
+\label{tab_sysnoise_type}
+\centering
+\begin{adjustbox}{max width=\textwidth}
+\begin{tabular}{lcccccccc}
+\toprule
+\textbf{Stage} & \multicolumn{3}{c}{\textbf{Pre-processing}} & \multicolumn{3}{c}{\textbf{Model inference}} & \multicolumn{1}{c}{\textbf{Post-processing}} \\
+\cmidrule(l{2pt}r{2pt}){2-4}\cmidrule(l{2pt}r{2pt}){5-7}
+\cmidrule(l{2pt}r{2pt}){8-8}
+Type & Decoder & Resize & Color Space & Ceil Mode & Upsample & Data Prec. & Detection Proposal \\
+\midrule
+Task & \clsdet & \clsdet & \clsdet & \clsdet & $\mathrm{Det/Seg}$ & $\mathrm{Cls/Det/Seg/NLP}$ & $\mathrm{Det}$ \\ Input Dependence & \xmark & \xmark &  \cmark & \xmark &  \xmark & \cmark &  \xmark \\
+Noise Effect Level & High & Very High & Middle & High & Very High & High & Middle \\
+Number of Categories & 4 & 11 & 2 & 2 & 2 & 3 & 2 \\
+Occurrence Frequency & Very High & Very High & High & High & Middle & High & Middle \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+%\vspace{-0.15in}
+\end{table*}
+
+
+%\yh{This subsection needs a triple-check.}
+
+
+\textbf{Types of SysNoise.} SysNoise originates from the implementation difference in hardware and software. In \autoref{tab_sysnoise_type}, we briefly summarize the types of SysNoise in each stage, as well as their applied task, dependence on input data, level of effect, and the number of categories. We highlight that here we view SysNoise as random noise since in practice it is inflexible to train a unique model for corresponding hardware. 
+
+
+%\begin{enumerate}[nosep, leftmargin=*]
+$\bullet$ \emph{Preprocessing Noise}
+    \begin{enumerate}[nosep, leftmargin=1.9em]
+        \item Decoder: To simulate noise during decoding process, four different python packages are selected to decode images — PIL~\cite{umesh2012image}, OpenCV~\cite{opencv_library}, FFmpeg ~\cite{ffmpeg_library} and DALI~\cite{nvidia-dali}, which implement their own image decode function, and output different image tensors. 
+        \item Resize: We choose up to 11 different resize methods to represent noise that occurred in image resizing. Specifically, we utilize two Python packages, the Pillow and the OpenCV. For Pillow, we adopt interpolations from \{bilinear, nearest, box, hamming, bicubic, lanczos\} methods, and for OpenCV, we adopt interpolations from \{bilinear, nearest, area, bicubic, lanczos\}. 
+        \item Color mode: To simulate noise that comes from the conversion of color space, we generate the noised images by first decoding the images to RGB and then transforming them to YUV color space and then back to RGB with Ascend Computing Language~(ACL)~\cite{cann}.
+    \end{enumerate}
+    
+$\bullet$ \emph{Model Inference Noise}
+    \begin{enumerate}[nosep, leftmargin=1.9em]
+        \item Ceil mode: This can only be tested on models which has stride 2 max-pooling layers, such as ResNets \cite{he2016deep}. We train the model with floor mode but test it with ceil mode.
+        \item Upsample: Nearest neighbor and bilinear are the two most commonly supported algorithms for upsampling. Following~\cite{faster-fpn}, we train the original upsample layers with nearest-neighbor interpolation and test it with bilinear interpolations.
+        \item Data Precision: To evaluate the model's robustness under different precisions, we quantize the model to FP16 or INT8 and test it. 
+    \end{enumerate}
+    
+$\bullet$ \emph{Postprocessing Noise}
+    \begin{enumerate}[nosep, leftmargin=1.9em]
+        \item Detection proposal: We evaluate the influence of whether to add the value of 1 when calculating bounding boxes from offsets, both of which are common in hardware implementations.
+%\end{enumerate}
+\end{enumerate}
+
+
+% \textbf{Training Setting.} SysNoise originates from the implementation difference in hardware. To benchmark the robustness against SysNoise, we train deep neural networks with one fixed setting which is also commonly used in pytorch framework,
+% %\yh{detailed defaulting training, better mention it is standard in pytorch}, 
+% and evaluate the task performance under other hardware settings. We highlight that here we view SysNoise as random noise since in practice it is inflexible to train a unique model for a corresponding hardware. Our training setting is shown as follows:
+
+% %\begin{enumerate}[nosep, leftmargin=*]
+% $\bullet$ \emph{Classification Task}
+%         \begin{itemize}[nosep, leftmargin=1.9em]
+%         \item[]
+%         We uses Nvidia DALI ~\cite{dali} to prepare data, \ie, image decode, resize and color space are configured by default function in DALI. All models take an input shape of $224*224$ except EfficientNet. We train the default model using FP32 format as this is the standard format in GPU training. For ResNet, we train it with floor mode of its maxpooling layer. All other training settings follow the original settings of the model.
+%         \end{itemize}
+        
+    
+% $\bullet$ \emph{Detection and Segmentation Task}
+%         \begin{itemize}[nosep, leftmargin=1.9em]
+%         \item[]
+%          For fair comparisons, we use Pillow package and choose bilinear as image resize interpolation method to prepare data. Following~\cite{faster-fpn} ,we resize images by keeping the ratio the same as the original image and make the maximum size of the image to be $1333*800$. Following as common practice, all backbones are pre-trained on ImageNet. We train the default model using FP32 format and train the original upsample layers with nearest interpolation. For the models with ResNet backbone, we train it with floor mode of its maxpooling layer. All other implementation follow the original settings of the model.
+%         \end{itemize}
+        
+
+
+\textbf{Evaluation Metrics.} For classification/detection/segmentation/natural language processing, we report the top-1 accuracy/mean Average Precision/mean Intersection over Union difference for measuring the robustness of models. If the SysNoise has multiple options, we report the mean difference as well as the max difference, otherwise, only the metric difference is reported. 
+
+

@@ -1,0 +1,87 @@
+\section{StarGAN-ZSVC}
+\label{sec:starganzsvc}
+
+While StarGAN-VC and StarGAN-VC2 allows training with non-parallel data and runs sufficiently fast, it is limited in its ability to only perform voice conversion for speakers seen during training: while parallel $X_{\text{src}}$ and $X_{\text{trg}}$ utterance pairs are not required, the model can only synthesize speech for target speaker identities (specified as one-hot vectors) seen during training.
+This could preclude the use of these models in many practical situations where zero-shot conversion is required between unseen speakers.
+Conversely, AutoVC allows for such zero-shot prediction and is trained on non-parallel data, but it is implemented with a slow vocoder and
+its performance suffers when trained on very little data. Combining the strengths of both of these methods, we propose the \textit{StarGAN zero-shot voice conversion} model -- StarGAN-ZSVC.
+
+\subsection{Overcoming the Zero-shot Barrier}
+To achieve voice conversion between multiple speakers, the original StarGAN-VC2 model creates an explicit embedding vector for each source-target speaker pairing, which is incorporated
+as part of the generator $G$ and discriminator $D$.
+This requires that each source-target speaker pairing is seen during training so that the corresponding embedding exists and has been trained -- prohibiting zero-shot voice conversion.
+To overcome this hurdle, we instead infer separate source and target speaker embeddings, $\mathbf{s}_{\text{src}}$ and $\mathbf{s}_{\text{trg}}$, using a speaker encoder network $E$ -- similar to the approach followed in AutoVC (Section~\ref{sec:autovc}).
+
+This framework is shown in Figure~\ref{fig:system-diagram}.
+Utterances from unseen speakers (i.e.\  $X_{\text{src}}$ and $Y_{\text{trg}}$) are fed to the speaker encoder $E$, yielding embeddings for these new speakers, which are then used to condition $G$ and $D$, 
+thereby enabling zero-shot conversion. 
+The generator uses these embeddings to produce a converted Mel-spectrogram $X_{\text{src}\rightarrow \text{trg}}$ from a given source utterance's Mel-spectrogram $X_{\text{src}}$.
+
+
+\begin{figure}[!t]
+\includegraphics[width=\textwidth]{figures/system-diagram.pdf}
+\caption{The StarGAN-ZSVC system framework. The speaker encoder network $E$ and the WaveGlow vocoder are pretrained on large speech corpora, while the generator $G$ and discriminator $D$ are trained on a 9-minute subset of the VCC dataset. During inference, arbitrary utterances for the source and target speaker are used to obtain source and target speaker embeddings, $\mathbf{s}_{\textrm{src}}$ and $\mathbf{s}_{\textrm{trg}}$. 
+} \label{fig:system-diagram}
+\end{figure}
+
+$E$ is trained on a large corpus 
+using a GE2E loss \cite{GE2E} which aims to simultaneously maximize distances between embeddings from different speakers while minimizing the distances between embeddings from utterances of the same speaker.
+NVIDIA's WaveGlow \cite{waveglow} is used, which does not require any speaker information for vocoding and thus readily allows zero-shot conversion.
+
+\subsection{Overcoming the Speed Barrier}
+The speed of the full voice conversion system during inference is bounded by 
+(a)~the speed of the generator $G$; 
+(b)~the speed of converting the utterance between time and frequency domains, consisting of the initial conversion from time-domain waveform to Mel-spectrogram and the speed of the vocoder; 
+and (c)~the speed of the speaker encoder $E$.
+To ensure that the speed of the full system is at least real-time, each subsystem needs to be
+faster than real-time.
+
+\subsubsection{(a) Generator Speed.}
+For the generator $G$ to be sufficiently fast, we design it to only include convolution, linear, normalization, and upscaling layers as opposed to a recurrent architecture like those used in AutoVC \cite{autovc}. 
+By ensuring that the majority of layers are convolutions, we obtain better-than real-time speeds for the generator.
+
+\subsubsection{(b) Vocoder and Mel-spectrogram Speed.} 
+The choice of vocoder greatly affects computational cost. 
+Higher-quality methods, such as those from the WaveNet family~\cite{wavenet}, are typically much slower than real-time, while purely convolutional methods such as MelGAN~\cite{MelGAN} are much faster 
+but has poorer quality.
+Often the main difference between the slower and faster methods is again the presence of traditional recurrent layers in the vocoder architecture. 
+
+We opt for a reasonable middle-ground choice with the WaveGlow vocoder, which does have recurrent connections but does not use any recurrent layers with dense multiplications such as LSTM or Gated Recurrent Unit (GRU, another kind of recurrent cell architecture \cite{gru}) layers. We specifically use a pretrained WaveGlow network, as provided with 
+the original paper \cite{waveglow}. 
+Furthermore, the speed of the Mel-spectrogram transformation for the input audio is well faster than real-time due to the efficient nature of the fast Fourier transform and the multiplication by Mel-basis filters.
+
+\subsubsection{(c) Speaker Encoder Speed.} 
+The majority of research efforts into obtaining speaker embeddings involve models using slower recurrent layers, often making these encoder networks the bottleneck. 
+We also make use of a recurrent stacked-GRU network as our speaker embedding network $E$.
+However, we only need to obtain a single speaker embedding to perform 
+any number of conversions involving that speaker.
+We therefore treat this as a preprocessing step where we apply $E$ to a few arbitrary utterances from the target and source speakers, averaging the results to obtain target and source speaker embeddings, and use those same embeddings for all subsequent conversions.
+
+We also design the speaker embeddings to be 256-dimensional vectors of unit length. If we were to use StarGAN-ZSVC downstream for data augmentation (where we want speech from novel speakers), we could then simply sample random unit-length vectors of this dimensionality  to use with the generator.
+
+\begin{figure}[!t]
+\includegraphics[width=\textwidth]{figures/architecture.pdf}
+\caption{StarGAN-ZSVC's network architectures. The speaker encoder $E$ is a recurrent network similar to that used in the original GE2E paper, while the generator $G$ and discriminator $D$ are modified versions from the original StarGAN-VC2 architecture. Within layers, \texttt{k} and \texttt{s} represent kernel size and stride (for convolutions), \texttt{f} is the scaling factor (for pixel shuffle), and \texttt{h} and \texttt{c} are the height and channels of the output (for reshape layers). A number alongside a layer indicates the number of output channels (for convolutions), or output units (for linear and GRU layers). GLU layers split the input tensor in half along the \textit{channels} dimension. GSP, GLU, and SELU indicate global sum pooling, gated linear units, and scaled exponential linear units, respectively.} \label{fig:architecture}
+\end{figure}
+
+\subsection{Architecture}
+With the previous considerations in mind, we design the generator $G$, discriminator $D$, and encoder network $E$, as shown in Figure~\ref{fig:architecture}.
+The generator and discriminator are adapted from StarGAN-VC2 \cite{stargan-vc2}, while the speaker encoder
+is adapted from the original model proposed for speaker identification \cite{GE2E}. 
+Specifically, for $E$ 
+we use a simple stacked GRU model, while for $D$ we use a projection discriminator \cite{projection_discriminator}. 
+For $G$, we use the 2-1-2D generator from StarGAN-VC2 with a modified central set of layers, denoted by the \textit{Conditional Block} in the figure. 
+
+These conditional blocks are intended to provide the network with a way to modulate the channels of an input spectrogram, with modulation factors conditioned on the specific source and target speaker pairing.
+They utilize a convolutional layer 
+followed by a modified conditional instance normalization layer \cite{CIN} and a gated linear unit \cite{glu}.
+
+The modified conditional instance normalization layer performs the following operation on an input feature vector $\mathbf{f}$:
+\begin{equation}
+\text{CIN}(\mathbf{f}, \gamma, \beta) 
+= \gamma \left( \frac{\mathbf{f} - \mu(\mathbf{f})}{\sigma (\mathbf{f}) } \right) + \beta
+\end{equation}
+where $\mu(\mathbf{f})$ and $\sigma(\mathbf{f})$ are respectively the scalar mean and standard deviation of vector $\mathbf{f}$, while $\gamma$ and $\beta$ are computed using two linear layers which derive their inputs from the speaker embeddings, as depicted in Figure~\ref{fig:architecture}. The above
+is computed separately for each channel when the input feature contains multiple~channels.
+
+For the discriminator, the source and target speaker embeddings are also fed through several linear layers and activation functions to multiply with the pooled output of $D$'s main branch.

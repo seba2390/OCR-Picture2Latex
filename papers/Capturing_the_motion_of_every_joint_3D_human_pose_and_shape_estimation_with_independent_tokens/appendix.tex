@@ -1,0 +1,151 @@
+
+\section{Model setups}
+
+
+\label{appendix:model}
+{\bf Base model.} For the Base model, we use a hybrid architecture with ResNet\footnote{\url{https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/resnetv2.py}}~\citep{resnet:he2016deep} and Transformer\footnote{\url{https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py}}~\citep{transformer:vaswani2017attention}, based on the ImageNet pretrained ViT model\footnote{\url{https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_resnet50_224_in21k-6f7c7740.pth}}~\citep{vit:dosovitskiy2020image}. 
+The transformer in the Base model has 6 Transformer blocks and the multi-head self-attention layer has 12 attention heads. 
+The embedding dimension is 768 for each token vector and the hidden dimension in the FFN is 3072 (4 times w.r.t. the embedding dimension 768).  
+
+{\bf Temporal Transformer.} As we find that increasing the number of layers brings a little improvement but with extra computational overhead,  we set the number of layers of Temporal Transformer as 3 for the trade-off. The number of attention heads is also set as 12. The temporal transformer is not pre-trained with any data.
+We also add a learnable temporal embedding to retain the temporal position information of tokens in the time dimension. 
+In the training, the length $T$ of video clips is 16 sampled at a interval of 8 from the original video data. In inference, we enlarge the bbox with a scale of 1.1 with respect to the original size of bbox. 
+
+And in practice, we find setting $T$ to be larger in inference could improve the accuracy, with acceptable additional computational overhead. In Tab.~\ref{appendix:seq_len}, we study on how the input sequence length of the temporal model affect the performances. The results show that longer sequence length brings weak improvements on the overall metrics but stable improvements on the acceleration error. For the INT-2 model, we use $T=64$ to report the results. Due to the length of learnable temporal embedding is initialized with 16, we interpolate the temporal embedding to the expected length when necessary.
+
+\section{Training data}
+\label{appendix:data}
+
+3D video datasets include Human3.6m~\citep{h36m:ionescu2013human3}, MPI-INF-3DHP~\citep{mpii3d:mehta2017monocular}, and 3DPW~\citep{3dpw:von2018recovering}. 3DPW~\citep{3dpw:von2018recovering} is a in-the-wild dataset with accurate pose and shape annotations. We use Human3.6m annotated with pose and shape parameters.
+%We train the model the w/ and wo/ 3DPW training dataset for comparison with previous methods.
+PennAction~\citep{pennaction:zhang2013actemes} and PoseTrack~\citep{posetrack:andriluka2018posetrack} are the 2D video datasets with only annotated 2D groundtruth. InstaVariety~\citep{insta:kanazawa2019learning} is the 2D video dataset with pseudo 2D grountruth annotations. For 2D image datasets, we use COCO~\citep{coco:lin2014microsoft}, MPII~\citep{mpii:andriluka14cvpr} and LSPET~\citep{lspet:Johnson11} datasets. They contain large amounts of 2D keypoint locations annotations of in-the-wild scenes, meanwhile we use their pseudo pose and shape annotations based on EFT~\citep{eft:oo2020exemplar}.
+
+\section{Progressive training scheme}
+\label{appendix:training}
+In this paper,  we develop an improved progressive training scheme adapting to our model, which consists of three training phases. 
+
+\textbf{In the first phase (phase-1)}, we expect the Base model and SMPL heads to be fully trained to produce accurate estimates for static images; so we train the model only using 2D image datasets and individual frames from Human3.6M~\citep{h36m:ionescu2013human3} and MPI-INF-3DHP~\citep{mpii3d:mehta2017monocular}. 
+
+\textbf{In the second phase (phase-2)}, we take the pre-trained weights of Base model and SMPL heads from the phase-1 as the initialization, and then use the mixed 2D/3D and image/video datasets to train the whole model, including the Base model, Temporal Transformer and SMPL heads. In practice, we find that the generalization of the model gradually deteriorates in the middle and late periods in the second phase, even when trained with 3DPW~\citep{3dpw:von2018recovering} training set.
+%That is, the model in later period performs worse on 3DPW model than earlier ones. 
+And we further observe that the estimated pose and shape of human mesh become implausible in the later period of the training process. 
+We empirically attribute such phenomena to that 1) a large proportion of training data has no annotations of pose and shape parameters, such as InstaVariety~\citep{insta:kanazawa2019learning} or PoseTrack~\citep{posetrack:andriluka2018posetrack}, and such data may dominate the model training in the later period; 2) domain gap exists among various datasets; 3) we do not leverage any prior reasonable SMPL pose and shape constraints on the tokens or the estimated parameters about the pose and shape. These factors may cause the conflicts between multiple objectives in the later stage of training, such as overfittng in $\mathcal{L}_{2D}$ making the model less constrained with reasonable SMPL pose or shape parameters.
+%We make ablation study on the effect of 2D video datasets.  
+Based on these observations and conjectures, we \textit{do not use 3DPW training set} in the second phase and develop the third training phase as follow. 
+
+\textbf{In the third phase (phase-3)}, we use the pre-trained weights from the phase-2 and \textit{fine-tune} the whole model on mixed datasets only consisting of 3DPW and Human3.6m that have accurate pose and shape annotations as supervision.
+This phase not only largely preserves the adaptability to in-the-wild scenarios that is learned in the phase-2, but also makes the model focus on learning to predict accurate and credible pose and shape values to fit the image appearance, 3D joint locations and 2D joint locations. 
+Note that we do not separately fine-tune the model on each dataset and report the best performance on both datasets separately. 
+Instead, we finally achieve a \textit{single} best model to report the results on 3DPW and Human3.6M, which has attained wider adaptability and good generalization.
+
+
+The default values of the weights $w_{\theta}, w_{\beta}, w_{norm}, w_{3D}, w_{2D}, w_{temp}$ are 60, 0.06, 1, 600, 300 and 600 unless otherwise stated.
+In the first phase, we use 4 Tesla V100 GPUs with a batch size of 120 for each GPU.  The $w_{temp}$ is set to 0.
+In the second phase, we use 16 Tesla V100 GPUs to conduct distributed training (2 nodes and 8 GPUs for each node). The batch sizes for 3D video/2D video/2D image datasets are 4, 3 and 7 for each GPU. The $w_{temp}$ is set to 0.
+In the third phase, we use 8 Tesla V100 GPUs with a batch size of 8 for each GPU. The $w_{norm}$ is set to 0.01.
+
+For training phase 1 and 2,  we train the model for 100 epochs separately using Adam with $1 e^{-4}$ initial learning rate, which decays 10 times at the 60-th and 90-th epochs. For the training phase 3, we fine-tune the model for 40 epochs using SGD with $1 e^{-4}$  initial learning rate, which decays 10 times at the 20-th and 30-th epochs. We found using SGD is better than using Adam for both 3DPW and Human3.6m datasets. For data augmentation, we follow the settings in MAED~\citep{maed:wan2021encoder}
+
+
+
+
+
+\begin{table}[!htbp]\footnotesize
+	\caption{Study on the sequence length of the input video clip for the temporal Transformer model.}
+	\label{appendix:seq_len}
+	\centering
+	
+    \resizebox{0.8\textwidth}{!}{
+	\begin{tabular}{ccccc}
+		\toprule
+		Input sequence length   & PA-MPJPE  $\downarrow$ & MPJPE $\downarrow$ &  PVE $\downarrow$ & Accel  $\downarrow$\\
+		\midrule
+		T=16& 42.2&  76.6   & 88.8&18.1 \\
+		T=32 &  42.5  & 76.2  & 88.8  &18.5 \\
+		T=64&   42.3 &  75.9 &88.5 &17.4   \\
+		T=128&   42.2  & 75.4 &88.0 &15.1   \\
+		
+		
+		\bottomrule
+	\end{tabular}}
+	
+	
+\end{table}
+
+
+
+% \begin{table}[!htbp]\footnotesize
+% 	\caption{Study on the effectiveness of temporal modeling. We evaluate the performances of the image-based  model and two types of video-based temporal models.}
+% 	\label{tab:temporal_sequence}
+% 	\centering
+	
+% 	\renewcommand{\arraystretch}{1.1}
+% 	\setlength{\tabcolsep}{0.9mm}
+% 	\begin{tabular}{ccccc}
+% 		\toprule
+% 		Sequence length   & Phase-1  $\downarrow$ & Phase-3 $\downarrow$ &  Phase-3 $\downarrow$ & Accel  $\downarrow$\\
+% 		\midrule
+% 		3DPW& 53.5 &  44.5   & 42.0\\
+% 		H36M &  40.0  & 38.7  & 38.5  \\
+		
+% 		\bottomrule
+% 	\end{tabular}
+	
+% \end{table}
+
+
+
+
+\section{Learned Poses and Examples of the in-the-wild and indoor scenes}
+\label{appendix:examples}
+
+\begin{figure}
+	\centering
+	\includegraphics[width=1.\linewidth]{figures/int_vs_vibe_1.pdf}
+	\includegraphics[width=1.\linewidth]{figures/int_vs_vibe_2.pdf}
+	\caption{The qualitative comparisons between our model (top) and the VIBE model~\citep{vibe:kocabas2020vibe} (bottom) for two video clips in the 3DPW test set.  
+		%Our model and MAED perform 42.0 and 45.1 mm errors in PA-MPJPE on the 3DPW.
+	}
+	\label{appendix:int_vs_vibe}
+\end{figure}
+
+In the section, to show our model indeed has learned reasonable pose using the joint rotation tokens, we also visualize the poses that are generated by sample the randomly initialized and the finally learned joint rotation tokens. We transform these tokens to the pose parameters using the learned rotation head and visualize the human meshes. As shown in Figure~\ref{fig:random_vs_learned}, we can see the random poses show very chaotic, distorted, and unnatural states, but the learned pose shows a relatively reasonable and natural human pose. 
+
+
+We compare our model with the typical video-based HMR method - VIBE~\citep{vibe:kocabas2020vibe} under the same detection and tracking framework provided by VIBE implementation. The reconstructed results for videos are show in Fig.~\ref{appendix:int_vs_vibe}. We encourage the readers to see the videos in the supplementary materials for better comparisons.
+
+We show more qualitative results for some \textit{complex scenes in the wild}, including crowded scenes, fast human motion and occluded persons. In Fig.~\ref{fig:examples}, Fig.~\ref{fig:h36m} and Fig.~\ref{fig:example_motion}, we show the human mesh reconstruction results of the examples from PoseTrack~\citep{posetrack:andriluka2018posetrack} and Human3.6M~\citep{h36m:ionescu2013human3}. We also provide the video files on the supplementary materials. Please see the supplementary video files for more references. %As shown in the videos, the reconstructed mesh results by our model show natural and robust motion transitions.
+
+
+
+\begin{figure}
+	\centering
+	\includegraphics[width=.9\linewidth]{figures/random_vs_learned_pose.pdf}
+	\caption{Visual pose comparison between randomly initialized and finally learned joint rotation tokens, transformed by the learned rotation head.}
+	\label{fig:random_vs_learned}
+\end{figure}
+
+\begin{figure}
+	\centering
+	\includegraphics[width=.9\linewidth]{figures/examples.pdf}
+	\caption{The human mesh reconstruction results on some hard examples from PoseTrack~\citep{posetrack:andriluka2018posetrack}.}
+	\label{fig:examples}
+\end{figure}
+
+
+
+\begin{figure}[h]
+	\centering
+	\includegraphics[width=.9\linewidth]{figures/h36m.pdf}
+	\caption{The human mesh reconstruction results on the examples from Human3.6M~\citep{h36m:ionescu2013human3}.}
+	\label{fig:h36m}
+\end{figure}
+
+\begin{figure}[h]
+	\centering
+	\includegraphics[width=0.9\linewidth]{figures/example_motion.pdf}
+	\caption{The human mesh reconstruction results for some video clips sampled from PoseTrack~\citep{posetrack:andriluka2018posetrack}.}
+	\label{fig:example_motion}
+\end{figure}
+
+

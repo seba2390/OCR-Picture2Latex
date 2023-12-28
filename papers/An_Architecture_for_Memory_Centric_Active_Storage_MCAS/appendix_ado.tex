@@ -1,0 +1,182 @@
+\newpage
+\subsubsection*{C. Example using ADO for multi-versioning}
+\label{appendix:ado_versioning}
+In this section, we describe a simple ADO example that adds versioning
+to the basic key-value store.
+\footnote{https://github.com/IBM/mcas/blob/master/examples/personalities/cpp\_versioning/}
+The ADO creates an area in persistent memory that saves multiple
+versions of values for a specific key and allows the client to
+retrieve prior versions of a value.  In the ADO layer we ``raise''
+the \code{get} and the \code{put} operations into the ADO handling
+above the basic client API (see Table~\ref{tab:clientapi}). The code
+is split into client-side library and server-side plugin. The message
+protocol implementation is based on flatbuffers.
+
+A client can invoke \code{put} and \code{get} operations (see Code
+Listing~\ref{lst:client versioning}).  Under the hood, \code{put}
+and \code{get} invocations result in calls to \code{invoke\_put\_ado}
+and \code{invoke\_ado} respectively.
+
+Corresponding messages are
+constructed and sent as part of the ADO invoke payloads.  In both operations, the target is a
+specific pool and key pair.  The messages are transmitted from the
+client over the network to the main shard process and then transferred to
+the ADO process via user-level IPC (see
+Section~\ref{subsec:ADO Invocation} for more detail).
+  
+The ADO plugin handling starts with an up-call to the \code{do work}
+ function (see Code Listing~\ref{lst:server_versioning}).  Here, the
+ message is unpacked and then dispatched to the appropriate \code{put}
+ or \code{get} handler.  The root pointer for the data structure that
+ handles the different versions is provided as part of the \code{do
+ work} invocation.  If it is the first-ever creation of the key the
+ ADO plugin must initialize the root data structure.  In this example,
+ the versioning metadata operations are made crash-consistent by using
+ a basic undo log to ensure power-fail atomicity. In this example, we
+ are using the \code{pmemlib} library and explicit 64-bit
+ transactions\footnote{Building handcrafted crash-consistency can be
+ complex but there are frameworks such as PMDK that can help to write
+ crash-consistent code}.
+
+During \code{put} invocation, the ADO handler creates (and persists)
+an undo log that records the prior value and then perform a
+transaction.  On successful completion of the transaction, the undo
+log is cleared.  When the system starts the ADO checks for the need to
+recover.  If the undo log is not clear, the logged data is copied back
+to the original location in memory.  Finally, the result of \code{put}
+and \code{get} operations are packed into a flatbuffer message and
+returned to the client.
+
+\newpage
+
+\begin{lstlisting}[caption={Client-side for ADO versioning},
+captionpos=b, label={lst:client versioning}, 
+frame=none]
+status_t Client::put(const pool_t pool,
+                     const std::string& key,
+                     const std::string& value)
+{
+
+  /* create request  message */
+  ...
+  s = _mcas->invoke_put_ado(pool,
+                            key,
+                            fbb.GetBufferPointer(),
+                            fbb.GetSize(),
+                            value.data(),
+                            value.length() + 1, 
+                            128, //root value length
+                            component::IMCAS::ADO_FLAG_DETACHED,
+                            response);
+  return s;
+}
+
+status_t Client::get(const pool_t pool,
+                     const std::string& key,
+                     const int version_index,
+                     std::string& out_value)
+{
+
+  /* create request  message */
+  ...
+  s = _mcas->invoke_ado(pool,
+                        key,
+                        fbb.GetBufferPointer(),
+                        fbb.GetSize(),
+                        0,
+                        response);
+  return s;
+}
+
+\end{lstlisting}
+
+
+\begin{minipage}{\linewidth}
+\begin{lstlisting}[caption={Server plugin for ADO versioning},
+captionpos=b, label={lst:server_versioning}, 
+frame=none]
+status_t ADO_example_versioning_plugin::do_work(const uint64_t work_key,
+                                        const char * key,
+                                        size_t key_len,
+                                        IADO_plugin::value_space_t& values,
+                                        const void *in_work_request,
+                                        const size_t in_work_request_len,
+                                        bool new_root,
+                                        response_buffer_vector_t& response_buffers)
+{
+  auto value = values[0].ptr;
+  auto root = static_cast<ADO_example_versioning_plugin_root *>(value);
+  if(new_root) {
+    root->init();
+  }
+  else {
+    root->check_recovery();
+  }
+
+  if(msg->element_as_PutRequest()) {
+    ...
+    //  Put
+    auto value_to_free = root->add_version(detached_value, detached_value_len, value_to_free_len);
+  /* create response message */
+    return S_OK;
+  }
+  else if(msg->element_as_GetRequest()) {
+    ...
+    // Get
+    root->get_version(pr->version_index(), return_value, return_value_len, timestamp);
+  }
+  /* create response message */
+  ...
+  return S_OK;
+}
+
+void init()
+{
+    pmem_memset_persist(this, 0, sizeof(ADO_example_versioning_plugin_root));
+}
+
+void check_recovery() {
+    /* check for undo */
+    if(_undo.mid_tx()) {
+       /* recover from the undo log and then clear the undo log */
+      _values[_current_slot] = _undo.value;
+      _undo.clear();
+    }
+ }
+
+
+void * add_version(void * value, size_t value_len, size_t& rv_len)
+{
+   void * rv = _values[_current_slot];
+   rv_len = _value_lengths[_current_slot];
+
+   /* create undo log for transaction */
+   _undo = { _current_slot, _values[_current_slot], _value_lengths[_current_slot], _timestamps[_current_slot] };
+   pmem_persist(&_undo, sizeof(_undo));
+
+   /* perform transaction */
+   _values[_current_slot] = value;
+
+   pmem_persist(&_current_slot, sizeof(_current_slot));
+
+   /* reset undo log */
+   _undo.clear();
+              
+   return rv; /* return value to be deleted */
+}
+
+void get_version(int version_index, void*& out_value, size_t& out_value_len, cpu_time_t& out_time_stamp) const
+{
+   int slot = _current_slot - 1;
+   while(version_index < 0) {
+     slot--;
+     if(slot == -1) slot = MAX_VERSIONS - 1;
+     version_index++;
+   }
+   out_value = _values[slot];
+}
+
+
+\end{lstlisting}
+\end{minipage}
+
