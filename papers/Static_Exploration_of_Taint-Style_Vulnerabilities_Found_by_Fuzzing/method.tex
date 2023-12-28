@@ -1,0 +1,261 @@
+Contemporary fuzzers and dynamic memory analysis tools have greatly advanced vulnerability detection and re-mediation, owing to their ease-of-use and public availability.
+Since fuzzers and memory analyzers are invoked at runtime, they require a test harness that accepts user input (usually read from a file or standard input), and invokes program APIs against this input.
+Therefore, the effectiveness of fuzzing and dynamic memory analysis depends on the availability of test cases that exercise a wide array of program APIs.
+
+In practice, code bases contain test harnesses for only a limited number of program APIs.
+%Thus, short of writing test harness for all program APIs, fuzzing is limited 
+This means that, even if fuzzing were to achieve 100\% test coverage (either line or edge coverage) for the set of {\it existing} test harnesses, it does not lead to 100\% {\it program API} coverage.
+%Short of writing test harnesses for all program APIs and fuzzing them, the assurance offered by state-of-the-art vulnerability assessment techniques is limited.
+Furthermore, for networking software, local test harnesses do not suffice, requiring elaborate setups involving multiple software components.
+
+Our work seeks to counter practical limitations of fuzz testing using a complementary approach.
+It builds on the idea that the reciprocal nature of static analysis and fuzzing may be leveraged to increase the effectiveness of source-code security audits.
+Our key insight is that vulnerabilities discovered using a fuzzer can be localized to a small portion of application code from which vulnerability templates may be derived.
+These templates may then be used to find recurring vulnerabilities that may have been either missed by the fuzzer, or are present in code portions that lack a fuzzable test harness.
+
+\paragraph{Motivating Example}
+We motivate our research using the example code shown in Listing~\ref{lst:example}.
+The example contains two synthetic vulnerabilities that are identical: program aborts while parsing (i) the input string literal {\tt doom}; (ii) the input whose cryptographic hash equals the string {\tt hash\_val}.
+The {\tt abort} call following the cryptographic comparison is invoked via an alias called {\tt CUSTOM}.
+We assume that the fuzzer is able to quickly find the crash due to the string literal comparison ({\tt doom}), but is unlikely to generate the input that satisfies the cryptographic operation.
+This is a reasonable assumption since hash collisions are highly unlikely.
+Faced with such a coverage bottleneck, we use the crash discovered by the fuzzer as a starting point for our vulnerability exploration, and proceed in three steps.
+We first localize the fault underlying the observed crash by computing the set difference of program coverage traces for the crashing and non-crashing runs respectively.
+Let us assume that the fuzzer corpus contains the crashing input {\tt doom} and it's parent mutation, say {\tt doo}.
+Using basic block (line) coverage tracing which is fast to obtain, we compute the set difference of the faulty and non-faulty executions to be line $9$ (i.e., the {\tt abort} call).
+Using the localized fault together with the crash stack trace, we then search for similar call sites using an automatically generated AST template.
+Listing~\ref{lst:query} shows the template derived from the line of code containing a call to {\tt abort}, and two matches resulting from template matching.
+Template matching results in two matches, one of which is the fuzzer-discovered vulnerability, and the other is a recurring instance {\it hiding} below cryptographic code.
+Although textual pattern matching for vulnerable code patterns is possible, it breaks down when code properties are crucial to finding a match e.g., call to {\tt abort()} via an alias (line 5 of Listing~\ref{lst:example}).
+Finally, we partially rank template matches by checking if the lines of code comprising a match have not been executed by a fuzzer (ranked high), or not (ranked low).
+In our example, such a ranking would place the undiscovered bug on line $17$ of Listing~\ref{lst:example} above the bug on line $9$ that has been found by the fuzzer.
+
+% Why is it useful? What implications does a good hybrid system have?
+Leveraging static analysis to complement fuzzing is appealing for two reasons.
+First, static analysis does not require a test harness, making it well-suited for our problem setting.
+Second, by taking a program-centric view, static analysis provides a greater overall assurance on software quality or lack thereof.
+Moreover, since we leverage concrete test cases to bootstrap our analysis, our vulnerability templates focus on a specific fault pattern that has occurred at least once with a demonstrable test input.
+This begets greater confidence in the returned matches and a higher tolerance for false positives, from an analyst's point of view.
+
+% What steps are involved in making this happen?
+The proposed vulnerability exploration framework requires a coupling between dynamic and static analysis.
+We begin by fuzzing a readily available program test case.
+Subsequently, the following steps are taken to enable static exploration of fuzzer-determined program crashes.
+\begin{itemize}
+\item {\bf Fault localization}: We localize vulnerabilities (faults) reported by the fuzzer to a small portion of the code base using either a dynamic memory error detector such as AddressSanitizer~\cite{asanfull}, or using differential execution slices.
+Fault localization serves as an interface for coupling dynamic and static analyses, and facilitates automatic generation of vulnerability templates.
+\item {\bf Vulnerability Templates}: Using lines of code returned by the fault localization module, together with the crash stack trace, we automatically generate vulnerability templates.
+The templates are encoded using code properties based on a program abstraction such as the abstract syntax tree (AST).
+Template matching is used to for finding potentially recurring vulnerabilities.
+\item {\bf Ranking Matches}: We rank matches returned by template matching before it is made available for human review.
+Matches comprising lines of code not covered by fuzzing are ranked higher than those that have already been fuzzed.
+\item {\bf Validation:} Finally, we manually audit the results returned by our analysis framework to ascertain if they can manifest as vulnerabilities in practice.
+\end{itemize}
+
+\subsection{Fault Localization}
+\label{sec:code_suspects}
+
+% Why localize
+% Localize what exactly
+% How localize
+% Benefit
+
+\begin{algorithm}[!t]
+\caption{Pseudocode for execution slice based fault localization.}
+\label{alg:slice_local}
+
+\begin{algorithmic}[1]
+\Function{obtain-slice}{$Input$, $Program$}
+\LineComment Slice generated using coverage tracer
+\State Return lines executed by $Program(Input)$
+\EndFunction
+\\
+\Function{obtain-dice}{$Slice1$, $Slice2$}
+\State dice = $Slice1$ - $Slice2$
+\State \Return dice
+\EndFunction
+\\
+\Function{localize-failure}{$Fault-Input$, $Program$, $Fuzz-Corpus$}
+\State fault-slice = obtain-slice($Fault-Input$, $Program$)
+\State nonfault-input = obtain-parent-mutation($Fault-Input$, $Fuzz-Corpus$)
+\State nonfault-slice = obtain-slice($nonfault-input$, $Program$)
+\State fault-dice = obtain-dice(fault-slice, nonfault-slice)
+\State \Return fault-dice
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+
+Although a program stack trace indicates where a {\it crash} happened, it does not necessarily pin-point the root-cause of the failure.
+This is because, a failure (e.g., memory access violation) manifests much after the trail of the faulty program instructions has been erased from the active program stack.
+Therefore, fault localization is crucial for templating the root-cause of a vulnerability.
+
+We localize a fuzzer-discovered program failure using a memory detector such as AddressSanitizer~\cite{asanfull}.
+AddressSanitizer is a dynamic analysis tool that keeps track of the state of use of program memory at run time, flagging out-of-bounds reads/writes at the time of occurrence.
+However, AddressSanitizer cannot localize failures {\it not} caused by memory access violations.
+For this reason, we additionally employ a differential execution slicing~\footnote{An execution slice is the set of source lines of code/branches executed by a given input.} algorithm to localize general-purpose defects.
+
+Agrawal et al.~\cite{agrawal1995fault} first proposed the use of differential execution slices (that the authors named execution dices) to localize a general-purpose program fault.
+Algorithm~\ref{alg:slice_local} shows an overview of our implementation of this technique.
+First, the execution slice for a faulty input is obtained ($fault-slice$, line 10 of Algorithm~\ref{alg:slice_local}).
+Second, the fuzzer mutation that preceded the faulty input and did not lead to a failure is determined (line 11), and the execution slice for this input obtained (line 12).
+Finally, the set difference of the faulty and the non-faulty execution slices is obtained (line 13).
+This set difference is called the fault dice for the observed failure.
+We obtain execution slices of a program using the SanitizerCoverage tool~\cite{coveragesan}.
+
+In summary, fault localization helps us localize a fuzzer-discovered vulnerability to a small portion of the codebase.
+Faulty code may then be used to automatically generate vulnerability templates.
+
+\subsection{Vulnerability Templates}
+\label{sec:traversals}
+
+% Why query
+% How query
+% What is flexible, what is templated
+% How are queries issued and matches returned
+
+Faulty code snippets contain syntactic and semantic information pertaining to a program failure.
+For example, the fact that dereference of the {\tt len} field from a pointer to {\tt struct udp} leads to an out-of-bounds memory access contains (i) the syntactic information that {\tt len} field dereference of a data-type {\tt struct udp} are potentially error-prone; and (ii) the semantic information that tainted input flows into the {\tt struct udp} type record, and that appropriate sanitization is missing in this particular instance.
+Therefore, we leverage both syntactic, and semantic information to facilitate static exploration of fuzzer-determined program crashes.
+
+Syntactic and semantic templates are derived from localized code snippets, and the crash stack trace.
+Syntactic templates are matched against the program's abstract syntax tree (AST) representation, while semantic templates against the program's control flow graph (CFG) representation.
+In the following, we briefly describe how templates are generated, and subsequently matched.
+
+\paragraph{Syntactic Templates}
+
+Syntactic templates are matched against the program abstract syntax tree (AST).
+They may be formulated as functional predicates on properties of AST nodes.
+We describe the process of formulating and matching AST templates using an out-of-bounds read in UDP parsing code of Open vSwitch v2.6.1 that was found by afl-fuzz and AddressSanitizer.
+
+Listing~\ref{lst:ovs} shows the code snippet responsible for the out-of-bounds read.
+The faulty read occurs on line 636 of Listing~\ref{lst:ovs} while dereferencing the {\tt udp\_header} struct field called {\tt udp\_len}.
+The stack trace provided by AddressSanitizer is shown in Listing~\ref{lst:ovs_stack}.
+In this instance, the fault is localized to the function named {\tt check\_l4\_udp}.
+Post fault localization, a vulnerability (AST) template is derived from the AST of the localized code itself.
+
+\lstinputlisting[style=minipage,firstnumber=624,xleftmargin=2em,label=lst:ovs,caption=Code snippet from Open vSwitch v2.6.1 that contains a buffer overread vulnerability in UDP packet parsing code.]{ovs.c}
+
+Listing~\ref{lst:ovs_ast} shows the AST fragment of the localized faulty code snippet, generated using the Clang compiler.
+The AST fragment is a sub-tree rooted at the declaration statement on line 636, that assigns a variable named {\tt udp\_len} of type {\tt size\_t}, to the value obtained by dereferencing a struct field called {\tt udp\_len} of type {\tt const unsigned short} from a pointer named {\tt udp} that points to a variable of type to {\tt struct udp\_header}.
+Using the filtered AST fragment, we use AST template matching to find similar declaration statements where {\tt udp\_len} is dereferenced.
+The templates are generated by automatically parsing the AST fragment (as shown in Listing~\ref{lst:ovs_ast}), and creating Clang libASTMatcher~\cite{libastmatcher} style functional predicates.
+Subsequently, template matching is done on the entire codebase.
+Listing~\ref{lst:ovs_query} shows the generated template and the matches discovered.
+
+\lstinputlisting[style=minipage,xleftmargin=0.5em,label=lst:ovs_stack,caption=Stack trace for the buffer overread in UDP packet parsing code obtained using AddressSanitizer.]{ovs_stack.txt}
+
+AST templates are superior to simple code searching tools such as {\tt grep} for multiple reasons.
+First, they encode type information necessary to filter through only the relevant data types.
+Second, they are flexible enough to mine for selective code fragments, such as searching for {\tt udp\_len} dereferences in binary operations in addition to declaration statements only.
+
+\lstinputlisting[style=minipage,xleftmargin=1em,firstnumber=538,label=lst:ovs_match,caption=Match returned using automatically generated AST template shows a potentially recurring vulnerability in Open vSwitch 2.6.1. This new flaw was present in the portion of OvS code that lacked a test harness and was found during syntactic template matching.]{ovs_match.c}
+
+\begin{table*}[!tbh]
+\lstinputlisting[style=minipage,xleftmargin=2em,label=lst:ovs_ast,caption=AST of the localized fault that triggers an out-of-bounds read in UDP packet parsing code. AST nodes of interest are shown in green.]{ovs_ast.txt}
+\centering
+\lstinputlisting[style=minipage,linewidth=15cm,xleftmargin=7em,label=lst:ovs_query,caption=AST template matching and its output. The code snippet surrounding match \#3 is shown in Listing~\ref{lst:ovs_match}.]{ovs_query.txt}  
+\end{table*}
+
+Listing~\ref{lst:ovs_match} shows one of the matches discovered (see Match \#3 of Listing~\ref{lst:ovs_query}).
+In the code snippet shown in Listing~\ref{lst:ovs_match}, the OVS controller function named {\tt pinctrl\_handle\_put\_dhcpv6\_opts} handles an incoming DHCP packet (containing a UDP packet) that is assigned to a pointer to {\tt struct udp\_header}, and subsequently dereferenced in the absence of a bounds-check on the length of the received packet.
+This is one of the bugs found using syntactic template matching that was reported upstream, and subsequently patched by the vendor~\cite{ovsmatch}.
+Moreover, this match alerted the OvS developers to a similar flaw in the DNS header parsing code.
+
+To be precise, vulnerability templates need to encode both data and control flow relevant failure inducing code.
+Otherwise, explicit sanitization of tainted input will be missed, leading to false positives.
+To this end, we augment syntactic template matching with semantic (control and data-flow) template matching.
+
+\paragraph{Semantic Templates}
+
+Control and data-flow templates encode semantic code properties needed to examine the flow of tainted input.
+However, since each defect is characterized by unique control and data-flow, semantic templates are harder to automate.
+We remedy this problem by providing {\it fixed} semantic templates that are generic enough to be applied to any defect type.
+
+We parse the program crash stack trace to perform semantic template matching.
+First, we determine the function in which the program fails (top-most frame in the crash trace), and generate a template to match other call-sites of this function.
+We call this a {\it callsite} template.
+Callsite templates intuitively capture the insight that, if a program failure manifests in a given function, other calls to that function demand inspection.
+Second, for memory access violation related vulnerabilities, we determine the data-type of the variable that led to an access violation, and assume that this data-type is {\it tainted}.
+Subsequently, we perform taint analysis on this data-type terminating at pre-determined security-sensitive sinks such as {\tt memcpy}, {\tt strcpy} etc.
+We call this a {\it taint} template.
+Taint templates provide insight on risky usages of a data-type that is known to have caused a memory access violation.
+Callsite and taint templates are matched against the program control flow graph (CFG).
+They have been implemented as extensions to the Clang Static Analyzer framework~\cite{clangsa}.
+
+% Syntactic, and semantic templates provide rich diagnostics to statically explore a fuzzer-discovered vulnerability.
+% However, owing their inherent incompleteness, the matches returned by them will contain false positives.
+% To reduce the burden of reviewing potential false positives, we propose a match-ranking algorithm that processes the raw list of template matches, and returns an ordered list of matches.
+
+\subsection{Match Ranking}
+\label{sec:mine}
+
+% 1. Matches can be overwhelming
+% 2. Not all matches may be interesting.
+% 3. Several heuristics may be used to rank matches.
+% 4. We leverage program test coverage for ranking.
+% 5. Present algo
+% 6. Argue that it is practically beneficial
+
+\begin{algorithm}[!t]
+\caption{Pseudocode for ranking statically explored vulnerability matches.}
+\label{alg:ranking}
+
+\begin{algorithmic}[1]
+\Function{isHigh}{$Matching-unit$, $Coverset$}
+\State \For{each $m-unit$ in $Coverset$}
+               \If{$m-unit$ == $Matching-unit$}
+               \Return True
+               \EndIf
+\EndFor
+\State \Return False
+\EndFunction
+\\
+\Function{rank-matches}{$Matches$, $Coverset$}
+\State RHigh = $\emptyset$
+\State RLow = $\emptyset$
+\State \For{each $match$ in $Matches$}
+\If{isHigh($match$, $Coverset$)}
+\State RHigh += $match$
+\Else
+\State RLow += $match$
+\EndIf
+\EndFor
+\State \Return (RHigh, RLow)
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+Matches returned using static template matching may be used to (in)validate potentially recurring vulnerabilities in a codebase.
+However, since vulnerability templates over-approximate failure-inducing code patterns, false positives are inevitable.
+We remedy the false-positive problem using a simple yet practical match ranking algorithm.
+
+Algorithm~\ref{alg:ranking} presents the pseudocode for our match ranking algorithm.
+The procedure called {\tt RANK-MATCHES} accepts the set of template matches (denoted as $Matches$), and the set of program functions covered by fuzz testing (denoted as $Coverset$)  as input, and returns a partially orders list suitable for manual review.
+For each match, we apply a ranking predicate on the program function in which the match was found.
+We call this function, the {\it matching unit}.
+The ranking predicate (denoted as the procedure $isHigh$) takes two input parameters: the matching function name, and the $Coverset$.
+Under the hood, $isHigh$ simply performs a test of set membership; it checks if the matching unit is a member of the coverset, returning {\tt True} if it is a member, {\tt False} otherwise.
+All matching units that satisfy the ranking predicate are ranked high, while the rest are ranked low.
+The ranked list is returned as output.
+
+Our ranking algorithm is implemented in Python using a hash table based data structure.
+Therefore, ranking a match takes $O(1)$ on average, and $O(n)$ in the worst case, where $n$ is the number of functions in the coverset.
+On average, the time to rank all matches grows linearly with the number of matches.
+This is really fast in practice e.g., in the order of a few milliseconds (see Table~\ref{tab:runtime}).
+
+Our prototype leverages {\it GCov}~\cite{gcov}, a publicly available program coverage tracing tool, for obtaining the coverset of a fuzzer corpus.
+Although our prototype currently uses function as a matching unit, it may be suitably altered to work at the level of source line of code (basic blocks).
+However, given that a fuzzer corpus typically contains thousands of test cases, we chose function-level tracing for performance reasons.
+
+\subsection{Validation}
+\label{sec:validate}
+
+% 1. Even after throwing the kitchen sink at it, false alarms might exist
+% 2. Therefore, manual validation is necessary
+% 3. However, our approach keeps the analyst interested by providing explorations of reliable ground truth data
+% 4. It prioritizes time budget by using a ranking system that processes the raw output of static analysis
+
+Although match ranking helps reduce the burden of false positives, it does not eliminate them entirely.
+Therefore, we rely on manual audit to ascertain the validity of analysis reports.
+Nonetheless, our approach focuses attention on recurrences of demonstrably vulnerable code patterns, thereby reducing the extent of manual code audit.

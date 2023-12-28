@@ -1,0 +1,169 @@
+\section{Methodology}
+\label{opt}
+
+In our work, we explore fine-grained  parallelization  across the column iterations for both deep convection, shown in Figure \ref{deep_convect}, and shallow convection. We propose various optimizations including load balancing, avoiding false sharing, data management and proportional partitioning of the columns across both the Xeon CPU and Xeon Phi coprocessor cores, shown in Figure \ref{deep_convect}, and shallow convection. We also propose various other  optimizations including proportional partitioning of the shallow convection columns across both the Xeon CPU and Xeon Phi coprocessor cores.
+
+\subsection{Load Balancing Convections}
+
+Deep convection is bound to have load imbalances due to varying cloud cover among the columns owned by the OpenMP threads. At grid points where there is no deep clouding, the corresponding column iterations of the deep convection computations will be skipped. It is likely that deep convection occurs over domains computing the tropics rather than those of the extra-tropics and polar regions. While CESM supports load balancing at the chunk level for the overall physics calculations, our work explores load balancing for fine-grained balancing at the column level. We have employed OpenMP {\em dynamic scheduling} to distribute the columns/iterations to the threads in a load balanced manner. 
+
+However, dynamic scheduling incurs overheads since the OpenMP runtime has to dynamically schedule the column iterations to the next available and free threads. The OpenMP dynamic chunksize parameter ({\em omp chunk size}) also plays a role in determining the scheduling overhead. To offset the overheads, the number of column iterations and/or the workload per column has to be sufficiently large. Thus the performance benefits of dynamic scheduling depend on the number of columns per chunk ({\em the model chunk size}) and the model resolution used. Table \ref{omp_chunk_xeon} shows the effect of OpenMP dynamic chunk sizes on the loop runtimes for the R1 resolution with 5 days of simulation on the Xeon CPU with 16 threads. The results indicate that increasing the chunk size of the Xeon beyond 14 degrades performance due to dynamic scheduling overheads. On Xeon Phi with 240 threads, using OpenMP dynamic chunk sizes of 1, 2 and 3 yielded loop runtimes of 311, 357 and 405 seconds, respectively. Due to the large number of Xeon Phi threads and limited number of columns per chunk, we were unable to increase the chunk size beyond 3. Thus, we generally found that an omp chunk size of 10-14 for the Xeon, and 1-2 for the Xeon Phi produced the best results.  We increased the model chunk size from the default value of 16 to 864 for the R1 resolution, and 1728 for the R2 and R3 resolutions for the dynamic scheduling to be effective.
+
+\begin{table}
+\small
+\centering
+\begin{tabular}{||p{0.58in}|p{0.15in}|p{0.15in}|p{0.15in}|p{0.15in}|p{0.15in}|p{0.15in}|p{0.15in}|p{0.15in}|p{0.15in}|p{0.15in}||}
+\hline\hline
+{\it Chunk Size} & 1 & 2 & 4 & 8 & 10 & 12 & 14 & 16 & 20 \\
+\hline
+{\it Runtime (secs)} & 117.8 & 104.3 & 92.4 & 73.8 & 73.1 & 74.7 & 72.0 & 76.2 & 76.7 \\
+\hline\hline
+\end{tabular}
+\caption{Effect of OpenMP dynamic chunk sizes on loop runtime on Xeon}
+\label{omp_chunk_xeon}
+\end{table}
+ 
+
+
+Our single-node experiments using 16 threads on Xeon and 240 threads on Xeon Phi show that the use of OpenMP dynamic scheduling resulted in improvements of 11.8\% on Xeon and 17.6-20.1\% on Xeon Phi for both the entrainment and precipitation loops when compared to the default static scheduling of the threads.
+
+Shallow convection too displays significant load imbalance among the column computations. In areas where there are no clouds, the cumulus convection computations are skipped, and this leads to load imbalance. Based on certain thermodynamic properties including pressure, a condition variable is assigned to either true or false for each column. This condition is set at multiple places in the loop, and if at any time it is true, further computations for that column are stopped. This leads to differing amounts of computations in different columns based on the condition, resulting in load imbalance.
+This is depicted in Figure \ref{shallow_convect}.
+Similar to deep convection, we employed OpenMP dynamic scheduling for the shallow convection and improved the performance of the loop by 15\% on the Xeon, and 10.5-12.5\% on the Xeon Phi in our single-node experiments.
+
+\begin{algorithm}
+\begin{small}
+\SetKwInOut{Input}{input}
+\SetKwInOut{Output}{output}
+\SetKwFor{Do}{do}{}{end}
+
+  OMP PARALLEL SCHEDULE(DYNAMIC,2)
+  \Do{i=1,numColumnsinChunk}{
+      ... \BlankLine
+      ... \BlankLine
+      shouldColumnExit = checkThermoDynProperties() \;
+      \If{shouldColumnExit = TRUE}{
+        goto END \;
+      }
+      \tcc{The above condition check is repeated at multiple points in the routine. Some column computations exit early leading to load imbalance}
+      ... \BlankLine
+      ... \BlankLine
+      shouldColumnExit = checkThermoDynProperties() \;
+      \If{shouldColumnExit = TRUE}{
+        goto END \;
+      }
+      ... \BlankLine
+      \tcc{Write output variables for this column}
+      END: \BlankLine
+        \tcc{Set output variables to ZERO for this column}
+    }
+\caption{Shallow Convection}
+\label{shallow_convect}
+\end{small}
+\end{algorithm}
+
+\subsection{Data Management for Offloading}
+
+After solving the load imbalance problem in the Shallow convection loop, we found a large difference of about 7-25\% between the time taken for the entire OpenMP column-loop and the individual thread times that correspond to the useful work done by the threads. Further analysis using Intel Vtune suggested that this was due to memcpy operation as a result of using the firstprivate clause for a large number of local variables in the OpenMP loop. The shallow convection routine had about 500 such local variables and about 40 input/output array variables. Out of the 500 local variables, about 220 are array variables. Total size of all the local 500 variables including scalars and arrays are roughly 16 MB, out of which the arrays contributed 99\%. FirstPrivate for a variable in OpenMP results in private copies of the variable for each thread and initialized to the value of the variable in the master thread prior to the OpenMP parallel loop. This incurs large overheads in OpenMP runtime since the runtime performs memcpy operations to initialize the variable copies in the threads. This memcpy time grew with the number of threads used, and severely affected Xeon Phi performance due to larger number of threads (180) used on Xeon Phi. The memcpy time alone contributed to about 44\% of the runtime for the loop on the Xeon Phi.
+
+All the 500 local variables could not be designated with the default {\em private} setting of OpenMP, since about 100 of the variables were initialized before the loop began. Using shared for all the variables also yielded incorrect results. Upon closer inspection, we found that all except 4 of the 100 variables that were being initialized were diagnostic array variables that were not used in model output. As each thread was indexing into the arrays, these variables were designated as shared. Only the 4 scalar variables were truly firstprivate since they were being initialized and used inside the loop. Thus, most of the large arrays could be safely used as shared variables, and many scalars could be used as private variables (instead of firstprivate) in the OpenMP clause for the shallow convection loop. This resulted in drastic reduction of the number of variables declared as firstprivate to only the four scalar variables.
+
+
+
+Hence, we proceeded to use dynamic scheduling for the shallow convection loop. We also verified the correctness by checking bit-by-bit accuracy. We also explored the use of OpenMP's {\em task} construct in place of the for-loop parallelization. We found that this resulted in a performance slowdown of 1.2X when compared to dynamic scheduling on both Xeon and Xeon Phi.
+
+
+\subsection{False Sharing among Threads and Loop Rearrangement}
+
+Further studying the scalability bottlenecks and hotspots with Intel VTune, we found that the shallow convection routine has two loops whose scaling efficiency and speedups are only about 37\% and 6x, respectively, when executing with 16 threads on the Xeon CPU cores. The two loops also contributed to about 35\% of the overall shallow convection routine. These loops write output values to 2D-arrays of $cols\times verticals$ for various vertical levels corresponding to the columns possessed by a thread as shown in Figure \ref{falseshare_write}. Due to the column major traversal in Fortran, multiple threads owning different columns access successive memory locations corresponding to the same vertical level, resulting in false sharing of cache lines by the threads. Also, access of successive vertical levels for a column by a thread results in access with non-unit large strides. As confirmed by the Intel compiler optimization report, this results in inefficient vectorization of the loop with generation of scatter-gather instructions.
+
+\begin{algorithm}
+\begin{small}
+\SetKwInOut{Input}{input}
+\SetKwInOut{Output}{output}
+\SetKwFor{Do}{do}{}{end}
+
+  \Output{A(numColsinChunk,numVerticalLevels), B(numColsinChunk,numVerticalLevels)}
+
+  OMP PARALLEL SCHEDULE(DYNAMIC,2)
+  \Do{i=1,numColumnsinChunk}{
+      ... \BlankLine
+      ... \BlankLine
+      \tcc{Write output variables for this column}
+      \Do{k=1,numVerticalLevels}{
+        A(i,k) = ....\;
+        B(i,k) = ....\;
+      }
+      END:
+      \tcc{Set output variables to ZERO for this column}
+      \Do{k=1,numVerticalLevels}{
+        A(i,k) = 0 \;
+        B(i,k) = 0 \;
+      }
+    }
+\caption{False Sharing and Unvectorized Writing Loops}
+\label{falseshare_write}
+\end{small}
+\end{algorithm}
+
+The solution to both the false sharing problem and inefficient vectorization is to interchange the array dimensions, and pad the arrays such that no two threads write to the same cache line at any time. Specifically, the number of vertical levels (k-loop in Figure \ref{falseshare_write}) is 30 in CESM. Since the cache line in Xeon and Xeon Phi architectures is 64 bytes, we need to ensure that the size of the innermost dimension, corresponding to the vertical levels, in arrays $A$ and $B$ is a multiple of 64. Hence, padding of two elements for the innermost dimension was applied. The modified code is shown in Figure \ref{nofalseshare_write}.
+
+\begin{algorithm}
+\begin{small}
+\SetKwInOut{Input}{input}
+\SetKwInOut{Output}{output}
+\SetKwFor{Do}{do}{}{end}
+
+  \tcc{Interchange of array dimensions}
+  \Output{A(numVerticalLevels+padding,numColsinChunk), B(numVerticalLevels+padding,numColsinChunk)}
+
+  OMP PARALLEL SCHEDULE(DYNAMIC,2)
+  \Do{i=1,numColumnsinChunk}{
+      ... \BlankLine
+      ... \BlankLine
+      \tcc{Write output variables for this column}
+      \Do{k=1,numVerticalLevels+padding}{
+        A(k,i) = ....\;
+        B(k,i) = ....\;
+      }
+    END:
+      \tcc{Set output variables to ZERO for this column}
+      \Do{k=1,numVerticalLevels+padding}{
+        A(k,i) = 0 \;
+        B(k,i) = 0 \;
+      }
+    }
+\caption{Modified code to avoid false Sharing and improve vectorization}
+\label{nofalseshare_write}
+\end{small}
+\end{algorithm}
+
+Our optimization resulted in the single-thread performance improvement, as mentioned in Section \ref{exp_res}, due to increased vectorization. This was also confirmed by the compiler report that did not show generation of scatter-gather instructions. 
+
+\subsection{Proportional Partitioning of Column Computations across CPU and Co-processor Cores}
+
+Recalling that the column computations are independent across different columns, all the columns corresponding to a MPI task of a node can be shared among the CPU and Xeon Phi cores for asynchronous and simultaneous computations on both the CPU and co-processor cores. We split the column computations in such a way that the Xeon and Xeon Phi complete their share of the computations at the same time. The Xeon asynchronously offloads a portion of the columns to the Xeon Phi and proceeds with its own column computations. When the Xeon finishes, results from the Xeon Phi can be collected. This way, a portion of the column computations can be hidden by using asynchronous offloads. The ratio of partitioning is based on the times for computations of the columns on Xeon and Xeon Phi, and further fine-tuned based on experiments with different values of columns/chunk.
+
+Due to our fine-grained offloading of the computations, Xeon-Xeon Phi data transfers are incurred for each offload. We performed a number of optimizations to reduce/hide the data transfer times: \\
+{\bf Packing:} The initial version of our proportional partitioning had very huge data transfer times, about 4-5X larger than the computation times on the Xeon Phi. This also resulted in extremely low bandwidth, of about 20 MB/s, on the Xeon-Xeon Phi interconnect while the bus supports up to 8GB/s transfer rates. The primary reason is that our initial version involved multiple transfers of small amount of data (2-5 MB) as a collection of multiple small arrays. Packing these arrays into a single user defined Structure of Arrays greatly increased the achieved bandwidth to about 400-500 MB/s (nearly 20-25x increase) and thus reduced the asynchronous offload set up and wait times. \\
+{\bf Offloading only the needed data:} We also avoided resending a large number of scalars that do not change between the offloads. We modified the offload algorithm to send these scalars only in the first timestep, and make them resident for subsequent offloads. \\
+{\bf Static in/out variables:} We made the input and output Structure of Arrays as static in order to further reduce the setup and wait overheads. This resulted in at least 10X reduction in data transfer times. \\
+The ratio of division of the available columns between the CPUs and co-processors depends on the different number of cores on both the resources, variable performance of the CPU and co-processor, the resolution of the model run and hence the workload of the column computation, and the number of available Xeon Phi cards in a single node. The ratio also depends on the compiler flags used. Use of fast compiler options result in larger performance improvements on Xeon Phi than on Xeon, and hence more columns can be offloaded to Xeon Phi. Use of more Xeon Phi cards can also result in offloading of more columns. We conducted offline experiments to determine these ratios for these different configurations.
+These techniques enable our proportional partitioning approach to be scalable to larger number of nodes and cores.
+
+
+\subsection{Other Optimizations}
+
+\subsubsection{Strength Reduction:} There were certain division operations within a performance critical subroutine of shallow convection routine that calculated some thermodynamic properties. These divisions could be replaced by less-expensive multiplication operations without affecting the result. We applied such strength reduction in various locations of the convection routines. e.g., $a=b/c/c$ was converted to $a=b/(c*c)$.
+
+\subsubsection{Computation and Data Reuse:} The themodynamical properties calculated in the above-mentioned subroutine were found to be in-variant across multiple iterations of the loops in this subroutine. Hence, these calculations can be performed outside the loops and the results can be used for multiple iterations instead of calculating for each iteration, as is done in the original code. Some of these calculations corresponded to costly divisions. By moving these calculations outside the column loop, we observed significant performance improvements.
+
+\subsubsection{Compiler Flags:} Past studies of application optimizations on the Xeon Phi have employed the use of compiler flags to speed up math computations, especially those involving exponent, logarithm and power computations. The Xeon Phi has low-precision hardware support to accelerate these computations and the compiler flags provide means to specify the needed precision. Apart from speeding up these transcendental math functions, there is also support for FMA (Fused Multiply and Add) on the Xeon Phi.
+These are hardware instructions that are generated only when using high speed compiler flags and not in the default flags, since they involve a change in the order of floating point calculations being performed and may not produce bit-by-bit identical results. 
+
+
+The shallow and deep convection loops, especially deep convection, are prime candidates for use of high speed compiler flags due to the presence of large number of power and log computations in performance sensitive loops. By using the ``$-fp-model$ $fast=2$'' compiler flags along with varying precisions, we were able to significantly improve performance of both the loops on the Xeon Phi.
+
+
+
+

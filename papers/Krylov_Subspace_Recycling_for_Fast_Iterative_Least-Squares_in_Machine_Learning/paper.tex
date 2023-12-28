@@ -1,0 +1,357 @@
+\documentclass{article}
+
+% if you need to pass options to natbib, use, e.g.:
+\PassOptionsToPackage{numbers, compress}{natbib}
+% before loading nips_2017
+%
+% to avoid loading the natbib package, add option nonatbib:
+% \usepackage[nonatbib]{nips_2017}
+
+%\usepackage{nips_2017}
+% to compile a camera-ready version, add the [final] option, e.g.:
+\usepackage[final]{nips_2017}
+
+
+\include{preamble}
+
+\usetikzlibrary{external}
+% \tikzexternalize%[mode=list and make]
+\tikzset{external/force remake=false}
+\tikzsetexternalprefix{fig/external/}
+% pdflatex --shell-escape paper.tex
+
+
+% \usepackage{caption}
+% \usepackage{subcaption}
+\graphicspath{{fig/}}
+
+\newlength{\figheight}
+\newlength{\figwidth}
+
+\setlength{\figwidth}{.9\textwidth}
+%\setlength{\figheight}{0.61803398875\figwidth}
+%\setlength{\figheight}{0.2\textheight}
+
+
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage[colorlinks   = true, %Colours links instead of ugly boxes
+  urlcolor     = blue, %Colour for external hyperlinks
+  linkcolor    = blue, %Colour of internal links
+  citecolor   = red %Colour of citations
+  ]{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts,amsmath,amssymb,mathtools}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+
+%\pgfplotsset{compat=newest}
+
+\newcommand{\CITE}{{\color{red}\textbf{[CITE]}}}
+
+\newcommand{\spa}{\operatorname{span}}
+
+\title{Krylov Subspace Recycling for\\{Fast} Iterative Least-Squares in Machine Learning}
+
+% The \author macro works with any number of authors. There are two
+% commands used to separate the names and addresses of multiple
+% authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to
+% break the lines. Using \AND forces a line break at that point. So,
+% if LaTeX puts 3 of 4 authors names on the first line, and the last
+% on the second line, try using \AND instead of \And before the third
+% author name.
+
+\author{
+  Filip de Roos and Philipp Hennig\\
+  Max Planck Institute for Intelligent Systems
+  Spemannstr. 34, T\"ubingen, Germany\\
+  \texttt{[fderoos|ph]@tue.mpg.de}
+}
+
+\begin{document}
+% \nipsfinalcopy is no longer used
+%\usepgfplotslibrary{plotmarks}
+\maketitle
+
+\begin{abstract}
+  Solving symmetric positive definite linear problems is a fundamental computational task in machine learning. The exact solution, famously, is cubicly expensive in the size of the matrix. To alleviate this problem, several linear-time approximations, such as spectral and inducing-point methods, have been suggested and are now in wide use. These are low-rank approximations that choose the low-rank space a priori and do not refine it over time. While this allows linear cost in the data-set size, it also causes a finite, uncorrected approximation error. Authors from numerical linear algebra have explored ways to iteratively refine such low-rank approximations, at a cost of a small number of matrix-vector multiplications. This idea is particularly interesting in the many situations in machine learning where one has to solve a sequence of related symmetric positive definite linear problems. From the machine learning perspective, such \emph{deflation} methods can be interpreted as transfer learning of a low-rank approximation across a time-series of numerical tasks. We study the use of such methods for our field. Our empirical results show that, on regression and classification problems of intermediate size, this approach can interpolate between low computational cost and numerical precision.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+Many of the most prominent machine learning problems can be seen as a sequence of linear systems, finding $\vec{x}^{(i)}$ such that 
+\begin{equation}\label{eq:task}
+A^{(i)} \vec{x}^{(i)} = \vec{b}^{(i)}\qq \text{for}\qq A^{(i)}\in\Re^{n\times n},\q \vec{x}^{(i)},\vec{b}^{(i)}\in\Re^{n}, \qq\text{and}\qq i\in\mathbb{N}.	
+\end{equation}
+A prominent example is nonparametric logistic regression, further explained below. But there are many more: Model adaptation in Gaussian process models \citep[][\textsection5.2]{RW-GPML} requires the solution of the problem $k_{\theta,XX}^{-1}\vec{y}$ for a sequence of parameter estimates $\theta$, where $k_{XX}$ is a kernel Gram matrix over the data set $X=[\vec{x}_1,\dots,\vec{x}_n]\Trans$, and $\vec{y}$ is the vector of target data. Further afield, although this view is not currently the popular standard, deep learning tasks have in the past been addressed by methods like Hessian-free optimization \cite{martens10}, which consist of such sequences. Importantly, in these machine learning examples, the matrix $A$ is usually symmetric positive definite (or, in the generally non-convex case of deep learning, is at least approximated by an spd matrix in the optimizer to ensure a descent step). This means that Eq.~\eqref{eq:task} is indeed an optimization problem, because $\vec{x}^{(i)}$ then equals the minimum of the quadratic function 
+\begin{equation}\label{eq:optimization-form}
+	\vec{x}^{(i)} = \argmin_{\tilde{\vec{x}}} \frac{1}{2} \tilde{\vec{x}}\Trans A^{(i)} \tilde{\vec{x}} - \tilde{\vec{x}}\Trans \vec{b}^{(i)} \q\text{with gradient}\q \vec{r}^{(i)}(\tilde{\vec{x}}) \ce \nabla f(\tilde{\vec{x}}) = A^{(i)} \tilde{\vec{x}} - \vec{b}^{(i)}.
+\end{equation}
+
+When facing linear problems of small to moderate size (i.e.~$n\lesssim 10^4$) in machine learning , the typical approach is to rely on standard algorithms (in particular, Cholesky decompositions) provided by toolboxes like BLAS libraries, or iterative linear solvers like the method of conjugate gradients~\cite{hestenes52} (CG). Exact methods like the Cholesky decomposition have cubic cost, $\mathcal{O}(n^3)$, iterative solvers like CG have quadratic cost, $\mathcal{O}(n^2m)$ for a small number of $m$ iterative steps. These algorithms are self-contained, generic ``black boxes''---they are designed to work on \emph{any} spd matrix and approach every new problem in the same way. A more critical way to phrase this property is that these algorithms are \emph{non-adaptive}. If the sequence of tasks ($A^{(i)},\vec{b}^{(i)}$) are related to each other, for example because they are created by an outer optimization loop, it seems natural to want to propagate information from one linear solver to another. One can think of this notion as a form of \emph{computational transfer learning}, in the ``probabilistic numerics'' sense of treating a computation as an inference procedure~\cite{hennig2015probabilistic}. As it turns out, the computational linear algebra community has already addressed this issue to some extent. In that community, the idea of re-using information from previous problems in subsequent ones is known as \emph{subspace-recycling}~\cite{parks06}. But these numerical algorithms have not yet found their way into the machine learning community. Below, we explore the utility of such a resulting method for application in machine learning, by empirically evaluating it on the test problem of Bayesian logistic regression (aka. Gaussian process classification, GPC).
+
+\subsection{Relation to Linear-Cost Methods}
+\label{sub:relation_to_linear_cost_methods}
+
+For linear problems of \emph{large} dimensionality (data-sets of size $n\gtrsim 10^4$), the current standard approach is to introduce an ``a-priori'' low-rank approximation: Sampling a small set of approximate eigenvectors of the kernel gram matrix~\cite{NIPS2007_3182,NIPS2008_3495}, and introducing various conditional independence assumptions over sets of inducing points~\cite{NIPS2000_1866,quinonero05,snelson07a}. These methods achieve \emph{linear} cost $\mathcal{O}(nm^2)$ because they project the problem onto a projective space of dimensionality $m$, and this space is not adapted over time (when it is adapted \cite{titsias09a}, additional computational overhead is created outside the solver). The downside of this approach is that it yields an approximation of finite quality---these methods fundamentally can not converge, in general, to the exact solution. The algorithms we consider below can be seen in some sense as the ``missing link'' between these linear-cost-but-finite-error methods and the cubic-cost, exact solvers for smaller problems: They \emph{adapt} the projective sub-space over time at the cost of a small number of quadratic cost steps, while also attempting to re-use as much information from previous runs as possible. In fact, the ``guessed'' projective space of the aforementioned methods could be used as the first initialization of the methods discussed below.
+
+\section{Method}
+\label{sec:method}
+
+\begin{figure}
+\centering
+\def\svgwidth{\linewidth}
+\input{fig/def_CG.pdf_tex}
+\caption{\label{fig:def_cg} The def-CG algorithm applied to a sequence of linear systems with the implicit preconditioning visualized. The first solution is obtained through normal CG and approximate eigenvectors $W$, corresponding to the largest eigenvalues are calculated from a low-rank approximation. If prior knowledge about the eigenvectors of the first system is available, def-CG can be used for the first system as well.}
+\end{figure}
+
+
+\subsection{Krylov Subspace Recycling}
+The \emph{Krylov sequence} of subspaces is a core concept of iterative methods for linear systems $A\vec{x}=\vec{b}$~\cite{saad11}. The \emph{Krylov subspace} $\mathcal{K}_j(A,\vec{r}_0)$ is the span of the truncated power iteration of $A$ operating on $\vec{r}_0$, where $\vec{r}_{0}$ is the gradient (\emph{residual}) from Eq.~\eqref{eq:optimization-form} at the starting point $\vec{x}_0$ of the optimization:
+\begin{equation}
+\mathcal{K}_j(A,\vec{r}_0)=\spa\{\vec{r}_0,A\vec{r}_0,...,A^{j-1}\vec{r}_0\}.
+\end{equation}
+Methods that \emph{transfer} information from one such iteration to the next in order to faster converge to a solution in subsequent systems are referred to as \emph{Krylov subspace recycling methods}~\cite{parks06}. The ``recycling'' of information is traditionally done by \textit{deflation}~\cite{saad00,frank01}, \textit{augmentation}~\cite{gaul13,morgan95}, or combinations thereof~\cite{ebadi16,chapman97}. These two approaches differ in their implementation, but have the same goal: restricting the solution to a simpler search space, to speed up convergence. Both store a set of $k$ linearly independent vectors $W^{(i)}\in\mathbb{R}^{n\times k}$. For problem $i$ in the above sequence of tasks, a subspace-recycling Krylov method computes solutions that satisfy
+\begin{align}
+\vec{x}_j ^{(i)}&\in \vec{x}_0+\mathcal{K}_j(A,\vec{r}_0) \cup \spa\{W^{(i)}\}, \\
+\vec{r}_j ^{(i)}&= \vec{b}-A\vec{x}_j \perp \mathcal{K}_j(A,\vec{r}_0) \cup \spa\{W^{(i)}\}. \label{eq:res}
+\end{align}
+An augmented iterative solver keeps the vectors in $W$ and orthogonalizes the updated residuals $\vec{r}_j ^{(i)}$ against $W$. This method is easily included in methods that contain an explicit orthogonalization step, an example of which is the General Minimum Residual method (GMRES)~\cite{morgan95}.\\
+For $A$ spd, one usually chooses CG as the iterative solver and deflation is easier incorporated~\cite{saad00}. A deflated method ``deflates'' a part of the spectrum of $A$ by projecting the solution onto the orthogonal complement of $W$. This can be viewed as a form of preconditioning\footnote{Not all authors agree: \citet{gaul13} argue that the projector $P_W$ should not be considered a preconditioner since its application removes a part of the spectrum of A while leaving the remainder untouched.} with a singular projector $P_W$, i.e.~solving $P^{(i)}_W A^{(i)
+} \vec{x}^{(i)}=P^{(i)}_W\vec{b}^{(i)}$. This property is in contrast to normal preconditioning where the whole spectrum of $A$ is modified by a non-singular matrix.  % \rightarrow \hat{A}^{(i)}\hat{\vec{x}}^{(i)}=\hat{\vec{b}}^{(i)}$ 
+ In order to keep the additional computational overhead incurred by subspace recycling low, the dimension of $W$ should be low, and contain vectors that optimally speed up the convergence. For iterative linear solvers, the rate of convergence is directly proportional to the condition number 
+\begin{equation}
+\kappa (A)=\frac{\lambda_{n}(A)}{\lambda_{1}(A)},
+\end{equation} 
+where $\lambda_j$ refers to the eigenvalues of $A$ sorted in ascending order \cite{nocedal06}. Typically, the smallest eigenvalues are the limiting factors for convergence; hence $W^{(i)}$ should ideally contain the eigenvectors related to the $k$ \emph{smallest} eigenvalues---this yields an effective condition number of $\kappa_{\text{eff}} = \nicefrac{\lambda_{n}}{\lambda_{k+1}}$, which can drastically improve the convergence rate~\cite{saad11,ebadi16}. Of course the same improvement in the condition number can also be achieved by changing the \emph{largest} eigenvalue.
+
+\subsection{Deflated Conjugate Gradient}
+\label{sec:def_cg}
+
+In the special case when $A$ is symmetric and positive definite (SPD), the conjugate gradient method (CG) \cite{hestenes52} is a popular choice to iteratively solve the system. As noted above, in machine learning, where linear tasks almost invariably arise in the form of least-squares problems, this is actually the typical setting. \citet{saad00} derived a deflated version of CG based on the Lanczos iteration (partly represented in Algorithm \ref{alg:defcg}): it implicitly forms a tri-diagonal low-rank approximation to a Hermitian matrix $A$, which translates to symmetric when $A$ is real-valued. By storing quantities that are readily available from the CG iterations, the low-rank approximation can be obtained without costly matrix-vector computations. 
+The eigenvalues of the approximation are known as Ritz values, which tend to approximate the extreme ends of the spectrum of $A$~\cite{saad11}. The corresponding Ritz vectors are used to find good approximations of the eigenvectors that can be used for a deflated subspace $W$ to improve the condition number \cite[see][for more details]{saad00}. 
+The algorithm will be referred to as def-CG($k,\ell$) where $\ell$ is the number of CG iterations from which information is stored in order to generate $k$ approximate eigenvectors. 
+\\
+For deflated CG, the orthogonality constraint of Eq.~\eqref{eq:res} is replaced by a constraint of \emph{conjugacy}, i.e.~$\vec{r}_i\Trans A\vec{r}_j=0$ for $i\neq j$.
+The associated preconditioner $P_W=I-AW(W^T A W)^{-1}W^T$ projects the residual onto the $A$-conjugate complement of $W$. Figure \ref{fig:def_cg} illustrates the effect of applying $P_W$ to $A$. For this figure, $W$ was chosen by the def-CG algorithm according to the harmonic projection method~\cite{morgan95}, so the approximate eigenvectors correspond to the largest eigenvalues. The algorithm (Algorithm \ref{alg:defcg}) differs from the standard method of conjugate gradients only in line 11 and the initialization in line 3. How the eigenvectors are approximated is outlined in Section \ref{sub:approximate_eigenvectors}.
+The additional inputs to the solver are a set of $k$ linearly independent vectors in $W$ and, optionally, $W$ multiplied with $A$ if it can be obtained cheaply. \\
+To estimate the computational cost of def-CG we assume $k\ll n$ so terms not containing $n$ in the computational complexity can be ignored. Each iteration in Algorithm \ref{alg:defcg} has a computational overhead of $\mathcal{O}(kn^2)$ of solving the linear system in line 11. Computing the matrix $W^TAW$ has complexity $\mathcal{O}(n^2k^2)$ but it only has to be computed once and if the procedure used by \citet{saad00} and further outlined in section \ref{sub:approximate_eigenvectors}, $W$ and $AW$ are obtained in $\mathcal{O}(n^2(\ell+1)k)$. By choosing $\ell$ and $k$ to be small the computational overhead can be kept modest. This shows the importance of choosing vectors in $W$ that significantly reduce the number of required iterations to make up for the computational overhead. Another factor to take into account is the additional storage requirements of the deflated CG. The main contributing factors are the matrices $W$ and $AW$, which each are of size $n\times k$ and $\ell$ search directions of size $n$. 
+
+\begin{algorithm}
+\begin{algorithmic}[1]
+\Procedure{Deflated-CG($k,\ell$)}{$A$, $b$, $x_{-1}$, $W$, $(AW)$, tol}
+\Ensure{$W\in\Re^{n\times k}$} \Comment{$k$ included in Alg. definition for interpretability, can obviously be inferred internally.}
+\LState \raisebox{0pt}[0pt][0pt]{Choose $x_0$ such that $W^Tr_0=0$ where $r_0=b-Ax_0$}
+\LState \raisebox{0pt}[0pt][0pt]{$x_0=x_{-1}+W(W^TAW)^{-1}W^Tr_{-1}$}
+\LState \raisebox{0pt}[0pt][0pt]{Solve $W^TAW\mu_0=W^TAr_0$ for $\mu$ and set $p_0=r_0-W\mu_0$} \Comment{deflation for initial iteration}
+\While{\raisebox{0pt}[0pt][0pt]{$|r_j|>\text{tol}$ (For j=1...)}}
+\LState \raisebox{0pt}[0pt][0pt]{$\phantom{\alpha_{j-1}}\mathllap{d_{j-1}}=p_{j-1}^TAp_{j-1}$} 
+\LState \raisebox{0pt}[0pt][0pt]{$\phantom{\alpha_{j-1}}\mathllap{\alpha_{j-1}}=r_{j-1}^Tr_{j-1}/{d_{j-1}}$}
+\LState \raisebox{0pt}[0pt][0pt]{$\phantom{\alpha_{j-1}}\mathllap{x_j}=x_{j-1}+\alpha_{j-1}p_{j-1}$}
+\LState \raisebox{0pt}[0pt][0pt]{$\phantom{\alpha_{j-1}}\mathllap{r_j}=r_{j-1}-\alpha_{j-1}Ap_{j-1}$}
+\LState \raisebox{0pt}[0pt][0pt]{$\phantom{\alpha_{j-1}}\mathllap{\beta_{j-1}}=r_{j}^Tr_{j}/r_{j-1}^Tr_{j-1}$} \Comment{from line 6 to here: standard conjugate gradient}
+\LState \raisebox{0pt}[0pt][0pt]{$\phantom{\alpha_{j-1}}\mathllap{\mu_j} = $ Solve $W^TAW\mu_j=W^TAr_j$} \Comment{deflation for following iteration}
+\LState \raisebox{0pt}[0pt][0pt]{$\phantom{\alpha_{j-1}}\mathllap{p_j}=\beta_{j-1}p_{j-1}+r_j-W\mu_j$}
+\If{$j<\ell$}
+\LState \raisebox{0pt}[0pt][0pt]{Store $d_j$, $\alpha_j$, $\beta_j$, $\mu_j$, $p_j$}
+\EndIf
+\EndWhile
+\EndProcedure
+\end{algorithmic}
+\caption{Deflated Conjugate Gradient method.}
+\label{alg:defcg}
+\end{algorithm}
+
+\subsection{Approximate Eigenvectors}
+\label{sub:approximate_eigenvectors}
+One way of obtaining approximate eigenvectors is with the Lanczos algorithm and extract Ritz value/vector pairs. The Lanczos algorithm from which \citet{saad00} derived def-CG, generates a sequence of vectors $\{\vec{p}_j\}$  such that
+\begin{equation*}
+\vec{p}_{j+1} \perp_A \spa\{W,\vec{p}_0,...,\vec{p}_j\}.
+\end{equation*} 
+The matrix $A$ can then be transformed into a symmetric and partly tridiagonal matrix $T_{l+k}=Z^TAZ$, with $Z=[W,P_l]\in \Re^{n\times (\ell +k)}$ and $P_\ell=[\vec{p}_0,...,\vec{p}_{\ell-1}]$. The eigendecomposition of $T_{l+k}$ produces pairs $(\theta_j,\vec{u}_j)_{j=1,...,\ell+k}$, of which $\theta_j$ are Ritz values that approximate the eigenvalues of $A$. The corresponding approximate eigenvector is obtained as the Ritz vector $\vec{v}_j=Z \vec{u}_j$. For an orthogonal projection technique, such as deflation, the residual of $(A-\theta I)\vec{v}$ should be orthogonal to $Z$ \cite{chapman97}, leading to the generalized eigenvalue problem
+\begin{equation*}
+Z\Trans (A-\theta I) Z \vec{u}=0 \q \Rightarrow \q Z\Trans A Z\vec{u}=\theta Z\Trans Z \vec{u}.
+\end{equation*}
+This can be transformed to a normal eigenvalue problem by multiplying both sides with $(Z\Trans Z)^{-1}$, which exist because the columns in $Z$ are linearly independent, but the symmetric properties would be lost. Computing these matrices generates an additional, non-negligible computational cost, because CG does not generate orthogonal, but $A$-conjugate directions.\footnote{Despite its name, the gradients produced by CG are actually orthogonal, not conjugate. The name arose out of the historical context, because it is a \emph{conjugate} directions method that uses \emph{gradients}.} By instead considering the base $AZ$ for orthogonality, \citet{morgan95} rephrased the problem as a Galerkin method for approximating the eigenvalues of the inverse of $A$  
+\begin{equation*}
+(AZ)^T(AZ\vec{u} - \theta Z\vec{u})=0.
+\end{equation*}
+This method is referred to as \textit{harmonic projection}. % or a Galerkin procedure for approximating harmonic values. 
+By introducing 
+\begin{equation*}
+F=(AZ)^TZ, \qquad \qquad G=(AZ)^T(AZ),
+\end{equation*}
+the problem is conveniently formulated as 
+\begin{equation}
+G\vec{u}=\theta F\vec{u}.
+\label{eq:eig}
+\end{equation}
+By using properties of the search directions and residuals generated from Algorithm \ref{alg:defcg}, \citet{saad00} explicitly formed $F$ and $G$ from sparse matrices containing the stored quantitities from the first $\ell$ iterations of Algorithm \ref{alg:defcg}. This effectively reduces the computational overhead of finding approximate eigenvectors and makes the method competitive. Once Eq.~\eqref{eq:eig} is solved, one chooses $k$ of the $\ell+k$ Ritz values $\theta$ with corresponding vectors $\vec{u}$ and stores them in $U$. The $k$ approximate eigenvectors for the next system are obtained as $W=ZU$. Preferably the largest or smallest $\theta$ are chosen but this is not required.   
+
+\paragraph{Remark: Connection to First-Order Methods}
+\label{sub:connection_to_first_order_methods}
+
+In very high-dimensional machine learning models, second-order optimization methods based on the quadratic model of Eq.~\eqref{eq:optimization-form} are not as popular as first-order methods, like (stochastic) gradient descent and its many flavors. Although we do not further consider this area below, it may be helpful to note that the schemes described here have a weak connection to it, at least in the case of noise-free gradients. That is because the first step of CG is simply gradient descent. The recycling schemes described above can thus be compared conceptually to methods like momentum-based gradient descent \cite{polyak1964some} and other acceleration techniques.
+
+\section{Experiments}
+\label{sec:experiments}
+
+We test the utility of def-CG in a classical machine learning benchmark: The infinite MNIST~\cite{loosli06} suite is a tool to automatically create arbitrary size datasets containing images of ``hand-written'' digits, by applying transformations to the classic MNIST set\footnote{\texttt{http://yann.lecun.com/exdb/mnist/}} of actual hand-written digits. We used it to generate a training set $X$ of $36\,551$ images for the digits three and five, each of size $28\times 28$ gray-scale pixels (This means the training set is three times larger than the set of threes and fives in the original MNIST set). By the standards of kernel methods, this is thus a comparably big data set. We consider binary probabilistic classification on this dataset, and follow a setup made popular by \citet{kuss06}. This setting is a good example of the role of linear solvers in machine learning. It involves two nested loops of repeated linear optimization problems. %
+
+This involves computing a (Gaussian) Laplace approximation to the posterior arising from a Gaussian process prior on a latent function $f$ (in our case, $p(f)=\GP(0,k)$, with the Gaussian/RBF kernel $k(\vec{x}_i,\vec{x}_j)=\theta^2 \exp \left(-\nicefrac{(\vec{x}_i-\vec{x}_j)^2}{2\lambda^2}\right)$), and the logistic link function $p(y_i \g f_i) = \sigma(y_i f_i) = 1/(1+e^{-y_if_i})$ as the likelihood (see also \cite[][\textsection 3.7.3, which also outlines the explicit algorithm]{RW-GPML}). 
+
+The outer loop will find the optimal hyperparameters for the kernel and the inner (which is the focus of this study) will find the $\vec{f}$ that maximize
+\begin{equation}
+\Psi(\vec{f})=\log p(\vec{y}|\vec{f}) + \log p(\vec{f}|X)=\log p(\vec{y}|\vec{f})-\frac{1}{2}\vec{f}^TK^{-1}\vec{f} - \frac{1}{2}\log |K| -\frac{n}{2} \log 2\pi,
+\label{eq:obj}
+\end{equation}
+for a given kernel matrix $K$ with Newton's method.
+
+Newton's method converges to an extremum by evaluating the Jacobian and Hessian of a function at the current location $\vec{x}_n$ and finds a new location by computing $\vec{x}_{n+1}=\vec{x}_n-\operatorname{Hess}_{(\Psi)}^{-1}\operatorname{Jac}_{(\Psi)}$. These iterations involve the solution of a linear system that changes in each iteration.
+%Each iteration of Newton's method requires the solution of a linear system $A^{(i)}\vec{x}^(i)=\vec{b}^{(i)}$ where both the target $\vec{b}^{(i)}$ and the matrix $A^{(i)}$ change with each new iteration. 
+%$\vec{x}_{n+1}=\vec{x}_n-H_{(f)}^{-1}J_{f}$
+%$x_{n+1}=x_n-\nice\frac{\nabla f(x_n)}{\nabla^2 f(x_n)}$
+For Laplace approximation the system to be solved can be made numerically stable by restructuring the computations \cite{kuss06}. In each iteration the target and matrix get a new value 
+\begin{align}
+\vec{b}^{(i)} &=H^{[i] \frac{1}{2}}K(H^{(i)}\vec{f}_{X}^{(i)} + \nabla \log p(y|\vec{f}_X^{(i)})),\\
+A^{(i)} &=I+H^{(i)\frac{1}{2}}K H^{(i) \frac{1}{2}},
+\label{eq:linsys}
+\end{align}
+with $H=-\nabla \nabla \log p(\vec{y}|\vec{f}_X^{(i)})$. This restructuring assures that the eigenvalues $\lambda_i$ of $A$ are contained in $[1,n \max_{ij}(K_{ij})/4]$ and is therefore well-conditioned for most kernels~\cite{RW-GPML}. 
+
+Note how this task fits the setting sub-space recycling methods are designed for: It is difficult to analytically track how an update to $\vec{f}_X^{(i)}$ affects the elements of $(A^{(i)})^{-1}$ and $\vec{b}^{(i)}$, due the non-linear dependence in $\vec{f}_X$. But as the Newton optimizer converges, the iterates change less and less: $|\vec{f}_X^{(i)}-\vec{f}_X^{(i-1)}|<|\vec{f}_X^{(i-1)}-\vec{f}_X^{(i-2)}|$. Thus, $A^{(i)}$ and $\vec{b}^{(i)}$ will change less and less between iterations, and subspace recycling should become increasingly advantageous---up to a point, because of course we have to limit the dimensionality of the deflated space for computational reasons.
+
+%The Newton optimization process for the Laplace approximation involves repeatedly computing a gradient and Hessian matrix of the posterior log marginal likelihoood  $\log p(\vec{f}_X \g X,\vec{y})$. Here $\vec{f}_X$ is the vector of latent function values at the training locations $X\in \mathbb{R}^{n\times d}$ with labels $\vec{y}\in\{-1;1\}^n$. It yields an approximate distribution  
+%\begin{equation}
+%q(\vec{f}|X,\vec{y})=\mathcal{N}(\vec
+%{f},\hat{\vec{f}},D^{-1})
+%\label{eq:q}
+%\end{equation}
+%where the mean $\hat{\vec{f}}=\text{argmax}_{\vec{f}} p(\vec{f}|X,\vec{y})$ is the MAP estimate, and the covariance matrix $D=-\nabla\nabla \log p(\vec{f}|X,\vec{y})|_{\vec{f}=\hat{\vec{f}}}$ is the Hessian of the negative log posterior evaluated at this maximum. The posterior distribution $p(\vec{f}|X,\vec{y})$ can be rewritten using Bayes' rule as $p(\vec{y}|\vec{f}) p(\vec{f}|X)/p(\vec{y}|X)$, of which only the nominator depend on $\vec{f}$. To find the mode $\hat{\vec{f}}$ that maximize the posterior it is enough to consider the logarithm of the nominator \textit{i.e.} the objective
+ %To maximize the posterior it is enough to consider the 
+%In the following experiments, the logistic regression function  was used for the likelihood $p(y_i|f_i)$. Rasmussen and Williams \cite{RW-GPML} presents an algorithm using Newton's method to iteratively find the optimal $\hat{\vec{f}}$ to maximize Eq.~\eqref{eq:obj}. For each iteration of the method, a system involving the matrix $A=I+H^{\frac{1}{2}}KH^{\frac{1}{2}}$ needs to be solved, where $H=-\nabla \nabla \log p(y|f)$ is the diagonal Hessian of the negative log likelihood. The diagonal matrix $H$ changes between the iterations of Newton's method and consequently $A$ as well. The eigenvalues of $A$ are contained in $\lambda_i \in \left[1,n \max_{ij}(K_{ij})/4\right]$, which makes $A$ well-conditioned for most covariance functions. Finding a solution to the system involving $A$ can be done via a Cholesky decomposition. 
+
+Solving the linear system in Eq.~\eqref{eq:linsys} with a Cholesky decomposition is $\mathcal{O}(n^3)$ expensive, where $n$ is the dimension of $A$ i.e.~the size of the training set $X$. Iterative methods, such as CG due to the kernel matrix $K$ being SPD, have been used to speed up the mode-finding of $\hat{\vec{f}}$~\cite{RW-GPML,davies14}. Table \ref{tab:acc} compares the cumulative computational cost and accuracy of the exact Cholesky decomposition, standard CG and deflated CG for each iteration in Newtons method. A reduction of the relative error $\epsilon=|\vec{b}-A\vec{x}_i|/|\vec{b}|$ was used as stopping criterion and was chosen to be $10^{-5}$. 
+%Iterative methods such as CG can be used to speed up the solution of the system \cite{davies14,RW-GPML}. When the problem is well-conditioned and the solution does not have to be exact, iterative methods generally require lower computational cost to find an approximate solution satisfying the error tolerance.
+
+%\begin{figure}[t]
+%  \centering \scriptsize
+%  \input{fig/example}
+%  \caption{Caption here}
+%  \label{fig:figure1}
+%\end{figure}
+
+\setlength{\tabcolsep}{5.4pt} % <- default: 6pt
+\begin{table}
+	\caption{Iterative solvers operating on the MNIST classification task. The table shows the progress over Newton iterations. Within each Newton iteration the system in Eq.~\eqref{eq:linsys} needs to solved. Both iterative solvers were set to run until they achieve a relative error of $\epsilon=10^{-5}$. The column labeled $t$ shows cumulative runtimes for each method with the time to extract $W$ included for def-CG.}
+	\label{tab:acc}
+	\centering
+	\begin{tabular}{c|cc|ccc|ccc}
+	\toprule
+	 & \multicolumn{2}{|c|}{Cholesky} &\multicolumn{3}{|c|}{CG} &\multicolumn{3}{|c}{def-CG($k=8,\,\ell = 12$)}  \\
+	\midrule
+	%\cline{1-6}
+	   It. & $\log p(\vec{y}|\vec{f})$ & $t\,[\mathrm{s}]$  & $\log p(\vec{y}|\vec{f})$ & rel. error $\delta$ & $t\,[\mathrm{s}]$ & $\log p(\vec{y}|\vec{f})$ & rel. error $\delta$ & $t\,[\mathrm{s}]$\\
+	\midrule
+	1 & -4926.523 & 426& -4968.760 &$8.573\cdot10^{-3}$ &231 &  -4968.760 & $8.573\cdot10^{-3}$ & 245   \\
+	2 & -1915.537 &896 & -1931.348 & $8.254\cdot10^{-3}$&492 &  -1938.585 & $1.203\cdot10^{-3}$ & 436   \\
+	3 & -919.124  &1366 & -924.891 & $6.274\cdot10^{-3}$&715 &  -926.668 & $8.208\cdot10^{-3}$ &  617  \\
+	4 & -549.182  &1875 & -551.432 & $4.097\cdot10^{-3}$&920 &  -551.796 & $4.760\cdot10^{-3}$ &  790  \\
+	5 & -407.058  &2362 & -408.010 & $2.339\cdot10^{-3}$&1088 &  -408.133 & $2.641\cdot10^{-3}$ &  947  \\
+	6 & -353.632  &2856 & -354.040 & $1.154\cdot10^{-3}$&1246 &  -354.085 & $1.281\cdot10^{-3}$ &  1101  \\
+	7 & -335.575  & 3342& -335.711 & $4.053\cdot10^{-4}$& 1444&  -335.744 & $5.036\cdot10^{-4}$ &  1258  \\
+	8 & -331.326  &3815& -331.346 & $6.036\cdot10^{-5}$&1647 &  -331.355 & $8.753\cdot10^{-5}$ &  1418  \\
+	9 & -330.997  &4317& -330.998 & $2.309\cdot10^{-6}$&1821 &  -330.996  & $4.018\cdot10^{-6}$ &  1571  \\
+	\bottomrule
+	\end{tabular}
+\end{table}
+Table \ref{tab:acc} shows that iterative methods on their own already save computations. Figure~\ref{fig:results} also shows a plot of these results. The increasingly steep downward slope of the CG error in later optimization problems suggests that the systems are getting easier to solve, possibly because the matrix $A^{(i)}$ becomes better conditioned. But the figure also shows the additional advantage of sub-space recycling in def-CG. Eight approximate eigenvectors were used, yielding a saving of at least 12 CG iterations per system ($\sim 25\%$). Enough to outweigh the the computational overhead of finding $W$ and $AW$. Initially, the reduction of iterations for def-CG stagnate (become parallel to CG) over the course of a few Newton iterations, which suggests the recycled subspace fails to reduce the effective condition number further. Either the recycled vectors do not find good approximations to the extreme eigenvalues and the algorithm can be improved, or the difference between successive $A^{(i)}$ is too significant so the propagated information is less useful. Additional experiments (not shown) suggest that both effects play a role, but the former, i.e.~numerical stability, dominates. % By choosing a larger $l$ a better convergence to the eigenvectors are expected. A much larger value of $l$ was not possible to use, likely due to numerical precision issues leading to non-orthogonal residuals.
+% The approximate eigenvalues would then become complex-valued instead of real-valued and positive as expected from a SPD matrix. 
+Methods that try to alleviate this problem by estimating the convergence of the approximate eigenvectors exist \cite{gosselet13}, but cause additional computational overhead.
+% increases so the problem sequences are very high-dimensional
+%({\color{red} Should w argue why it was not implemented?}).
+
+\setlength{\figwidth}{.5\textwidth}
+\setlength{\figheight}{0.61803398875\figwidth}
+
+\begin{figure}[t]
+    \centering \scriptsize
+        \hfill\input{fig/CPU}\hfill%
+        \input{fig/iterations}\hfill\null
+    \caption{\textbf{Left:} Computational cost (CPU time) per iteration of Newton's method. \textbf{Right:} number of iterations required for CG and def-CG(8,12) to solve a single system (Eq.~\eqref{eq:linsys}) to a relative error of $\epsilon=10^{-5}$. The stopping criterion for the Newton iteration was $\Delta \Psi(\vec{f}) < 1$, thus only requiring the first two terms in Eq.~\eqref{eq:obj} to be computed.}\label{fig:results}
+\end{figure}
+\setlength{\figwidth}{.9\textwidth}
+
+To better understand the effect of the deflation on individual solutions of Eq.~\eqref{eq:linsys}, Figure~\ref{fig:comparison} compares the convergence of def-CG and standard CG. Each solver was set to run until a relative error of $10^{-8}$ was achieved and the results are shown in Fig.~\ref{fig:comparison}. The figure indicates that the computational savings do not stem from the initial projection onto the A-orthogonal complement of $W$ as one could suspect, but rather from a steeper convergence. This fits with the idea that deflation lowers the effective condition number of deflated system relative to the original problem. 
+
+%\setlength{\figwidth}{.49\textwidth}
+%\setlength{\figheight}{0.61803398875\figwidth}
+%\begin{figure}
+%    \centering \scriptsize
+%        \input{fig/iter1}\hfill%
+%        \input{fig/iter2}\hfill\null%
+%        \input{fig/iter3}\hfill
+%        \hfill\input{fig/iter4}\hfill%
+%        \input{fig/iter7}\hfill \null
+%    \caption{{\color{red} Align pictures, i+=1} The computational resources required to solve successive systems to a relative %residual of $\epsilon=10^{-8}$. The yellow and green curves show the convergence of standard CG and def-CG(8,12). The dashed green is the convergence of def-CG(8,12) with only one step recurrence. Only approximate eigenvectors from the preceeding iteration are saved in $W$. The benefit of maintaining a set of approximate eigenvectors that are refined in each iteration of systems is thus made clear. In iteration $i=1$ are the same vectors in $W$ used for the 1-step recurrence and the normal def-CG and the curves are therefore almost indiscernible. Def-CG shows a steeper convergence compared to standard CG and the computaional gain should be more obvious for higher precision.}\label{fig:suc_cpu}
+%\end{figure}
+%\setlength{\figwidth}{.9\textwidth}
+
+
+
+\setlength{\figwidth}{.99\textwidth}
+\setlength{\figheight}{0.41803398875\figwidth}
+%\setlength{\figheight}{0.61803398875\figwidth}
+
+\begin{figure}[b]
+    \centering \scriptsize
+        \input{fig/comparison}
+    \caption{\label{fig:comparison}Relative residual over multiple solutions of Newton's method i.e. the systems described in Eq.~\eqref{eq:linsys} were solved. Each solver had a relative error of $\epsilon=10^{-8}$ as stopping criterion. Similarly to the results in Fig.~\ref{fig:results}, the time required to find a solution that satisfies the error bound becomes faster for each Newton iteration. The deflated method achieves a faster convergence rate as seen by the slope of the relative residual. This confirms that re-using information from a previous system indeed lowers the effective condition number.}
+
+\end{figure}
+\setlength{\figwidth}{.9\textwidth}
+
+\subsection{Comparison to Linear-Cost Approximations}%\label{sub:ind_point}
+
+We now investigate the utility of sub-space recycling relative to the linear cost approximation methods of finite error discussed above in Section~\ref{sub:relation_to_linear_cost_methods}, in particular to inducing point methods. These methods assume that the training set elements $\vec{f}_n$ at $X\in \Re^{n\times d}$ are approximately independent of each other when conditioned on a smaller set of values $\vec{f}_m$ at representer points $X_m\in \Re^{m\times d}$. In GPC, this effectively reduces the task to optimizing only the latent variables $\vec{f}_m\in \Re^{m}$ with $m<n$, to maximize the objective in Eq.~\eqref{eq:obj}. The latent variables for the remaining points in the data set are then \emph{induced} by the conditional distribution $p(\vec{f}_{n-m}\g\vec{f}_m)$, with mean $\Exp [\vec{f}_{n-m}\g\vec{f}_m]=K_{(n-m)m} K^{-1}_{mm}\vec{f}_m$. A measure of the performance over the training set is then obtained by evaluating the objective with the inferred latent variables.  
+
+%A common approach to handle high-dimensional datasets in Gaussian process regression is to use various low-rank approximations by considering a subset of the data \cite{quinonero05}. These methods are referred to as inducing point methods that give rise to inducing variables. As explained in section \ref{sub:ind_point}. Such methods are there to make approximate inference tractable when ... solved. 
+We compared the accuracy of iterative methods to inducing point methods with a randomly selected subset of the training data. Figure \ref{fig:convlin} shows the convergence of the Newton optimizer for subsets $X_m$ of $\log p(\vec{y}\g \vec{f})$ of varying sizes. (each time, error was evaluated on the entire training set $X$). The results confirm the expected picture: The approximate methods can be significantly faster than the iterative solves, but they also incur a significant approximation error. If an accurate solution is required, the iterative solvers can be competitive. For this experiment, the iterative methods have a computational cost comparable to that of the approximate methods running on a (comparably large) subset of between $25\%$ and $50\%$ of the data set. But they also achieve an improvement of about 6 orders of magnitude in precision.
+
+\setlength{\figwidth}{.99\textwidth}
+\setlength{\figheight}{0.41803398875\figwidth}
+\begin{figure}
+    \centering \scriptsize
+        \input{fig/convlin}
+   \caption{\label{fig:convlin}Comparison of accuracy between the iterative methods CG, def-CG and differently sized subsets of data measured as the relative error of $\log p(\vec{y}\g \vec{f})$ to the ``exact'' (up to machine precision) value achieved by a direct (Cholesky) solver on the full data set. Each dot represents the approximated $\log p(\vec{y}\g \vec{f})$ for the full training set after each iteration of Newton's method. The CPU time refers to the cumulative time spent solving the linear systems in Eq.~\eqref{eq:linsys}, which is the computationally most expensive part of each Newton iteration.}
+\end{figure}
+\setlength{\figwidth}{.9\textwidth}
+
+
+% \subsection{outlook}
+
+% \begin{itemize}
+% \item approximate $\log |K|$
+% \item improve $W$
+% \end{itemize}
+% \cite{gosselet13} looked for converged Ritz vectors to dynamically change $W$
+
+\section{Conclusion} 
+\label{sec:conclusion}
+
+We have investigated the use of Krylov sub-space recycling methods for a realistic example application in machine learning. ML problems often involve outer loops of (hyper-) parameter optimization, which produce a sequence of interrelated linear, symmetric positive definite (aka.~least-squares) optimization problems. Subspace-recycling methods allow for iterative linear solvers to share information across this sequence, so that later instances become progressively cheaper to solve. Our experiments suggests that doing so can lead to a useful reduction in computational cost. While non-trivial, sub-space recycling methods can be implemented and used with moderate coding overhead. 
+
+We also compared empirically to the popular option of fixing a low-rank sub-space a priori, in the form of spectral or inducing point methods. The overarching intuition here is that these methods can achieve much lower computational cost when they use a low-dimensional basis. But in exchange they also incur a significant computational error. In applications where computational \emph{precision} is at least as important as computational \emph{cost}, sub-space recycling iterative solvers provide a reliable answer of high quality. While their run-time scales quadratically with data-set size, they are certainly scalable, at acceptable run-times, to data-sets containing $\sim 10^5$ to $\sim 10^6$ data points.
+
+% \newpage
+\small
+\bibliographystyle{abbrvnat}
+\bibliography{bibfile}
+
+
+\end{document}

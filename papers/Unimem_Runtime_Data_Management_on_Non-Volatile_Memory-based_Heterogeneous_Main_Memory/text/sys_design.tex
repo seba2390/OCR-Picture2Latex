@@ -1,0 +1,736 @@
+\section{Design and Implementation} 
+\label{sec:sys_des}
+%Our preliminary performance study reveals that 
+%placing data objects appropriately on NVM and DRAM
+%is very beneficial to bridge the performance gap between NVM and DRAM.
+Motivated by the preliminary performance study, we introduce a runtime system (named ``Unimem'') targeting on directing data placement on HMS for HPC applications.
+
+%\subsection{Unimem Overview}
+%\label{sec:overview}
+\begin{comment}
+To make Unimem a runtime for HPC applications, we have several design goals.
+First, Unimem must be lightweight. This means that 
+changing data placement (i.e., data movement) should have minimum impact on application performance.
+This also means that the process to determine data placement
+must be lightweight.
+%collecting application information and making data placement decision  before data movement must be lightweight.
+Second, enforcing data placement should be transparent to applications.
+We want to enable automatic data movement, and relieve users from
+handling data movement details.
+Third, we want to avoid any disruptive change to applications,
+such that legacy applications can be easily ported to NVM-based HMS
+with few programming efforts. 
+%Third, Unimem should be portable across common HPC platforms and scalable.
+\end{comment}
+
+Unimem directs data placement for data objects (e.g., multi-dimensional arrays). The data objects must be %can be the critical data structures 
+allocated using certain Unimem APIs by the programmer.
+%can be either specified by the programmer using certain Unimem API.  %or allocated through regular heap memory allocation.
+We call those data objects, the \textit{target data objects}, in the rest of the paper.
+Unimem is phase based. It decides and changes data placement for target data objects for each phase based on runtime profiling and lightweight performance models.
+
+In particular, Unimem profiles memory references to target data objects
+with a few invocations of each phase. 
+Then Unimem uses performance models to predict performance benefit and cost of data placement,
+and formulates the problem of deciding optimal data placement as a knapsack problem. 
+The results of the performance models and formulation direct data placement for each phase in the rest of the application execution.
+%To improve runtime performance, we introduce a series of optimization techniques.
+%such as proactive data movement, optimizing initial data movement, and decomposing large data objects.
+We describe the design and implementation details in this section.
+
+\begin{comment}
+In particular, Unimem profiles memory accesses for target data objects
+with a few invocations of each phase.  %based on common performance counters
+The profiling leverages performance counters commonly found in modern processors,
+and catch problematic data objects whose memory accesses can suffer from 
+the performance limitation of NVM.
+Using the profiling information, Unimem applies lightweight performance models
+to capture the sensitivity of data objects to memory bandwidth and latency,
+and predict performance benefit and cost if moving data objects from NVM to DRAM.
+Given the performance benefit and cost of data movement, we formulate the problem of deciding optimal data placement as a a knapsack problem, and use dynamic programming to solve it. 
+The results of the performance models and dynamic programming direct data placement for each phase in the rest of the application execution.
+%To avoid creating memory bandwidth bottleneck on DRAM, we introduce an algorithm to pair data objects and minimize the possibility to reach peak memory bandwidth.
+
+To avoid the impact of data movement on application performance, we introduce a proactive data movement mechanism. For a specific phase $i$, this mechanism uses a helper thread to trigger data movement before $i$.
+The helper thread runs in parallel with the application, overlapping the data movement with application execution.  This proactive data movement mechanism removes data movement overhead off the critical path.
+
+% The proactive data movement can compete the memory bandwidth with the ongoing application execution;
+To further improve runtime performance, we introduce a couple of optimization techniques. The first technique decides initial data placement before the major computation of the application, based on compiler analysis.
+The second technique partitions the large data object into multiple chunks and exposes new opportunities for data movement. 
+%uses a global view to examine the data placement and formulate the data placement problem as a knapsack, and explore the optimal data placement based on dynamic programming.
+To accommodate execution variability of application phases, we introduce the third technique which periodically refines the data placement.
+%In general, our runtime improves the performance by xxx, with xxx overhead.
+We describe the design and implementation details as follows.
+\end{comment}
+
+
+\subsection{Design}
+\label{sec:design}
+Unimem includes three %fours 
+steps in its workflow: phase profiling, performance modeling, and data placement decision and enforcement.
+%phase profiling, performance modeling, data placement decision, and data placement enforcement.
+The phase profiling happens in the first iteration of the main computation loop of the application.
+At the end of the first iteration, we build performance models and
+make data placement decision. After the first iteration, we enforce
+the data placement decision for each phase.
+We describe the three %four 
+steps in details as follows.
+%(1) Profiling --- hw counter 
+%(2) data placement decision  --- bandwidth vs. latency;
+%(3) adapation --- global view vs. local view; asynchrnous data migration; when to trigger data migration 
+%(4) DRAM management  (minimize data movement) --> dynamic programming
+%(5) data placement refinement
+\vspace{-5pt}
+
+%\textbf{Step 1: phase profiling.} 
+\subsubsection{Phase Profiling}
+This step collects memory access information for each phase. This information is leveraged by the second and third steps to decide data placement for each phase.
+%The workload characteristics should capture the bandwidth consumption of target data objects. 
+
+We rely on hardware performance counters widely deployed in modern processors. 
+In particular, we collect the number of last level cache miss event,
+%and \textbf{xxx}, 
+and then map the event information to data objects. Leveraging the common sampling mode in performance counters (e.g., Precise Event-Based Sampling from Intel or Instruction-based Sampling from AMD),
+we collect memory addresses whose associated memory references cause last level cache misses. 
+Those memory addresses help us identify target data objects that have frequent memory accesses in main memory.
+%are recorded in a pre-allocated buffer accessible by the runtime.
+
+Note that the number of last level cache misses can reflect how intensive main memory accesses happen within a fixed sampling interval.
+It works as an indication for which target data objects potentially suffer from the performance limitation of NVM. 
+However, there are other events that cause main memory accesses, such as cache line eviction and prefetching operations.
+The current performance counters either do not support counting such event (cache line eviction) or do not have the sampling mode
+for such event (prefetching operation). Hence, we cannot include those events when counting main memory accesses. %at runtime.
+However, the last level cache miss accounts for a large part of main memory accesses.
+It can work as a reliable indicator to direct data placement, as shown in the evaluation section. The last level cache miss is also one of the most common events in modern processors, which makes our runtime highly portable across HPC platforms. To compensate for the potential inaccuracy caused by the limitation of performance counters, we introduce constant factors in the performance models in Step 2. 
+\vspace{-5pt}
+\begin{comment}
+    "The stall latency of each access in a modern superscalar processor
+    is not the same as the time to access memory. The
+    processor can hide the latency to access memory by locating
+    multiple memory requests in the instruction stream and
+    then using out-of-order execution to issue them in parallel
+    to memory via non-blocking caches [39]. In addition, microprocessors
+    incorporate prefetchers that locate striding accesses
+    in the stream of addresses originating from execution
+    and prefetch ahead. As a result the effective latency to access
+    memory can be much smaller than the actual physical
+    latency for certain access patterns. "
+    my comments: "the effects of prefetching is not measured in our HW events,
+    because the prefetching does not have instructions.
+    streaming access patterns can benefit from prefetching."
+\end{comment}
+
+%\textbf{Step 2: performance modeling.}
+\subsubsection{Performance Modeling}
+Given the memory access information collected for each phase, 
+we select those target data objects that have memory accesses 
+recorded by performance counters. Those data objects are potential candidates to move from NVM to DRAM.
+%However, moving data objects have performance cost. 
+To decide which target data objects should be moved,
+we introduce lightweight performance models.
+
+\textbf{General description.}
+The performance models estimate performance benefit (Equations~\ref{eq:bft_bw} and~\ref{eq:bft_lat})
+%(after moving data from NVM to DRAM) 
+and data movement cost (Equation~\ref{eq:cost}) between NVM and DRAM. We trigger data movement only when the benefit outweighs the cost. 
+To calculate the performance benefit, we must decide if the data object is bandwidth sensitive or latency sensitive (Equation~\ref{eq:app_bw}).
+This is necessary to model the performance difference between 
+bandwidth sensitive and latency sensitive workloads.
+
+\begin{comment}
+In particular, if the data object is bandwidth sensitive, the performance benefit is formulated in Equation~\ref{eq:bft_bw};
+if the data object is latency sensitive, the performance benefit
+is formulated in Equation~\ref{eq:bft_lat}.
+\end{comment}
+
+\textbf{Bandwidth sensitivity vs. latency sensitivity.}
+To decide if a target data object in a phase is bandwidth sensitive or latency sensitive, we use Equation~\ref{eq:app_bw}. This equation estimates main memory bandwidth consumption due to memory accesses to the data object ($BW_{data\_obj}$). 
+
+\begin{equation}
+\label{eq:app_bw}
+\scriptsize
+BW_{data\_obj} = \frac{\#data\_access \times cacheline\_size}{\frac{\#samples\_with\_data\_accesses}{\#samples} \times phase\_execution\_time}
+\end{equation}
+
+The numerator of Equation~\ref{eq:app_bw} is the accessed data size.
+$\#data\_access$ in the numerator is the number of memory accesses to the data object in main memory.
+$\#data\_access$ is collected in Step 1 (phase profiling) with performance counters.
+\begin{comment}
+%We further weight $\#data\_access$ by $\#samples$. 
+%$\#samples$ is the number of samples collected for a s
+In Step 1, we use a sampling-based approach to collect performance events.
+This means that we periodically examine the last cache miss. Hence, in the two equations, $\#data\_access$ is weighted by 
+$\#samples$ 
+the total number of samples in a 
+
+($\#data\_access \times \#samples$).
+$\#samples$ is calculated by $phase\_execution\_time$ divided by $sampling\_interval$.
+$phase\_\\execution\_time$ is measured in the profiling iteration.
+\end{comment}
+For a target data object in a phase, the accessed total data size is
+calculated as ($\#data\_access \times cacheline\_size$).
+%$\#data\_access \times \#samples \times cacheline\_size$.
+
+The denominator of the equation is the fraction of the execution time that has memory accesses to the target data object in main memory.
+This fraction of the execution time is calculated based on $\frac{\#samples\_with\_data\_accesses}{\#samples}$, which is the ratio between the number of samples that collect non-zero accesses to the target data object and the total number of samples.
+
+For example, suppose that the phase execution time is 10 seconds, the hardware counter sampling rate is 1000 cycles, and the CPU frequency is 1 GHz. Then we will have $10^7$ samples in total during the phase execution. Assuming that $10^5$ samples of all samples have memory accesses to the data object, then the fraction of the execution time that accesses the data object is $\frac{10^5}{10^7} \times 10 = 0.1s$. 
+
+Given a data object in a phase, if its  $BW_{data\_obj}$ reaches $t_1$\% of  the peak NVM bandwidth $BW_{peak}$ ($t_1=80$ in our evaluation), then this data object is most likely to be bandwidth sensitive. The performance benefit after moving the data object from NVM to DRAM (i.e., $BFT_{data\_obj\_bw}$) is dominated by the memory bandwidth effect, and can be
+calculated based on Equation~\ref{eq:bft_bw}, which will be discussed next.
+If $BW_{data\_obj}$ of the data object is less than $t_2$\% of $BW_{peak}$ ($t_2=10$ in our evaluation), then this data object is most likely to be highly latency sensitive.
+The performance benefit after moving the data object from NVM to DRAM (i.e., $BFT_{data\_obj\_lat}$) is dominated by the memory latency effect, and can be
+calculated based on Equation~\ref{eq:bft_lat}, which will be discussed next.
+If $BW_{data\_obj}$ of the data object 
+is between $t_1$\% and $t_1$\%, then the data object is likely
+to be sensitive to either bandwidth or latency. %or both.
+The performance benefit after data movement from NVM to DRAM
+is estimated by $max(BFT_{data\_obj\_bw}, BFT_{data\_obj\_lat})$.
+To measure $BW_{peak}$, we run 
+a highly memory bandwidth intensive benchmark, the STREAM benchmark~\cite{stream_benchmark}, with maximum memory concurrency, and use Equation~\ref{eq:app_bw} and performance counters.
+
+%may have many concurrent memory accesses, but those memory accesses do %not reach the peak  NVM bandwidth. Placing the data object in DRAM 
+%does not help performance.
+
+\textbf{Calculation of data movement benefit.}
+Equations~\ref{eq:bft_bw} and~\ref{eq:bft_lat} calculate performance benefits (after data movement from NVM to DRAM) for bandwidth sensitive and latency sensitive data objects, respectively. 
+The two equations are simply based on an estimation on the performance difference between running the application on NVM and on DRAM.
+If the data object is bandwidth-sensitive, then
+the application performance on a specific memory is
+modeled by $\frac{accssed\_data\_size}{mem\_bw}$ ($mem$ is NVM or DRAM).
+%which accounts for memory bandwidth impact.
+$accessed\_data\_size$ is \\ $\#data\_access \times cacheline\_size$,
+the same as the one in Equation~\ref{eq:app_bw}. 
+If the data object is latency-sensitive, then the application
+performance on a specific memory is modeled by ${\#data\_access \times mem\_lat}$ ($mem$ is NVM or DRAM). %which accounts for memory latency impact.  
+%$\#data\_access$ in the two equations is the number of memory accesses to the data object in main memory.
+%$\#data\_access$ is collected in Step 1 with performance counters.
+\begin{comment}
+%We further weight $\#data\_access$ by $\#samples$. 
+%$\#samples$ is the number of samples collected for a s
+In Step 1, we use a sampling-based approach to collect performance events.
+This means that we periodically examine the last cache miss. Hence, in the two equations, $\#data\_access$ is weighted by 
+$\#samples$ 
+the total number of samples in a 
+
+($\#data\_access \times \#samples$).
+$\#samples$ is calculated by $phase\_execution\_time$ divided by $sampling\_interval$.
+$phase\_\\execution\_time$ is measured in the profiling iteration.
+\end{comment}
+%For a specific data object in a phase, the accessed total data size is calculated as $\#data\_access \times cacheline\_size$.
+%$\#data\_access \times \#samples \times cacheline\_size$.
+
+\scriptsize
+\begin{multline}
+\label{eq:bft_bw}
+    BFT_{data\_obj\_bw} = \\ (\frac{\#data\_access \times cacheline\_size}{NVM\_bw} - \\ 
+     \frac{\#data\_access \times cacheline\_size}{DRAM\_bw}) \times CF\_bw
+\end{multline}
+
+\begin{multline}
+\label{eq:bft_lat}
+    BFT_{data\_obj\_lat} = \\ (\#data\_access \times NVM\_lat - \\ 
+     \#data\_access \times DRAM\_lat) \times CF\_lat
+\end{multline}
+\normalsize
+
+In the above two equations, we have constant factors $CF\_bw$ (see Equation~\ref{eq:bft_bw}) and $CF\_lat$ (see Equation~\ref{eq:bft_lat}).
+Such constant factors are used to improve modeling accuracy.
+To meet high performance requirement of our runtime,
+the performance models are rather lightweight, and only capture the critical impacts of memory bandwidth or memory latency.
+However the models ignore some important performance factors (e.g., overlapping between memory accesses, and overlapping between memory accesses and computation).
+Also, the limitation of the sampling-based approach to
+count performance events can underestimate the number of memory accesses due to the inability of counting cache eviction and prefetching operations and sampling nature of the approach.
+The constant factors $CF\_bw$ and $CF\_lat$ work as a simple but powerful approach to improve modeling accuracy without increasing modeling complexity and runtime overhead.
+
+The basic idea of the two factors is to measure performance ratios between measured performance and predicted performance for representative workloads, and then use the ratios to improve online modeling accuracy for other workloads.
+
+\begin{comment}
+In particular, the constant factor $CF\_bw$ is obtained offline. Since Equation~\ref{eq:bft_bw} 
+targets on the data object that is sensitive to memory bandwidth,
+we run the benchmark STREAM to obtain $CF\_bw$.
+In particular, we calculate the performance ratio
+between the predicted performance and measured performance 
+%when the major data arrays ($a, b$ and $c$) in the benchmark are placed in DRAM
+%and other data is placed in NVM.
+when running the benchmark in DRAM.
+%In particular, we calculate the performance ratio
+%between the performance with NVM (no DRAM) and the performance when the 
+%major data array in the benchmark is placed in DRAM.
+Such performance ratio is $CF\_bw$. The predicted performance is calculated based on ($\#data\_access \times cacheline\_size/DRAM\_bw$), where $\#data\_access$ is collected with performance counters using the sampling-based approach.
+Hence, $CF\_bw$ accounts for the potential performance difference between the sampling-based approach and real performance.
+\end{comment}
+
+In particular, we run the bandwidth-sensitive benchmark STREAM to obtain $CF\_bw$ offline.
+We calculate the performance ratio between the predicted performance and measured performance,
+and such ratio is $CF\_bw$. 
+The predicted performance is calculated based on ($\#data\_access \times cacheline\_size/DRAM\_bw$), where $\#data\_access$ is collected with performance counters using the sampling-based approach. Hence, $CF\_bw$ accounts for the potential performance difference between our sampling-based modeling and real performance.
+The constant factor $CF\_lat$ is obtained in the similar way, except that
+we use a latency-sensitive benchmark, the pointer-chasing benchmark~\cite{pointer_chasing} (using a single thread and no concurrent memory accesses).
+Also, to calculate the predicted performance, we use ($\#data access \times DRAM\_{lat}$).
+Given a hardware platform, $CF\_bw$ and $CF\_lat$ need to be calculated only once. 
+
+\begin{comment}
+Given a data object, our performance model for a phase is formulated in Equations~\ref{eq:bft} and~\ref{eq:cost}.
+Equation~\ref{eq:bft} estimates the performance benefit after migrating data from NVM and DRAM.
+$\#data\_access$ is the number of data accesses to the target data object in main memory.
+$\#data\_access$ is collected in Step 1 with performance counters.
+Since we use a sampling-based approach to collect performance events,
+the complete number of data accesses is upper-bounded by $\#data\_access \times sampling\_rate$.
+Hence, the size of all data fetched from main memory in the phase is
+$\#data\_access \times sampling\_rate \times cacheline\_size$.
+
+%If the phase is bounded by memory bandwidth, Equation~\ref{eq:bft} estimates the
+%potential performance benefits after migration.
+%Note that this is a very lightweight, but pretty conservative model.
+\end{comment}
+
+\begin{comment}
+In Equation~\ref{eq:bft_lat}, we have another constant factor $CF\_lat$ to improve modeling accuracy.
+%is to calculate performance benefit for the latency sensitive data object.
+%Although the equation captures the critical impact of memory latency on performance, the equation assumes no data access parallelism for latency sensitive data objects. 
+%To improve the modeling accuracy, we introduce a simple constant factor
+The idea of using $CF\_lat$ for Equation~\ref{eq:bft_lat} is the same as the one for Equation~\ref{eq:bft_bw}: using a simple but powerful approach to improve modeling accuracy without increasing modeling complexity and runtime overhead.
+\end{comment}
+
+\begin{comment}
+%following the similar approach in Equation~\ref{eq:bft_bw}.
+The constant factor $CF\_lat$ for the latency-sensitive data object is also obtained offline.
+We run a pointer-chasing benchmark~\cite{pointer_chasing} offline (using a single thread and no concurrent memory accesses), and measure the performance ratio between the predicted performance and measured performance when running the benchmark in DRAM.
+The performance ratio is then $CF\_lat$.
+The predicated performance is calculated in the same way as that
+for offline calculation of $CF\_bw$.
+%the performance with NVM (no DRAM) and the performance when the major data array in the benchmark is placed in DRAM.
+
+Given a hardware platform, $CF\_bw$ and $CF\_lat$ need to be calculated only once. They can be used to model performance for bandwidth-sensitive or latency-sensitive data objects on the platform.
+%all applications running on the platform.
+\end{comment}
+
+\begin{comment}
+To decide if a data object in a phase is bandwidth sensitive or latency sensitive, we use Equation~\ref{eq:app_bw}. This equation estimate main memory bandwidth consumption due to memory accesses to the data object. 
+
+The numerator of Equation~\ref{eq:app_bw} is the accessed data size;
+The denominator of the equation is the fraction of the execution time that has memory accesses to the data object in the main memory.
+This fraction of the execution time is calculated based on $\frac{\#samples\_with\_data\_accesses}{\#samples}$, which is the ratio between the number of samples that collect non-zero accesses to the data object and the total number of samples.
+For example, suppose that the phase execution time is 10 seconds, the hardware
+counter sampling rate is 1000 cycles, and the CPU frequency is 1 GHz.
+Then we will have $10^7$ samples in total during the phase execution. Assuming that $10^5$ samples of all samples have memory accesses to the data object, then the fraction of the execution time that accesses the data object is $\frac{10^5}{10^7} \times 10 = 0.1s$. 
+
+\begin{equation}
+\label{eq:app_bw}
+\scriptsize
+BW_{data\_obj} = \frac{\#data\_access \times cacheline\_size}{\frac{\#samples\_with\_data\_accesses}{\#samples} \times phase\_execution\_time}
+\end{equation}
+
+Given a data object in a phase, if its  $BW_{data\_obj}$ reaches $t_1$\% of 
+the peak NVM bandwidth $BW_{peak}$ ($t_1=80$ in our evaluation), then this data object is most likely to be bandwidth sensitive. The performance benefit after moving the data object from NVM to DRAM is dominated by the memory bandwidth effect, and can be
+calculated based on Equation~\ref{eq:bft_bw}.
+If $BW_{data\_obj}$ of the data object is less than $t_2$\% of $BW_{peak}$ ($t_2=10$ in our evaluation), then this data object is most likely to be highly latency sensitive.
+The performance benefit after moving the data object from NVM to DRAM is dominated by the memory latency effect, and can be
+calculated based on Equation~\ref{eq:bft_lat}.
+If $BW_{data\_obj}$ of the data object 
+is between $t_1$\% and $t_1$\%, then the data object is likely
+to be sensitive to either bandwidth or latency, or both.
+The performance benefit after data movement from NVM to DRAM
+is estimated by $max(BFT_{data\_obj\_bw}, BFT_{data\_obj\_lat})$.
+To measure $BW_{peak}$, we run the STREAM benchmark with maximum memory concurrency, and use Equation~\ref{eq:app_bw} and performance counters.
+
+
+%may have many concurrent memory accesses, but those memory accesses do %not reach the peak  NVM bandwidth. Placing the data object in DRAM 
+%does not help performance.
+\end{comment}
+
+
+\textbf{Calculation of data movement cost.}
+Data placement comes with data movement cost.
+%Equation~\ref{eq:cost} estimates data movement cost $COST_{data\_obj}$.  
+The data movement cost can be simply calculated based on data size 
+and memory copy bandwidth between NVM and DRAM, which is ($\frac{data\_size}{mem\_copy\_bw}$). 
+To reduce the data movement cost, we want to overlap
+data movement with application execution. 
+This is possible with a helper thread
+that runs in parallel with the application to implement
+an asynchronous data movement. We discuss this in details 
+in Section~\ref{sec:impl}. 
+In summary, the data movement cost ($COST_{data\_obj}$) 
+is modeled in Equation~\ref{eq:cost}
+with the overlapped cost ($mem\_comp\_overlap$) included.
+
+\begin{comment}
+To overlap data movement with the application execution, 
+we introduce a helper thread that performs data movement (see Section~\ref{sec:impl} for details).
+The helper thread runs in parallel with the main program,
+which reduces the data movement cost by $mem\_comp\_overlap$.
+We describe how to calculate $mem\_comp\_overlap$ as follows.
+\end{comment}
+
+\begin{equation}
+\label{eq:cost}
+\scriptsize
+COST_{data\_obj} = max(\frac{data\_size}{mem\_copy\_bw} - mem\_comp\_overlap, 0)
+\end{equation}
+
+We describe how to calculate $mem\_comp\_overlap$ as follows.
+To minimize the data movement cost, we want to overlap data movement
+with application execution as much as possible.
+Meanwhile, we must respect data dependency and ensure execution correctness. This means during data movement, the migrated data object must not be read or written by the application.
+Given the above requirement on respecting data dependency and minimizing the data movement cost, we can estimate $mem\_comp\_overlap$. 
+
+\begin{comment}
+%how to draw a colored circle with text in it.
+%see this http://latex-community.org/forum/viewtopic.php?t=25483
+%\tikz \node[circle,scale=0.75,color=white, fill=blue]{1}; 
+\begin{figure*}
+%\centering
+\begin{minipage}[t]{.33\textwidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/trigger_migration.pdf}
+  \caption{An example for determining where to trigger data migration in Step 2. The blue circle is the point to trigger the migration of the data object $a$ for the phase $i$.}
+\label{fig:trigger_migration}
+\end{minipage}%
+
+\begin{minipage}[t]{.33\textwidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/trigger_migration.pdf}
+  \caption{Another figure}
+  \label{fig:local_vs_global}
+\end{minipage}
+\end{figure*}
+\end{comment}
+
+\begin{comment}
+Given a phase $i$ and a data object to be migrated for $i$, we trigger the movement of this data object in the beginning of a preceding phase $j$. Between the phases $j$ (including the phase $j$) and $i$, the data object is not referenced, while the immediately preceding phase of the phase $j$ references the data object. $mem\_comp\_overlap$ is the application execution time between the phases $j$ and $i$. 
+\end{comment}
+
+Figure~\ref{fig:trigger_migration} explains how to calculate 
+$mem\_comp\_overlap$ with an example. This example shows how to calculate
+$mem\_comp\_overlap$ for a data object ($a$)  in a specific phase (the phase $i$). 
+If $a$ is not in DRAM, we can trigger data migration of $a$ as early as the beginning of the phase $j$, because $a$ is not referenced between $j$ and $i$. 
+We cannot trigger data migration of $a$
+at the beginning of the phase $j-1$, because $a$ is referenced there. $mem\_comp\_overlap$ is the application execution time between the phases $j$ and $i$. The data movement time, $\frac{data\_size}{mem\_copy\_bw}$, can
+be smaller than $mem\_comp\_overlap$. In this case, the data movement
+is completely overlapped with application execution, and the data movement cost $COST_{data\_ obj}$ is 0.
+
+\begin{figure}
+%\centering
+  \centering
+  \includegraphics[height=0.2\textheight, width=0.3\textwidth]{figures/trigger_migration.pdf}
+  \vspace{-10pt}
+  \caption{An example to show how to calculate $mem\_comp\_overlap$  for the data object $a$ in the phase $i$. The yellow arrow is the point to trigger the migration of $a$ from NVM to DRAM for the phase $i$, if $a$ is not in DRAM. The letters in brackets represent target data objects referenced in the corresponding phases.}
+\label{fig:trigger_migration}
+\vspace{-15pt}
+\end{figure}
+
+Our estimation on $COST_{data\_obj}$ could be an overestimation (a conservative estimation). In particular,
+when a data object is to be migrated from NVM to DRAM for a phase,
+it is possible that the data object is already in DRAM.
+Use Figure~\ref{fig:trigger_migration} as an example again.
+Since the phase $j-1$ references $a$, it is possible that
+$a$ is already in DRAM before the point to trigger the data migration.
+Also, $COST_{data\_obj}$ does not include the cost of moving data from 
+DRAM to NVM when there is no enough space in DRAM and we need to switch data.
+Such overestimation and ignorance of data movement from DRAM to NVM are due to the fact that the data movement cost
+for each phase is isolatedly calculated during the modeling time.
+Hence, what data objects are in DRAM and whether there is enough space in DRAM is uncertain during the modeling time. We will solve the above problems in the next step (Step 3). 
+
+\begin{comment}
+The above discussion on $COST_{data\_obj}$ assumes that there is enough empty memory space in DRAM to move the data object from NVM to DRAM. If there is no enough space, then some existing data objects in DRAM must be moved from DRAM to NVM. Such data movement cost should be included in $COST_{data\_obj}$. However, during the modeling time, whether 
+there is enough space in DRAM is uncertain, because the data placement plan is not determined yet.
+\end{comment}
+
+\begin{comment}
+For such case, $COST_{data\_obj}$ should include the data movement cost from DRAM to NVM. To calculate such cost, we must decide which data object in DRAM must be moved from DRAM to NVM. We make such decision based on the sizes of data objects in DRAM. In particular, we move data objects from DRAM to NVM whose total size is just big enough to allow the target data object to move from NVM to DRAM. Furthermore, the data movement from DRAM to NVM should be overlapped with application execution as much as possible. Using the same approach as the above discussion on the data movement from NVM to DRAM, we proactively trigger the data movement from DRAM to NVM and include
+this cost in $COST_{data\_obj}$. 
+\end{comment}
+
+\begin{comment}
+Based on the above formulation and discussion, we can calculate the benefit and cost of data movement from NVM to DRAM for any data object referenced in a specific phase.
+\end{comment}
+
+%Hence, the data movement cost can be zero (i.e., completely hidden).
+%We will discuss $mem\_comp\_overlap$ in details in \textbf{Step x}.
+
+%\textbf{Step 3: data placement decision.}
+\subsubsection{Data Placement Decision and Enforcement}
+\label{sec:dp_decision_enforcement}
+Based on the above formulation for the benefit and cost of data movement, we determine data placement for all phases \textit{one by one}. In particular, to determine data placement for a specific phase, 
+we define a weight $w$ for each target data object referenced in this phase:
+
+\begin{equation}
+w = BFT_{data\_obj} - COST_{data\_obj} - extra\_COST_{data\_obj}
+\end{equation}
+
+$extra\_COST_{data\_obj}$ accounts for the data movement cost, 
+when there is no enough space in DRAM to move the target data object
+from NVM to DRAM and we have to move data from DRAM to NVM to save space.
+To calculate $extra\_COST_{data\_obj}$, we must decide which data object in DRAM must be moved. We make such decision based on the sizes of data objects in DRAM. In particular, we move data objects from DRAM to NVM whose total size is just big enough to allow the target data object to move from NVM to DRAM. 
+Note that since we determine data placements for all phases one by one,  when we decide the data placement for a specific phase, we have made the data placement decisions for previous phases. Hence, we have a clear knowledge on which data objects are in DRAM and whether the target data object is already in DRAM.
+%Based on the knowledge, it is also possible to know whether the target data object is already in DRAM. If it is, then there will be no data movement cost.
+
+%Furthermore, the data movement from DRAM to NVM should be overlapped with application execution as much as possible. 
+
+Besides the weight $w$, each data object has a data size.
+Given the DRAM size limitation, our data placement problem
+is to maximize total weights of data objects in DRAM while
+satisfying the DRAM size constraint.
+This is a 0-1 knapsack problem~\cite{knapsackbook}.
+
+The knapsack problem can typically be solved by dynamic programming
+in pseudo-polynomial time. If each data object has a distinct value per unit of weight ($data\_size/w$),
+the empirical complexity is $O((log(n))^2)$~\cite{knapsackbook}, where $n$ is the number of target data objects referenced in a phase.
+
+The above approach can determine data placement
+for individual phases. We name this approach as ``phase local search''. Determining data placement at the granularity of individual phases can lead to the optimal data placement for each phase, but result in frequent data movements, some of which may not be able to be completely overlapped by application execution. Alternatively, determining data placement at the granularity of all phases (named ``cross-phase global search'') has less data movement than phase local search, because all phases are in fact treated as a combined single phase: Once the optimal data placement is determined within the combination of all phases, there is no data movement within the combination. However, the optimal data placement for the combination of all phases does not necessarily result in the best performance for each individual phase.
+
+%\textbf{Dong: add more details about the dynamic programming. formulate global search and local search}
+
+\begin{comment}
+as well as a combination of all phases.
+For a combination of all phases, once the optimal data placement is determined,
+there is no data movement within the combination. Hence,
+treating all phases as a combination, we minimize the data movement.
+However, the optimal data placement for the combination of all phases does not necessarily result in the best performance for each individual phase.
+Determining the data placement at the granularity of single phase
+can lead to the optimal data placement for each phase, but result in more frequent data movement. If those extra data movement cannot be hidden,
+then determining the data placement at the granularity of single phase (called ``local view'') may have worse performance than determining the data placement at the granularity of all phases (called ``global view'').
+\end{comment}
+
+Based on the above discussion, we use dynamic programming to
+\textit{determine the data placement using both phase local search and cross-phase global search}, and then choose the best data placement of the two searches.
+
+%\textbf{Step 4: data placement enforcement.}
+%proactive data movement --> the data movement may disturb the application execution.
+After we make the data placement decision at the end of the first iteration, we enforce data placement since the second iteration.
+At the beginning of each phase, the runtime asks a helper thread (see Section~\ref{sec:impl} for implementation details)
+to proactively move data objects between NVM and DRAM based on the data placement decision for future phases.
+
+\begin{figure*}
+%\centering
+  \centering
+  \includegraphics[height=0.18\textheight, width=0.7\textwidth]{figures/helper_thread_migration.pdf}
+  \caption{An example to show proactive data migration with a helper thread. The letters in the figure represent data objects. The letters in brackets (e.g., (a) and (b)) represent target data objects that are determined to be placed in DRAM for the corresponding phases. DRAM can hold two data objects at most.}
+\label{fig:proactive_migration}
+\end{figure*}
+
+Figure~\ref{fig:proactive_migration} gives an example for how to enforce data placement with a helper thread after determining data placement. In this example, there are three target data objects ($a, b$, and $c$) and five phases. The data placement decision for each phase
+is represented with letters in brackets (e.g., ($a$) for the phase 1). 
+We assume DRAM can hold two data objects at most. 
+The data movement enforced by the helper thread respects data dependence across phases and the availability of DRAM space. Such example is a case of phase local search, where each phase makes 
+its own decision for data placement. There are eight data movements in total. With a cross-phase global search, only two data objects will be moved to DRAM for all phases. %because they are the most common ones in this example. 
+The cross-phase global search results in only two data movements.
+Based on the performance modeling and dynamic programming, we can decide whether the cross-phase global search or phase local search is better. 
+\vspace{-10pt}
+
+\subsection{Optimization}
+\label{sec:opt}
+To improve runtime performance, we introduce a couple of optimization techniques as follows.
+
+\textbf{Handling workload variation across iterations.}
+In many scientific applications, the computation and memory access patterns remain stable across iterations.
+This means once the data placement decision is made at the end of the first iteration, 
+we can reuse the same decision in the rest of iterations.
+However, some scientific applications have workload variation across iterations.
+We must adjust data placement decision correspondingly.
+
+To accommodate workload variation across iterations, Unimem monitors the performance of each phase after data movement. If there is obvious performance variation (larger than 10\%),
+then the runtime will activate phase profiling again and adjust the data placement decision. 
+%Such performance monitor is based on, hence it is very lightweight. 
+
+\textbf{Initial data placement.} 
+By default, all data objects are initially placed in NVM and moved between DRAM and NVM by Unimem at runtime.
+However, data movement can be expensive, especially for large data objects, even though we use the proactive data movement to overlap data movement
+with application execution.
+%In fact, comparing with our lightweight performance models and execution profiling, the data movement accounts for most of the runtime overhead. 
+To reduce the data movement cost, we selectively
+place some data objects in DRAM at the beginning of the application, instead of placing all data objects in NVM. 
+The existing work has demonstrated performance benefit of the initial data placement on GPU with HMS~\cite{asplos15:agarwal, pcm_gpu_pact13}.
+Our initial data placement technique on NVM-based HMS is consistent with those existing efforts.
+%This method removes some of the data movement off the critical path.
+
+%To determine which data objects should be placed in DRAM initially, 
+For initial data placement, we place in DRAM those target data objects with the largest amount of memory references (subject to the DRAM space limitation).
+To calculate the number of memory reference for each target data object, we employ compiler analysis and represent the number of memory reference
+as a symbolic formula with unknown application information, similar to~\cite{icpcds99:ding}.
+Such information includes the number of iterations and coefficients of array access. This information is typically available before the main computation loop and before memory allocation for target data objects.
+Hence it is possible to decide and implement initial data placement before main computation loop for many HPC applications. 
+%In particular, we employ static analysis to count the total amount of memory accesses for each 
+%target data object.
+However, we cannot determine initial data placement for those data objects that do not have the information available before the main computation loop (e.g., the number of iteration is determined by a convergence test at run time).
+
+Our method determines initial data placement simply based on the number of memory reference and ignores caching effects.
+The ignorance of caching effects can impact the effectiveness of initial data placement.
+In particular, some data objects with intensive memory references may have good reference locality and do not cause a lot of main memory accesses.
+However, our practice shows that in all cases of our evaluation, initial data placement based on compiler analysis makes the data placement decision consistent with the runtime data placement decision using the cross-phase global search.
+Using compiler analysis can work as a practical and effective solution to direct initial data placement, because the target data objects with a large amount of memory references tend to frequently access main memory.
+
+\textbf{Handling large data objects.} 
+We move data between DRAM and NVM at the granularity of data object. This means a data object larger than the DRAM space cannot be migrated.
+This problem is common to any software-based data management on HMS.
+
+A method to address the above problem is to partition the large data object into multiple chunks with each chunk smaller than the DRAM size.
+At runtime, we can profile memory access for each chunk instead of the whole data object, and move data chunk if the benefit overweight the cost of data chunk movement.
+This method exposes new opportunities to manage data and improve performance.
+
+However, this solution is not always feasible, because it can involve a lot of programming efforts to refactor the application such that memory references to the large data object are based on chunk-based partitioning.
+A compiler tool can be helpful to transform some regular memory references into new ones based on chunk-based partitioning (assuming the input problem size and number of loop iterations are known). However, this kind of automatic code transformation can be impotent for high-dimensional arrays with the notorious memory alias problem and irregular memory access patterns. In Unimem, we employ a conservative approach which only partitions those one-dimensional arrays with regular memory references. %and transform the code correspondingly.
+
+In our evaluation with representative numerical kernels, we find that partitioning large data objects is often not helpful, %because the memory referecnes to multiple chunks often happen in one phase 
+because making the data placement decision based on chunks leads to much more frequent data movements,
+most of which are difficult to be overlapped with application execution and hence exposed to the critical path, but we do have a benchmark (FT) benefit from partitioning large data objects.
+
+%In general, we expect that partitioning large data objects is a conservative optimization technique, and may take effects in limited applications.
+
+\begin{comment}
+\textbf{Phase combination.}
+Some phase can be small in terms of execution time.
+For such phase, the phase profiling and performance modeling alone can take most of the phase execution time.
+This kind of phase is commonly spotted in communication intensive applications. To amortize the phase profiling and performance modeling cost, we do not consider such small phases.
+Instead, those phases are combined with neighbor phases to build a larger phase. We make phase combination when the phase profiling and performance modeling of a phase take more than 20\% of the phase execution time.
+\end{comment}
+
+\subsection{Implementation}
+\label{sec:impl}
+We have implemented Unimem as a runtime library to perform online adaptation of data placement on HMS. To leverage the library, the programmer needs to insert a couple of APIs into the application.
+Such change to the application is very limited, and is used to initialize the library and identify the main computation loop and target data objects.
+In all applications we evaluated, the modification to the applications is less than 20 lines of code.
+Table~\ref{tab:api} list those APIs and their functionality.
+
+%``We target parallel applications from the HPC domain with
+%iterative structure, such that each program phase is executed many times.
+%We exploit this property to collect hardware event rates during
+%the first few executions of each phase to serve as input for the
+%model. We hardcode the model itself into the runtime system by
+%programming the coefficients derived during the training process
+%for a particular model into the library. The runtime system facilitates
+%online predictions of performance based on the collected
+%hardware event rates. ''
+
+\begin{table}
+        \begin{center}
+        \vspace{-10pt}
+        \caption{APIs for using Unimem runtime}
+        \vspace{-10pt}
+        \label{tab:api}
+        \scriptsize
+        \begin{tabular}{|p{2.3cm}|p{4.3cm}|}
+        \hline
+        \textbf{API Name}     & \textbf{Functionality}                                 \\ \hline \hline
+        {\fontfamily{qcr}\selectfont unimem\_init}       & initialization for hardware counters, timers and global variables            \\\hline
+        {\fontfamily{qcr}\selectfont unimem\_start}      & identify the beginning of the main computation loop                 \\ \hline
+        {\fontfamily{qcr}\selectfont unimem\_end}       & identify the end of the main computation loop                    \\ \hline
+        {\fontfamily{qcr}\selectfont unimem\_malloc}    & identify and allocate target data objects                    \\ \hline
+        {\fontfamily{qcr}\selectfont unimem\_free}   & free memory allocation for target data objects                  \\ \hline
+        \end{tabular}
+        \end{center}
+        \vspace{-20pt}
+\end{table}
+The runtime library decides data placement at the granularity of execution phase. As discussed before, a phase is delineated by MPI operations.
+To automatically form phases, we employ the MPI standard profiling interface (PMPI). 
+{\fontfamily{qcr}\selectfont PMPI\_} function behaves in the same way as 
+{\fontfamily{qcr}\selectfont MPI\_} function, but PMPI allows one 
+to write functions that have the behavior of the standard function plus any other behavior one would like to add.
+Based on PMPI, we can transparently identify execution phases and control profiling without programmer intervention.
+Figure~\ref{fig:pmpi} depicts the general idea. In particular,
+we implement an MPI wrapper based on PMPI. The wrapper encapsulates 
+the functionality of enabling and disabling profiling and uses a global
+counter to identify phases. 
+%the into MPI collective operation, blocking communication and synchronization 
+
+
+\begin{figure}
+	\vspace*{10pt}
+    \centering
+    \includegraphics[width=0.48\textwidth, height=0.18\textheight]{figures/pmpi.pdf}
+    \caption{Transparently identifying phases based on PMPI.}
+    \label{fig:pmpi}
+    \vspace{-20pt}
+\end{figure}
+
+To identify target data objects, the programmer must use \\{\fontfamily{qcr}\selectfont unimem\_malloc} to allocate them before the main computation loop.
+This API allows Unimem to collect pointers pointing to target data objects.
+Collecting those pointers are necessary to implement data movement without asking the programmer to change the application after data movement. 
+%the runtime collects pointers pointing to the target data objects in {\fontfamily{qcr}\selectfont umem\_init} 
+%(the programmer provides those pointers).
+In particular, after data movement for a target data object, the runtime changes the data object pointer and makes it point to the new memory space of the data object without disturbing execution correctness. If there is a memory alias to the data object but such alias is created within the main computation loop, then the memory alias can still work correctly, because it is updated in each iteration and will point to the new memory space of the data object after data movement.
+If the memory alias to the data object is created before the main computation loop, then such memory alias information must be explicitly sent to the runtime by the programmer using {\fontfamily{qcr}\selectfont unimem\_malloc}, such that the memory alias can be updated and points to the correct memory space after data movement.
+%due to the iterative structure of the main computation loop. 
+
+The DRAM space is limited in HMS. To manage the DRAM space, we avoid making any change to the operating system (OS), and introduce
+a user-level service. Each node runs an instance of such service.
+The service coordinates the DRAM allocation from multiple MPI processes on the same node.
+In particular, the service responds to any DRAM allocation request from the runtime, and bounds
+the memory allocation within the DRAM space allowance.
+Our current implementation for such service 
+is based on a simple memory allocator without consideration of memory allocation efficiency and fragmentation,
+because we expect that data movement should not be frequent, and data allocation for data movement should not be frequent for performance reason.
+However, an advanced implementation could be based on an existing memory allocator, such as HOARD~\cite{asplos00:berger} and the lock-free allocator~\cite{pldi04:maged}.
+%Furthermore, to transparently implement the interaction between the service and MPI processes,
+%we track an application's memory allocation by using features of the GNU linker to interpose the interaction code between the application and memory allocation functions (e.g., malloc, free, new, and delete).
+
+As discussed in Section~\ref{sec:design} (see Step 2), we use a helper thread to proactively trigger data movement, such that data movement 
+%is not in the critical path and 
+is overlapped with  application execution. The helper thread is invoked in {\fontfamily{qcr}\selectfont unimem\_init}. In the main computation loop, the helper thread and the main thread interact through a shared FIFO queue. The main thread puts data movement requests into the queue; the helper thread checks the queue, performs data movement, and removes the data movement request off the queue once the data movement is done. 
+At the beginning of each phase, the runtime of the main thread will check the queue status to determine if all proactive data movement for the current phase is done. Hence, the queue works as a synchronization mechanism between the helper thread and the main thread. 
+Note that checking the queue status and putting data movement requests into the queue is lightweight, because we avoid frequent data movement in our design. 
+
+As discussed in Section~\ref{sec:design} (see Step 2), to ensure execution correctness, the runtime must respect data dependency across phases when moving data objects with the helper thread.
+The data dependency check is implemented by static analysis.
+We introduce an LLVM~\cite{Lattner:Mthesis} pass to analyze data references to target data objects 
+between MPI calls. 
+To handle those unresolved control flows during the static analysis, we
+embed data dependency analysis result for each branch,
+and delay data dependency analysis until runtime.
+The compiler-based data dependency analysis can be conservative
+due to the challenge of pointer analysis~\cite{popl03:chakaravarthy}. 
+There is also a large body of research related to the
+approximation of pointer analysis to improve compiler-based data dependency analysis. However, to simplify our implementation, we currently use a directive-based
+approach that allows the programmer to use directives to explicitly inform
+the runtime of data dependency for target data objects across phases.
+This approach is inspired by task dependency clauses in OpenMP, and works
+as a practical solution to address complicated data dependency analysis.
+Figure~\ref{fig:general_workflow} depicts the general workflow. %of Unimem.
+\vspace{-5pt}
+\begin{figure}
+   \centering
+   \includegraphics[height=0.15\textheight]{figures/general_workflow.pdf}
+   \vspace{-10pt}
+   \caption{The general workflow for Unimem.}
+   \label{fig:general_workflow}
+   \vspace{-20pt}
+   	\vspace*{5pt}
+\end{figure}
+
+
+%How to choose the target data objects;
+%"we track an application's memory allocation by using features of the GNU linker to interpose 
+%code between the application and standard C/C++ memory allocation functions (e.g., malloc, free, new, and delete)"
+
+%MEM\_TRANS\_RETIRED:LOAD\_LATENCY:ldlat=42.  \\
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{comment}
+"The stall latency of each access in a modern superscalar processor
+is not the same as the time to access memory. The
+processor can hide the latency to access memory by locating
+multiple memory requests in the instruction stream and
+then using out-of-order execution to issue them in parallel
+to memory via non-blocking caches [39]. In addition, microprocessors
+incorporate prefetchers that locate striding accesses
+in the stream of addresses originating from execution
+and prefetch ahead. As a result the effective latency to access
+memory can be much smaller than the actual physical
+latency for certain access patterns.
+"
+
+
+my comments: "the effects of prefetching is not measured in our HW events,
+because the prefetching does not have instructions.
+streaming access patterns can benefit from prefetching."
+\end{comment}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+

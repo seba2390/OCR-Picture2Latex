@@ -1,0 +1,185 @@
+\subsection{Node Splitting}\label{node-splitting}
+The second approach we propose is based on changing the graph structure itself to balance the load.
+Since the root cause of the load-imbalance is skewed outdegree distribution across graph nodes, node splitting preprocesses the graph to split each high-degree node into multiple low-degree child-nodes.
+This approach is implemented as follows.
+We define an input parameter called maximum-out-degree-threshold (MDT). 
+If a node's outdegree is more than MDT, then the node is split into $\lceil\frac{outdegree}{MDT}\rceil$ nodes, with the outgoing edges of the node distributed evenly among the original (parent) and the split (child) nodes. 
+For example, Figure~\ref{fig:ns} depicts our node splitting approach, where a node 8 is split into two nodes, 8 (parent) and 8' (child) which share the outgoing edges.
+Multiple child nodes can get formed from a parent node. 
+Note that the graph now does not contain the original high-degree node.
+By repeating this splitting procedure for each of the high-degree graph nodes, we can obtain another graph with maximum degree bounded by MDT.
+
+\begin{figure}
+\centering
+\includegraphics[scale=0.48]{images/rn-ns.pdf}
+%\includegraphics[scale=0.5]{images/ns.pdf}
+\caption{Node Splitting (maximum outdegree threshold MDT = 4)}
+\label{fig:ns}
+\end{figure}
+
+As evident, node-splitting approach has the advantage that it can work with the space-efficient CSR representation.
+Since node-splitting creates duplicates of a node, incoming edges to the original node need special consideration.
+To address this issue without increasing any existing node degrees, we maintain the incoming edges of a node only for the parent node.
+The parent node, in turn, keeps track of its children.
+The algorithm is modified to reflect the attributes (distance in case SSSP) of a parent node onto its children.
+This strategy ensures that no new edges get added to the graph (parent-child relationship does not interfere with the normal graph edges).
+%To achieve this, every node maintains a count of its children by which it can update the distance of the child nodes. 
+%The distance updates to the child nodes are represented as dashed edges (pseudo edges) in Figure~\ref{fig:ns}. 
+%Thus, while the original graph representation is augmented with new nodes, no new edges are added to the graph data structure.
+
+%Figure~\ref{NS-cpu-pseudocode} presents the pseudocode for the node-splitting strategy. 
+%To identify the nodes to be split, we use a histogram-based method.
+%This method determines MDT, the maximum outdegrees of the child nodes after node splitting (Line~\ref{histo-line} of Algorithm~\ref{NS-cpu-pseudocode}). 
+%The distances of both the parent and the child nodes are updated in Line~\ref{child-update-line}.
+%%We update the distances of both the parent and the child nodes in our GPU function (Line~\ref{child-update-line} of the GPU function).
+%Note that similar to that of the parent, the child nodes' distances also need to be updated atomically.
+
+\REM{
+\begin{algorithm}[t]
+\begin{small}
+\SetKwInOut{Input}{input}
+\SetKwInOut{Output}{output}
+\SetKwProg{Fn}{}{ \{}{\}}
+
+\Input{a graph $graph(N,E)$ with $N$ Nodes and $E$ edges}
+\Input{$HistoBinCount$ indicating number of bins}
+%\Input{edgesdst[E] - contains the destinations of all edges}
+%\Input{For SSSP: edgeswt[E] contains the weight of all edges}
+
+$graph$.init() \\
+\BlankLine
+%Take command line argument, $HistogramBinCount$ \;
+$MDT$ = getMDT($HistoBinCount$) \label{histo-line} \\
+%Call getMaxAllowedOutDegree(HistogramBinCount) \; \label{histo-line} 
+%Expand graph structure with new nodes, distributing the out-going edges to new nodes, and without adding in-coming edges \;
+\For{each node $n$ with degree $>$ maxDegree} {
+	$graph$.split($n$) \\
+}
+
+%Create two worklists, $inputWl$ and $outputWl$ \;
+%Create distance vector, $dist[N]$ \;
+$\forall\ n: dist[n] = \infty$ \\
+$dist[source] = 0$ \\
+$inputWl$.push($source$) \\
+\For{each child $c$ of $source$} {
+	$dist[c] = 0$ \\
+	$inputWl$.push($c$) \\
+}
+%Add $source$ to $inputWl$; Initialize $sizeWl$ with the size of the $inputWl$\;
+%Initialise $dist = \infty$; Initialize $dist[source]$ and  $dist$ of source's children to $0$ \;
+%Add $source$ and its children to $inputWl$; Initialize $sizeWl$ with the size of the $inputWl$\;
+
+\BlankLine
+\While{$inputWl.size() > 0$}{
+   \textbf{\textit{sssp\_kernel}}($graph, dist, inputWl, outputWl$) \\
+   %CUDAKERNEL($dist, graph, inputWl, outputWl$) \;
+   %copy $outputWl$ to CPU \\
+   $inputWl = outputWl$ \\ 
+   $outputWl$.clear() \\
+}
+
+\BlankLine
+\Fn(){\textbf{sssp\_kernel}($graph, dist, inputWl, outputWl$)}{
+\For{each node $n$ assigned to me} {	\tcc{uses round-robin node assignment}
+  \For{each neighbor $neigh$ of $n$}{
+    %Get $destination$ for neighbor \;
+    %Initialize $weight$; 
+    $altdist = dist[n] + weight(n, neigh)$ \\
+    \If{$dist[neigh] > altdist$}{    
+      %Get $ChildCount$ of $destination$ \;
+	$dist[neigh] = altdist$ \\
+	$outputWl.push(neigh)$ \\
+	\For{each child $cneigh$ of $neigh$} {
+		$dist[cneigh] = altdist$ \label{child-update-line}	\\
+		$outputWl.push(cneigh)$ \\
+	}
+      %Atomically update $dist[destination]$ and its children with $altDist$ \;  \label{child-update-line} 
+       %Atomically add node numbers to $outputWl$ \;
+    }
+  }
+   %Increment $tid$ by $gridsize \times blocksize$ ; \tcc{round-robin assignment}
+}
+
+}
+\caption{SSSP Pseudocode illustrating Node-Splitting}
+\label{NS-cpu-pseudocode}
+\label{NS-gpu-pseudocode}
+\end{small}
+\end{algorithm}
+}
+
+\REM {
+\begin{algorithm}
+\begin{small}
+\SetKwProg{Fn}{}{ \{}{\}}
+
+\Fn(){CUDAKERNEL($dist, graph, inputWl, outputWl$)}{
+Initialize $tid, start, end$ \;
+$nodeNumber$ = $start+tid$ \;
+
+\BlankLine
+\While{$tid < end$}{
+  \For{all neighbors of $nodeNumber$}{
+    Get $destination$ for neighbor \;
+    Initialize $weight$; $altDist = dist[source] + weight$ \;
+    \If{$dist[destination] > altDist$}{    
+      Get $ChildCount$ of $destination$ \;
+      Atomically update $dist[destination]$ and its children with $altDist$ \;  \label{child-update-line} 
+       Atomically add node numbers to $outputWl$ \;
+    }
+  }
+   Increment $tid$ by $gridsize \times blocksize$ ; \tcc{round-robin assignment}
+}
+
+}
+
+\caption{GPU Pseudocode for Node-Splitting}
+\label{NS-gpu-pseudocode}
+\end{small}
+\end{algorithm}
+}
+
+\begin{figure*}
+\centering
+\includegraphics[scale=0.4]{images/rn-hp.pdf}
+%\includegraphics[scale=0.5]{images/hp-illustration.pdf}
+\caption{Hierarchical Processing (MDT = 3, i.e., three edges per node are processed in each iteration)}
+\label{hp-illustration}
+\end{figure*}
+
+ 
+\vspace{0.1in}
+\noindent
+{\bf Automatic Determination of Node Splitting Threshold:}
+%The discussion in the previous section explains \textit{how} to perform node-splitting, but it does not tell us \textit{when} to do it.
+A salient feature of our node splitting strategy is to automatically determine the threshold MDT for node splitting.
+%Let's understand why this automation is non-trivial.
+Obvious methods based on a threshold or max-degree etc. do not work in general.
+For instance, we cannot fix the value of MDT to a constant, since it is unsuitable across graphs and degree distributions.
+We cannot also fix MDT to the maximum degree in the graph, since there could be a big skew in the degree distribution with a few very high degree nodes and a large number of medium degree nodes.
+A better alternative is to use the difference between the average degree and the maximum degree in the graph; but such a function would be influenced by the graph size.
+Another constraint is that the number of nodes to be split should be minimum possible, to reduce the splitting (and processing) cost.
+To account for these issues, 
+we use a histogram based method in which we use \textit{HistogramBinCount} number of bins representing the ranges of outdegrees of the nodes in the original graph. 
+The number of bins is given as an input parameter to our algorithm. 
+We then find the distributions of the outdegrees across the bins. 
+We find the bin or range with the maximum height, i.e., the range of outdegrees for which the graph has the maximum number of nodes. 
+Let \textit{binIndex} be the index of this bin. 
+We then find the maximum degree threshold \textit{MDT} for the outdegrees as \textit{(binIndex/HistogramBinCount)$\times$ maxDegree}, where \textit{maxDegree} is the maximum outdegree in the graph. 
+Our node-splitting algorithm then finds the nodes in the graph with outdegrees greater than \textit{MDT} and splits them into child nodes such that each parent and the child nodes will have a maximum of \textit{MDT} outdegrees. 
+Our histogram approach of finding \textit{MDT} attempts to maximize the number of nodes (parent and child) with \textit{MDT} outdegrees. 
+By choosing the bin with the maximum height in which the nodes already have their outdegrees closer to \textit{MDT}, our algorithm minimizes the amount of splitting. 
+Since the histogram-based method considers degree distributions of a graph to achieve load balancing, it can be applied to different graphs with different kinds of distributions including highly skewed distributions.
+
+An advantage of the node splitting approach is that it continues to work with the space-efficient CSR format.
+Another advantage over workload-decomposition (Section~\ref{workload-decomposition}) is that all the edges of a node are processed by the same thread, reducing bookkeeping and improving the scope for memory coalescing.
+%The advantages of the node-splitting approach is that unlike the workload-decomposition strategy, each thread processes all edges of only one node (parent or child node), thereby simplifying book-keeping. 
+The primary disadvantage of node splitting is that it results in extra atomic operations to update the child nodes whenever the parent node gets updated.
+A secondary disadvantage is the overhead of computing the histogram to find the MDT.
+One may wonder that the strategy has a space overhead due to explicit splitting, but we found in our experiments that less than 5\% of the nodes undergo split, resulting in negligible space overhead.
+%the additional space and time complexity for creating the new nodes. If for a graph with $N$ nodes and $E$ edges, $N'$ child nodes are created, the space complexity for the new graph is $N+N'+E$. $N'$ depends on the degree distribution of the graph. In our experiments, we found that in the worst case, $N'=N/2$, while in the average case, $N'$ is less than $5\%$ of $N$. Thus the increase in space complexity is mostly negligible for our experiments. Additional overhead is also incurred to determine the MDT using the histogram-based approach. Node-splitting also results in extra atomic operations to update the child nodes along with the parent nodes.
+
+As we observe in our experiments (Section~\ref{exp_res}), node-splitting provides considerably better load-balancing.
+In addition, it provides comparable performance for large diameter graphs (such as road networks); but it has a high overhead for power-law degree distribution graphs.
+
+

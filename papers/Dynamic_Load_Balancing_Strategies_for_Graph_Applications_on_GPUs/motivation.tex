@@ -1,0 +1,164 @@
+\section{Motivation}\label{motivation}
+In this section we motivate the need for dynamic load-balancing strategies.
+Towards this goal, we first explain the existing static approaches, namely, node-based task-distribution and edge-based task-distribution,
+along with their advantages and disadvantages.
+
+\subsection{Node-based Task-distribution}
+In node-based task-distribution, the unit of processing is a node.
+Thus, when a GPU kernel is invoked, the number of threads in the launch-configuration is proportional to the number of graph nodes.
+In an extreme case, one may assign each node to a different thread.
+For a node-based distribution it is natural to represent the graph in a CSR format.
+Such a representation is also space-efficient.
+Each thread then operates on each of the assigned set of nodes, and may propagate a computed information along the set of edges incident on the node.
+Therefore, the amount of work done by a thread becomes proportional to the degree of the node on which it operates.
+Since this degree is unknown statically and varies across inputs, node-based task-distribution (and in general, a static load-balancing technique)
+incurs a high load-imbalance if the variance in the node-degrees is large (e.g., in social networks wherein degrees follow a power-law distribution).
+
+Figures~\ref{fig:websdd} and \ref{fig:rmatdd} show the outdegree distribution of the USA road network and Stanford web graph respectively. 
+We find that the Stanford graph has a relatively larger variation in the node outdegrees (USA: minimum=1, maximum=9, average=2.4, Stanford: minimum=1, maximum=255, average=8.2).
+We observe similar skewed degree distribution across other social networks as well (flickr, citations, twitter, etc.).
+For such graphs, if a thread is assigned to a node, the threads operating on high outdegree nodes would dominate the computation time.
+This causes the threads operating on low outdegree nodes to incur a long wait resulting in inefficient GPU resource utilization. 
+In summary, node-based task-distribution, which is used in several recent works~\cite{nasre-morphgpus-ppopp2013, nasre-datavstoplogy-ipdps2013, merrill-scalablegputraversal-ppopp2012, sariyuce-bc-gpgpu2013, gharaibeh-graphsgpus-ipdps2013}, may deliver poor performance on high-skew graphs (it should be noted that load-balancing was not their primary goal).
+
+\begin {figure}
+\centering
+\subfigure[USA Road Network]{
+  \includegraphics[width=0.45\linewidth]{images/usadd.png}
+  \label{fig:rmatdd}
+}
+\subfigure[Stanford Web Graph]{
+  \includegraphics[width=0.45\linewidth]{images/websdd.pdf}
+  \label{fig:websdd}
+}
+\caption{Degree Distributions of Graphs and Load Imbalance}
+\label{fig:dd}
+\end{figure}
+
+\subsection{Edge-based Task-distribution}
+In order to improve load-balance, former research has proposed edge-based task-distribution for graph algorithms on GPUs~\cite{sariyuce-bc-gpgpu2013}.
+In this approach, threads operate on the graph edges;
+that is, the number of threads in the kernel launch configuration is proportional to the number of graph edges.
+Edge-based task-distribution provides near-perfect load-balance for propagation algorithms (such as BFS, SSSP, etc.),
+since the edges can be almost evenly distributed across threads.
+Such an edge-based graph partitioning is also oblivious to the degree distribution, and hence is likely to work well across different types of graphs.
+%To realize this strategy, we use the coordinate ($COO$) representation for the graph which uses a pair of source and destination arrays to store the end points of each edge in the graph. 
+Given $E$ edges and $T$ threads with $T < E$, the threads are assigned to the edges in a round-robin manner. This ensures coalesced access since the neighboring edges are assigned to consecutive threads. For our work, we spawned the GPU kernel with the maximum number of active threads possible for a given CUDA architecture.
+
+Figure~\ref{EP-cpu-pseudocode} shows the pseudocode for edge-based parallelism using SSSP as an example.  SSSP maintains two worklists: \textit{inputWl} and \textit{outputWl} for reading and writing, respectively.  The \textit{while} loop at Lines~\ref{whilestart-line}--\ref{whileend-line} processes all the edges in the current input worklist by repeatedly calling \textit{sssp\_kernel} on the GPU. In the end, the computed distance values (attribute \textit{dist}) are copied from GPU to CPU.
+
+Parallel edge-based SSSP requires synchronization across threads.
+This is required when two edges being operated by two threads point to the same node -- resulting in a conflict.
+We use atomic primitives (\textit{atomicMin}) to update the distance values.
+Populating a shared worklist such as \textit{outputWl} also necessitates synchronization and we rely on atomic primitives for inserting edges.
+A na\"ive way to insert each outgoing edge of a node results in a considerable overhead.
+We employ work-chunking~\cite{nasre-datavstoplogy-ipdps2013} to club together multiple edges and use a single atomic instruction for adding all the edges of a node.
+%When adding edges to the output worklist at the end of the GPU kernel for processing in the next iteration (line \ref{work-chunk-line} of the GPU function), atomic updates to the worklist will have to be performed to prevent multiple simultaneous updates to the worklist by multiple threads and the resulting wrong results. We use work chunking \cite{nasre-datavstoplogy-ipdps2013} in which all the out-going edges corresponding to a single node are collected and added to the worklist using one atomic operation. This greatly reduces the number and cost of atomic operations when compared to a naive scheme in which an atomic operation is used for addition of each edge to the worklist.
+
+\begin{algorithm}[t]
+\begin{small}
+\SetKwInOut{Input}{input}
+\SetKwInOut{Output}{output}
+\SetKwProg{Fn}{}{ \{}{\}}
+
+\Input{a graph $graph(N,E)$ with $N$ nodes and $E$ edges}
+%\Input{edgessrc[E], edgesdst[E] contain the sources and destinations, respectively, of all edges}
+%\Input{For SSSP: edgeswt[E] contains the weight of all edges.}
+
+\BlankLine
+$graph$.init()\\
+%Create two worklists, $inputWl$ and $outputWl$ \;
+%Create distance vector, $dist[N]$ \;
+$\forall n: dist[n] = \infty$	\label{distinit-line} \\ 
+$dist[source] = 0$ 		\label{distinitsource-line} \\
+$inputWl$.push($source.edges$)\\
+%Add outgoing edge numbers of $source$ to $inputWl$\; 
+%Initialize $sizeWl$ with the size of the $inputWl$\;
+
+\BlankLine
+\While{$inputWl.size() > 0$} {	\label{whilestart-line}
+   \textbf{\textit{sssp\_kernel}}($graph, dist, inputWl, outputWl$) \\
+   %copy $outputWl$ to CPU \\
+   $inputWl = outputWl$\\
+   $outputWl$.clear() \\
+}	\label{whileend-line}
+copy $dist$ to CPU 
+
+\BlankLine
+\Fn(){\textbf{sssp\_kernel}($graph, dist, inputWl, outputWl$)}	{
+
+%$tid =$ get global thread ID \;
+%$start =$ start of $inputWl$ \;
+%$end =$ end of $inputWl$ \;
+
+\For{each edge $e$ assigned to me}{ \tcc{round-robin edge assignment}
+%\While{$tid < end$}{
+  %Get edge index (start+tid) from $inputWl$ \;
+  %Get $src$, $dest$ corresponding to edge index \;
+  %Initialize $weight = 1$ (for BFS), and $weight=$ edgeweights (for SSSP) \;
+  $altdist = dist[e.source] + e.weight$ \\
+ 
+  \If{$dist[e.destination] > altdist$}{
+    $dist[e.destination]$ = $altdist$ \\
+    $outputWl.push(e.destination.edges)$ \label{work-chunk-line} \\
+    %Atomically add edge numbers of $destination$ to $outputWl$ \label{work-chunk-line} \\
+  }
+  %Increment $tid$ by $gridsize \times blocksize$ ; \tcc{round-robin assignment}
+}
+}
+\caption{SSSP Pseudocode illustrating Edge-Based Parallelism}
+\label{EP-cpu-pseudocode}
+\label{EP-gpu-pseudocode}
+\end{small}
+\end{algorithm}
+
+
+
+\REM {
+\begin{algorithm}
+\begin{small}
+\SetKwProg{Fn}{}{ \{}{\}}
+
+\Fn(){\textbf{sssp\_kernel}($graph, dist, inputWl, outputWl$)}{
+
+%$tid =$ get global thread ID \;
+%$start =$ start of $inputWl$ \;
+%$end =$ end of $inputWl$ \;
+
+\For{each edge $e$ assigned to me}{
+%\While{$tid < end$}{
+  %Get edge index (start+tid) from $inputWl$ \;
+  %Get $src$, $dest$ corresponding to edge index \;
+  %Initialize $weight = 1$ (for BFS), and $weight=$ edgeweights (for SSSP) \;
+  $altdist = dist[e.source] + e.weight$ \\
+ 
+  \If{$dist[e.destination] > altdist$}{
+    $dist[e.destination]$ = $altdist$ \\
+    $outputWl.push(e.destination.edges)$ \label{work-chunk-line} \\
+    %Atomically add edge numbers of $destination$ to $outputWl$ \label{work-chunk-line} \\
+  }
+  %Increment $tid$ by $gridsize \times blocksize$ ; \tcc{round-robin assignment}
+}
+}
+\caption{Example GPU Pseudocode for Edge-Based Parallelism (SSSP)}
+\label{EP-gpu-pseudocode}
+\end{small}
+\end{algorithm}
+}
+
+Despite its advantages over the node-based approach, edge-based task-distribution suffers from the following limitations.
+First, it may not always be possible to use an edge-based distribution.
+For a node-based computation to be converted into a functionally equivalent edge-based computation, the computation needs to have a distributivity property.
+A function $f$ distributes over another function $g$ if $f(g(a, b), c) \equiv g(f(a, c), f(b, c))$.
+For example, in BFS, computing the minimum level for the destination node distributes over the addition (one plus) operation on the source node level.
+
+Second disadvantage of edge-based distribution is its higher space complexity. 
+A space-efficient CSR representation is unsuitable for edge-based distribution since the source node information is not duplicated across all the outgoing edges of that node.
+Therefore, edge-based distribution often demands a less-normalized COO format wherein source node is duplicated across edges emanating from that source.
+For a graph with $E$ edges, the COO representation requires $2E$ elements for storing the two arrays (in contrast to $N + E$ for CSR representation in case of node-based distribution).
+This additional storage cost can be substantial for denser graphs, and is especially relevant for GPUs which continue to have smaller main memories (maximum 12 GB for NVIDIA GPUs).
+If the vertices in the arrays are represented by 4-byte integers, the maximum number of edges that can accommodated in a system with GPU device memory of $4GB$ is 500 million for non-weighted graphs and about 350 million for weighted graphs. 
+Third, edge-based task-distribution can lead to the size explosion of worklists. 
+The size of the worklist can become greater than the number of edges $E$ since the outgoing edges of a node may be added redundantly to the worklist by multiple threads. 
+This would require condensing the worklist and removing redundancy at the end of each GPU kernel invocation, resulting in condensing overhead~\cite{merrill-scalablegputraversal-ppopp2012}.
+Large worklists also stress the memory resources.

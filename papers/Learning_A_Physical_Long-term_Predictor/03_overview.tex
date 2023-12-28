@@ -1,0 +1,94 @@
+% -------------------------------------------------------------------
+\section{Mechanics Networks}\label{sec:method}
+% -------------------------------------------------------------------
+
+In this section, we introduce a number of neural network models that can predict the behaviour of a simple mechanical system. We start by describing the physical setup and then we introduce the proposed network architectures.
+
+
+% -------------------------------------------------------------------
+\subsection{Physical setup}\label{sec:phys}
+% -------------------------------------------------------------------
+
+The physical setup (\cref{fig:simulation_setup}) consists of a small object sliding down an inclined plane. For notational simplicity, we identify the 3D Euclidean space with the underlying vector space $\mathbb{R}^3$ and denote as $\bp = (p_x,p_y,p_z)\in\mathbb{R}^3$ the coordinates of points as well as of vectors. The plane, which for simplicity passes through the origin, has equation $\pi= \{\bp \in \mathbb{R}^3:\langle \bn, \bp \rangle = 0\}$, where $\bn$ is the plane unit normal vector. In addition to the normal $\bn$, capturing the inclination, the plane has also a Coulomb \emph{friction coefficient} $\rho$, which in the simple case is \emph{homogeneous}, but which can also be a spatially varying quantity $\rho : \pi \rightarrow \mathbb{R}_+$.
+
+We set the camera to be located above the plane, at height $h > 0$, centered at point $(0,0,h)$, and looking downwards along the Z-direction $(0,0,-1)$. The camera axes are aligned to the world axes and the camera projection model is orthographic; in this setting, a world point $\bp$ simply projects to pixel $(p_x,p_y)$ in the image. Note that $h$ does not have an influence on the generated image and can be dropped.
+
+The sliding object is a cube with center of mass $\bq(t) = (q_x(t),q_y(t),q_z(t))$ at time $t$, which projects to pixel $\by(t) = \alpha (q_x(t),q_y(t))+\beta$ in the image. Here we consider $H_i\times W_i = 128 \times 128$ images with pixels of size $\alpha = 1$ and offset $\beta =(-64,-64)$. Initially, the cube is placed at rest on top of the plane at a random location $(q_x^0,q_y^0)$, and then starts to slide under the effect of gravity. The cube motion is also affected by friction. 
+
+An experiment instance is a tuple $\alpha = (q_x^0,q_y^0,\bn,\rho)$, consisting of the values of the initial object position, the plane normal, and the friction coefficient or distribution. The inclination $\bn$ is arbitrary (within limits), such that the object can slide in any direction. These parameters, as well as many other constant parameters described in~\cref{sec:data}, are passed to a physical simulator and rendered to simulate the experiment, resulting in a sequence of color images $\mathcal{X}_T^\alpha=(\bx^\alpha(0),\bx^\alpha(1),\dots,\bx^\alpha(T-1))$. The simulator also produces the ground-truth center of mass projections $\mathcal{Y}_T^\alpha = (\by^\alpha(0),\dots,\by^\alpha(T-1))$. Note that, for the purpose of learning predictors, physics needs not to be specified further; while in fact a complete set of parameters are required to run the physical simulation, the predictor learns automatically to extract the required information from the observed images.
+
+% -------------------------------------------------------------------
+\subsection{Neural network architectures}\label{sec:nets}
+% -------------------------------------------------------------------
+
+\begin{figure}[t]
+    \centering
+    \begin{overpic}[width=\linewidth]{images/overview/overview_basic}
+    \put(1,6){\small Input images $t=0\ldots3$}
+    \end{overpic}
+    \caption{Overview of our proposed pipeline. The first four images of a sequence first pass through a partially pre-trained feature extraction network to build the concept of physical state. It then recursively passes through a propagation layer to produce long-term predictions about the future positions of the objects. Extrapolation requires us to handle the notion of uncertainty, which is why \NetFour\ performs the best under changing physical conditions in \mbox{Scenario~\stwo}, see \cref{tab:results}. }
+    \label{fig:over}
+\end{figure}
+
+We focus on long-term predictors $\Phi :\mathcal{X}_{T_0} \mapsto \mathcal{Y}_T$ that take as input the first $T_0=4$ frames $\mathcal{X}_{T_0}$ of a video sequence $\mathcal{X}_T$ and produce as output a long-term estimate $\mathcal{Y}_T$ of the location of the object's center of mass at times $t=0,1,\dots, T$, where $T \gg T_0$.
+
+Our method comprises \textbf{three building blocks} (\cref{fig:over}): a feature extractor, a propagation network and an estimation network. The core of our model is the internal representation of the physics, initialized by the feature extractor, updated by the propagation module, and decoded by the estimation module. We compare two representation types: a \emph{vector representation}, in which each frame is encoded as $C$-dimensional vector (or $1 \times 1 \times C$ tensor), and a $H \times W \times C$ \emph{tensor representation}. The importance of this difference is that the vector representation is spatially \emph{concentrated}, whereas the tensor representation is spatially distributed.
+
+Next, the three modules are discussed in detail.
+
+\paragraph{(i)~Feature extraction network.}
+The predictor $\mathcal{Y}_T = \Phi(\mathcal{X}_{T_0})$ starts by extracting information from $T_0$ video frames. Similarly to~\cite{fragkiadaki2015learning}, the RGB channels of the images are concatenated in a single $H_i \times W_i \times 3T_0$ tensor and this is processed by a convolutional neural network $\phi_\text{init}$, obtaining a $\phi_\text{init}(\bx_0, \ldots \bx_{T_0-1}) \in \mathbb{R}^{H\times W\times C}$ tensor output. These features serve as the internal physical representation of our network that is propagated through time. Inspired by \cite{fragkiadaki2015learning}, we start from the VGG16 network pre-trained on \mbox{ImageNet~\cite{Simonyan15}}. The network is cut and the last layer adapted as needed. In particular, starting from a $(H_i,W_i)=(128,128,3)$ image, the vector representation uses the $(H,W,C)=(1,1,128)$ dimensional output of layer \texttt{fc6}, and the tensor representation uses the $(8,8,512)$ dimensional output of \texttt{conv5} instead. All feature extraction layers are frozen in training, except the new layer \texttt{fc6} and \texttt{conv1}, whose shape changes.
+
+\paragraph{(ii)~Propagation network.} 
+The internal representation initialized by the feature extractor is evolved through time by the propagation network $F : \mathbb{R}^{H\times W\times C} \rightarrow \mathbb{R}^{H\times W\times C}$. Formally, the internal state $S_t$ is initialized as $S_0 = \phi_\text{init}(\mathcal{X}_{T_0})$ and updated by iteratively applying $F$ as $S_{t+1} = F(S_t) = F^{t}(\phi_\text{init}(\mathcal{X}_{T_0}))$ for $t\geq 1$ (note that there is an index shift between state and time, so that $S_t$ predicts the objct position at time $t+T_0-1$). For the vector representation, the propagation network is an LSTM with 128 hidden units. Since there are no more observations after $T_0$, the LSTM input at time $t$ is set to the internal state of the LSTM at the previous time. This is  similar in approach to \cite{cho-al-emnlp14}, although our output is directly fed to the network without re-embedding. For the distributed representation, we use a simple chain of two convolution layers (with $256$ and $512$ filters respectively, of size $3\times3$, stride 1, and padding 1) interleaved by a ReLU layer. When using \textit{discrete probability map}, the representation $S_t$ is normalised channel-wise in $L^2$ norm after each update in order to avoid the decay of intermediate propagation layers.
+
+\paragraph{(iii)~Estimation network.}
+In the simplest instance, the network predictor estimates directly the values $\widehat{\mathcal{Y}}_T=(\hat \by(0),\dots, \hat \by(T-1))$ of the object's center of mass $\widehat{\by}(t)\in\mathbb{R}^2$ during the sequence. The learning loss is simply the average squared distance between predicted and ground-truth locations:
+\vnudgeeq
+\[
+   \losstwo(\widehat{\mathcal{Y}}_T,\mathcal{Y}_T)
+   =\frac{1}{T} \sum_{t=0}^{T-1} \| \hat \by(t) - \by(t) \|^2.
+\vnudgeeq
+\]
+As discussed above, however, it is preferable to predict the \emph{uncertainty} of the estimate as well. While in some cases this cannot improve accuracy directly (i.e in the bivariate gaussian case), it is interesting to see if a network is able to develop an internal sense of prediction errors. Further, probabilistic modelling may help the network discount difficult-to-predict points during training, which may otherwise work as outliers negatively affecting training.
+
+We propose to do so in two ways. In the first approach, we predict the mean and variance $\widehat{\mathcal{Y}}_T=(\mu(t),\Sigma(t);t=0,\dots,T-1)$ of a bivariate Gaussian distribution $\mathcal{N}(\cdot;\mu,\Sigma)$. The loss is the negative log-likelihood of the measured object locations:
+\vnudgeeq
+\[
+ \lossnormal(\widehat{\mathcal{Y}}_T,\mathcal{Y}_T)
+   = - \frac{1}{T} \sum_{t=0}^{T-1} \log \mathcal{N}(\by(t); \mu(t),\Sigma(t)).
+\vnudgeeq
+\]
+In practice, the neural network estimates the two dimensional vector $\mu(t)$ as well as a three dimensional vector $\lambda_1(t), \lambda_2(t), \theta(t)$ with the first two  being the eigenvalues of $\Sigma(t)$, and the third entry being the angle of the rotation matrix in the decomposition $\Sigma(t) = R(-\theta(t)) \begin{bmatrix}
+    \lambda_1(t) & 0\\
+         0 & \lambda_2(t) 
+\end{bmatrix}R(\theta(t))$. In order to ensure numerical stability, eigenvalues are constrained to be in the range $[0.01 \ldots 100]$ by setting them as the output of a scaled and translated sigmoid $\lambda_i(t) = \sigma_{\lambda,\alpha}(\beta_i(t))$, where $\sigma_{\lambda,\alpha}(z) = \lambda/(1 + \exp(-z)) + \alpha$.
+%
+%To summarise, the network outputs $\mu$(t), $\theta$(t), $\beta_1$(t), $\beta_2$(t) and obtains $\Sigma(t)$ as $R(-\theta(t)) \begin{bmatrix}
+%    \sigma_{\lambda,\alpha}(\beta_1(t)) & 0\\
+%          0 & \sigma_{\lambda,\alpha}(\beta_2(t)) 
+% \end{bmatrix}R(\theta(t))$.
+%
+For more details regarding the training procedure of this model please see section~\ref{sec:implem}.
+
+In the second approach, we predict \emph{discrete probability maps} $\mathcal{Y}_T=(p(0),\dots,p(T-1))$, where $p(t) \in \mathbb{R}^{H_i\times W_i}$ and $p(t)_{ij}$ is the probability that the object's center of mass is contained in a $1 \times 1$ square centered at location $(j-W_i/2,i-H_i/2)$. Similar to the Gaussian loss, we use the negative log-likelihood of the ground-truth observations as loss:
+\vnudgeeq
+\vnudgeeq
+\[
+ \lossheat(\widehat{\mathcal{Y}}_T,\mathcal{Y}_T)
+   = 2 \log \delta - \frac{1}{T} \sum_{t=0}^{T-1} \log p(t)_{\left\lfloor\by(t)\right\rceil},
+\]
+where $\lfloor \cdot \rceil$ is the rounding operator and $\delta=1$ is the sampling step.\footnote{The correction $2\log \delta$ results in the log-likelihood value of the piecewise-constant continuous distribution corresponding to the discrete one and makes likelihood values comparable for different step sizes $\delta$, as well as comparable to the Gaussian log-likelihood.} The probability maps $p(t)$ sum to one and are obtained by applying the softmax operator to a tensor $A(t)\in\mathbb{R}^{H_i \times W_i}$ estimated by the neural network:
+\vnudgeeq
+\[
+  p(t)_{ij} = 
+  \frac{e^{A(t)_{ij}}}{\sum_{mn}e^{A(t)_{mn}}}.
+\vnudgeeq
+\]
+All the output predictions at time $t+T_0-1$ are extracted from the internal state $S_t$ by a single layer $L(S_t)$. The layer $L$ is linear and fully-connected layer for $\losstwo$ and $\lossnormal$, and a deconvolutional layer similar to \cite{Long_2015_CVPR} in the case of $\lossheat$. Outputs at times $t=0,1,\dots,T_0$ are all predicted from $S_0$ using an analogous but independently-trained fully-connected layer $L'$.
+%Except for the probability map $L$ will be a fully-connected layer otherwise a deconvolution layer similar to \cite{Long_2015_CVPR}. 
+Overall, the output of the predictor is given by:
+\begin{align*}
+   \Phi(\mathcal{X}_{T_0}) = (L'(S_{0})_1, &\ldots , L'(S_{0})_{T_0},
+   \\& L(S_{1}),  \ldots, L(S_{T-T_0-1})). 
+\end{align*}

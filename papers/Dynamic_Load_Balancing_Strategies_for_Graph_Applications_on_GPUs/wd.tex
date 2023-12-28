@@ -1,0 +1,174 @@
+\subsection{Workload Decomposition}\label{workload-decomposition}
+%In this work, we employ workload decomposition, a form of space decomposition, for the first time, to our knowledge, for graph applications.
+Workload decomposition combines node-based and edge-based task-distribution.
+It can be viewed as a form of space decomposition.
+In this approach, the processing elements in the worklist continue to be the nodes, but the workload of the nodes, namely, the edges, are decomposed across threads using a block distribution.
+$E$ number of graph edges are partitioned across $T$ threads such that each thread receives a contiguous chunk of $E/T$ edges for processing.
+%rewrite: Given $E$ edges and $T$ threads, the first $E/T$ edges are assigned to thread 0, the second $E/T$ edges are assigned to thread 1, the third $E/T$ to threads 2, and so on.
+Thus, a given thread processes a subset of edges corresponding to a subset of nodes and all the edges outgoing from a node may not be processed by the same thread.
+Figure~\ref{wd-illustration} illustrates the workload decomposition strategy with two nodes. 
+In this figure, four threads process three edges each from two nodes with the first node having five outgoing edges and the second node having seven edges. 
+We find that Thread 2 processes two edges from node 1 and one edge from node 8.
+
+\begin{figure}
+\centering
+\includegraphics[scale=0.5]{images/rn-wd.pdf}
+%\includegraphics[scale=0.5]{images/wd-illustration.pdf}
+\caption{Workload Decomposition}
+\label{wd-illustration}
+\end{figure}
+
+Figure~\ref{WD-cpu-pseudocode} presents the pseudocode for the strategy. 
+Each GPU thread processes \textit{edgesPerThread} number of edges starting from a particular outgoing edge of a particular node. 
+Each worklist maintains the nodes to be processed and each node's outdegree as two associative arrays.
+Both the arrays are populated while updating the worklist, but only the second array (node outdegrees) is used in the prefix sum computation to determine \textit{edgePerThread} and to populate the \textit{offset} array of structure.
+%These particular nodes and edges are stored in the \textit{offset} array of structure. 
+These offsets are calculated in the GPU in a separate kernel function \textbf{\textit{find\_offsets}} (Lines~\ref{getoffset-line-1} and \ref{getoffset-line-2}). 
+A GPU thread in this kernel uses the prefix sums of the outdegrees of the nodes and the \textit{edgesPerThread} to find the particular node and edge that it has to start with for processing. 
+The prefix sums of the outdegrees are also calculated on the GPU using a separate kernel. 
+We use the NVIDIA's Thrust API for inclusive scan for this purpose (Line~\ref{prefixsum-line}). 
+The \textit{while} loop in the kernel (Line~\ref{while-line}) handles the situation when a thread, after processing a subset of edges for a node, moves to processing the next set of edges from the next node in the worklist.
+
+\begin{algorithm}[t]
+\begin{small}
+\SetKwInOut{Input}{input}
+\SetKwInOut{Output}{output}
+\SetKwProg{Fn}{}{ \{}{\}}
+
+\Input{a graph \textit{graph(N,E)} with \textit{N} nodes and \textit{E} edges}
+%\Input{For SSSP: edgeswt[E] contains the weight of all edges.}
+%\Input{prefixsum[N] - stores prefix sum of outdegrees of nodes in the worklist}
+\label{offset-line} \Input{\textit{offset[numThreads]} - array of structure containing two fields: (i) \textit{NodeOffset} is the starting offset of a node in the input worklist to be processed by a thread, (ii) \textit{EdgeOffset} is the starting edge of the node to be processed by the thread}
+
+\BlankLine
+%worklist structure - contains 2 arrays, 1. Nodenumbers - indices of the nodes, 2. outgoing - outdegree of the nodes \;
+\textit{graph}.init()\\
+%Create two worklists, $inputWl$ and $outputWl$ \;
+%Create distance vector, $dist[N]$ \;
+\textit{$\forall$ n: dist[n] = $\infty$} \\
+\textit{dist[source] = 0} \\
+\textit{inputWl}.push(\textit{source}) \\
+%Add $source$ to $inputWl$; Initialize $sizeWl$ with the size of the $inputWl$\;
+
+%\BlankLine
+\textit{offsets} = \textbf{\textit{find\_offsets}}(\textit{graph, inputWl, edgesPerThread, numThreads}) \label{getoffset-line-1} \\
+%CUDA\_GETOFFSETS ($graph,inputWl,edgePerThr,nthreads,size)$ \; \label{getoffset-line-1} 
+
+\BlankLine
+\While{inputWl.size() $>$ 0} {
+   \textbf{\textit{sssp\_kernel}}(\textit{graph, dist, inputWl, outputWl, offsets}) \\
+   %copy \textit{outputWl} to CPU \\
+   \textit{inputWl = outputWl} \\ 
+   \textit{outputWl}.clear() \\
+   \BlankLine
+
+   \textit{prefixsum = scan(\textit{graph})}	\label{prefixsum-line}	\tcc{Use Thrust API}
+   %Do Inclusive Scan of $outgoing$ array and store in $prefixsum$ ; \label{prefixsum-line}
+   \textit{edgesPerThread = ceil(prefixsum.size() / outputWl.size())} \\
+   %$psum$ = Last value of $prefixsum$ array \;
+   %$nthreads =$ size of $outputWl$ \;
+   %$nblocks = ceil(nthreads/ blocksize)$ ; \tcc{blockSize = 1024}
+   %$edgePerThread = ceil(psum / nthreads)$ \;
+   \textit{offsets} = \textbf{\textit{find\_offsets}}(\textit{graph, inputWl, edgesPerThread, numThreads}) \label{getoffset-line-2} \\
+   %CUDA\_GETOFFSETS ($graph,inputWl,edgePerThr,nthreads,size)$ \; \label{getoffset-line-2}
+}
+
+\BlankLine
+\Fn(){\textbf{sssp\_kernel}(graph, dist, inputWl, outputWl, offsets)}{
+
+%Intialize $tid, start, end$ \;
+%$size$ = $numThreads$ = size of inputWl \;
+%$edgePerThr = ceil(prefixsum[size-1] / numThreads)$ \;
+%$source = $ node number located at $offsets[tid].NodeOffset$\;
+%$currentindex =$ startindex of $source$ in edge array of CSR $+ offsets[tid].Edgeoffset$ \;
+%$lastIndex =$ startIndex of $source$ in edge array of CSR $+$ outdegree of $source$ \;
+\textit{source = offsets[myid].NodeOffset} \\
+\textit{ecurrent = offsets[myid].EdgeOffset} \\
+\For{(\textit{edge = 0; edge $<$ edgesPerThread; ++edge})}{
+  \While{ecurrent does not belong to source} {	\label{while-line} \tcc{check next node's edge}
+	++\textit{offsets[myid].NodeOffset} \\
+     	\textit{source = offsets[myid].NodeOffset} \\
+     	\textit{offsets[myid].EdgeOffset = 0} \\
+	\textit{ecurrent = offsets[myid].EdgeOffset + first edge index of source} \\
+  }
+% \While{($currentindex >= lastIndex$)}{
+%
+%    \tcc{if $currentIndex$ points to an edge of the next node}
+%     $offsets[tid].NodeOffset++$ \;
+%     $source = $ node number located at $offsets[tid].NodeOffset$\;
+%     $offsets[tid].EdgeOffset = 0$ \;
+%     $currentindex =$ startindex of $source$ in edge array of CSR $+ offsets[tid].Edgeoffset$ \;
+%   }
+   %Get $destination$ at $currentindex$ \;
+   %Initialize $weight$; 
+   \textit{altdist = dist[ecurrent.source] + ecurrent.weight} \\
+   \If{dist[ecurrent.destination] $>$ altdist}{
+	\textit{dist[ecurrent.destination] = altdist} \\
+      %Atomically update $dist[ecurrent.destination]$ with $altDist$ \;
+	\textit{outputWl}.push(nodes with updated distance values) \\
+      %Atomically add node numbers of the updated nodes to $outputWl.Nodenumbers$ \;
+      %Add the outdegree of node to $outputWl.outgoing$ \;                   
+   }
+   \textit{offsets[myid].EdgeOffset++} \\
+   \textit{ecurrent++} \\
+}
+}
+\caption{SSSP Pseudocode illustrating Workload Decomposition}
+\label{WD-cpu-pseudocode}
+\end{small}
+\end{algorithm}
+
+\REM {
+\begin{algorithm}
+\begin{small}
+\SetKwProg{Fn}{}{ \{}{\}}
+
+\Fn(){CUDAKERNEL($dist, graph, inputWl, outputWl$)}{
+
+Intialize $tid, start, end$ \;
+$size$ = $numThreads$ = size of inputWl \;
+$edgePerThr = ceil(prefixsum[size-1] / numThreads)$ \;
+$source = $ node number located at $offsets[tid].NodeOffset$\;
+$currentindex =$ startindex of $source$ in edge array of CSR $+ offsets[tid].Edgeoffset$ \;
+$lastIndex =$ startIndex of $source$ in edge array of CSR $+$ outdegree of $source$ \;
+
+\For{($edge=0; edge<edgePerThr; edge++$)}{
+  \While{($currentindex >= lastIndex$)}{
+
+    \tcc{if $currentIndex$ points to an edge of the next node}
+     $offsets[tid].NodeOffset++$ \;
+     $source = $ node number located at $offsets[tid].NodeOffset$\;
+     $offsets[tid].EdgeOffset = 0$ \;
+     $currentindex =$ startindex of $source$ in edge array of CSR $+ offsets[tid].Edgeoffset$ \;
+   }
+   Get $destination$ at $currentindex$ \;
+   Initialize $weight$; $altDist = dist[source] + weight$ \;
+   \If{$dist[destination] > altDist$}{
+      Atomically update $dist[destination]$ with $altDist$ \;
+      Atomically add node numbers of the updated nodes to $outputWl.Nodenumbers$ \;
+      Add the outdegree of node to $outputWl.outgoing$ \;                   
+   }
+   $offsets[tid].EdgeOffset++$ \;
+   $currentindex++$ \;
+}
+}
+\caption{GPU Pseudocode for Workload Decomposition}
+\label{WD-gpu-pseudocode}
+\end{small}
+\end{algorithm}
+}
+
+An advantage of workload decomposition is that it works with the CSR format and therefore, has a lower space complexity.
+%The advantage of this approach is that the load balancing strategy using decomposition of edges in space is natural and easy to implement. 
+%Unlike the edge-based assignment strategy, since the processing elements are nodes, larger graphs can be accommodated.  
+Assuming a conservative estimate of the number of nodes equal to half the number of edges, graphs of at least 350 million edges can be accommodated with the CSR format on the GPU.  
+Also, since it distributes edges of a node across threads, it has a better load-balancing compared to a node-based distribution.
+%The drawback of this approach is the need for extra atomic instructions since multiple threads can process the outgoing edges of a single node. 
+A drawback of the workload decomposition is that it can lead to uncoalesced accesses since a node's edges may get separated.
+The method also incurs some overhead for the prefix sum operations, extra kernel-calls to obtain node offsets, and due to the atomic instructions required as a node may be operated upon by multiple threads.
+Despite saving space compared to a COO format, workload decomposition requires extra space to store the node and edge offsets for each thread.
+
+In our experiments, we observe that the limitations of workload decomposition affect its performance for large-diameter graphs (such as the road networks) 
+but the method performs very well for scale-free graphs such as the social networks (Section~\ref{exp_res}).
+
+

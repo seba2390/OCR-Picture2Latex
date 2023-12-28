@@ -1,0 +1,235 @@
+\subsection{Hierarchical Processing}\label{hierarchical-processing}
+Hiearchical processing performs a time-decomposition of the workload.
+It achieves this by partitioning the main (super) worklist into several sub-worklists. 
+If the sub-worklist is large, it can be further partitioned into sub-sub-worklists, and so on. 
+This builds a hierarchy of worklists. 
+The depth of this hierarchy is tunable, and we utilize the histogram-based approach in node-splitting (Section~\ref{node-splitting}) for finding the maximum degree threshold (MDT) which determines when to split a worklist into sub-worklists.
+%Similar to node-splitting approach, this strategy also uses a maximum degree threshold (MDT) for nodes in a node worklist. 
+%The histogram strategy used in the node-splitting approach is also used for finding the maximum degree threshold. 
+%However, instead of splitting or forming new nodes, this method processes a worklist in a hierarchical manner forming different sub worklists. 
+
+An iteration for processing a node worklist is composed of sub-iterations. 
+In each sub-iteration, a sublist consisting of nodes remaining to be processed from the super-worklist is formed, and a GPU kernel is invoked to process this sublist. 
+Each GPU thread considers a set of nodes in the sublist, processing only up to MDT unprocessed outgoing edges of these nodes. 
+Thus, all the threads corresponding to the kernel invocation of the sub-iteration are load-balanced within this threshold. 
+The nodes in the sublist with the number of unprocessed outgoing edges less than or equal to MDT will be processed. % and removed from the next sublist. 
+The next sublist with a reduced set of nodes will be processed in the next sub-iteration. 
+This continues until all the nodes in the super list are processed before processing the next super list in the next iteration. 
+
+Figure~\ref{hp-illustration} illustrates the hierarchical processing of sublists within an iteration for an input graph. 
+The super worklist in the figure contains two nodes 1 and 8 with five and seven outgoing edges respectively. 
+In each kernel for a sub-iteration, two threads are spawned for processing the two nodes.
+Let MDT be $3$. Then each thread in a sub-iteration processes maximum three edges.
+%The thick edges represent the unprocessed edges while the dashed lines represent the processed edges.
+%The shaded portion represents the subgraph processed in each sub-iteration.
+
+%Figure~\ref{HP-cpu-pseudocode} presents the pseudocode for the hierarchical processing strategy. 
+%Lines~\ref{subiter-begin-line}~--~\ref{subiter-end-line} show the inner loop corresponding to the sub-iterations. 
+%In the kernel code, the creation of the next sub-list for the next sub-iteration is shown in Line~\ref{sublist-creation-line}. 
+
+The sizes of the sublists decrease over the sub-iterations due to the removal of the processed nodes. 
+Since the GPU kernel is spawned using a node-parallel approach in which the number of GPU threads is proportional to the size of the sublist, the reduction of the sublist size can result in a situation where the GPU kernel is invoked with a small number of threads to process a small number of nodes in the sublist. 
+This will result in very low GPU occupancy. 
+For example, consider a situation where, if after a few sub iterations, only one node remains to be processed and this node has $100$ edges remaining to be relaxed. 
+If the MDT is $5$, twenty more sub-iterations will invoke twenty more GPU kernels successively, each spawning one GPU thread to process $5$ edges of the node. 
+To avoid this situation, our strategy switches to the workload-decomposition technique when the sublist size becomes smaller than a threshold.
+% (Line~\ref{switching-line}). 
+A natural threshold is governed by the GPU kernel block size which, in our experiments, is set to $1024$. 
+We also switch to workload decomposition for processing the super worklist at the beginning of the top-level iterations when the size of the super list becomes smaller than the block size.
+
+The fundamental advantage of the hierarchical processing strategy over node-splitting is that it avoids the space and time complexity needed for creation of new nodes. 
+By following a hybrid method of using workload-decomposition for small number of nodes and using the technique of sub-iterations for larger number of nodes, it combines the advantages of multiple approaches. 
+However, the hierarchical processing method incurs extra overhead due to additional kernel invocations corresponding to the sub-iterations. 
+The method also incurs increased space complexity and atomic operations for the sub worklists.
+
+In our experiments (Section~\ref{exp_res}) we found that despite its overheads, hierarchical processing is a scalable mechanism.
+For larger graphs in our experimental suite where other proposed strategies fail to execute due to insufficient memory requirment, hierarchical processing
+successfully completes execution offering good benefits in terms of load-balancing.
+
+\REM{
+\begin{algorithm}[t]
+\begin{small}
+\SetKwInOut{Input}{input}
+\SetKwInOut{Output}{output}
+\SetKwProg{Fn}{}{ \{}{\}}
+
+\Input{A graph $graph(N,E)$ with $N$ Nodes and $E$ edges}
+\Input{$HistoBinCount$ indicating number of bins}
+%\Input{edgesdst[E] - contains the destinations of all edges}
+%\Input{For SSSP: edgeswt[E] contains the weight of all edges}
+
+$graph$.init() \\
+%Take command line argument, $HistogramBinCount$ \;
+%Create three worklists, $inputWl$, $outputWl$, $subWl$ \;
+%Create distance vector, $dist[N]$ \;
+%Initialise $dist = \infty$; Initialize $dist[source]$ to $0$ \;
+%Add $source$ to $inputWl$; Initialize $sizeWl$ with the size of the $inputWl$\;
+%$MDT = getMaxAllowedOutDegree(HistogramBinCount)$ \;
+$maxDegree$ = getMaxDegree($HistoBinCount$) \\
+$\forall\ n: dist[n] = \infty$ \\
+$dist[source] = 0$ \\
+$inputWl$.push($source$) \\
+
+\BlankLine
+\While{$inputWl.size() > 0$}{
+  $subWl$.clear() \\
+  $subIteration = 0$ \\
+  $continue$ = TRUE \\
+  \While{continue == TRUE}{ \label{subiter-begin-line} 
+    \If{$subWl.size() < Threshold$}{ \label{switching-line} 
+      Call Workload-Decomposition() \tcc{Algorithm~\ref{WD-cpu-pseudocode}}
+    }
+    $continue$ = FALSE \\
+    copy $continue, subIteration$ to GPU \\
+    \textbf{\textit{sssp\_kernel}}(\textit{graph, dist, inputWl, outputWl, subWl, continue}) \\
+    $inputWl = subWl$ \\
+  } \label{subiter-end-line} 
+  %copy $outputWl$ to CPU \\
+  $inputWl = outputWl$ \\ 
+  clear $outputWl$ \\
+}
+\Fn(){\textbf{sssp\_kernel}(graph, dist, inputWl, outputWl, subWl, continue)}{
+\For{each edge $e$ assigned to me} {
+	$altdist = dist[e.source] + e.weight$ \\
+	\If {$dist[e.destination] > altdist$} {
+		$dist[e.destination] = altdist$ \\
+		$outputWl.push(e.destination)$ \\
+	}
+}
+\If{the assigned node $n$ has more edges} {
+	$continue$ = TRUE \\
+	$subWl$.push($n$) \label{sublist-creation-line}
+}
+}
+\caption{SSSP Pseudocode illustrating Hierarchical Processing}
+\label{HP-cpu-pseudocode}
+\label{HP-gpu-pseudocode}
+\end{small}
+\end{algorithm}
+
+\REM {
+\begin{algorithm}
+\begin{small}
+\SetKwProg{Fn}{}{ \{}{\}}
+
+\Fn(){CUDAKERNEL($dist, graph, inputWl, outputWl, subWl,$ \\$subIteration, continue, MDT$)}{
+Initialize $tid, start, end$ \;
+$loffset$ = $MDT$ \;
+
+\BlankLine
+\If{$tid < end$}{
+  $NodeNumber = start+tid$ \;
+  $NodeIndex =$ get index of $NodeNumber$ from CSR \;
+  $currentindex = NodeIndex + (subIteration * loffset)$ \;
+  $lastindex = NodeIndex + outdegree$ \;
+  \For{($E=currentindex; E<(currentindex+loffset), E<lastindex; E++$)}{
+    Get $destination$ for $E$ \;
+    Initialize $weight$; $altDist = dist[source] + weight$ \;
+    \If{$dist[destination] > altDist$}{
+       Atomically update $dist[destination]$ with $altDist$ \;
+       Atomically add $destination$ to $outputWl$ \;
+    }
+  }
+  \If{$currindex + loffset < lastindex$}{
+    $continue = TRUE$ \;
+    Atomically add $NodeNumber$ to $subWl$ ; \label{sublist-creation-line} \tcc{More edges to be processed for this node. Add node to the next sublist}
+  }
+}
+}
+
+\caption{GPU Pseudocode for Hierarchical-Processing}
+\label{HP-gpu-pseudocode}
+\end{small}
+\end{algorithm}
+}
+}
+
+Table \ref{strategies-summary} summarizes the advantages and disadvantages of the different load balancing strategies.
+
+\begin{table*}
+ \centering
+ \footnotesize
+ \caption{Advantages and Disadvantages of the Load Balancing Strategies}
+ \begin{tabular}{|c|p{1.45in}|p{2.45in}|p{2.55in}|}
+  \hline\hline
+  & {\em Strategy} & {\em Advantages} & {\em Disadvantages} \\
+  \hline\hline
+  \parbox[t]{2mm}{\multirow{2}{*}{\rotatebox{90}{Existing}}} &
+  Node-based Distribution (BS) &
+   \parbox{2.5in} {
+	\begin{itemize}
+	\item Simple to implement (static)
+	\item  Works with CSR graph format
+   	\end{itemize} 
+   } &
+   \parbox{2.5in} {
+   	\begin{itemize}
+	\item High load-imbalance
+   	\end{itemize} 
+   } \\\cline{2-4}
+   &
+  Edge-based Distribution (EP) & 
+   \parbox{2.5in} {
+   	\begin{itemize}
+	\item Implicit load balancing 
+	\item Simple to implement (static)
+   	\end{itemize} 
+   } &
+  \parbox{2.5in}{
+  \begin{itemize}
+   \item Large space complexity for COO representation
+   \item Explosion in worklist size, worklist condensing overhead, large memory consumption
+   \item Requires the kernel operation to be distributive
+  \end{itemize}
+  } \\ \hline
+  \parbox[t]{2mm}{\multirow{3}{*}{\rotatebox{90}{Proposed}}} &
+  Workload Decomposition (WD) & 
+  \parbox{2.5in}{
+  \begin{itemize}
+   \item Larger graphs can be processed
+   \item Space decomposition is easy to implement
+  \end{itemize}
+  } & 
+  \parbox{2.5in}{
+  \begin{itemize}
+   %\item A thread can process multiple nodes
+   \item Atomic operations for updating same out-going edges by multiple threads
+   \item Overheads for prefix sum and offset computations, extra space for offsets
+   \item  Uncoalesced data access on the GPU
+  \end{itemize}
+  } \\ \cline{2-4}
+  &
+  Node Splitting (NS) & 
+  \parbox{2.5in}{
+   \begin{itemize}
+	\item Graph algorithm does not require modification
+   \end{itemize} 
+  } &
+  \parbox{2.5in}{
+  \begin{itemize} 
+   \item Additional space and time complexity for new nodes
+   \item Extra atomic operations for updating child nodes
+   \item  Overhead for MDT finding
+  \end{itemize}
+  } \\ \cline{2-4}
+  &
+  Hierarchical Processing (HP) & 
+  \parbox{2.5in}{
+  \begin{itemize}
+   \item Performs well for large graphs
+   \item  A thread processes only one node without forming child nodes
+   \item  Hybrid method for switching to workload decomposition strategy for small super and sub worklists
+  \end{itemize}
+  } & 
+  \parbox{2.5in}{
+  \begin{itemize}
+   \item Sub lists result in additional space and atomics
+   \item Multiple kernel calls
+  \end{itemize}
+  } \\ \hline\hline
+ \end{tabular}
+ \label{strategies-summary}
+\end{table*}
+
+
+

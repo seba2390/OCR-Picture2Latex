@@ -1,0 +1,146 @@
+% !TEX root = ../SinkhornDivergences.tex
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Sinkhorn AutoDiff Algorithm}
+
+Computing an approximation of $\nabla E$ is itself a difficult problem, even when $\epsilon=0$. 
+%
+In the latter case, a workaround is to use, instead of differentiating the ``primal'' formula~\eqref{primal}, the optimum of the ``dual'' formula, resulting in
+$\nabla E_0(\th) = \int_\Zz \nabla[ h \circ g_\th ](z) \d\muz(z)$, where $h$ is an optimal dual continuous potential for $\mu=\mut$, see~\cite{WassersteinGAN}.  % montavon2016wasserstein
+%
+This requires the use of approximate semi-discrete OT solvers (because $\mut$ is a continuous measure while $\nu$ is discrete), which typically operate by approximating the continuous dual potential $h$, see for instance~\cite{2016-genevay-nips} which uses an RKHS expansion, or~\cite{WassersteinGAN} which uses a deep-network expansion.
+%
+While the dual formalism is appealing (in particular because it involves only integration over $\Zz$ and not the product space $\Zz \times \Xx$), the resulting gradient formula requires differentiating the dual potential, which tends to be difficult to compute and unstable. A very similar conclusion is reached by~\cite{Bousquet2017} (see in particular their Proposition 3).% }
+
+We propose a different route, by making two key simplifications: (i) approximate the function $E_\epsilon(\th)$ by a size-$(\m,\n)$ mini-batch sampling $\hat E_\epsilon(\th)$ to make it amenable to stochastic gradient descent ; (ii) approximate $\hat E_\epsilon(\th)$ by $L$-steps of the Sinkhorn algorithm~\cite{CuturiSinkhorn} to obtain an algorithmic loss $\hat E_\epsilon ^{(L)}(\th)$ which is amenable to automatic differentiation.
+
+
+%%%
+\paragraph{(i) Mini-batch sampling loss.}
+
+We replace the initial functional $E_\epsilon(\th)$ by an expectation over mini-batches of size $(\m,\n)$, with leads to consider 
+\eql{\label{eq-minibatches}
+	 \umin{\th}
+	\EE(\hat E_\epsilon(\th))\qwhereq E_\epsilon(\th)\eqdef  \Wce(\hat \mu_\theta,\hat\nu)}
+	
+	\eq{\qandq \choice{
+		\hat \mu_\theta \eqdef \frac{1}{\m}\sum_{i=1}^{\m} \de_{x_i}, \\
+		\hat \nu \eqdef \frac{1}{\n}\sum_{j \in J} \de_{y_j}, 
+	}
+	\:
+	\choice{
+		(z_i)_{i=1}^{\m} \overset{\text{i.i.d}}{\sim} \muz,\\
+		\foralls i, \: x_i \eqdef g_\th(z_i), 
+	}
+}
+The expectation is taken over the samples $(z_i)_{i=1}^\m$ (drawn independently according to $\muz$) and the indexes $J \subset \{1,\ldots,\N\}$ with $|J|=\n$. As $(\m,\n)$ increases, $\EE(\hat E_\epsilon)$ approaches $E_\epsilon$, and convergence of minimizers is studied in~\cite{bernton2017inference}.
+
+At a given iterate of this stochastic gradient descent scheme (see pseudo-code~\ref{algo-sgd}), one draws a mini-batch $(z_i)_{i=1}^{\m} \overset{\text{i.i.d}}{\sim} \muz$ and a subset $J$ of observations, and aims at computing the gradient of 
+\eql{\label{eq-linprog-finite}
+	\hat E(\th) = 
+		 \umin{\P \in \RR_+^{\m \times \n}} \enscond{
+		 	 	\dotp{\P}{\tc}
+			}{ \P \ones_{\m} = \ones_\n, \P^\top \ones_{\m} = \ones_\n }, 
+}
+where we defined $\tc \eqdef \begin{bmatrix}c(g_\th(z_i), y_j)\end{bmatrix}_{i,j}\in\RR^{\m\times
+\n}$ (which depends on $\th$ because the $x_i$'s do).
+%
+Note that this is simply a rephrasing of~\eqref{primal} in the case where both input measures are discrete (sums of Dirac masses), so that couplings $\pi$ can be treated as matrices $\P \in \RR^{\m \times \n}$, namely $\pi=\sum_{i,j} \P_{i,j} \de_{(z_i,y_j)} \in \Mm_+^1(\Zz \times \Xx)$. 
+ 
+%%%
+\paragraph{(ii) Sinkhorn iterates.}
+
+One major advantage of regularizing the optimal transport problem is that it becomes solvable efficiently using Sinkhorn's algorithm~\cite{Sinkhorn64} (when dealing with discrete measures), and leads to a differentiable loss function (as first noticed in~\cite{CuturiSinkhorn,CuturiDoucet}). Such a regularization is known to be equivalent to restricting the search space in~\eqref{eq-linprog-finite} to couplings having the so-called scaling form
+\eq{
+	\P_{i,j} = a_i K_{i,j} b_j
+	\qwhereq
+	K_{i,j} \eqdef  e^{-\tc_{i,j}/\epsilon}.}
+Matrix $K$ is the so-called Gibbs kernel. Note that $K$ depends implicitly on $\th$ (because matrix $\tc$ does), and contains therefore all of the geometric information related to the ability of $\th$ to sample points near the dataset.
+%
+Starting with $b^{(0)} \eqdef \ones_{\m}$, $\ell \leftarrow 0$, Sinkhorn iterates read
+\eql{\label{eq-sinkhorn}
+\itt{a} \eqdef \frac{\ones_\n}{K \it{b}} 
+\qandq
+\itt{b} \eqdef \frac{\ones_\m}{K^\top \itt{a}} 
+}
+where $\frac{\cdot}{\cdot}$ denotes component-wise division. 
+%
+The main computational burden of~\eqref{eq-sinkhorn} are the matrix-vector multiplication, which stream extremely well on GPU architectures, and therefore nicely add to a typical deep network architecture with $L$ additional layer of linear operations ($K$ can be interpreted as a localized linear filtering) and entry-wise non-linear operations (here divisions). 
+
+For a given budget $L$ of iterations, our final loss is then obtained by using $\IT{\P} \eqdef \diag(\IT{a})K\diag(\IT{b})$ as a proxy for the optimal transport coupling, and thus
+\eql{\label{eq-return-value}
+	\hat E_\epsilon ^{(L)}(\th) \eqdef \dotp{\tc}{\IT{\P}} = 
+	\sum_{i=1}^{\m} \sum_{j=1}^\n \tc_{i,j} \ITi{a} \ITj{b} K_{i,j}}
+where it is once again important to remind that $K,\tc,\IT{b},\IT{a}$ depend on $\th$. As $\epsilon \rightarrow 0$ and $L \rightarrow +\infty$, one can show that the $\IT{\P}$ computed by Sinkhorn's iterates approaches a solution to~\eqref{eq-linprog-finite}, with linear convergence rate (deteriorating as $\epsilon \rightarrow 0$), so that $\hat E_\epsilon ^{(L)}(\th)$ is a smooth proxy for $E_\epsilon(\th)$ which can be differentiated in a fast and stable way, while being accurate as $\epsilon\rightarrow 0$ and $(\m,\n,L)$ increase. 
+% 
+It is however important to realize that for large scale and high dimensional learning applications, empirical considerations~\cite{CuturiSinkhorn,kusner2015word,2015-Frogner} suggest that, unlike relevant applications of the same scheme in graphics~\cite{solomon2015convolutional}, a relatively strong regularization---a large $\epsilon$---leads not only to more stable results but also faster convergence, so that the value for $L$ can be set quite low.
+
+\paragraph{Learning the cost function}
+
+Aside from the regularization parameter, a key element of the Sinkhorn loss is the choice of the ground cost $c$ on the data space. In some cases, using a simple metric such as the $L^2$ norm is sufficient to compare two data points, but when dealing with high-dimensional objects, choosing $c$ is more critical. In such cases, we  propose to learn the cost $c$ with the following parametrization
+\eq{
+	c_\phi(x,y) \eqdef \norm{f_\phi(x)-f_\phi(y)} \qwhereq f_\phi : \Xx \rightarrow \RR^p,
+}
+where $f_\phi$ can be modelled by a neural network, and can be seen as a feature extractor that reduces the dimensionality of $\Xx$ through a mapping onto $\RR^p$. 
+
+Learning the cost function here is very similar to learning a parametric kernel in an MMD model, as done in \cite{MMDGAN}. The optimization problem becomes a min-max problem over $(\theta,\phi)$ instead of a simple minimization problem over $\theta$ 
+\eq{
+\min_\theta \max_\phi \bar{\Ww}_{c_\phi,\epsilon(\mut,\nu)}}
+where in practice $\bar{\Ww}_{c_\phi,\epsilon}$ is approximated by minibatches and Sinkhorn, as mentioned above.
+
+%%%
+\paragraph{Putting everything together.} We can now describe efficiently our scheme and use Figure~\ref{fig-workflow} again for that purpose. In that figure, the generator (blue) and real data (green) parts are combined to compute a pairwise distance matrix $\tc$. This matrix, as in MMD-GAN's approach~\cite{li2015generative} is all we need. We do, however, significantly depart from a ``flat'' MMD approach in the red block of the figure, in which a finite number of Sinkhorn steps are used to approximate the Wasserstein distance. These Sinkhorn steps are used to evaluate (forward pass) and compute the gradient (backward pass) of that proxy as described in Algorithm~\ref{algo-sinkhorn}. Samples are repeatedly taken by taking push-forwards of samples of the initial measure in $\Zz$ to perform SGD as described in Algorithm~\ref{algo-sgd}. 
+
+% \todo{Explain $\tau_k$ (step size) and $\th_0$ (initialization). }
+
+%% THE FOLLOWING IS NO LONGER TRUE ::::::::: The reader will notice at this point that we have little assumption on the form of the cost function $c(x,y)$. We only require that $c$ can be evaluated and differentiated with a program. 
+Note that the procedure $\texttt{AutoDiff}_\th$ corresponds to classical reverse mode automatic differentiation of $L$ steps of the Sinkhorn iteration, and has therefore naturally the same complexity as Sinkhorn, \emph{i.e.} $O(L\m\n)$ operations, with an extra storage cost required to run the backward iteration with no additional computational overhead.
+
+The training procedure is the same as \cite{WassersteinGAN},\cite{MMDGAN} and consists in alterning $n_c$ optimisation steps to train the cost function $f_\phi$ and an optimisation step to train the generator $g_\th$. Following implementation advice from these papers,we clip the weights $\phi$ to ensure a bounded gradient in the maximization and use RMSProp as an optimizer.
+
+%\begin{wrapfigure}{R}{\textwidth}
+\begin{algorithm}[H]
+	    \caption{\label{algo-sgd}SGD with Auto-diff}
+	 \begin{algorithmic}
+	 	\Require $\th_0$, $\phi_0$, $(y_j)_{j=1}^\n$ (the real data), \m (batch size), $L$ (number of Sinkhorn iterations), $\epsilon$ (regularization parameter), $\alpha$ (learning rate)
+		\Ensure $\th$, $\phi$ %output
+	\State $\th  \leftarrow \th_0$, $\phi  \leftarrow \phi_0$,
+	\For{$k = 1,2,\dots$}
+		\For {$t = 1,2,\dots,n_c$}
+			\State Sample $(y_j)_{j=1}^{\m}$ from the observations.
+			\State Sample $(z_i)_{i=1}^{\m} \overset{\text{i.i.d}}{\sim} \muz$, $(x_i)_{i=1}^{\m} \eqdef g_\theta(z_1^m)$
+			\State $\texttt{grad}_\phi \leftarrow \texttt{AutoDiff}_\phi \Big( 2 \hat W_{\phi,\epsilon}^{(L)} (x_1^m,y_1^m)  $
+			\State \hspace*{40pt} $ - \hat W_{\phi,\epsilon}^{(L)} (x_1^m,x_1^m) - \hat W_{\phi,\epsilon}^{(L)} (y_1^m,y_1^m) \Big) $
+			\State $\phi \leftarrow \phi + \alpha \texttt{RMSProp}(\texttt{grad}_\phi)$.
+			\State $\phi \leftarrow \texttt{clip}(\phi,-c,c)$ 
+		\EndFor
+		
+		\State Sample $(y_j)_{j=1}^{\m}$ from the observations.
+		\State Sample $(z_i)_{i=1}^{\m} \overset{\text{i.i.d}}{\sim} \muz$, $(x_i)_{i=1}^{\m} \eqdef g_\theta(z_1^m)$
+		\State $\texttt{grad}_\th \leftarrow \texttt{AutoDiff}_\th \Big( 2 \hat W_{\phi,\epsilon}^{(L)} (x_1^m,y_1^m)  $
+			\State \hspace*{40pt} $ - \hat W_{\phi,\epsilon}^{(L)} (x_1^m,x_1^m) - \hat W_{\phi,\epsilon}^{(L)} (y_1^m,y_1^m) \Big) $
+		\State $\th \leftarrow \th - \alpha \texttt{RMSProp}(\texttt{grad}_\th)$.
+	\EndFor
+	\end{algorithmic}
+	  \end{algorithm}
+
+	  \begin{algorithm}[H]
+	    \caption{\label{algo-sinkhorn}Sinkhorn loss $\hat W_{\phi,\epsilon}^{(L)} (x_1^m,y_1^m)$}
+	 \begin{algorithmic}
+	 	\Require $\th, (x_i)_{i=1}^\m, (y_j)_{j=1}^\m, \epsilon$ 
+		\Ensure $w$ %output
+	\State $\foralls (i,j), \:  \tc_{i,j} \eqdef \norm{f_\phi(x_i)-f_\phi(y_j)}$
+	\State $K_{i,j} = e^{-\frac{\tc_{i,j}}{\epsilon}}$
+	\State $b  \leftarrow \ones_\n$,
+	\For{$\ell = 1,2,\dots,L$}
+		\State $a \leftarrow \frac{\ones_\n}{K b}$, 
+			$b \leftarrow \frac{\ones_\n}{K^\top a}$
+	\EndFor \\
+	\Return $w = \dotp{(K\odot \tc) b}{a}$ (see \eqref{eq-return-value})
+	\end{algorithmic}
+	  \end{algorithm}
+		
+%\end{wrapfigure}
+  
+

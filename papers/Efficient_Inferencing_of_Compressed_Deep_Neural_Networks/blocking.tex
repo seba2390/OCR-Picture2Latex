@@ -1,0 +1,181 @@
+
+In this section, we discuss the various approaches for inferencing using the compressed model,
+where the compressed model is stored  in  the format as shown in the previous section.
+Clearly, the trivial method of exploding the model back to the dense format  and doing the computation 
+(using standard frameworks like Caffe, Tensorflow etc) is not a good choice since the entire purpose of
+model compression gets defeated because  of the 
+excessive memory usage. The other extreme of decoding element by element of the matrix and doing the operations on the
+decoded element 
+has little memory overhead, but is computationally inefficient.
+This calls for the need to develop an efficient stand-alone module (independent of the
+Caffe/Tensorflow framework) for inferencing using the compressed model.
+The na{\"i}ve algorithm for doing the inferencing is presented in Algorithm~\ref{alg:pseudocode1}.
+The idea here is to work  sequentially on the individual rows of the weight matrix (line 3).
+For a particular row, the $col\_ind$ and the $val$ entries for that row are first  Huffman-decoded (line 5-6);
+this is followed by converting relative column index of $col\_ind$ to absolute index (line 7) 
+and creating an $abs\_val$ array which  is essentially the $val$ array with its entries replaced by the
+corresponding codebook entires. 
+All these steps  in fact  create the arrays in Figure~\ref{fig:repr_f1} from 
+Figure~\ref{fig:repr_f5} for a particular row segment.
+%Finally the dot product of $abs\_val$ and input activation is done by
+%invoking MKL routine for sparse matrix-vector product. For multiple batches,
+Finally we call MKL routine $mkl\_scsrmm$ for 
+sparse matrix-matrix multiplication  of $abs\_val(i)$ and $a$
+to compute $b[i,:]$.
+
+%   some standard library:
+%in our work, we apply Intel MKL kernels to effe
+ %the 
+%and then evaluating the dot product of the respective codebook entries
+%corresponding to the column entries with the input activation (line 9-12).
+
+
+\begin{algorithm}[t]
+\caption{Na{\"i}ve algorithm for inferencing using compressed model }
+\label{alg:pseudocode1}
+\small
+\begin{algorithmic}[1]
+	\STATE Input: $row\_ptr$ array, entry $i$ of which is a tuple 
+	of  starting address of row $i$ in $val$ and that in $col\_ind$.\\
+	$val$ Huffman encoded cluster index bit stream. \\
+	$col\_ind$ Huffman encoded rel. indexed column bit stream. \\
+	$\calC$ codebook of quantized weights. \\
+	$a$ input activation matrix. \\
+	\STATE Output: $b$ output  activation  matrix. \\
+		 
+	\FOR{every entry $i$ of the $row\_ptr$ array}
+		\STATE Set $val\_begin(i)$,  $val\_end(i)$, $col\_begin(i)$, $col\_end(i)$\\
+		 for row $i$ as follows \\
+		 \quad  \quad $\langle val\_begin(i), col\_begin(i) \rangle \leftarrow row\_ptr(i)$\\
+		 \quad  \quad $\langle val\_end(i), col\_end(i) \rangle \leftarrow row\_ptr(i+1)$.
+		 \STATE $dec\_val(i)$ $\leftarrow$ Huffman decoding of bit stream in $val$ between $val\_begin(i)$ and  $val\_end(i)$.
+		\STATE  $dec\_col(i)$ $\leftarrow$ Huffman decoding of bit stream in \\
+		$col\_ind$ between $col\_begin(i)$ and  $col\_end(i)$.
+		\STATE $abs\_col(i)$ $\leftarrow$  Prefix sum of $dec\_col(i)$.
+		\STATE Set $abs\_val(i)[j]$ $\leftarrow$ $\calC [dec\_val(i)[j]]$ , $\forall j$.
+		\STATE $b[i, :]$ += MKL\_CSRMM($abs\_val(i)$, $a$)
+%		\FOR{every entry $j$ of the $abs\_col(i)$ array}
+%			\STATE col = $abs\_col(i)[j]$.
+%			\STATE $b_i$+=$a_{col}$ * $\calC [dec\_val(i)[j]]$.
+%		\ENDFOR	 
+	\ENDFOR	
+\end{algorithmic}
+\end{algorithm}
+
+The above algorithm can be parallelized by employing different threads to operate on different rows of the weight matrix.
+Moreover MKL internally can use multiple threads for sparse matrix operations.
+However  Algorithm~\ref{alg:pseudocode1} faces multiple drawbacks.
+Firstly, the algorithm decodes an entire row of the matrix, and thus the memory requirement becomes
+significant for large matrices. 
+Secondly, most  algorithms for matrix multiplication work more efficiently using  blocks rather than individual elements, to achieve necessary reuse of data in local memory.
+The advantage of this approach is that the small blocks can be moved into the fast local memory and their elements can then be repeatedly used.
+This motivates us to employ blocking even for compressed model inferencing, which we describe next.
+
+
+
+
+\subsection{Blocking of Weight Matrix}
+
+ The
+general idea of blocking is to organize the data structures in a program into  chunks called blocks. The program is
+structured so that it loads a block into the L1 cache, does all the reads and writes that it needs to on that
+block, then discards the block, loads in the next block, and so on. 
+Similar to standard matrix multiplication, the blocking algorithm for inferencing shall work 
+ by partitioning the matrices into submatrices and then exploiting
+the mathematical fact that these submatrices can be manipulated just like scalars.
+%However, our inferencing procedure first needs to perform Huffman decoding followed by
+%absolute index computation on the submatrices before the block multiplication can be performed.
+Instead of storing the  original weight matrix in row major format,
+we need to ensure that any particular block of the matrix is stored in contiguous memory.  
+This will make certain	 that the Huffman decoding happens on contiguous memory locations and  generates the submatrix 
+corresponding to a block.
+
+
+See Figure~\ref{fig:block_f1} and Figure~\ref{fig:block_f2} for illustration.
+Suppose the original weight matrix  stored in dense row major format is of dimension 8x8, and we decide to work on blocks each sized 4x4. 
+We first convert  this matrix to   4 x 16 format, such that each row of the new matrix stores 
+elements of the corresponding block of the old matrix in contiguous locations. This new matrix 
+is then stored in CSR format with relative indexing and Huffman encoding, as discussed in the 
+previous section. 
+\\
+{\it Size of the modified model}:
+
+
+It is observed that the non zeroes  in the weight matrix are uniformly distributed, thus
+the size of the $val$ and $col\_ind$ vectors does not change a lot  (even with zero padding in the compressed format)  when the matrix is
+stored in block contiguous fashion.
+The number of rows in the modified matrix is same as the number of blocks in the original matrix, and may be larger or smaller than that
+in the  original matrix depending on the block size. From experimental results, it is however observed, that
+change in model size due to this difference in the size of the $row\_ptr$ is insignificant. Hence we can assume that 
+storing the model in block contiguous fashion does not add to memory overhead.
+
+
+
+\begin{figure}[!tbp]
+  \centering
+  \subfloat[Original Connection Matrix.]{\includegraphics[width=2in]{figures/block1.pdf}\label{fig:block_f1}}
+ % \hfill
+ \hspace{10mm}
+  \subfloat[Modified Connection Matrix]{\includegraphics[width=2.5in]{figures/block2.pdf}\label{fig:block_f2}}
+  \caption{Representation of a compressed model.}
+\end{figure}
+
+
+
+\subsection{Blocked Inferencing Procedure}
+
+Next we present our inferencing algorithm using the blocked storage scheme. 
+Our algorithm ensures that once a  row of the connection matrix (which corresponds to a block
+in the original weight matrix) is decoded,
+the decoded entries are used for all the computations that require them.
+This is illustrated in Figure~\ref{fig:block_mult}. A row is decoded and multiplied with all possible subblocks of 
+input activation matrix to generate partial results for the output activation matrix. 
+The blocked inferencing algorithm is presented in Algorithm~\ref{alg:pseudocode2}.
+
+
+\begin{figure}[b]
+\centering
+\includegraphics[width=3in]{figures/mult.pdf}
+\caption{Blocked inference scheme.}
+\label{fig:block_mult}
+\end{figure}
+
+
+
+
+
+\begin{algorithm}[t]
+\caption{Algorithm for block inferencing}
+\label{alg:pseudocode2}
+\small
+\begin{algorithmic}[1]
+	\STATE Input: Compressed model stored in $bh$ x $bw$ block contiguous manner with \\
+	$row\_ptr$ array, entry $i$ of which is a tuple $\langle x,y \rangle$ \\
+	where $x$ and $y$ being respectively starting address of row $i$ in $val$ and 	that in $col\_ind$.\\
+	$val$ Huffman encoded cluster index bit stream. \\
+	$col\_ind$ Huffman encoded relative indexed column bit stream. \\
+	$\calC$ codebook of quantized weights. \\
+	$a$ input activation matrix with $a_{rows}$ rows\\
+	\STATE Output: $b$ output  activation matrix\\
+		 
+	\FOR{every entry $i$ of the $row\_ptr$ array}
+		\STATE Set $val\_begin(i)$,  $val\_end(i)$, $col\_begin(i)$, $col\_end(i)$\\
+		 for row $i$ as follows \\
+		 \quad  \quad $\langle val\_begin(i), col\_begin(i) \rangle \leftarrow row\_ptr(i)$\\
+		 \quad  \quad $\langle val\_end(i), col\_end(i) \rangle \leftarrow row\_ptr(i+1)$.
+		\STATE $dec\_val(i)$ $\leftarrow$ Huffman decoding of bit stream in $val$ between $val\_begin(i)$ and  $val\_end(i)$.
+		\STATE  $dec\_col(i)$ $\leftarrow$ Huffman decoding of bit stream in \\
+		$col\_ind$ between $col\_begin(i)$ and  $col\_end(i)$.
+		\STATE $abs\_col(i)$ $\leftarrow$  Prefix sum of $dec\_col(i)$.
+		\STATE Set $abs\_val(i)[j]$ $\leftarrow$ $\calC [dec\_val(i)[j]]$ , $\forall j$.
+		\STATE Arrange $abs\_val(i)$ as $bh$ x $bw$ block. \\
+		\STATE col\_id = $ ( i \% (a_{rows}/bw) ) * bw$  \\
+		\STATE row\_id = $ ( i / (a_{rows}/bw) ) * bh$  \\
+		\STATE b[row\_id:(row\_id+bh-1),:] += MKL\_CSRMM($abs\_val(i)$, a[col\_id:(col\_id+bw-1),:] ) \\
+	\ENDFOR	
+\end{algorithmic}
+\end{algorithm}
+
+
+
+

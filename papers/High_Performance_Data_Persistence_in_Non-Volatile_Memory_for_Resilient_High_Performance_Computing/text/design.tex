@@ -1,0 +1,898 @@
+\section{High Performance Data Persistence}
+\label{sec:design}
+%To improve the performance of preliminary design, we must reduce (or even eliminate) data copy overhead, and improve efficiency of cache flushing.
+We introduce a technique, called ``in-place versioning'', to remove data copying. %overhead. %and remove checkpoint.
+Because the in-place versioning has to come with cache flushing, 
+we introduce an asynchronous and proactive
+cache flushing %with {\fontfamily{qcr}\selectfont WBINVD} instruction
+to improve performance.
+%We want to avoid the overhead of NVM-based checkpoint, whose overhead comes from data copy. We introduce a solution called "Dual version" which avoid data copy while keep a clean persistent copy. 
+
+\subsection{In-Place Versioning}
+%Paragraph 1: Naive Dual version. describe the basic idea of dual version: one version for read and the other version for update.
+%The dual version aims to establish an invariant across iteration: in a specific iteration $i$, we always have a consistent copy of the target data objects from the last iteration $i-1$.
+%\textbf{Naive Dual version.} 
+\textbf{Basic Idea.}
+%Like other data persistent mechanisms, in-place logging aims to
+%establish a consistent data copy on NVM for application critical data objects throughout the application execution, such that whenever the crash happens, we can use the consistent data copy to restart.
+The in-place versioning is based on the idea of the dual version~\cite{hpdc16:wu}.
+Both the in-place versioning and the dual version aim to remove data copying by leveraging application-inherent memory write operations to create a new version of the target data objects. But the dual version heavily relies on numerical algorithm knowledge, and is only applicable to those algorithms with specific characteristics.
+The implementation of the dual version for an algorithm requires the programmer to manually change the code based on algorithm knowledge.
+
+The in-place versioning significantly improves the dual version.
+The in-place versioning works for any numerical algorithm, and is algorithm-agnostic. We generalize a couple of rules to implement the in-place versioning.
+Based on the rules, we can use compiler to automatically transform the application into a new one with the implementation of in-place versioning. The new application creates data copy at runtime without programmer intervention. In the following, we describe the basic idea of the dual version in an \textit{algorithm-agnostic} way and give an example. Based on the example, we derive a basic rule for the in-place versioning.
+
+%The basic idea of the dual version is to use application-inherent memory write operations to update data in NVM, instead of using extra data copy operations to update data.
+%In-place means the data copy update happens embedded within the application
+Before the main computation loop, 
+the dual version allocates an extra copy of the target data objects (a new version). Then, in each iteration of the main computation loop, both versions of the data objects are involved into the computation, but memory write operations only happen to one version of the data objects (which we call ``working version''),
+%(naming as the copy A);
+the other version (which we call ``consistent version'')%(naming as the copy B) 
+ remains unchanged until the next iteration.
+At the end of each iteration, the working version 
+is flushed out of the cache and becomes consistent in NVM. 
+This version will not be changed in the next iteration, and 
+becomes the consistent version since then.
+The previous consistent version becomes the working version,
+and is updated by memory write operations of the application.
+Two versions alternate roles across iterations, with one version being consistent and the other being updated.
+Hence, we ensure that there is always a consistent version in NVM for restart.
+The recomputation is limited to at most one iteration, equivalent
+to the recomputation in the frequent checkpoint we discuss in Section~\ref{sec:prelim_design}.
+
+%This idea of dual version is straight forward, as shown in Table~\ref{table:basic_rule} 
+Figure 8 shows an example %from NPB BT benchmark 
+to further explain the basic idea. In this example, the array \textit{u} is the target data object. %that we want to establish persistency with consistence in NVM. 
+In the main loop (Lines 13-17) of the original code, all elements of $u$ are updated, and those elements are both read and written in each iteration of the main loop. 
+In the dual version, 
+we allocate an extra copy of $u$ ($u\_e$) and rename the original copy as $u\_o$. 
+%$u\_e$ is initialized with the same values as $u\_o$, and 
+$u\_o$ is enforced to be consistent in NVM (Lines 4-6) before the computation loop. 
+In the main loop, both $u_o$ and $u_e$ participate in
+the computation. 
+However, at any iteration, only one version of $u$
+is updated, and the other version is read.
+The update to one version of $u$ is naturally embedded
+in the place of write operations (Line 12).
+Also, at any iteration, we always maintain a consistent version of $u$ in NVM.
+Depending on the iteration number (odd or even), we decide
+which version should be updated and which one should be consistent.
+The two versions switch their roles (either write or read) after each iteration (Lines 19-25).
+
+Based on the above example and description in an algorithm-agnostic
+way, we derive a basic rule for our in-place versioning.
+
+\begin{itemize}
+\vspace{-10pt}
+\item Basic rule: within each iteration of the main computation loop, write operations happen to one version of the target data objects and read operations happen on the other version. Alternate the role of the two versions, and flush data blocks of the updated version out of caches after each iteration.  %should use two different copy of the data object. 
+\end{itemize}
+
+\begin{comment}
+$update(u)$ will be called in each iteration, and each element of u will be updated. In dual version codes, we will have two version of u and they are denoted as $u_o$ and $u_e$ respectively.  In odd iteration only $u_o$ will be written, while in even iteration only $u_e$ be updated. Hence We will have a persistent clean copy of $u$ whenever program crashed. In function $update$, whenever $u$ appears at the right rand side it will be replaced with $u_{old}$. If $u$ appears at the left hand side, it will be replaced with $u_{new}$. With such simple rule, we can assure that we always read from old version of data and write to the elements of new version of data. New version and old version is switched across iteration. A clean data object will be preserved during each iteration which could be served as restarting data if the program  crashed.
+\end{comment}
+
+
+%\begin{figure}
+%\centering
+%\includegraphics[width=0.5\textwidth, height=0.2\textheight]{figures/naive_dual_version.pdf}
+%\caption{Basic idea of the dual version. The code on the left is the original one, and the code on the right is the dual version. $u$ (an array) is the data object we want to establish a consistent state on NVM. $u$ has $Nu$ number of elements.}
+%\label{fig:dual_version_naive}
+%\end{figure}
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+%\lstset{escapeinside={<@}{@>}}   
+
+\lstdefinestyle{style1}{
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\footnotesize,
+%    breakatwhitespace=false,         
+%    breaklines=true,                 
+%    captionpos=b,                    
+%    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt, 
+%    showspaces=false,                
+%    showstringspaces=false,
+    %showtabs=false,                  
+    %tabsize=2
+	escapeinside={(*@}{@*)},
+}
+\lstset{style=style1}
+
+\begin{comment}
+\begin{figure}[!htb]
+\centering
+    \begin{subfigure}[t]{0.5\textwidth}
+        \centering
+          \begin{lstlisting}[language=c]
+void update(u) {
+  ... //Calculate e;
+  for(i=0;i<Nu;i++) 
+    u[i] = u[i] + e ;
+}
+
+init(u);
+//Main computation Loop  
+for (it=0; it<Nit;i++){  
+  update(u);
+}
+\end{lstlisting}
+        \caption{Original codes.}
+    \end{subfigure}%
+    ~ 
+    
+    \begin{subfigure}[t]{0.5\textwidth}
+        \centering
+        
+\begin{lstlisting}[language=c]
+void update(u) {
+  ...
+  for(i=0;i<Nu;i++) 
+    u[i] = u[i] + e ;
+}
+
+init(u);
+u_c = u;//Create copy 
+for (it=0; it<Nit;i++){    
+  update(u);
+  u_c = u; flush_cache();//Memory Copy
+}
+\end{lstlisting}
+	\caption{Memory copy based check-pointing.}
+    \end{subfigure}
+    
+\begin{subfigure}[h]{0.5\textwidth}
+	\centering   
+ 	\begin{lstlisting}[language=c]
+void update(u_new, u_old) {
+  ... 
+  for(i=0;i<Nu;i++) 
+    u_new[i] = u_old[i] + e ;
+}
+
+init(u_o);//u_o: updated in odd iteration.
+u_e = u_o;flush_cache();//Create dual versions.
+for (it=0; it<Nit;i++){
+  if (it%2==0) {  update(u_e,u_o);flush_cache();} 
+  else         {  update(u_o,u_e);flush_cache();}
+}
+	\end{lstlisting}
+ 	\caption{Basic rule of dual version.}
+\end{subfigure}
+
+\caption{Basic idea of the dual version. The code on the left is the original one, and the code on the right is the dual version. $u$ (an array) is the data object we want to establish a consistent state on NVM. $u$ has $Nu$ number of elements.}
+\label{fig:basic_rule}
+\end{figure}
+\end{comment}
+
+
+%\captionsetup[table]{name=Fig.}
+\begin{table}
+\centering
+\small
+\begin{tabular}{c p{0.1cm} c}
+  \begin{lstlisting}[language=c++]
+...
+//initialization of u[]
+init(u);
+
+void update(u) {
+  ... 
+  for(i=0;i<Nu;i++) 
+    u[i] = u[i] + e;
+  ...
+}
+
+//main computation Loop  
+for (it=0; it<Nit;i++){  
+  ...
+  update(u);
+  ...
+}
+...
+  (a) The original code
+\end{lstlisting}
+& 
+& \begin{lstlisting}[language=c++]
+...
+/*u_o and u_e are 
+two versions of u*/
+u_e = malloc(..);
+init(u_o);  
+flush_cache(u_o); 
+
+void update(u_new, u_old) 
+{
+  ... 
+  for(i=0;i<Nu;i++) 
+    u_new[i] = u_old[i] + e;
+  ...
+}
+
+//main computation loop
+for (it=0; it<Nit;i++){
+  ...
+  if (it%2==0) {
+    update(u_e,u_o);
+    flush_cache(u_e);
+  } else {
+    update(u_o,u_e);
+    flush_cache(u_o);
+   }
+  ...
+}     
+...
+(b) The dual version
+\end{lstlisting}\\
+\end{tabular}
+\caption*{Figure 8: An example to explain the basic idea of the dual version described in an algorithm-agnostic way. $u$ (an array) is the target data object. $u$ has $Nu$ number of elements.}
+\label{table:basic_rule}
+\vspace{-20pt}
+\end{table}
+
+Although the basic rule is straightforward, it can be applied to many 
+target data objects (see Table 2). However, the basic rule is also
+very restricted. 
+There are two special cases violating the basic rule.
+In the first case, within one iteration, read operations reference one version (i.e., the consistent version) before any update happens to the target data object.
+However, after the first update, read operations should reference the updated version (i.e., the working version) for program correctness. Read operations should not use the same version before and after the first update.
+We name this case as \textit{post-update version switch for read operations}. We use an example to further explain it. 
+
+\begin{comment}
+To apply the basic rule, the target data object 
+must be updated uniformly. Also,
+the basic rule suggests that read operations should always use
+the same version of the target data objects within an iteration, which is not 
+valid if there is any update happened to the target data object. 
+We discuss two cases that violate the basic rules as follows.
+\end{comment}
+
+\begin{comment}
+It is possible to rely on a compiler to apply the basic rule to the application.
+We introduce a compiler pass that automatically transform the application into the in-place versioning based on the analysis of read and write operations. 
+
+However, the basic rule of in-place versioning 
+has an implicit requirement: within an iteration of the main loop, all data elements of the target data objects are updated in a uniform way and only updated once. This assumption is true for some applications. For example,in the benchmark NPB BT, a distributed mesh structure for checkpoint is only updated once and uniformly at the end of each iteration by inter-process communication.
+However, some applications update their data objects in a way
+that does not meet the requirement.
+%We must handle those cases to make the in-place versioning general and algorithm-agnostic. 
+We discuss those cases as follows.
+%can be used to handle simple memory access patterns for the data objects.
+%To make the in-place logging general and feasible, 
+%we extend the above basic rule to handle special cases. 
+%we must handle special cases. We discuss those cases as follows.
+\end{comment}
+
+\begin{comment}
+The naive idea of dual version need to be polished when applied to practical cases. First kind of special cases is inconsistent update of data objects which make it unable to implement dual version. The second kind of special cases is that multiple updates occur in single iteration.
+\end{comment}
+
+%Paragraph 3:Special case II: Multiple updates.
+%\textbf{Special case I: Using different versions for read operations.} 
+\textbf{Special case I: post-update version switch for read operations.}
+%Within an iteration of the main computation loop, the data objects are updated more than once.
+%Within an iteration of the main computation loop, read operations may need to
+%reference different versions of the target data object, instead of always using the same version suggested by the basic rule. 
+See Figure 9. In this example, we only show the routine where the updates to the target data object (the array $u$) happen (the routine \textit{update}), but ignore the main computation loop which is already shown in Figure 8.
+
+In this example, %all elements of $u$ are updated twice.
+for the first update of $u$ (Line 4 in Figure 9.b), we can 
+use the basic rule correctly. The read operations use $u\_old$.
+However, after the first update (Line 6 in Figure 9.b), we should read the most recent update from $u\_new$, not $u\_old$ suggested by the basic rule (see Line 6 in Figure 9.c for a correct version).
+The read operations in Lines 4 and 6 in Figure 9.c use different version of $u$ after the first update in Line 4 in Figure 9.c. 
+\begin{comment}
+In naive dual version implementation, all $u$ which appears at the right hand side should be replaced with ${u_old}$ while $u$ at left hand side is ${u_new}$. The latter part is correct because whenever $u$ is written, there will be a status update with $u$. In Fig~\ref{fig:multi_updates} (b), $u$ experience two updates in single iteration. after first update, the status of according element has change, hence for second update, we need to read the new value of u instead of old value. For Fig~\ref{fig:multi_updates} (c), $update(u)$ is called call twice within single loop. The value of u is updated in first call, hence for second call of update, it should read new value of u. Therefore both two arguments passed to $update$ should be update version. These two cases remind us that when $u$ is read, it could be old value  or new value, hence we need to tracked the update status u within for-loop and across function call. 
+\end{comment}
+
+%
+%\begin{figure}
+%\centering
+%\includegraphics[width=0.5\textwidth, height=0.25\textheight]{figures/multi_updates.pdf}
+%\caption{Special case I: multiple updates happen to the data object $u$.  we want to be consistent on NVM. $u$ has $Nu$ number of elements. The code on the left is~\textbf{xxx}. The code on the right is~\textbf{xxx}.}
+%\label{fig:multi_updates}
+%\end{figure}
+\lstset{style=style1}
+
+\begin{table*}
+\centering
+\begin{tabular}{c p{1cm} c p{1cm} c}
+   \begin{lstlisting}[language=c++]
+void update(u) {
+  ...
+  for(i=0;i<Nu;i++) {
+    u[i] = u[i] + e;
+    ...
+    u[i] = u[i] + f;
+    ...
+  }
+  ...
+}     
+
+(a) The original code
+\end{lstlisting}
+&
+& \begin{lstlisting}[language=c++,escapechar=!]
+void update(u_new, u_old) {
+  ... 
+  for(i=0;i<Nu;i++) {
+    u_new[i] = u_old[i] + e;
+    ...
+    u_new[i] = u_old[i] + f;
+    ...
+  }
+  ...
+}
+(b) The wrong code based on 
+the basic rule
+\end{lstlisting} 
+&
+& \begin{lstlisting}[language=c++]
+void update(u_new, u_old) {
+  ... 
+  for(i=0;i<Nu;i++) {
+    u_new[i] = u_old[i] + e;
+    ...
+    u_new[i] = u_new[i] + f;
+    ...
+  }
+  ...
+}      
+
+(c) The correct code 
+\end{lstlisting}\\
+\end{tabular}
+\caption*{Figure 9: Special case I: post-update version switch for read operations. The target data object is $u$. The main computation loop is ignored in this figure. $u$ has $Nu$ number of elements. Line 6 in Figure 9.b is the incorrect code.}
+\label{table:special_case_I}
+\vspace{-20pt}
+\end{table*}
+
+The other case violating the basic rule is that elements of the target data object
+are not updated uniformly within an iteration.
+As a result, read operations should reference one version for
+some elements of the target data object, but reference the other
+version for the other elements. 
+We use an example to further explain it.
+
+\textbf{Special case II: nonuniform updates.} 
+%The elements of the data objects are not updated uniformly within an iteration
+%of the main computation loop.
+Figure 10 gives an example. 
+%In this example, the array $u$ has nonuniform updates.
+%In this example, we only show the routine where the data object updates happen, but ignore the main computation loop shown in Figure~\ref{fig:dual_version_naive}. 
+There are two loops in the figure, each of which updates $u$.
+In the first loop (Figure 10.a), the elements from 1 to $Nu-2$ of $u$ are updated,
+while the elements 0 and $Nu-1$ are not updated.
+In the second loop, all elements are updated.
+Hence, across two loops, all elements are not updated uniformly.
+
+Based on the basic rule, we replace $u$
+in the first loop with the two versions of $u$ (Line 4 in Figure 10.b), which is correct.
+In the second loop, 
+we do the same thing (Line 7 in Figure 10.b) based on the basic rule. 
+%based on the basic rule we should replace $u$ with $u\_old$~\textbf{Line xxx}.
+However, the program will not run correctly.
+For the elements $u[0]$ and $u[Nu-1]$ that have not been updated in the first loop, we should use $u\_old$ for read operations in the second loop (Line 8 in Figure 10.c), while for the other elements that have been updated, we should use $u\_new$ for read operations (Line 10 in Figure 10.c). 
+
+\begin{comment}
+Fig~\ref{fig:inconsistent_update} (a)and(c) are  two inconsistent update cases. Fig~\ref{fig:inconsistent_update} (b)and(d) are potential dual version implementation of (a)and(c). The inconsistent state is marked as bold in figure. In Fig~\ref{fig:inconsistent_update}(a), when $i$= $1$ to $Nu/2$, $u_?$ should be replaced with $u_old$, but when $i$= $Nu/2+1$ to $Nu$, $u_?$ should be replaced with $u_new$. In Fig~\ref{fig:inconsistent_update}(c), $u$ experienced two update, while the first loop  make a partial update to $u$, the second loop accesses whole $u$. While When $i$= $2$ to $Nu-1$, $u_?$ should be replaced with $u_new$. But when $i$= $1$ or $Nu$, $u_?$ should be replaced with $u_{old}$.  The approach that we replace $u$ with $u_{old}$ or $u_{new}$ should be applied to every element of the array. But the individual element of array may have inconsistent state. Therefore, we need to make a consistent state check before we implement dual version. Only those data objects which pass consistent check could be implemented with dual versions, others will check-pointed with data copy. The overhead of doing consistence check could be extremely high since we will need to track the update status of every element in array. However, we observed that HPC benchmarks follow some similar update pattern, and 
+we propose a light weight consistency check method which only track the update status of key elements. 
+\end{comment}
+
+\begin{comment}
+\begin{figure}
+\centering
+\includegraphics[width=0.5\textwidth, height=0.2\textheight]{figures/inconsistent_update.pdf}
+\caption{Special case II: nonuniform update. The code on the left is the original code. The code on the right is the dual version with uncertainty. The array $u$ is the data object we want to be consistent on NVM. $u$ has $Nu$ number of elements.}
+\label{fig:inconsistent_update}
+\end{figure}
+\end{comment}
+\lstset{style=style1}
+\begin{table*}
+\centering
+\begin{tabular}{c p{1cm} c p{1cm} c}
+   \begin{lstlisting}[language=c++]
+void update(u) {
+  ...
+  //The first collective 
+  //update to u
+  for(i=1;i<Nu-1;i++) 
+    u[i] = u[i] + e;
+  ...
+  //The first collective 
+  //update to u
+  for(i=0;i<Nu;i++) 
+    u[i] = u[i] + f;
+  ...
+}
+(a) The original code
+
+  \end{lstlisting}
+&
+& \begin{lstlisting}[language=c++]
+void update(u_new, u_old) {
+  ...
+  for(i=1;i<Nu-1;i++) 
+    u_new[i] = u_old[i] + e;
+  ...
+  for(i=0;i<Nu;i++) 
+    u_new[i] = u_old[i] + f;
+  ...
+}    
+
+
+
+(b) The wrong code based on 
+the basic rule
+\end{lstlisting} 
+&
+& \begin{lstlisting}[language=c++]
+void update(u_new, u_old) {
+  ...
+  for(i=1;i<Nu-1;i++) 
+    u_new[i] = u_old[i] + e;
+  ...
+  for(i=0;i<Nu;i++) {
+    if (i==0 || i==Nu-1)
+      u_new[i] = u_old[i] + f;
+    else
+      u_new[i] = u_new[i] + f;
+  }
+  ...
+}      
+(c) The correct code
+\end{lstlisting}\\
+\end{tabular}
+\caption*{Figure 10: Special case II: the elements of the data object $u$ are not updated uniformly. The main computation loop is ignored in this figure. $u$ has $Nu$ number of elements. Line 7 in Figure 10.b is the incorrect code.}
+\label{table:special_case_II}
+\vspace{-20pt}
+\end{table*}
+
+%https://en.wikipedia.org/wiki/Profile-guided_optimization
+To handle the above two cases and enable automatic code transformation to implement the in-place versioning, we introduce a profile-guided code transformation.
+This method uses the results of a profiling test to detect the first update and nonuniform updates, and then transforms the application into the in-place versioning accordingly.
+We particularly target on arrays, the most common target data object in HPC applications. %Also, in HPC applications, the operations on the array elements are typically based on array indexing. 
+We explain our method in details as follows.
+
+Our method first leverages an LLVM compiler~\cite{Lattner:Mthesis} instrumentation pass~\cite{ispass13:shao} to generate a set of dynamic LLVM instruction traces for the first iteration of the main computation loop. 
+Those traces include dynamic register values and memory addresses referenced in each instruction. 
+%and \textbf{statement ID} for each instruction (\textbf{ask AZ for how to get such ID}).
+Each of the traces corresponds to either a loop or instructions
+between two neighbor loops.
+%The collective update is the code structure that updates the data object based on 
+%an iterative code structure. 
+%(i.e., the update based on the iterative code structure) on the target data object.
+For example, the \textit{update} routine in Figure 10.a has three traces:
+Two of them correspond to {\fontfamily{qcr}\selectfont for} loops and the third one corresponds to the instructions between the two loops.
+We also record the whole memory address ranges of the target data objects in the beginning of each trace, based on the LLVM instrumentation.
+
+Furthermore, we develop a trace analysis tool. Given the traces and memory address ranges of the target data objects as input, this tool tracks register allocation and memory references to determine which elements are updated in each trace.
+%The tool tracks the register allocation when analyzing the trace, 
+%such that we can know at any moment which registers have the data of the target data object.
+%collective update.
+Based on the analysis results across and within the traces, we identify the first update for each target data object; 
+%and determine where the second update happens; 
+we also determine the coverage of each loop-based update (e.g., Lines 7-8 in Figure 8.a) and whether the coverages in all loop-based updates are different. This will be used to detect non-uniform update.
+
+%If multiple updates are detected to a data object to implement the in-place versioning, then in the first update,%collective update, 
+Based on the trace analysis results, we use a static LLVM pass to 
+replace the references to the target data objects with 
+the references to either the working version or the consistent version.
+%After the first update to a target data object is identified,
+In particular, any read reference to the target data object before the first update will be replaced with the reference to the old version of the target data object (i.e., the consistent version); after the first update,
+%collective update, 
+any read reference to the target data object will be replaced with
+the reference to the new version (i.e., the working version). Any write reference to the target data object is always replaced with the reference to the new version, based on the basic rule.
+Figure 9.c is an example of such replacement. 
+%We implement the above reference replacement with an LLVM pass.
+
+If nonuniform updates are detected, then for a loop-based structure we need to add control flow constructs within the loop to control which version of the data objects should be used.
+Figure 10.c (Lines 7-10) is such an example. 
+However, in practice, we find that such control flow constructs can be rather sophisticated, especially for a statement of the loop with multiple elements of the data objects. Furthermore, 
+the prevalence of such control flow constructs in loops can bring
+large performance overhead. 
+Hence, we do not apply the in-place versioning to the data object with nonuniform updates.
+Instead, we use our preliminary design 2 (i.e., data copying based on non-temporal load/store) at the persistence establishment point for those target data objects.
+
+\textbf{Discussion.}
+We profile the first iteration to detect the first update and nonuniform updates.
+This method aims to generate a short trace and make the trace analysis time manageable.
+This method is based on an assumption that the first iteration and the rest of
+iterations in the main loop have the same read and write patterns for the target data objects.
+Based on our experience with 10 data objects from six NPB benchmarks (24 input problem sizes) and 7 data objects from a large-scale production code (Nek5000), we find such assumption is true in all cases.
+%However, a few more iterations can also be profiled to gain more confidence. 
+
+Furthermore, we find that different input problems (not different input problem size) can have different read and write patterns to the data objects, and hence needs to generate different code for the in-place versioning.
+However, profiling the first iteration and generating the code is quick, based on our compiler-based approach.
+
+\begin{comment}
+Our method first instruments the application and introduces a profiling test of
+the instrumented application. %to detect multiple updates and nonuniform updates.
+The profiling test uses the first iteration of the main computation loop
+to determine the existence of multiple updates and nonuniform updates
+within each iteration. 
+For the case of multiple updates, the profiling test also detects where the second update happens. The profiling results will be used as input for a compiler to make the automatic
+code transformation.
+
+\textbf{Figure x.} uses an example to explain how we instrument the application.
+In particular, we add a compiler instrumentation pass to collect accessed element indexes
+of the target data object and read/write information (see \textit{add\_access\_info()} in \textbf{Figure x.(b)}). Based on the instrumentation, the profiling run generates
+a trace of memory access information for the target data object. 
+The trace also includes the statement ID (\textbf{Ask AZ how to get statement ID}) to facilitate trace analysis. 
+The trace analysis identifies repeated access pattern to detect multiple updates and
+determines where the second update happens.
+Furthermore, based on the iterative structure of array update (e.g., the two loops in the update routine in \textbf{Figure x.(a)}), the trace analysis determines the coverage
+of each update and whether there is inconsistent coverage across multiple collective updates.
+This will be used to detect non-uniform update.
+
+Based on the trace analysis and statement ID embedded in the trace, 
+\end{comment}
+
+
+%a small input problem to generally determine the existence of multiple updates in large input problems. 
+%\textbf{Our study on 15 data objects for checkpoint from six NPB benchmarks and xxx large-scale production code (Nek5000)} reveals that 
+%in terms of the existence of multiple updates for checkpoint data objects, 
+%a small input problem is 100\% consistent with large input problems.
+
+
+
+\begin{comment}
+However, if there is dynamic info (e.g., convergence...) we need to ask users to provide hints.
+\end{comment}
+
+\begin{comment}
+``Rather than programmer-supplied frequency information, profile-guided optimisation uses the results of profiling test runs of the instrumented program to optimize the final generated code.[5][6] The compiler is used to access data from a sample run of the program across a representative input set.
+
+The caveat, however, is that the sample of data fed to the program during the profiling stage must be statistically representative of the typical usage scenarios; otherwise, profile-guided feedback has the potential to harm the overall performance of the final build instead of improving it.
+
+If the dynamic profile changes during execution, it can deoptimize the previous native code, and generate a new code optimized with the information from the new profile.
+''
+\end{comment}
+
+
+
+\begin{comment}
+%Paragraph 4:Final dual version.
+\textbf{Dual version with light-weight consistency state tracking.} As shown in the discussion above, we need to track the update status of target object for dual version. However, element level consistency state tracking will introduce large overhead since it has to record and update status of every element using hash map data structure.  After full analysis of NPB and other HPC benchmarks, we found that most HPC benchmarks follows regular linear indexing. It means that we only need to track the status of first and last element since the address is monotonically increasing or decreasing. We need two hash map data structure $hm$ and $s$ to record the status of update objects. For each potential object $u$, we need to make a decision to replace it with $u_{new}$ or $u_{old}$ and it is stored in vector $d$. As shown in Fig ~\ref{fig:light_weight_dual_version} (a) We first initialize the $hm$ and $s$ to status $'O'(Old)$. For each target position of $u$, we need to instrumented it as shown in ~\ref{fig:light_weight_dual_version} (b). 
+~\ref{fig:light_weight_dual_version} (c). For each potential $u$, if and only if the status of all elements in $u$ have the same status that can we apply dual version. 
+Although the codes here only involved 1 data objects, it could be extend to multiple data objects (Like NPB:CG )with little efforts. 
+\end{comment}
+
+\begin{comment}
+\begin{figure*}[h]
+\centering
+\includegraphics[width=1\textwidth, height=0.25\textheight]{figures/light_weight_dual_version.png}
+\caption{Dual version with consistent state tracking. $hm$ $(b)$ Instrumented codes will inserted in every potential position where $u$ experienced update. $(c)$ Dual version decision. 0:No dual version; 1:replaced with old version; 2:replaced with new version}
+\label{fig:light_weight_dual_version}
+\end{figure*}
+\end{comment}
+
+\begin{comment}
+\begin{table}
+\begin{tabular}{c p{0.01cm} c}
+   \begin{lstlisting}[language=c++]
+void update();
+
+init(u);
+
+//main computation loop
+for (it=0; it< Nit; i++) 
+  update(u);
+
+void update(u){
+  ... 
+  //The first collective 
+  //update to u
+  for(i=0;i<Nu;i++) {
+    u[i] = u[i] + e;
+    ...
+    u[i] = u[i] + f;
+    ...
+  }
+  ...
+  //The second collective 
+  //update to u
+  for(i=1;i<Nu;i++){
+   u[i] = u[i-1] + e; 
+   ...
+  }
+}            
+  (a) The original code
+\end{lstlisting}
+&
+&
+\begin{lstlisting}[language=c++]
+void update(u) {
+  ...
+  //The first collective 
+  //update to u
+  for(i=0;i<Nu;i++){
+   add_access_info(i, 'r');
+   add_access_info(i, 'w');
+   u[i] = u[i] + e; 
+   ... 
+   add_access_info(...);
+   u[i] = u[i] + f; 
+   ...
+  }
+  ...
+  //The second collective 
+  //update to u
+  for(i=1;i<Nu;i++){
+   add_access_info(i-1, 'r');
+   add_access_info(i, 'w');
+   u[i] = u[i-1] + e; 
+   ...
+  }
+}             
+  (b) The instrumented code 
+  for the update routine
+\end{lstlisting} \\
+\end{tabular}
+\caption*{Fig. x: pending. The blue lines are those instrumentation code.}
+\label{table:final_dual_version}
+\end{table}
+\end{comment}
+
+\begin{comment}
+\begin{table*}
+\begin{tabular}{l c c}
+   \begin{lstlisting}[language=c++]
+void update();
+
+init(u);
+
+//main computation loop
+for (it=0; it< Nit; i++) {
+  update(u);
+} 
+
+void update(u) {
+  ... 
+  for(i=0;i<Nu;i++) {
+    u[i] = u[i] + e;
+    ...
+    u[i] = u[i] + f;
+    ...
+  }
+}            
+  (a) The original code
+\end{lstlisting}
+&
+\begin{lstlisting}[language=c++]
+unordered_map<addr,char> current_status;
+unordered_map<addr,char> update_status[x];
+int decision[x];//decision
+
+void check_status();
+void update();
+
+init(u); 
+
+//main computation loop.
+//we profile the first iteration
+for (it=0; it<1; it++){ 
+  current_status[&u[0]] = 'O' ;    
+  current_status[&u[Nu-1]] = 'O';
+  update(u);
+  check_status();
+}     
+
+   (b-1) The instrumented code for the main computation loop
+
+\end{lstlisting} \\ \\
+\begin{lstlisting}[language=c++]
+void update(u) {
+  for i= 0 to Nu-1{
+    if (i== 0|| i == Nu-1){ 
+      if there is an "u" on the right hand side 
+        update_status[1].[&u[i]] = current_status[&u[i]];
+      if there is a "u" on the left hand side    
+        current_status[&u[i]] = 'N';
+     }
+    u[i] = u[i] + e; 
+    if (i== 0|| i == Nu-1){ 
+       if there is a "u" on the right hand side 
+          update_status[2].[&u[i]] = current_status[&u[i]];
+       if there is an "u" on the left hand side    
+          current_status[&u[i]] = 'N';
+     }
+     u[i] = u[i] + e; 
+  }
+}             
+  (b-2) The instrumented code for the update routine
+
+
+\end{lstlisting}
+&
+\begin{lstlisting}[language=c++]
+void check_status(){
+  t = size(update_status) - 1;
+  for i = 0 to t {
+    for item in update_status[i]
+      if update_status[i].[item] !=update_status[i].[item+1] {
+        decision[i] = 0 ;//use check pointing
+        break;
+      }
+    if(s[0] == 'O')
+      decision[i] = 1;//use u_old
+    else 
+      decision[i] = 2;//use u_new
+  }
+} 
+
+     (b-3) The instrumented code-3
+\end{lstlisting}\\
+\end{tabular}
+\caption*{Fig. x: Dual version with consistent state tracking. $hm$ $(b)$ Instrumented codes will inserted in every potential position where $u$ experienced update. $(c)$ Dual version decision. 0:No dual version; 1:replaced with old version; 2:replaced with new version}
+\label{table:final_dual_version}
+\end{table*}
+\end{comment}
+
+%\textbf{TODO: emphasize that the index computation must be monotonically increasing or decreasing.} 
+
+
+%Paragraph 5: explain the fundamental differences between the dual version and checkpoint.
+\textbf{In-place versioning vs. checkpoint.} 
+There is a significant difference between the in-place versioning and checkpoint mechanism. 
+Creating data copy in the checkpoint mechanism is an extra operation,
+and also the data copy is not involved in the computation; 
+Creating data copy in the in-place versioning 
+leverages inherent memory write operations in the application,
+and is part of the computation (not extra operation).
+Hence, the in-place versioning significantly reduces data copying overhead
+from which the checkpoint mechanism suffers. 
+
+However, the in-place versioning can bring performance loss from two perspectives. First, the in-place versioning has to allocate one extra data copy before the main computation loop. However, this cost happens just once, and can be easily amortized by the main computation.
+Second, the in-place versioning increases memory footprint of the application, because the two versions of the target data object are involved in the computation. This may increase CPU cache miss rate, which hurt performance. This may also consume more DRAM cache space,
+reducing the DRAM space for other data objects.
+However, we see small performance difference (less than 8.2\% and 2.7\% on average) between the in-place version and the native execution without it. The reason is as follows.
+
+For the DRAM cache problem, the software-based cache management we use 
+in our study~\cite{eurosys16:dulloor} treats each extra data copy as a new data object and chooses the best data placement in DRAM and NVM for optimal performance, which effectively reduces the impact of larger working set in the in-place versioning.  
+For the CPU cache problem, we study it based on performance counters, but do not find significant increase in cache miss rates because of the ``streaming-like'' memory access patterns in target data objects. We discuss it further in the performance evaluation section.
+
+%\vspace{-10pt}
+
+\begin{comment}
+The Comparison between Dual version and Checkpoints can be done in 5 dimension. As shown in Table ~\ref{table:comparision}. 
+$Expertise$ Checkpoint has to store much larger data than persistent memory. Checkpoint cannot be done very frequently, because we have to suffer from large I/O overhead. On the other hand, if the checkpoint frequency is too sparse, re-computation cost after system crash could be very high. Hence, we need domain expertise experience to decide the checkpoint frequency with respect to I/O overhead and re-computation cost. For dual version, there is little expertise evolved. $Cache flush$ Both method need to flush cache to ensure data persistency. But Dual version method could be implement in a more flexible way than check-pointing. As shown in later section, we could implement non-blocking cache flushing to hide part of flushing overhead.
+
+\begin{table}
+\centering
+\begin{tabular}{|c |c |c|}
+       \hline
+       Task & Checkpoint & Dual version\\
+        \hline 
+        Re-computation Cost & 1/Checkpoint frequency & 1 iteration\\
+         \hline 
+         Data copy & Yes(I/O Bounded) & No \\ \hline
+        Runtime Overhead &checkpoint frequency * data size& cache miss rate difference\\ \hline
+        Cache flush &Yes:Blocking  &Yes: Blocking/Non-Blocking\\ \hline
+        Expertise & Yes &No\\ \hline
+        Flexibility & \\ &Yes\\ \hline
+\end{tabular}
+\caption{Comparision between Checkpointing and Dual version}
+\label{table:comparision}
+\end{table}
+
+%Paragraph 6: show performance difference between dual version and no dual version. Quantify the cache misses. Explain the reason for why there is no big performance difference.
+The performance difference between clean and dual-version is shown in Fig~\ref{fig:Dual_clean}.
+The cache miss rate collected via hardware counter is shown in Fig~\ref{fig:cache_miss_rate}
+%How to quantify cache misses. 
+As we introduce another copy of target data object, the size of memory footprint will increase, hence there could be potential increase of cache miss rate. However, as shown in Fig~\ref{fig:cache_miss_rate}, the cache hit rate of original program is high and the introduce of dual version doesn't degrade the situation. The result Fig~\ref{fig:Dual_clean} further reveal that the overhead is relative small(0.01-0.10). It is because the memory access pattern in such benchmark is "Streaming", which means there is litter cache reuse across iteration. Furthermore, it is safe to assume that "streaming access pattern" applied to target object of most HPC benchmarks. 
+\end{comment}
+
+
+
+\subsection{Optimization of Cache Flushing}
+\label{sec:perf_opt}
+% The reason for bad performance;
+The in-place versioning avoids memory copying. However, to make data consistent between NVM and caches at the persistence establishment point, we need to flush caches.
+As shown in Figure~\ref{fig:perf_loss_breakdown}, periodically flushing caches accounts for a large portion of the total overhead. 
+The fundamental reason for such large overhead is that we cannot know which cache blocks of the data objects are in the cache hierarchy and whether they are dirty, and have to issue cache flushing instructions on every single cache block of the target data objects. 
+
+\begin{comment}
+However, our performance study reveals that if a cache block is not in the cache or the cache line is clean, flushing the cache line is very costly. 
+Figure~\ref{fig:perf_cache_flush} depicts performance of flushing cache lines using 
+{\fontfamily{qcr}\selectfont clflush} instruction. 
+\end{comment}
+
+%\textbf{Yingchao TODO: In modern out-of-order processor, to  measure the overhead of single instruction will lead to ambiguous results. In order to obtain accurate result we use two approaches. 1. Flush a block of array address instead of single address. With subtle manipulation, we can measure the performance difference of flushing empty, clean and dirty cache line. 2.  Use  RDTSCP/RDTSC to avoid the out-of-order effect. More discussion on $rdtscp$ instruction can be found in ~\cite{intel_rtdscp}}.
+\begin{comment}
+\begin{figure}
+\centering
+\includegraphics[width=0.5\textwidth, height=0.1\textheight]{figures/prelim_design2.pdf}
+\caption*{Figure x: Performance study for flushing cache lines.}
+\label{fig:perf_cache_flush}
+\end{figure}
+\end{comment}
+
+\begin{comment}
+\begin{table}
+\centering
+\caption*{Table x: Performance of flushing cache blocks in different states in caches.}
+\footnotesize 
+\begin{tabular}{| p{1.7cm} | p{1.7cm} | p{1.7cm} | p{1.8cm} |}
+       \hline
+       & \textbf{Flush a dirty cache line} & \textbf{Flush a clean cache line} & \textbf{Flush an non-existent cache line} \\ \hline \hline
+     Performance () & 5.16E+06 & 4.54E+06 & 3.50E+06 \\
+       \hline
+\end{tabular}
+\label{tab:diff_clflush_perf}
+\end{table}
+\end{comment}
+
+To reduce the cache flushing cost, we propose two optimization techniques: whole cache flushing and proactive cache flushing.
+
+\textbf{Whole cache flushing.}
+The basic idea of the whole cache flushing is to use {\fontfamily{qcr}\selectfont WBINVD} instruction to flush the entire cache hierarchy, instead of flushing individual cache blocks of the target data objects. If the size of the target data objects is much larger than the last level cache size, %it is highly possible that most of the cache blocks are not in the cache. In that case, flushing cache blocks of the target data objects is more expensive than flushing the whole hierarchy.
+it is highly possible that most of the cache blocks are not in caches, and flushing the entire cache hierarchy is cheaper than flushing all cache blocks of the target data objects. 
+
+However, {\fontfamily{qcr}\selectfont WBINVD} is a privileged instruction, and only the kernel level code can issue this instruction. Hence we introduce a kernel module %system call 
+that allows the application to indirectly issue the instruction. The drawback of using {\fontfamily{qcr}\selectfont WBINVD} is that the cache blocks that do not belong to the target data objects
+are flushed out of the caches. If those cache blocks are to be reused, they have to be
+reloaded, which lose performance. However, when the total size of the target data objects is large enough,
+flushing all cache blocks of the target data objects that are not resident in caches is much more expensive than data reloading because of {\fontfamily{qcr}\selectfont WBINVD}. We empirically decide that
+if the total size of the target data objects is ten times larger than the last level cache size, it is beneficial to use {\fontfamily{qcr}\selectfont WBINVD}.
+
+\textbf{Asynchronous and proactive cache flushing.}
+In the in-place versioning, we trigger cache flushing (including CPU cache flushing with {\fontfamily{qcr}\selectfont WBINVD} and DRAM cache flushing)
+at the persistence establishment point to make the working version consistent in NVM.
+%flush the cache blocks for the working version at the end of the iteration, and make it become the consistent version for the next iteration. 
+To improve cache flushing performance, we want to remove cache flushing off the execution critical path as much as possible. 
+Also, we can trigger cache flushing ahead of the persistence establishment point
+under certain conditions (discussed as below). 
+We introduce a helper thread-based mechanism to implement asynchronous
+and proactive cache flushing. 
+
+In particular, we do not wait until the persistence establishment point to flush caches. Instead, as soon as the working version is not updated in the current iteration, a helper thread will
+proactively flush caches. Furthermore, the cache flushing does not have to be finished at the end of each iteration. As long as the working version from the last iteration %(i.e., the consistent version in the current version) 
+is not read in the current iteration, the cache flushing can continue. But, the helper thread must finish cache flushing
+at the point where the working version 
+%(i.e., the consistent version in the current version) 
+from the last iteration is read for the first time.
+Figure 11 describes the idea.
+
+%\captionsetup[table]{name=Fig.}
+
+\begin{figure}
+\centering
+\includegraphics[width=0.5\textwidth, height=0.3\textheight]{figures/proactive_cache_flushing.pdf}
+\vspace{-20pt}
+\caption*{Figure 11: The proactive cache flushing scheme.}
+\label{fig:proactive_cache_flushing}
+\vspace{-20pt}
+\end{figure}
+
+\begin{comment}
+\begin{figure}
+\centering
+\includegraphics[width=0.5\textwidth, height=0.2\textheight]{figures/Dual_clean.png}
+\caption*{Figure x: The proactive cache flushing scheme.}
+\label{fig:proactive_cache_flushing}
+\end{figure}
+\end{comment}
+
+To implement the above proactive cache flushing, we develop a lightweight library for HPC applications and a set of APIs. To use the library, the programmer needs to insert a thread creation API (flush\_init() in Figure 11) before the main loop to create a helper thread and a FIFO
+queue shared between the helper thread and main thread.
+The programmer also needs to insert an API (flush\_async() in Figure 11) into the program to specify where the cache flush can happen within each iteration; %and which data objects should be flushed; 
+The cache flush point does not have to be the same as the persistence establishment point. 
+Using this API will insert a cache flush request into the FIFO queue.
+The programmer also needs to insert an API to specify where the cache flush must finish within each iteration (flush\_barrier() in Figure 11). This API works as a synchronization between the helper thread and the main thread to ensure that the working version is completely flushed before it becomes the consistent version and read by the application.
+
+\textbf{Discussion.} Similar to any help thread-based approaches~\cite{mem_reg_cf11, ipdps10:tiwari, hpca03:mutlu, tpds09:prefetching}, our approach depends on the availability of 
+idling core for helper threads. We expect that the future many-core platform can provide such core abundance. Note that even without the helper thread, the in-place versioning with {\fontfamily{qcr}\selectfont WBINVD} already provide significant performance improvement over checkpoint, shown in Figure 12 in the evaluation section.
+
+
+%\textbf{Dong TODO: discuss the availability of helper threads.}
+
+
+
+%Helper thread.
+%Discussion on the availability of helper thread.
